@@ -435,11 +435,16 @@ if ($detectedVRAM -gt 0) {
     Write-Warn "Could not detect VRAM - defaulting to 8GB tier."
 }
 
-# Build list: recommendation first, others after
-$ditOptions = [System.Collections.Generic.List[object]]::new()
+# Build deduplicated list: recommendation first, others after (skip duplicate models)
+$seenDiT     = @{}
+$ditOptions  = [System.Collections.Generic.List[object]]::new()
+$seenDiT[$recommendedTier.DiTModel] = $true
 $ditOptions.Add($recommendedTier)
 foreach ($t in $VRAM_TIERS) {
-    if ($t.Label -ne $recommendedTier.Label) { $ditOptions.Add($t) }
+    if ($t.Label -ne $recommendedTier.Label -and -not $seenDiT.ContainsKey($t.DiTModel)) {
+        $seenDiT[$t.DiTModel] = $true
+        $ditOptions.Add($t)
+    }
 }
 
 $ditLabels = @()
@@ -452,6 +457,8 @@ $selectedTier = $ditOptions[$ditResult.Index]
 
 $autoLbl = if ($ditResult.AutoSelected) { " (autoselected - timeout)" } else { " (user selected)" }
 Write-OK "SeedVR2 model: $($selectedTier.DiTModel)$autoLbl"
+Write-Info "NOTE: This model will be downloaded automatically by ComfyUI on first use."
+Write-Info "      Source: https://huggingface.co/models?other=seedvr"
 Add-Summary "SeedVR2 model" "$($selectedTier.DiTModel) [$($selectedTier.Label) tier]$autoLbl" $ditResult.AutoSelected
 
 
