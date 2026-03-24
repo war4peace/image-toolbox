@@ -44,60 +44,48 @@ from collections import defaultdict
 
 
 # ─────────────────────────────────────────────────────────────
-#  CONFIG  –  adjust to match your setup
+#  CONFIG  –  loaded from config.json
 # ─────────────────────────────────────────────────────────────
 
-OLLAMA_URL   = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "llava:34b"
+def _load_config():
+    """
+    Load settings from config.json in the same directory as this script.
+    Raises a clear error if the file is missing or malformed.
+    """
+    import json as _json
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if not os.path.exists(config_path):
+        print(f"\nERROR: config.json not found at: {config_path}")
+        print("Run setup.ps1 first to generate it, or create it manually.")
+        print("See README.md for the expected format.\n")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8") as _f:
+        return _json.load(_f)
 
-# Resolution threshold for non-upscaled originals.
-# Process if width >= MIN_WIDTH OR height >= MIN_HEIGHT.
-MIN_WIDTH  = 3840
-MIN_HEIGHT = 2160
+_CFG = _load_config()
+_O   = _CFG.get("ollama",  {})
+_T   = _CFG.get("tagging", {})
 
-# Name of the upscaled subfolder (must match the upscaling script).
-UPSCALED_SUBDIR = "upscaled"
+OLLAMA_URL   = _O.get("url",   "http://127.0.0.1:11434")
+OLLAMA_MODEL = _O.get("model", "llava:34b")
 
-# Image extensions to consider.
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
+MIN_WIDTH       = _T.get("min_width",       3840)
+MIN_HEIGHT      = _T.get("min_height",      2160)
+UPSCALED_SUBDIR = _T.get("upscaled_subdir", "upscaled")
+IMAGE_EXTS      = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
 
-# Camera default filename patterns (case-insensitive regex).
-# A file is eligible for RENAMING only if its stem matches one of these.
-# Files not matching are still TAGGED but keep their existing name.
-# Add more patterns as you discover them in your archive.
-CAMERA_FILENAME_PATTERNS = [
-    r"^IMG_\d+",           # IMG_3548       — Canon, Apple, many others
-    r"^DSC\d+",            # DSC00123       — Sony
-    r"^DSCF\d+",           # DSCF0045       — Fujifilm
-    r"^DSCN\d+",           # DSCN1234       — Nikon Coolpix
-    r"^STA\d+",            # STA0003        — Samsung (older)
-    r"^HPIM\d+",           # HPIM0042       — HP cameras
-    r"^IMAG\d+",           # IMAG0099       — HTC / early Android
-    r"^P\d{7}",            # P1000001       — Panasonic
-    r"^MVI_\d+",           # MVI_1234       — Canon video stills
-    r"^MOV_\d+",           # MOV_0001       — various
-    r"^GOPR\d+",           # GOPR0001       — GoPro
-    r"^PXL_\d{8}",         # PXL_20210915   — Google Pixel
-    r"^PANO_\d+",          # PANO_0001      — panorama stills
-    r"^VID_\d+",           # VID_20200101   — Android video stills
-    r"^WP_\d+",            # WP_20140510    — Windows Phone
-    r"^DCIM\d*",           # DCIM generic
-    r"^\d{8}_\d{6}$",      # 20210915_143022 — generic timestamp names
-    r"^\d+$",              # 6, 7, 42       — bare numeric names
-]
+CAMERA_FILENAME_PATTERNS = _T.get("camera_filename_patterns", [
+    r"^IMG_\d+", r"^DSC\d+", r"^DSCF\d+", r"^DSCN\d+",
+    r"^STA\d+",  r"^HPIM\d+", r"^IMAG\d+", r"^P\d{7}",
+    r"^MVI_\d+", r"^MOV_\d+", r"^GOPR\d+", r"^PXL_\d{8}",
+    r"^PANO_\d+", r"^VID_\d+", r"^WP_\d+", r"^DCIM\d*",
+    r"^\d{8}_\d{6}$", r"^\d+$",
+])
 
-# Maximum words in the condensed filename description.
-CONDENSED_MAX_WORDS = 5
-
-# Ollama request timeout in seconds.
-OLLAMA_TIMEOUT = 120
-
-# How many consecutive failures trigger an outage pause.
-OUTAGE_THRESHOLD = 3
-
-# Marker written to EXIF UserComment after successful processing.
-# Files with this marker in UserComment are skipped on re-run.
-PROCESSED_MARKER = "TaggedBy:tag_and_rename"
+CONDENSED_MAX_WORDS = _T.get("condensed_max_words", 5)
+OLLAMA_TIMEOUT      = _T.get("ollama_timeout",      120)
+OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
+PROCESSED_MARKER    = "TaggedBy:tag_and_rename"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -282,7 +270,7 @@ def analyse_image(path):
         "You are an image analysis assistant. Look at this image carefully "
         "and respond with EXACTLY two lines and nothing else:\n"
         "LINE 1: A single natural-language sentence (20-40 words) describing "
-        "the main subject, setting, and any notable details. Be specific "
+        "the main subject, setting, mood, and any notable details. Be specific "
         "and factual.\n"
         "LINE 2: A condensed 4-5 word title suitable for a filename "
         "(Title_Case_With_Underscores, no punctuation, no articles like "
@@ -295,7 +283,7 @@ def analyse_image(path):
         "prompt":  prompt,
         "images":  [img_b64],
         "stream":  False,
-        "options": {"temperature": 0.1, "num_predict": 200, "num_ctx": 16384},
+        "options": {"temperature": 0.2, "num_predict": 120},
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -540,7 +528,7 @@ def main():
         print(f"    After {OUTAGE_THRESHOLD} consecutive failures the script pauses")
         print("    and waits for Enter before retrying.")
         print()
-        print("  Configuration (edit the CONFIG block at the top of the script):")
+        print("  Configuration (edit config.json in the same directory as this script):")
         print(f"    OLLAMA_URL                {OLLAMA_URL}")
         print(f"    OLLAMA_MODEL              {OLLAMA_MODEL}")
         print(f"    MIN_WIDTH / MIN_HEIGHT    {MIN_WIDTH} / {MIN_HEIGHT} px")
