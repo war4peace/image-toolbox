@@ -569,9 +569,16 @@ if (-not $workflowsPath) {
             Write-OK "Workflow installed: $workflowDest"
             Add-Summary "Workflow JSON" "downloaded to $workflowDest"
         } catch {
-            Write-Warn "Download failed: $_"
-            Write-Info "Download manually from: $workflowUrl"
-            Add-Summary "Workflow JSON" "download failed - manual install needed"
+            if ($_.Exception.Message -like "*404*") {
+                Write-Warn "Workflow not found (404). The GitHub repository may be private."
+                Write-Info "This will work once the repository is made public."
+                Write-Info "Or download manually and place in: $workflowsPath"
+                Write-Info "URL: $workflowUrl"
+            } else {
+                Write-Warn "Download failed: $_"
+                Write-Info "Download manually from: $workflowUrl"
+            }
+            Add-Summary "Workflow JSON" "download failed (404 - repo may be private)"
         }
     } else {
         Write-Info "Keeping existing workflow."
