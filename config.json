@@ -1,0 +1,53 @@
+{
+    "comfyui": {
+        "url": "http://127.0.0.1:8000",
+        "venv_python": "C:\\Users\\...\\ComfyUI\\.venv\\Scripts\\python.exe",
+        "custom_nodes_dir": "C:\\Users\\...\\ComfyUI\\custom_nodes",
+        "models_dir": "C:\\Users\\...\\ComfyUI\\models"
+    },
+    "ollama": {
+        "url": "http://127.0.0.1:11434",
+        "model": "llava:34b"
+    },
+    "upscale": {
+        "resolution": 2160,
+        "max_resolution": 3840,
+        "output_subdir": "upscaled",
+        "poll_interval": 3,
+        "poll_timeout": 600,
+        "attention_mode": "sdpa",
+        "color_correction": "lab",
+        "dit_model": "seedvr2_ema_7b_fp16.safetensors",
+        "vae_model": "ema_vae_fp16.safetensors",
+        "outage_threshold": 3,
+        "discord_webhook_url": ""
+    },
+    "tagging": {
+        "min_width": 3840,
+        "min_height": 2160,
+        "upscaled_subdir": "upscaled",
+        "condensed_max_words": 5,
+        "ollama_timeout": 120,
+        "outage_threshold": 3,
+        "camera_filename_patterns": [
+            "^IMG_\\d+",
+            "^DSC\\d+",
+            "^DSCF\\d+",
+            "^DSCN\\d+",
+            "^STA\\d+",
+            "^HPIM\\d+",
+            "^IMAG\\d+",
+            "^P\\d{7}",
+            "^MVI_\\d+",
+            "^MOV_\\d+",
+            "^GOPR\\d+",
+            "^PXL_\\d{8}",
+            "^PANO_\\d+",
+            "^VID_\\d+",
+            "^WP_\\d+",
+            "^DCIM\\d*",
+            "^\\d{8}_\\d{6}$",
+            "^\\d+$"
+        ]
+    }
+}
