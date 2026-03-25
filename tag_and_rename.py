@@ -59,7 +59,7 @@ def _load_config():
         print("Run setup.ps1 first to generate it, or create it manually.")
         print("See README.md for the expected format.\n")
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as _f:
+    with open(config_path, "r", encoding="utf-8-sig") as _f:
         return _json.load(_f)
 
 _CFG = _load_config()

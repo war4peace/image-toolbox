@@ -648,7 +648,7 @@ if ($configExists) {
 }
 
 if ($overwrite) {
-    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $CONFIG_PATH -Encoding UTF8
+    [System.IO.File]::WriteAllText($CONFIG_PATH, ($config | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
     Write-OK "config.json $(if ($configExists) { 'updated' } else { 'created' }): $CONFIG_PATH"
     Add-Summary "config.json" "$(if ($configExists) { 'updated' } else { 'generated' })"
 } else {
