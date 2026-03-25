@@ -656,6 +656,43 @@ if ($overwrite) {
     Add-Summary "config.json" "kept existing (not overwritten)"
 }
 
+# Discord webhook (optional)
+Write-Host ""
+Write-Host "  Discord webhook URL for script outage notifications (optional)." -ForegroundColor Gray
+Write-Host "  How to create one: https://support.discord.com/hc/en-us/articles/228383668" -ForegroundColor Gray
+Write-Host ""
+$webhookUrl = Read-Host "  Enter webhook URL, or press Enter to skip"
+$webhookUrl = $webhookUrl.Trim()
+
+if ($webhookUrl -ne "") {
+    # Patch the discord_webhook_url into the existing config.json
+    try {
+        # Read the raw JSON text and do a simple string replacement of the
+        # empty webhook value. This avoids PSCustomObject assignment issues
+        # in PowerShell 5.1 and preserves all other config values exactly.
+        $jsonText = [System.IO.File]::ReadAllText($CONFIG_PATH, [System.Text.UTF8Encoding]::new($false))
+        if ($jsonText -match '"discord_webhook_url"') {
+            # Replace the empty value with the provided URL
+            $escaped    = $webhookUrl -replace '\\', '\\\\' -replace '"', '\"'
+            $jsonText   = $jsonText -replace '("discord_webhook_url"\s*:\s*)"[^"]*"', "`$1`"$escaped`""
+            [System.IO.File]::WriteAllText($CONFIG_PATH, $jsonText, [System.Text.UTF8Encoding]::new($false))
+            Write-OK "Discord webhook saved to config.json."
+            Add-Summary "Discord webhook" "configured"
+        } else {
+            Write-Warn "discord_webhook_url key not found in config.json."
+            Write-Info "Set it manually in config.json."
+            Add-Summary "Discord webhook" "key not found - set manually"
+        }
+    } catch {
+        Write-Warn "Could not update config.json with webhook: $_"
+        Write-Info "Set discord_webhook_url manually in config.json."
+        Add-Summary "Discord webhook" "failed to save - set manually"
+    }
+} else {
+    Write-Info "Skipped. Set discord_webhook_url in config.json at any time to enable."
+    Add-Summary "Discord webhook" "skipped (optional)"
+}
+
 
 # ---------------------------------------------------------------
 #  SETUP COMPLETE - Summary
