@@ -607,7 +607,6 @@ $config = [ordered]@{
     upscale = [ordered]@{
         resolution          = 2160
         max_resolution      = 3840
-        output_subdir       = "upscaled"
         poll_interval       = 3
         poll_timeout        = 600
         attention_mode      = "sdpa"
@@ -676,8 +675,26 @@ if ($webhookUrl -ne "") {
             $escaped    = $webhookUrl -replace '\\', '\\\\' -replace '"', '\"'
             $jsonText   = $jsonText -replace '("discord_webhook_url"\s*:\s*)"[^"]*"', "`$1`"$escaped`""
             [System.IO.File]::WriteAllText($CONFIG_PATH, $jsonText, [System.Text.UTF8Encoding]::new($false))
-            Write-OK "Discord webhook saved to config.json."
-            Add-Summary "Discord webhook" "configured"
+            # Verify by GET - Discord returns webhook metadata if valid, 401/404 if not.
+            # No message is sent to the channel.
+            try {
+                $local:ErrorActionPreference = "Stop"
+                $response = Invoke-RestMethod -Uri $webhookUrl -Method Get -TimeoutSec 10
+                $channelName = if ($response.name) { $response.name } else { "unknown" }
+                Write-OK "Discord webhook verified - connected to channel: $channelName"
+                Add-Summary "Discord webhook" "configured and verified (channel: $channelName)"
+            } catch {
+                $code = $_.Exception.Response.StatusCode.value__
+                if ($code -eq 401) {
+                    Write-Warn "Webhook invalid (401 Unauthorized) - URL may be incorrect."
+                } elseif ($code -eq 404) {
+                    Write-Warn "Webhook not found (404) - URL may be incorrect or the webhook was deleted."
+                } else {
+                    Write-Warn "Could not verify webhook: $_"
+                }
+                Write-Info "URL saved anyway. Correct discord_webhook_url in config.json if needed."
+                Add-Summary "Discord webhook" "configured (verification failed - check URL)"
+            }
         } else {
             Write-Warn "discord_webhook_url key not found in config.json."
             Write-Info "Set it manually in config.json."

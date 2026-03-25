@@ -12,7 +12,6 @@
     "upscale":  {
                     "resolution":  2160,
                     "max_resolution":  3840,
-                    "output_subdir":  "upscaled",
                     "poll_interval":  3,
                     "poll_timeout":  600,
                     "attention_mode":  "sdpa",
@@ -25,7 +24,7 @@
                     "encode_tile_size":  1024,
                     "decode_tile_size":  1024,
                     "outage_threshold":  3,
-                    "discord_webhook_url":  ""
+                    "discord_webhook_url":  "https://discord.com/api/webhooks/1429833028569665768/QtEwcMgezLAWYCglCX5i--6Q-oM0lJXKHinjqy0hwNETh6reuQbMUF0cyt9jWtwOxn7U"
                 },
     "tagging":  {
                     "min_width":  3840,
