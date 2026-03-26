@@ -949,6 +949,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 # ─────────────────────────────────────────────
 
 def main():
+    global UPSCALE_CUTOFF_PCT
     if len(sys.argv) < 2:
         print("Usage: python batch_upscale.py <source_dir> [output_dir] [cutoff_pct]")
         print("")
@@ -995,7 +996,6 @@ def main():
 
     # Optional third argument: upscale cutoff percentage
     # Overrides the value from config.json for this run only.
-    global UPSCALE_CUTOFF_PCT
     if len(sys.argv) >= 4:
         try:
             UPSCALE_CUTOFF_PCT = int(sys.argv[3])

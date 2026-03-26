@@ -1,0 +1,5 @@
+Log file: X:\Work\AI\image-toolbox\logs\batch_upscale_2026-03-26_11-03-12.log
+Source:   X:\Personale\Poze
+Output:   X:\Personale\Poze\__upscaled__
+Cutoff:   66% (skip images >= 66% of target resolution)
+Scanning 'X:\Personale\Poze' recursively ...
