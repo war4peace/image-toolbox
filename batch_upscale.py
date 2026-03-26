@@ -66,6 +66,8 @@ _C   = _CFG.get("comfyui", {})
 _U   = _CFG.get("upscale", {})
 
 COMFYUI_URL              = _C.get("url",              "http://127.0.0.1:8000")
+_comfy_models_dir        = _C.get("models_dir",        "")
+COMFYUI_OUTPUT_DIR       = os.path.normpath(os.path.join(_comfy_models_dir, "..", "output")) if _comfy_models_dir else ""
 IMAGE_EXTS               = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 POLL_INTERVAL            = _U.get("poll_interval",    3)
 POLL_TIMEOUT             = _U.get("poll_timeout",     600)
@@ -606,19 +608,65 @@ def fetch_output_image(history_entry, output_dir, dest_name):
     for _, node_output in history_entry.get("outputs", {}).items():
         images = node_output.get("images", [])
         if images:
-            img    = images[0]
+            img       = images[0]
+            subfolder = img.get("subfolder", "")
+            filename  = img["filename"]
+            img_type  = img.get("type", "output")
+
             params = urllib.parse.urlencode({
-                "filename":  img["filename"],
-                "subfolder": img.get("subfolder", ""),
-                "type":      img.get("type", "output")
+                "filename":  filename,
+                "subfolder": subfolder,
+                "type":      img_type,
             })
+
             os.makedirs(output_dir, exist_ok=True)
             dest_path = os.path.join(output_dir, dest_name)
+
+            # Download from ComfyUI output folder to our destination
             with urllib.request.urlopen(f"{COMFYUI_URL}/view?{params}") as resp:
                 with open(dest_path, "wb") as f:
                     f.write(resp.read())
+
+            # Delete from ComfyUI output folder to prevent accumulation
+            _delete_comfyui_output(filename, subfolder, img_type)
+
             return dest_path
     raise RuntimeError("No output image found in history entry.")
+
+
+def _delete_comfyui_output(filename, subfolder, img_type):
+    """
+    Remove the file from ComfyUI's output folder after we have copied it.
+    Uses direct filesystem deletion via the configured ComfyUI output path.
+    Silently ignores failures — deletion is best-effort.
+    """
+    import glob
+
+    comfy_output_dir = COMFYUI_OUTPUT_DIR
+    if not comfy_output_dir or not os.path.isdir(comfy_output_dir):
+        return
+
+    deleted = 0
+
+    # Primary: delete the exact file ComfyUI reported
+    target_dir = os.path.join(comfy_output_dir, subfolder) if subfolder else comfy_output_dir
+    comfy_file = os.path.join(target_dir, filename)
+    try:
+        if os.path.exists(comfy_file):
+            os.remove(comfy_file)
+            deleted += 1
+    except Exception:
+        pass
+
+    # Fallback: delete any __batch__*.png files in the output root
+    # ComfyUI names batch outputs as __batch___00001_.png etc.
+    if deleted == 0:
+        for stale in glob.glob(os.path.join(comfy_output_dir, "__batch__*.png")):
+            try:
+                os.remove(stale)
+                deleted += 1
+            except Exception:
+                pass
 
 
 
@@ -792,14 +840,16 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
     done    = folder_stats[dirpath]["skipped_done"]
     large   = folder_stats[dirpath]["skipped_size"]
     missing = folder_stats[dirpath]["skipped_missing"]
-    if done == 0 and large == 0 and missing == 0:
+    corrupt = folder_stats[dirpath]["skipped_corrupt"]
+    if done == 0 and large == 0 and missing == 0 and corrupt == 0:
         return
     parts = []
     if done    > 0: parts.append(f"{done} already done")
     if large   > 0: parts.append(f"{large} too large")
-    if missing > 0: parts.append(f"{missing} file(s) no longer exist")
+    if missing > 0: parts.append(f"{missing} no longer exist")
+    if corrupt > 0: parts.append(f"{corrupt} corrupted/unreadable")
     summary = ", ".join(parts)
-    if missing > 0:
+    if missing > 0 or corrupt > 0:
         logger.tee(f"  [skipped {summary}]")
     else:
         logger.terminal_only(f"  [skipped {summary}]")
@@ -816,13 +866,14 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
     folder_stats = defaultdict(lambda: {
         "processed": 0, "skipped_done": 0, "skipped_size": 0,
-        "skipped_missing": 0, "failed": 0, "elapsed": 0.0
+        "skipped_missing": 0, "skipped_corrupt": 0, "failed": 0, "elapsed": 0.0
     })
 
     total_processed       = 0
     total_skipped_done    = 0
     total_skipped_size    = 0
     total_skipped_missing = 0
+    total_skipped_corrupt = 0
     total_failed          = 0
     total                 = len(work_items)
     current_folder        = None
@@ -875,13 +926,18 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         w, h      = get_image_dimensions(local_path)
         img_start = time.time()
 
-        if w:
-            scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
-            out_w   = round(w * scale)
-            out_h   = round(h * scale)
-            dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
-        else:
-            dim_str = "?x?px"
+        # Unreadable dimensions = corrupted/unsupported file — skip without
+        # counting as a ComfyUI failure or incrementing the outage counter.
+        if w == 0 or h == 0:
+            logger.tee(f"  {prefix} SKIP (unreadable image — file may be corrupted)  {local_path}", timestamp=True)
+            folder_stats[dirpath]["skipped_corrupt"] += 1
+            total_skipped_corrupt += 1
+            continue
+
+        scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
+        out_w   = round(w * scale)
+        out_h   = round(h * scale)
+        dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
 
         os.makedirs(output_dir, exist_ok=True)
         logger.tee(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
@@ -969,6 +1025,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "total_skipped_done":    total_skipped_done,
         "total_skipped_size":    total_skipped_size,
         "total_skipped_missing": total_skipped_missing,
+        "total_skipped_corrupt": total_skipped_corrupt,
         "total_failed":          total_failed,
         "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
     }
@@ -1221,6 +1278,7 @@ def main():
             "total_skipped_done":    s1["total_skipped_done"]    + s2["total_skipped_done"],
             "total_skipped_size":    s1["total_skipped_size"]    + s2["total_skipped_size"],
             "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
+            "total_skipped_corrupt": s1["total_skipped_corrupt"] + s2["total_skipped_corrupt"],
             "total_failed":          s1["total_failed"]          + s2["total_failed"],
         }
 
@@ -1230,6 +1288,7 @@ def main():
     total_skipped_done    = combined["total_skipped_done"]
     total_skipped_size    = combined["total_skipped_size"]
     total_skipped_missing = combined["total_skipped_missing"]
+    total_skipped_corrupt = combined["total_skipped_corrupt"]
     total_failed          = combined["total_failed"]
 
     col_path = min(60, max(len("Folder"),
@@ -1263,9 +1322,13 @@ def main():
     logger.tee(row.format("TOTAL", total_processed, total_skipped,
                           total_failed, fmt_hhmmss(grand_elapsed)))
     logger.tee(sep)
-    logger.tee(f"  ({total_processed} processed, {total_skipped_done} already done, "
-               f"{total_skipped_size} too large, {total_skipped_missing} missing, "
-               f"{total_failed} failed)")
+    parts = [f"{total_processed} processed", f"{total_skipped_done} already done",
+             f"{total_skipped_size} too large"]
+    if total_skipped_missing > 0: parts.append(f"{total_skipped_missing} missing")
+    if total_skipped_corrupt > 0: parts.append(f"{total_skipped_corrupt} corrupted")
+    if total_failed          > 0: parts.append(f"{total_failed} failed")
+    else: parts.append("0 failed")
+    logger.tee(f"  ({', '.join(parts)})")
     logger.tee(f"Log written to: {logger.path}")
     logger.close()
 
