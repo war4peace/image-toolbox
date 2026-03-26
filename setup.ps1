@@ -422,10 +422,84 @@ if (-not $customNodesPath) {
 
 
 # ---------------------------------------------------------------
-#  STEP 4 - SeedVR2 Model Selection
+# ---------------------------------------------------------------
+#  STEP 4 - Target Resolution
 # ---------------------------------------------------------------
 
-Write-Header "STEP 4 - SeedVR2 Model Selection"
+Write-Header "STEP 4 - Target Resolution"
+
+Write-Host "  Select the target upscale resolution:" -ForegroundColor Cyan
+Write-Host ""
+
+$resOptions = @(
+    [ordered]@{ Label="4K";    Width=3840; Height=2160 },
+    [ordered]@{ Label="2K";    Width=2560; Height=1440 },
+    [ordered]@{ Label="1080p"; Width=1920; Height=1080 }
+)
+
+$resResult = Get-TimedSelection `
+    -Prompt "Select target resolution:" `
+    -Options @("3840x2160", "2560x1440", "1920x1080") `
+    -Labels  @("4K (3840x2160) [RECOMMENDED]", "2K (2560x1440)", "1080p (1920x1080)")
+
+$selectedRes   = $resOptions[$resResult.Index]
+$targetWidth   = $selectedRes.Width
+$targetHeight  = $selectedRes.Height
+$resAutoLbl    = if ($resResult.AutoSelected) { " (autoselected - timeout)" } else { " (user selected)" }
+
+Write-OK "Target resolution: $($selectedRes.Label) (${targetWidth}x${targetHeight})$resAutoLbl"
+Add-Summary "Target resolution" "$($selectedRes.Label) (${targetWidth}x${targetHeight})$resAutoLbl" $resResult.AutoSelected
+
+
+# ---------------------------------------------------------------
+#  STEP 5 - Source Resolution Cutoff
+# ---------------------------------------------------------------
+
+Write-Header "STEP 5 - Source Resolution Cutoff"
+
+$defaultCutoff = 66
+$cutoffW       = [math]::Round($targetWidth  * $defaultCutoff / 100)
+$cutoffH       = [math]::Round($targetHeight * $defaultCutoff / 100)
+
+Write-Host "  Images already close to the target offer minimal upscale benefit." -ForegroundColor Gray
+Write-Host "  The cutoff skips sources at or above a percentage of the target resolution." -ForegroundColor Gray
+Write-Host ""
+Write-Host "  At $defaultCutoff% with $($selectedRes.Label) target, images >= ${cutoffW}x${cutoffH}px will be skipped." -ForegroundColor Gray
+Write-Host "  (These would be upscaled less than 1.5x, with minimal visible gain.)" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  Press Enter to accept $defaultCutoff%, or type a value (0-99) and press Enter:" -ForegroundColor Cyan
+Write-Host "  (0 = no cutoff - process all images regardless of source resolution)" -ForegroundColor Gray
+Write-Host ""
+
+$cutoffInput    = Read-Host "  Cutoff percentage [$defaultCutoff]"
+$cutoffInput    = $cutoffInput.Trim()
+$selectedCutoff = $defaultCutoff
+
+if ($cutoffInput -ne "") {
+    $parsed = 0
+    if ([int]::TryParse($cutoffInput, [ref]$parsed) -and $parsed -ge 0 -and $parsed -le 99) {
+        $selectedCutoff = $parsed
+    } else {
+        Write-Warn "Invalid value '$cutoffInput' - using default ($defaultCutoff%)."
+    }
+}
+
+$cutoffW = [math]::Round($targetWidth  * $selectedCutoff / 100)
+$cutoffH = [math]::Round($targetHeight * $selectedCutoff / 100)
+
+if ($selectedCutoff -eq 0) {
+    Write-OK "Source cutoff: disabled (all eligible images will be processed)."
+    Add-Summary "Source cutoff" "disabled"
+} else {
+    Write-OK "Source cutoff: $selectedCutoff% (skip images >= ${cutoffW}x${cutoffH}px)."
+    Add-Summary "Source cutoff" "$selectedCutoff% (skip images >= ${cutoffW}x${cutoffH}px)"
+}
+
+
+#  STEP 6 - SeedVR2 Model Selection
+# ---------------------------------------------------------------
+
+Write-Header "STEP 6 - SeedVR2 Model Selection"
 
 $recommendedTier = Get-RecommendedTier $detectedVRAM
 
@@ -466,7 +540,7 @@ Add-Summary "SeedVR2 model" "$($selectedTier.DiTModel) [$($selectedTier.Label) t
 #  STEP 5 - Ollama Model Selection and Pull
 # ---------------------------------------------------------------
 
-Write-Header "STEP 5 - Ollama Model"
+Write-Header "STEP 7 - Ollama Model"
 
 # Build deduplicated options list
 $seenOllama    = @{}
@@ -541,7 +615,7 @@ if (-not $ollamaInfo) {
 #  STEP 6 - ComfyUI Workflow
 # ---------------------------------------------------------------
 
-Write-Header "STEP 6 - ComfyUI Workflow"
+Write-Header "STEP 8 - ComfyUI Workflow"
 
 if (-not $workflowsPath) {
     Write-Warn "Could not find ComfyUI workflows directory - skipping."
@@ -591,7 +665,7 @@ if (-not $workflowsPath) {
 #  STEP 7 - Generate config.json
 # ---------------------------------------------------------------
 
-Write-Header "STEP 7 - Generating config.json"
+Write-Header "STEP 9 - Generating config.json"
 
 $config = [ordered]@{
     comfyui = [ordered]@{
@@ -605,8 +679,8 @@ $config = [ordered]@{
         model = $selectedOllamaModel
     }
     upscale = [ordered]@{
-        resolution          = 2160
-        max_resolution      = 3840
+        resolution          = $targetHeight
+        max_resolution      = $targetWidth
         poll_interval       = 3
         poll_timeout        = 600
         attention_mode      = "sdpa"
@@ -620,7 +694,7 @@ $config = [ordered]@{
         decode_tile_size    = 1024
         outage_threshold    = 3
         discord_webhook_url = ""
-        upscale_cutoff_pct  = 66
+        upscale_cutoff_pct  = $selectedCutoff
     }
     tagging = [ordered]@{
         min_width           = 3840
@@ -650,7 +724,7 @@ if ($configExists) {
 if ($overwrite) {
     [System.IO.File]::WriteAllText($CONFIG_PATH, ($config | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
     Write-OK "config.json $(if ($configExists) { 'updated' } else { 'created' }): $CONFIG_PATH"
-    Add-Summary "config.json" "$(if ($configExists) { 'updated' } else { 'generated' })"
+    Add-Summary "config.json" "$(if ($configExists) { 'updated' } else { 'generated' }) | target: $($selectedRes.Label) | cutoff: $selectedCutoff%"
 } else {
     Write-Info "Keeping existing config.json."
     Add-Summary "config.json" "kept existing (not overwritten)"

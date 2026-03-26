@@ -139,9 +139,17 @@ def send_discord_notification(title, description, color, fields=None):
     try:
         req = urllib.request.Request(
             DISCORD_WEBHOOK_URL, data=payload,
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
         )
         urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try: body = exc.read().decode("utf-8", "replace")
+        except Exception: pass
+        print(f"  [Discord] Failed to send notification: HTTP {exc.code} {exc.reason} -- {body}")
     except Exception as exc:
         print(f"  [Discord] Failed to send notification: {exc}")
 
@@ -300,12 +308,18 @@ class EligibilityCache:
             self._data[rel]["already_done"] = True
             self._dirty = True
 
-    def remove_missing(self, source_root):
-        """Remove entries for files that no longer exist on disk."""
-        to_remove = [
-            rel for rel in self._data
-            if not os.path.exists(os.path.join(source_root, rel))
-        ]
+    def remove_missing(self, source_root, progress_cb=None):
+        """
+        Remove entries for files that no longer exist on disk.
+        progress_cb: optional callable(current_path) called for each entry checked.
+        """
+        to_remove = []
+        for rel in self._data:
+            full_path = os.path.join(source_root, rel)
+            if progress_cb:
+                progress_cb(os.path.dirname(full_path))
+            if not os.path.exists(full_path):
+                to_remove.append(rel)
         for rel in to_remove:
             del self._data[rel]
         if to_remove:
@@ -717,13 +731,17 @@ class PauseController:
 def collect_work_items(root, output_root, already_done=None):
     """
     Walk root recursively.
-    Returns list of (dirpath, local_path, output_dir, out_name).
+    Returns (items, folder_count) where items is a list of
+    (dirpath, local_path, output_dir, out_name).
     Never descends into output_root.
     already_done: optional set of local_path strings to skip (used for rescan).
     """
     already_done = already_done or set()
     items = []
+    folder_count = 0
     output_root_norm = os.path.normcase(os.path.normpath(output_root))
+
+    _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Skip the output root entirely when scanning
@@ -732,6 +750,8 @@ def collect_work_items(root, output_root, already_done=None):
             if os.path.normcase(os.path.normpath(os.path.join(dirpath, d)))
             != output_root_norm
         ]
+
+        folder_count += 1
 
         # Mirror the source subdirectory structure under output_root
         rel_dir    = os.path.relpath(dirpath, root)
@@ -747,7 +767,17 @@ def collect_work_items(root, output_root, already_done=None):
             ext      = os.path.splitext(filename)[1].lower()
             out_name = f"{stem}{ext}"
             items.append((dirpath, local_path, output_dir, out_name))
-    return items
+
+        # Live progress: update in place every folder
+        display = f"  {folder_count} folder(s), {len(items)} image(s) found ..."
+        sys.stdout.write(display[:_tw].ljust(_tw) + chr(13))
+        sys.stdout.flush()
+
+    # Clear the progress line — final count printed by caller
+    sys.stdout.write(" " * _tw + chr(13))
+    sys.stdout.flush()
+
+    return items, folder_count
 
 
 # ─────────────────────────────────────────────
@@ -1021,21 +1051,38 @@ def main():
     logger.tee(f"Output:   {output_root}")
     logger.tee(f"Cutoff:   {UPSCALE_CUTOFF_PCT}% (skip images >= {UPSCALE_CUTOFF_PCT}% of target resolution)")
     logger.tee(f"Scanning '{root}' recursively ...")
-    all_items = collect_work_items(root, output_root)
+    all_items, total_folders = collect_work_items(root, output_root)
 
     if not all_items:
         logger.tee("No images found.")
         sys.exit(0)
 
-    logger.tee(f"Found {len(all_items)} image(s) total.")
+    logger.tee(f"Found {total_folders} folder(s) and {len(all_items)} image(s).")
 
     # ── Load eligibility cache ────────────────────────────────────────────────
     cache = EligibilityCache(root, output_root)
     if cache.entry_count > 0:
         logger.tee(f"Loaded eligibility cache: {cache.entry_count} entries ({cache.path})")
-        removed = cache.remove_missing(root)
+        print("  Verifying cached entries against disk (may take a moment on network drives) ...", flush=True)
+
+        _last_folder = [""]
+        _folder_idx  = [0]
+        def _verify_progress(folder):
+            if folder != _last_folder[0]:
+                _last_folder[0] = folder
+                _folder_idx[0] += 1
+                pct     = int(_folder_idx[0] / max(total_folders, 1) * 100)
+                display = f"{pct}% ({_folder_idx[0]}/{total_folders}) | {folder}"
+                _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+                sys.stdout.write(display[:_tw].ljust(_tw) + chr(13))
+                sys.stdout.flush()
+
+        removed = cache.remove_missing(root, progress_cb=_verify_progress)
+        _tw = min(os.get_terminal_size().columns - 1, 200) if hasattr(os, "get_terminal_size") else 119; sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()  # clear the folder line
         if removed:
-            logger.tee(f"  Removed {removed} entries for files no longer on disk.")
+            logger.tee(f"  Removed {removed} stale entries (files no longer on disk).")
+        else:
+            logger.tee(f"  All {cache.entry_count} cached entries verified.")
     else:
         logger.tee(f"No cache found — full eligibility check required.")
 
@@ -1055,8 +1102,8 @@ def main():
         # Progress indicator every 200 files or on last file
         if i % 200 == 0 or i == total_all:
             pct = int(i / total_all * 100)
-            print("  Checking eligibility ... %d%% (%d/%d) | cache hits: %d    " % (
-                pct, i, total_all, cache_hits), end="\r", flush=True)
+            sys.stdout.write("  Checking eligibility ... %d%% (%d/%d) | cache hits: %d    " % (
+                pct, i, total_all, cache_hits) + chr(13)); sys.stdout.flush()
 
         cached = cache.get(local_path)
 
@@ -1118,7 +1165,7 @@ def main():
     else:
         logger.tee("")
         logger.tee("  Rescanning source directory for any new or renamed files ...")
-        rescan_items = collect_work_items(root, output_root, already_done=processed_paths)
+        rescan_items, _ = collect_work_items(root, output_root, already_done=processed_paths)
 
         # Eligibility filter for new items — check resolution and already-done
         eligible_rescan = []
