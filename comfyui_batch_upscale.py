@@ -39,6 +39,7 @@ import random
 import uuid
 from collections import defaultdict
 import threading
+import datetime
 
 # ─────────────────────────────────────────────
 #  CONFIG  –  loaded from config.json
@@ -56,7 +57,7 @@ def _load_config():
         print("Run setup.ps1 first to generate it, or create it manually.")
         print("See README.md for the expected format.\n")
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8") as _f:
+    with open(config_path, "r", encoding="utf-8-sig") as _f:
         return _json.load(_f)
 
 _CFG = _load_config()
@@ -136,6 +137,51 @@ def send_discord_notification(title, description, color, fields=None):
         urllib.request.urlopen(req, timeout=10)
     except Exception as exc:
         print(f"  [Discord] Failed to send notification: {exc}")
+
+
+# ─────────────────────────────────────────────
+#  LOGGER
+# ─────────────────────────────────────────────
+
+class Logger:
+    """
+    Writes timestamped lines to both the terminal and a log file.
+    Log file is created next to the script:
+        batch_upscale_YYYY-MM-DD_HH-MM-SS.log
+    Skipped files are NOT written to the log (counted silently instead).
+    """
+    def __init__(self):
+        ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir  = os.path.dirname(os.path.abspath(__file__))
+        self.path = os.path.join(log_dir, f"batch_upscale_{ts}.log")
+        self._fh  = open(self.path, "w", encoding="utf-8", buffering=1)
+
+    def _ts(self):
+        return datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+
+    def tee(self, msg, timestamp=False):
+        """Print to terminal and write to log file."""
+        if timestamp:
+            line = f"{self._ts()} | {msg}"
+        else:
+            line = msg
+        print(line)
+        self._fh.write(line + "\n")
+
+    def log_only(self, msg, timestamp=False):
+        """Write to log file only (not printed to terminal)."""
+        if timestamp:
+            line = f"{self._ts()} | {msg}"
+        else:
+            line = msg
+        self._fh.write(line + "\n")
+
+    def terminal_only(self, msg):
+        """Print to terminal only (not written to log)."""
+        print(msg)
+
+    def close(self):
+        self._fh.close()
 
 
 # ─────────────────────────────────────────────
@@ -285,7 +331,7 @@ def build_prompt(image_filename, w, h):
             "inputs": {
                 "model":              _U.get("dit_model", "seedvr2_ema_7b_fp16.safetensors"),
                 "device":             "cuda:0",
-                "blocks_to_swap":     0,
+                 "blocks_to_swap":     _U.get("blocks_to_swap", 0),
                 "swap_io_components": False,
                 "offload_device":     "none",
                 "cache_model":        False,
@@ -297,11 +343,11 @@ def build_prompt(image_filename, w, h):
             "inputs": {
                 "model":               _U.get("vae_model", "ema_vae_fp16.safetensors"),
                 "device":              "cuda:0",
-                "encode_tiled":        False,
-                "encode_tile_size":    1024,
+                 "encode_tiled":        _U.get("encode_tiled", False),
+                 "encode_tile_size":    _U.get("encode_tile_size", 1024),
                 "encode_tile_overlap": 128,
-                "decode_tiled":        False,
-                "decode_tile_size":    1024,
+                 "decode_tiled":        _U.get("decode_tiled", False),
+                 "decode_tile_size":    _U.get("decode_tile_size", 1024),
                 "decode_tile_overlap": 128,
                 "tile_debug":          "false",
                 "offload_device":      "none",
@@ -516,121 +562,134 @@ class PauseController:
 #  DIRECTORY SCANNER  (recursive)
 # ─────────────────────────────────────────────
 
-def collect_work_items(root):
+def collect_work_items(root, output_root, already_done=None):
     """
     Walk root recursively.
-    Returns list of (local_path, output_dir, out_name), grouped by source folder.
-    Never descends into OUTPUT_SUBDIR folders.
+    Returns list of (dirpath, local_path, output_dir, out_name).
+    Never descends into output_root.
+    already_done: optional set of local_path strings to skip (used for rescan).
     """
+    already_done = already_done or set()
     items = []
+    output_root_norm = os.path.normcase(os.path.normpath(output_root))
+
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d.lower() != OUTPUT_SUBDIR.lower()]
-        output_dir  = os.path.join(dirpath, OUTPUT_SUBDIR)
+        # Skip the output root entirely when scanning
+        dirnames[:] = [
+            d for d in dirnames
+            if os.path.normcase(os.path.normpath(os.path.join(dirpath, d)))
+            != output_root_norm
+        ]
+
+        # Mirror the source subdirectory structure under output_root
+        rel_dir    = os.path.relpath(dirpath, root)
+        output_dir = os.path.normpath(os.path.join(output_root, rel_dir))
+
         for filename in sorted(filenames):
             if os.path.splitext(filename)[1].lower() not in IMAGE_EXTS:
                 continue
             local_path = os.path.join(dirpath, filename)
-            stem       = os.path.splitext(filename)[0]
-            ext        = os.path.splitext(filename)[1].lower()
-            out_name   = f"{stem}_upscaled{ext}"
+            if local_path in already_done:
+                continue
+            stem     = os.path.splitext(filename)[0]
+            ext      = os.path.splitext(filename)[1].lower()
+            out_name = f"{stem}{ext}"
             items.append((dirpath, local_path, output_dir, out_name))
     return items
 
 
 # ─────────────────────────────────────────────
-#  MAIN
+#  SKIP SUMMARY HELPER
 # ─────────────────────────────────────────────
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python comfyui_batch_upscale.py <directory>")
-        sys.exit(1)
+def _emit_skip_summary(dirpath, root, folder_stats, logger):
+    """
+    If the folder had any skipped files, emit a single summary line.
+    Missing-file skips are logged (important); routine skips are terminal only.
+    """
+    done    = folder_stats[dirpath]["skipped_done"]
+    large   = folder_stats[dirpath]["skipped_size"]
+    missing = folder_stats[dirpath]["skipped_missing"]
+    if done == 0 and large == 0 and missing == 0:
+        return
+    parts = []
+    if done    > 0: parts.append(f"{done} already done")
+    if large   > 0: parts.append(f"{large} too large")
+    if missing > 0: parts.append(f"{missing} file(s) no longer exist")
+    summary = ", ".join(parts)
+    if missing > 0:
+        logger.tee(f"  [skipped {summary}]")
+    else:
+        logger.terminal_only(f"  [skipped {summary}]")
 
-    root = os.path.abspath(sys.argv[1])
-    if not os.path.isdir(root):
-        print(f"ERROR: '{root}' is not a valid directory.")
-        sys.exit(1)
 
-    try:
-        api("/system_stats")
-    except Exception as e:
-        print(f"ERROR: Cannot reach ComfyUI at {COMFYUI_URL}\n  → {e}")
-        print("Make sure ComfyUI is running before starting this script.")
-        sys.exit(1)
+def run_pass(work_items, root, output_root, grand_start, pause, logger,
+             processed_paths, pass_label="Pass"):
+    """
+    Process a list of work items. Returns a stats dict.
+    Adds each successfully found local_path to processed_paths so the rescan
+    can exclude already-attempted files regardless of outcome.
+    """
+    consecutive_failures = 0
 
-    print(f"Scanning '{root}' recursively …\n")
-    work_items = collect_work_items(root)
-
-    if not work_items:
-        print("No images found.")
-        sys.exit(0)
-
-    print(f"Found {len(work_items)} image(s) total.\n")
-
-    pause = PauseController()
-    if pause.available:
-        print("  Keyboard control active: Space/P = pause, Q = quit after current image.\n")
-
-    consecutive_failures = 0   # reset to 0 on every successful image
-
-    # ── Per-folder stats (keyed by dirpath) ─────────────────────────────────
-    # Each entry: {"processed": int, "skipped_done": int, "skipped_size": int,
-    #              "failed": int, "elapsed": float}
     folder_stats = defaultdict(lambda: {
         "processed": 0, "skipped_done": 0, "skipped_size": 0,
-        "failed": 0, "elapsed": 0.0
+        "skipped_missing": 0, "failed": 0, "elapsed": 0.0
     })
 
-    total_processed  = 0
-    total_skipped_done  = 0
-    total_skipped_size  = 0
-    total_failed     = 0
-    grand_start      = time.time()
-    total            = len(work_items)
-    current_folder   = None
-    folder_start     = None
+    total_processed       = 0
+    total_skipped_done    = 0
+    total_skipped_size    = 0
+    total_skipped_missing = 0
+    total_failed          = 0
+    total                 = len(work_items)
+    current_folder        = None
+    folder_start          = None
 
     for idx, (dirpath, local_path, output_dir, out_name) in enumerate(work_items, 1):
-        rel_path = os.path.relpath(local_path, root)
         out_path = os.path.join(output_dir, out_name)
-        prefix   = f"[{idx}/{total}]"
+        prefix   = f"[{pass_label} {idx}/{total}]"
 
-        # Print a folder banner whenever we move into a new directory
+        # ── Folder banner ────────────────────────────────────────────────────
         if dirpath != current_folder:
-            # Close out timing for the previous folder
             if current_folder is not None:
+                _emit_skip_summary(current_folder, root, folder_stats, logger)
                 elapsed = time.time() - folder_start
                 folder_stats[current_folder]["elapsed"] += elapsed
-                print(f"\n  Folder done in {fmt_duration(elapsed)}\n")
-                print("─" * 64)
-
+                if folder_stats[current_folder]["processed"] + folder_stats[current_folder]["failed"] > 0:
+                    logger.tee(f"  Folder done in {fmt_duration(elapsed)}")
+                logger.tee("─" * 64)
             current_folder = dirpath
             folder_start   = time.time()
             rel_folder     = os.path.relpath(dirpath, root) if dirpath != root else "."
-            print(f"\n📁  {rel_folder}\n")
+            logger.tee(f"📁  {rel_folder}")
 
-        # ── Pause / quit check ──────────────────
+        # ── Pause / quit check ───────────────────────────────────────────────
         if not pause.check():
-            print("  Stopping at user request.\n")
+            logger.tee("  Stopping at user request.")
             break
 
-        # ── Already upscaled? ───────────────────
+        # ── File still exists? ───────────────────────────────────────────────
+        if not os.path.exists(local_path):
+            logger.tee(f"  {prefix} SKIP (file no longer exists)  {local_path}", timestamp=True)
+            folder_stats[dirpath]["skipped_missing"] += 1
+            total_skipped_missing += 1
+            continue
+
+        # ── Already upscaled? ────────────────────────────────────────────────
         if os.path.exists(out_path):
-            print(f"  {prefix} SKIP (already done)  {os.path.basename(local_path)}")
             folder_stats[dirpath]["skipped_done"] += 1
             total_skipped_done += 1
             continue
 
-        # ── Too large? ──────────────────────────
+        # ── Too large? ───────────────────────────────────────────────────────
         skip, reason = should_skip_resolution(local_path)
         if skip:
-            w, h = get_image_dimensions(local_path)
-            print(f"  {prefix} SKIP (too large: {w}x{h}px — {reason})  {os.path.basename(local_path)}")
             folder_stats[dirpath]["skipped_size"] += 1
             total_skipped_size += 1
             continue
 
-        # ── Process ─────────────────────────────
+        # ── Process ──────────────────────────────────────────────────────────
         w, h      = get_image_dimensions(local_path)
         img_start = time.time()
 
@@ -638,11 +697,12 @@ def main():
             scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
             out_w   = round(w * scale)
             out_h   = round(h * scale)
-            dim_str = f"{w}x{h}px → {out_w}x{out_h}px"
+            dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
         else:
             dim_str = "?x?px"
 
-        print(f"  {prefix} {dim_str}  {local_path}")
+        os.makedirs(output_dir, exist_ok=True)
+        logger.tee(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
 
         try:
             comfy_name    = upload_image(local_path)
@@ -652,9 +712,10 @@ def main():
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
-            print(f"           ✓ Done in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}\n")
+            logger.tee(f"           Done in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}", timestamp=True)
 
             consecutive_failures = 0
+            processed_paths.add(local_path)
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
 
@@ -662,110 +723,240 @@ def main():
             img_elapsed        = time.time() - img_start
             grand_elapsed      = time.time() - grand_start - pause.paused_seconds
             consecutive_failures += 1
-            print(f"           ✗ FAILED in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)} — {e}\n")
+            logger.tee(f"           FAILED in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)} -- {e}", timestamp=True)
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
-            # ── Outage detection ─────────────────────────────────────────
             if consecutive_failures >= COMFYUI_OUTAGE_THRESHOLD:
                 outage_msg = (
                     f"{consecutive_failures} consecutive image(s) failed. "
                     f"ComfyUI may be down or unresponsive.\n"
                     f"Last error: {e}"
                 )
-                print(f"  ⚠️  OUTAGE DETECTED ({consecutive_failures} consecutive failures) — pausing.")
-                print(f"  Repair ComfyUI, then press Space or P to resume.\n")
+                logger.tee(f"  WARNING: OUTAGE DETECTED ({consecutive_failures} consecutive failures) -- pausing.")
+                logger.tee(f"  Repair ComfyUI, then press Space or P to resume.")
 
                 send_discord_notification(
-                    title       = "⚠️ Upscale Script — ComfyUI Outage Detected",
+                    title       = "Upscale Script -- ComfyUI Outage Detected",
                     description = outage_msg,
-                    color       = 15548997,  # red
+                    color       = 15548997,
                     fields      = [
                         {"name": "Last failed image", "value": local_path},
-                        {"name": "Progress",          "value": f"{idx}/{total} images ({total_processed} done, {total_failed} failed)"},
+                        {"name": "Progress",          "value": f"{idx}/{total} ({pass_label})"},
                         {"name": "Total elapsed",     "value": fmt_hhmmss(grand_elapsed)},
                         {"name": "Machine",           "value": os.environ.get("COMPUTERNAME", "unknown")},
                     ]
                 )
 
-                # Force a pause — blocks here until Space/P or Q is pressed.
-                # We set the internal flag directly so the existing pause
-                # machinery handles the blocking and timing correctly.
                 with pause._lock:
                     pause._paused      = True
                     pause._pause_start = time.time()
-                    consecutive_failures = 0   # reset so we don't re-trigger immediately
+                    consecutive_failures = 0
 
-                # check() will block until the user resumes
+                logger.tee("  Press Space/P to resume, or Q to quit gracefully.")
                 if not pause.check():
-                    print("  Stopping at user request.\n")
+                    logger.tee("  Stopping at user request.")
                     break
 
                 send_discord_notification(
-                    title       = "▶️ Upscale Script — Resumed",
+                    title       = "Upscale Script -- Resumed",
                     description = "Script resumed after outage pause.",
-                    color       = 3066993,   # green
+                    color       = 3066993,
                     fields      = [
-                        {"name": "Progress",      "value": f"{idx}/{total} images"},
+                        {"name": "Progress",      "value": f"{idx}/{total} ({pass_label})"},
                         {"name": "Total elapsed", "value": fmt_hhmmss(time.time() - grand_start - pause.paused_seconds)},
                     ]
                 )
 
             continue
 
-    # Close out the last folder's timing
+    # ── Close last folder ────────────────────────────────────────────────────
     if current_folder is not None:
+        _emit_skip_summary(current_folder, root, folder_stats, logger)
         elapsed = time.time() - folder_start
         folder_stats[current_folder]["elapsed"] += elapsed
-        print(f"\n  Folder done in {fmt_duration(elapsed)}\n")
+        if folder_stats[current_folder]["processed"] + folder_stats[current_folder]["failed"] > 0:
+            logger.tee(f"  Folder done in {fmt_duration(elapsed)}")
 
-    # ── Final summary table ──────────────────────────────────────────────────
-    grand_elapsed = time.time() - grand_start - pause.paused_seconds
+    return {
+        "folder_stats":          folder_stats,
+        "total_processed":       total_processed,
+        "total_skipped_done":    total_skipped_done,
+        "total_skipped_size":    total_skipped_size,
+        "total_skipped_missing": total_skipped_missing,
+        "total_failed":          total_failed,
+        "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
+    }
 
-    # Determine column widths dynamically
-    col_path  = max(
-        len("Folder"),
-        max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)
-    )
-    col_proc  = len("Processed")
-    col_skip  = len("Skipped")
-    col_fail  = len("Failed")
-    col_time  = max(len("Elapsed"), max((len(fmt_duration(v["elapsed"])) for v in folder_stats.values()), default=7))
 
-    # Cap path column at 60 chars to avoid very wide tables
-    col_path = min(col_path, 60)
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python batch_upscale.py <source_dir> [output_dir]")
+        print("")
+        print("  source_dir   Directory to scan for images (searched recursively).")
+        print("  output_dir   Optional. Where to write upscaled images.")
+        print("               Defaults to <source_dir>\\__upscaled__")
+        print("               Can be an absolute path outside the source tree.")
+        print("")
+        print("  Example:")
+        print("    python batch_upscale.py \"X:\\Photos\\old\"")
+        print("    python batch_upscale.py \"X:\\Photos\\old\" \"X:\\Photos\\new\"")
+        sys.exit(0)
+
+    root = os.path.abspath(sys.argv[1])
+    if not os.path.isdir(root):
+        print(f"ERROR: Source directory not found: '{root}'")
+        sys.exit(1)
+
+    # ── Determine output root ────────────────────────────────────────────────
+    default_output = os.path.join(root, "__upscaled__")
+
+    if len(sys.argv) >= 3:
+        # Output path provided as second argument
+        output_root = os.path.abspath(sys.argv[2])
+        print(f"Output directory: {output_root}")
+    else:
+        # Prompt with default
+        print(f"")
+        print(f"  Output directory for upscaled images.")
+        print(f"  Press Enter to use default, or type an absolute path:")
+        print(f"  Default: {default_output}")
+        print(f"")
+        user_input = input("  Output path: ").strip()
+        if user_input:
+            output_root = os.path.abspath(user_input)
+        else:
+            output_root = default_output
+
+    # Create output root if needed
+    os.makedirs(output_root, exist_ok=True)
+
+    try:
+        api("/system_stats")
+    except Exception as e:
+        print(f"ERROR: Cannot reach ComfyUI at {COMFYUI_URL}\n  -> {e}")
+        print("Make sure ComfyUI is running before starting this script.")
+        sys.exit(1)
+
+    logger = Logger()
+    logger.tee(f"Log file: {logger.path}")
+    logger.tee(f"Source:   {root}")
+    logger.tee(f"Output:   {output_root}")
+    logger.tee(f"Scanning '{root}' recursively ...")
+    work_items = collect_work_items(root, output_root)
+
+    if not work_items:
+        logger.tee("No images found.")
+        sys.exit(0)
+
+    logger.tee(f"Found {len(work_items)} image(s) total.")
+
+    pause = PauseController()
+    if pause.available:
+        logger.tee("  Keyboard control active: Space/P = pause, Q = quit after current image.")
+
+    # ── Run first pass ──────────────────────────────────────────────────────
+    grand_start     = time.time()
+    processed_paths = set()
+    stats1 = run_pass(work_items, root, output_root, grand_start,
+                      pause, logger, processed_paths, pass_label="Pass 1")
+
+    # ── Rescan for new/renamed files (skip if user quit) ────────────────────
+    stats2 = None
+    if stats1.get("user_quit"):
+        logger.tee("")
+        logger.tee("  Quit requested by user — skipping rescan.")
+    else:
+        logger.tee("")
+        logger.tee("  Rescanning source directory for any new or renamed files ...")
+        rescan_items = collect_work_items(root, output_root, already_done=processed_paths)
+
+        # Filter out items whose output already exists (handled before this run)
+        rescan_items = [
+            item for item in rescan_items
+            if not os.path.exists(os.path.join(item[2], item[3]))
+        ]
+
+        if rescan_items:
+            logger.tee(f"  Found {len(rescan_items)} new item(s) — processing second pass.")
+            grand_start2 = time.time()
+            stats2 = run_pass(rescan_items, root, output_root, grand_start2,
+                              pause, logger, processed_paths, pass_label="Pass 2")
+        else:
+            logger.tee("  No new items found.")
+
+    # ── Combined summary table ──────────────────────────────────────────────
+    grand_elapsed = time.time() - grand_start
+
+    # Merge stats from both passes
+    def merge(s1, s2):
+        if s2 is None:
+            return s1
+        merged = defaultdict(lambda: {
+            "processed": 0, "skipped_done": 0, "skipped_size": 0,
+            "skipped_missing": 0, "failed": 0, "elapsed": 0.0
+        })
+        for d, v in s1["folder_stats"].items():
+            for k in v: merged[d][k] += v[k]
+        for d, v in s2["folder_stats"].items():
+            for k in v: merged[d][k] += v[k]
+        return {
+            "folder_stats":          merged,
+            "total_processed":       s1["total_processed"]       + s2["total_processed"],
+            "total_skipped_done":    s1["total_skipped_done"]    + s2["total_skipped_done"],
+            "total_skipped_size":    s1["total_skipped_size"]    + s2["total_skipped_size"],
+            "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
+            "total_failed":          s1["total_failed"]          + s2["total_failed"],
+        }
+
+    combined        = merge(stats1, stats2)
+    folder_stats    = combined["folder_stats"]
+    total_processed       = combined["total_processed"]
+    total_skipped_done    = combined["total_skipped_done"]
+    total_skipped_size    = combined["total_skipped_size"]
+    total_skipped_missing = combined["total_skipped_missing"]
+    total_failed          = combined["total_failed"]
+
+    col_path = min(60, max(len("Folder"),
+        max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)))
+    col_proc = len("Processed")
+    col_skip = len("Skipped")
+    col_fail = len("Failed")
+    col_time = max(len("Elapsed"),
+        max((len(fmt_duration(v["elapsed"])) for v in folder_stats.values()), default=7))
 
     def trunc(s, n):
-        return s if len(s) <= n else "…" + s[-(n - 1):]
+        return s if len(s) <= n else "..." + s[-(n - 3):]
 
-    sep   = "═" * (col_path + col_proc + col_skip + col_fail + col_time + 16)
-    row   = f"  {{:<{col_path}}}  {{:>{col_proc}}}  {{:>{col_skip}}}  {{:>{col_fail}}}  {{:>{col_time}}}"
-    print("\n" + sep)
-    print(row.format("Folder", "Processed", "Skipped", "Failed", "Elapsed"))
-    print("─" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    sep = "=" * (col_path + col_proc + col_skip + col_fail + col_time + 16)
+    row = f"  {{:<{col_path}}}  {{:>{col_proc}}}  {{:>{col_skip}}}  {{:>{col_fail}}}  {{:>{col_time}}}"
 
-    for dirpath, stats in folder_stats.items():
-        rel = os.path.relpath(dirpath, root) if dirpath != root else "."
-        skipped = stats["skipped_done"] + stats["skipped_size"]
-        print(row.format(
-            trunc(rel, col_path),
-            stats["processed"],
-            skipped,
-            stats["failed"],
-            fmt_duration(stats["elapsed"])
-        ))
+    logger.tee("")
+    logger.tee(sep)
+    logger.tee(row.format("Folder", "Processed", "Skipped", "Failed", "Elapsed"))
+    logger.tee("-" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
 
-    print("═" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    for dp, stats in folder_stats.items():
+        rel = os.path.relpath(dp, root) if dp != root else "."
+        total_skipped_folder = stats["skipped_done"] + stats["skipped_size"]
+        logger.tee(row.format(trunc(rel, col_path),
+                              stats["processed"], total_skipped_folder,
+                              stats["failed"], fmt_duration(stats["elapsed"])))
+
+    logger.tee("=" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
     total_skipped = total_skipped_done + total_skipped_size
-    print(row.format(
-        "TOTAL",
-        total_processed,
-        total_skipped,
-        total_failed,
-        fmt_duration(grand_elapsed)
-    ))
-    print(sep)
-    print(f"\n  ({total_skipped_done} already done, {total_skipped_size} too large, {total_failed} failed)\n")
+    logger.tee(row.format("TOTAL", total_processed, total_skipped,
+                          total_failed, fmt_hhmmss(grand_elapsed)))
+    logger.tee(sep)
+    logger.tee(f"  ({total_processed} processed, {total_skipped_done} already done, "
+               f"{total_skipped_size} too large, {total_skipped_missing} missing, "
+               f"{total_failed} failed)")
+    logger.tee(f"Log written to: {logger.path}")
+    logger.close()
 
 
 if __name__ == "__main__":

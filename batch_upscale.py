@@ -779,12 +779,13 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             logger.tee(f"  Folder done in {fmt_duration(elapsed)}")
 
     return {
-        "folder_stats":        folder_stats,
-        "total_processed":     total_processed,
-        "total_skipped_done":  total_skipped_done,
-        "total_skipped_size":  total_skipped_size,
+        "folder_stats":          folder_stats,
+        "total_processed":       total_processed,
+        "total_skipped_done":    total_skipped_done,
+        "total_skipped_size":    total_skipped_size,
         "total_skipped_missing": total_skipped_missing,
-        "total_failed":        total_failed,
+        "total_failed":          total_failed,
+        "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
     }
 
 
@@ -864,25 +865,29 @@ def main():
     stats1 = run_pass(work_items, root, output_root, grand_start,
                       pause, logger, processed_paths, pass_label="Pass 1")
 
-    # ── Rescan for new/renamed files ─────────────────────────────────────────
-    logger.tee("")
-    logger.tee("  Rescanning source directory for any new or renamed files ...")
-    rescan_items = collect_work_items(root, output_root, already_done=processed_paths)
-
-    # Filter out items whose output already exists (handled before this run)
-    rescan_items = [
-        item for item in rescan_items
-        if not os.path.exists(os.path.join(item[2], item[3]))
-    ]
-
+    # ── Rescan for new/renamed files (skip if user quit) ────────────────────
     stats2 = None
-    if rescan_items:
-        logger.tee(f"  Found {len(rescan_items)} new item(s) — processing second pass.")
-        grand_start2 = time.time()
-        stats2 = run_pass(rescan_items, root, output_root, grand_start2,
-                          pause, logger, processed_paths, pass_label="Pass 2")
+    if stats1.get("user_quit"):
+        logger.tee("")
+        logger.tee("  Quit requested by user — skipping rescan.")
     else:
-        logger.tee("  No new items found.")
+        logger.tee("")
+        logger.tee("  Rescanning source directory for any new or renamed files ...")
+        rescan_items = collect_work_items(root, output_root, already_done=processed_paths)
+
+        # Filter out items whose output already exists (handled before this run)
+        rescan_items = [
+            item for item in rescan_items
+            if not os.path.exists(os.path.join(item[2], item[3]))
+        ]
+
+        if rescan_items:
+            logger.tee(f"  Found {len(rescan_items)} new item(s) — processing second pass.")
+            grand_start2 = time.time()
+            stats2 = run_pass(rescan_items, root, output_root, grand_start2,
+                              pause, logger, processed_paths, pass_label="Pass 2")
+        else:
+            logger.tee("  No new items found.")
 
     # ── Combined summary table ──────────────────────────────────────────────
     grand_elapsed = time.time() - grand_start
