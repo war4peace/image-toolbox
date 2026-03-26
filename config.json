@@ -24,7 +24,8 @@
                     "encode_tile_size":  1024,
                     "decode_tile_size":  1024,
                     "outage_threshold":  3,
-                    "discord_webhook_url":  "https://discord.com/api/webhooks/1429833028569665768/QtEwcMgezLAWYCglCX5i--6Q-oM0lJXKHinjqy0hwNETh6reuQbMUF0cyt9jWtwOxn7U"
+                    "discord_webhook_url":  "https://discord.com/api/webhooks/1429833028569665768/QtEwcMgezLAWYCglCX5i--6Q-oM0lJXKHinjqy0hwNETh6reuQbMUF0cyt9jWtwOxn7U",
+                    "upscale_cutoff_pct":  66
                 },
     "tagging":  {
                     "min_width":  3840,

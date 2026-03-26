@@ -40,6 +40,7 @@ import uuid
 from collections import defaultdict
 import threading
 import datetime
+import hashlib
 
 # ─────────────────────────────────────────────
 #  CONFIG  –  loaded from config.json
@@ -73,6 +74,12 @@ RESOLUTION               = _U.get("resolution",       2160)
 MAX_RESOLUTION           = _U.get("max_resolution",   3840)
 DISCORD_WEBHOOK_URL      = _U.get("discord_webhook_url", "")
 COMFYUI_OUTAGE_THRESHOLD = _U.get("outage_threshold", 3)
+
+# Images whose shortest dimension is already >= this fraction of the target
+# will be skipped. Default 66% means a 2538x1428 image (66% of 3840x2160)
+# would be skipped — only images that need at least a 1.5x upscale are processed.
+# Set to 0 to disable (process all eligible images regardless of how close to target).
+UPSCALE_CUTOFF_PCT = _U.get("upscale_cutoff_pct", 66)
 
 
 # ─────────────────────────────────────────────
@@ -152,7 +159,8 @@ class Logger:
     """
     def __init__(self):
         ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_dir  = os.path.dirname(os.path.abspath(__file__))
+        log_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
         self.path = os.path.join(log_dir, f"batch_upscale_{ts}.log")
         self._fh  = open(self.path, "w", encoding="utf-8", buffering=1)
 
@@ -183,6 +191,130 @@ class Logger:
     def close(self):
         self._fh.close()
 
+
+
+
+# ─────────────────────────────────────────────
+#  ELIGIBILITY CACHE
+# ─────────────────────────────────────────────
+
+class EligibilityCache:
+    """
+    Persists per-file eligibility results to avoid re-scanning on every run.
+
+    Cache file location:
+        <script_dir>/scans/cache_<src_hash>_<out_hash>.json
+
+    Each entry is keyed by the file's path relative to the source root and
+    stores mtime, size, eligible flag, already_done flag, and skip_reason.
+    The mtime+size fingerprint detects changes to source files between runs.
+    """
+
+    VERSION = 1
+
+    def __init__(self, source_root, output_root):
+        self.source_root = source_root
+        self.output_root = output_root
+
+        # Derive a short hash from the two roots for a unique filename
+        key      = f"{source_root}|{output_root}".encode("utf-8")
+        digest   = hashlib.sha256(key).hexdigest()[:12]
+        scans_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans")
+        os.makedirs(scans_dir, exist_ok=True)
+        self.path = os.path.join(scans_dir, f"cache_{digest}.json")
+
+        self._data   = {}   # rel_path -> entry dict
+        self._dirty  = False
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if raw.get("version") != self.VERSION:
+                return   # incompatible version — start fresh
+            if raw.get("source_root") != self.source_root:
+                return   # wrong source root — start fresh
+            self._data = raw.get("entries", {})
+        except Exception:
+            self._data = {}
+
+    def save(self):
+        if not self._dirty:
+            return
+        payload = {
+            "version":     self.VERSION,
+            "source_root": self.source_root,
+            "output_root": self.output_root,
+            "saved_at":    datetime.datetime.now().isoformat(),
+            "entries":     self._data,
+        }
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            self._dirty = False
+        except Exception:
+            pass   # non-fatal — cache is best-effort
+
+    def _fingerprint(self, path):
+        """Return (mtime, size) for a file, or (0, 0) if unreadable."""
+        try:
+            st = os.stat(path)
+            return round(st.st_mtime, 3), st.st_size
+        except OSError:
+            return 0, 0
+
+    def get(self, local_path):
+        """
+        Return the cached entry for local_path if the fingerprint matches,
+        else None (meaning a fresh check is needed).
+        """
+        rel = os.path.relpath(local_path, self.source_root)
+        entry = self._data.get(rel)
+        if entry is None:
+            return None
+        mtime, size = self._fingerprint(local_path)
+        if entry.get("mtime") != mtime or entry.get("size") != size:
+            return None   # file changed — re-check
+        return entry
+
+    def set(self, local_path, eligible, already_done, skip_reason=None):
+        """Store or update the cache entry for local_path."""
+        rel = os.path.relpath(local_path, self.source_root)
+        mtime, size = self._fingerprint(local_path)
+        self._data[rel] = {
+            "mtime":        mtime,
+            "size":         size,
+            "eligible":     eligible,
+            "already_done": already_done,
+            "skip_reason":  skip_reason,
+        }
+        self._dirty = True
+
+    def mark_done(self, local_path):
+        """Mark a file as already_done=True after successful processing."""
+        rel = os.path.relpath(local_path, self.source_root)
+        if rel in self._data:
+            self._data[rel]["already_done"] = True
+            self._dirty = True
+
+    def remove_missing(self, source_root):
+        """Remove entries for files that no longer exist on disk."""
+        to_remove = [
+            rel for rel in self._data
+            if not os.path.exists(os.path.join(source_root, rel))
+        ]
+        for rel in to_remove:
+            del self._data[rel]
+        if to_remove:
+            self._dirty = True
+        return len(to_remove)
+
+    @property
+    def entry_count(self):
+        return len(self._data)
 
 # ─────────────────────────────────────────────
 #  IMAGE DIMENSION READER  (no Pillow needed)
@@ -269,20 +401,40 @@ def get_image_dimensions(path):
             return (0, 0)
 
 
-def should_skip_resolution(path):
+def should_skip_resolution(path, cutoff_pct=None):
     """
     Skip if EITHER dimension already meets or exceeds the output target:
       width  >= MAX_RESOLUTION (3840) — already at or beyond max horizontal
       height >= RESOLUTION     (2160) — already at or beyond max vertical
-    Both axes checked independently, so banners in either orientation are caught.
+
+    Also skip if the image is already close enough to the target that upscaling
+    would give minimal benefit. The cutoff is expressed as a percentage of the
+    target resolution. For example, at 66%:
+      width  >= 0.66 * 3840 = 2534px  OR
+      height >= 0.66 * 2160 = 1426px
+    means the image is skipped (would be upscaled less than 1.52x).
     """
+    if cutoff_pct is None:
+        cutoff_pct = UPSCALE_CUTOFF_PCT
+
     w, h = get_image_dimensions(path)
     if w == 0 and h == 0:
         return False, ""
+
+    # Already at or above target
     if w >= MAX_RESOLUTION:
         return True, f"width {w}px >= {MAX_RESOLUTION}px"
     if h >= RESOLUTION:
         return True, f"height {h}px >= {RESOLUTION}px"
+
+    # Within cutoff percentage of target — upscale gain too small
+    if cutoff_pct > 0:
+        cutoff_w = MAX_RESOLUTION * cutoff_pct / 100
+        cutoff_h = RESOLUTION     * cutoff_pct / 100
+        if w >= cutoff_w or h >= cutoff_h:
+            scale = min(MAX_RESOLUTION / w, RESOLUTION / h)
+            return True, f"within cutoff ({w}x{h}px, would upscale {scale:.2f}x < {100/cutoff_pct:.2f}x minimum)"
+
     return False, ""
 
 
@@ -624,7 +776,7 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
 
 
 def run_pass(work_items, root, output_root, grand_start, pause, logger,
-             processed_paths, pass_label="Pass"):
+             processed_paths, cache=None, pass_label="Pass"):
     """
     Process a list of work items. Returns a stats dict.
     Adds each successfully found local_path to processed_paths so the rescan
@@ -648,7 +800,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
     for idx, (dirpath, local_path, output_dir, out_name) in enumerate(work_items, 1):
         out_path = os.path.join(output_dir, out_name)
-        prefix   = f"[{pass_label} {idx}/{total}]"
+        prefix   = f"[{idx}/{total}]" if not pass_label else f"[{pass_label} {idx}/{total}]"
 
         # ── Folder banner ────────────────────────────────────────────────────
         if dirpath != current_folder:
@@ -716,6 +868,9 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             consecutive_failures = 0
             processed_paths.add(local_path)
+            if cache is not None:
+                cache.mark_done(local_path)
+                cache.save()
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
 
@@ -742,7 +897,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     color       = 15548997,
                     fields      = [
                         {"name": "Last failed image", "value": local_path},
-                        {"name": "Progress",          "value": f"{idx}/{total} ({pass_label})"},
+                        {"name": "Progress",          "value": f"{idx}/{total}"},
                         {"name": "Total elapsed",     "value": fmt_hhmmss(grand_elapsed)},
                         {"name": "Machine",           "value": os.environ.get("COMPUTERNAME", "unknown")},
                     ]
@@ -763,7 +918,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     description = "Script resumed after outage pause.",
                     color       = 3066993,
                     fields      = [
-                        {"name": "Progress",      "value": f"{idx}/{total} ({pass_label})"},
+                        {"name": "Progress",      "value": f"{idx}/{total}"},
                         {"name": "Total elapsed", "value": fmt_hhmmss(time.time() - grand_start - pause.paused_seconds)},
                     ]
                 )
@@ -795,16 +950,22 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python batch_upscale.py <source_dir> [output_dir]")
+        print("Usage: python batch_upscale.py <source_dir> [output_dir] [cutoff_pct]")
         print("")
         print("  source_dir   Directory to scan for images (searched recursively).")
         print("  output_dir   Optional. Where to write upscaled images.")
         print("               Defaults to <source_dir>\\__upscaled__")
         print("               Can be an absolute path outside the source tree.")
+        print(f"  cutoff_pct   Optional. Skip images already at or above this percentage")
+        print(f"               of the target resolution (default: {UPSCALE_CUTOFF_PCT}%).")
+        print(f"               Example: 66 means skip images >= 66% of target size.")
+        print(f"               Set to 0 to process all eligible images.")
         print("")
-        print("  Example:")
+        print("  Examples:")
         print("    python batch_upscale.py \"X:\\Photos\\old\"")
         print("    python batch_upscale.py \"X:\\Photos\\old\" \"X:\\Photos\\new\"")
+        print("    python batch_upscale.py \"X:\\Photos\\old\" \"X:\\Photos\\new\" 75")
+        print("    python batch_upscale.py \"X:\\Photos\\old\" \"\" 50  # empty string = use default output path")
         sys.exit(0)
 
     root = os.path.abspath(sys.argv[1])
@@ -832,6 +993,18 @@ def main():
         else:
             output_root = default_output
 
+    # Optional third argument: upscale cutoff percentage
+    # Overrides the value from config.json for this run only.
+    global UPSCALE_CUTOFF_PCT
+    if len(sys.argv) >= 4:
+        try:
+            UPSCALE_CUTOFF_PCT = int(sys.argv[3])
+            if not 0 <= UPSCALE_CUTOFF_PCT <= 99:
+                raise ValueError
+            print(f"Upscale cutoff: {UPSCALE_CUTOFF_PCT}% (from command line)")
+        except ValueError:
+            print(f"WARNING: Invalid cutoff percentage '{sys.argv[3]}' — using config value ({UPSCALE_CUTOFF_PCT}%)")
+
     # Create output root if needed
     os.makedirs(output_root, exist_ok=True)
 
@@ -846,24 +1019,96 @@ def main():
     logger.tee(f"Log file: {logger.path}")
     logger.tee(f"Source:   {root}")
     logger.tee(f"Output:   {output_root}")
+    logger.tee(f"Cutoff:   {UPSCALE_CUTOFF_PCT}% (skip images >= {UPSCALE_CUTOFF_PCT}% of target resolution)")
     logger.tee(f"Scanning '{root}' recursively ...")
-    work_items = collect_work_items(root, output_root)
+    all_items = collect_work_items(root, output_root)
 
-    if not work_items:
+    if not all_items:
         logger.tee("No images found.")
         sys.exit(0)
 
-    logger.tee(f"Found {len(work_items)} image(s) total.")
+    logger.tee(f"Found {len(all_items)} image(s) total.")
+
+    # ── Load eligibility cache ────────────────────────────────────────────────
+    cache = EligibilityCache(root, output_root)
+    if cache.entry_count > 0:
+        logger.tee(f"Loaded eligibility cache: {cache.entry_count} entries ({cache.path})")
+        removed = cache.remove_missing(root)
+        if removed:
+            logger.tee(f"  Removed {removed} entries for files no longer on disk.")
+    else:
+        logger.tee(f"No cache found — full eligibility check required.")
+
+    logger.tee(f"Checking eligibility (this may take a while) ...")
+
+    # ── Eligibility pre-check (cache-aware) ───────────────────────────────────
+    work_items     = []
+    pre_done       = 0
+    pre_too_large  = 0
+    cache_hits     = 0
+    total_all      = len(all_items)
+
+    for i, item in enumerate(all_items, 1):
+        dirpath, local_path, output_dir, out_name = item
+        out_path = os.path.join(output_dir, out_name)
+
+        # Progress indicator every 200 files or on last file
+        if i % 200 == 0 or i == total_all:
+            pct = int(i / total_all * 100)
+            print("  Checking eligibility ... %d%% (%d/%d) | cache hits: %d    " % (
+                pct, i, total_all, cache_hits), end="\r", flush=True)
+
+        cached = cache.get(local_path)
+
+        if cached is not None:
+            cache_hits += 1
+            if cached["already_done"]:
+                pre_done += 1
+                continue
+            if not cached["eligible"]:
+                pre_too_large += 1
+                continue
+            # Eligible and not done — add to work list
+            work_items.append(item)
+            continue
+
+        # Cache miss — do full check and store result
+        if os.path.exists(out_path):
+            cache.set(local_path, eligible=True, already_done=True)
+            pre_done += 1
+            continue
+
+        skip, reason = should_skip_resolution(local_path)
+        if skip:
+            cache.set(local_path, eligible=False, already_done=False, skip_reason=reason)
+            pre_too_large += 1
+            continue
+
+        cache.set(local_path, eligible=True, already_done=False)
+        work_items.append(item)
+
+    print()  # newline after progress indicator
+    cache.save()
+
+    logger.tee(f"Found {len(work_items)} eligible file(s) "
+               f"({pre_done} already done, {pre_too_large} too large — "
+               f"{cache_hits}/{total_all} from cache).")
+
+    if not work_items:
+        logger.tee("Nothing to process.")
+        sys.exit(0)
 
     pause = PauseController()
     if pause.available:
         logger.tee("  Keyboard control active: Space/P = pause, Q = quit after current image.")
+    logger.tee("")
+    logger.tee("Processing ...")
 
     # ── Run first pass ──────────────────────────────────────────────────────
     grand_start     = time.time()
     processed_paths = set()
     stats1 = run_pass(work_items, root, output_root, grand_start,
-                      pause, logger, processed_paths, pass_label="Pass 1")
+                      pause, logger, processed_paths, cache=cache, pass_label="")
 
     # ── Rescan for new/renamed files (skip if user quit) ────────────────────
     stats2 = None
@@ -875,17 +1120,36 @@ def main():
         logger.tee("  Rescanning source directory for any new or renamed files ...")
         rescan_items = collect_work_items(root, output_root, already_done=processed_paths)
 
-        # Filter out items whose output already exists (handled before this run)
-        rescan_items = [
-            item for item in rescan_items
-            if not os.path.exists(os.path.join(item[2], item[3]))
-        ]
+        # Eligibility filter for new items — check resolution and already-done
+        eligible_rescan = []
+        for item in rescan_items:
+            dirpath, local_path, output_dir, out_name = item
+            out_path = os.path.join(output_dir, out_name)
+            if os.path.exists(out_path):
+                cache.set(local_path, eligible=True, already_done=True)
+                continue
+            cached = cache.get(local_path)
+            if cached is not None:
+                if cached["already_done"] or not cached["eligible"]:
+                    continue
+                eligible_rescan.append(item)
+            else:
+                skip, reason = should_skip_resolution(local_path)
+                if skip:
+                    cache.set(local_path, eligible=False, already_done=False, skip_reason=reason)
+                    continue
+                cache.set(local_path, eligible=True, already_done=False)
+                eligible_rescan.append(item)
+        cache.save()
+        rescan_items = eligible_rescan
 
         if rescan_items:
             logger.tee(f"  Found {len(rescan_items)} new item(s) — processing second pass.")
+            logger.tee("")
+            logger.tee("Processing new items ...")
             grand_start2 = time.time()
             stats2 = run_pass(rescan_items, root, output_root, grand_start2,
-                              pause, logger, processed_paths, pass_label="Pass 2")
+                              pause, logger, processed_paths, cache=cache, pass_label="")
         else:
             logger.tee("  No new items found.")
 

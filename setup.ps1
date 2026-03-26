@@ -620,6 +620,7 @@ $config = [ordered]@{
         decode_tile_size    = 1024
         outage_threshold    = 3
         discord_webhook_url = ""
+        upscale_cutoff_pct  = 66
     }
     tagging = [ordered]@{
         min_width           = 3840
