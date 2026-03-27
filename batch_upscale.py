@@ -157,6 +157,22 @@ def send_discord_notification(title, description, color, fields=None):
 
 
 # ─────────────────────────────────────────────
+#  TERMINAL HELPERS
+# ─────────────────────────────────────────────
+
+def _osc8_link(path):
+    """
+    Wrap a filesystem path in an OSC 8 hyperlink (ESC ] 8 ;; URI ESC backslash).
+    Supported by Windows Terminal and VS Code terminal.
+    Shift+Click opens the file in the default application.
+    """
+    ESC = chr(27)
+    ST  = chr(92)   # string terminator: backslash (ESC + backslash = ESC ST)
+    uri = "file:///" + path.replace(chr(92), "/")
+    return ESC + "]8;;" + uri + ESC + ST + path + ESC + "]8;;" + ESC + ST
+
+
+# ─────────────────────────────────────────────
 #  LOGGER
 # ─────────────────────────────────────────────
 
@@ -940,7 +956,14 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
 
         os.makedirs(output_dir, exist_ok=True)
-        logger.tee(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
+        linked_path = _osc8_link(local_path)
+        # Clear any lingering status line, then print the new image line
+        _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+        sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()
+        import datetime as _dt
+        _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+        print(f"{_ts} |   {prefix} {dim_str}  {linked_path}", flush=True)
+        logger.log_only(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
 
         try:
             comfy_name    = upload_image(local_path)
@@ -950,7 +973,11 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
-            logger.tee(f"           Done in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}", timestamp=True)
+            status = f"Last: {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}"
+            _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+            sys.stdout.write((" " * 13 + status)[:_tw].ljust(_tw) + chr(13))
+            sys.stdout.flush()
+            logger.log_only(f"           Done in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}", timestamp=True)
 
             consecutive_failures = 0
             processed_paths.add(local_path)
@@ -964,6 +991,9 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             img_elapsed        = time.time() - img_start
             grand_elapsed      = time.time() - grand_start - pause.paused_seconds
             consecutive_failures += 1
+            # Clear the status line first, then print failure visibly
+            _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+            sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()
             logger.tee(f"           FAILED in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)} -- {e}", timestamp=True)
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
