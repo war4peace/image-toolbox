@@ -957,12 +957,11 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
         os.makedirs(output_dir, exist_ok=True)
         linked_path = _osc8_link(local_path)
-        # Clear any lingering status line, then print the new image line
-        _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
-        sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
-        print(f"{_ts} |   {prefix} {dim_str}  {linked_path}", flush=True)
+        # Print without newline — timing will be appended on the same line when done
+        sys.stdout.write(f"{_ts} |   {prefix} {dim_str}  {linked_path}")
+        sys.stdout.flush()
         logger.log_only(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
 
         try:
@@ -973,11 +972,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
-            status = f"Last: {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}"
-            _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
-            sys.stdout.write((" " * 13 + status)[:_tw].ljust(_tw) + chr(13))
+            timing = f" | {fmt_mmss(img_elapsed)} | Total: {fmt_hhmmss(grand_elapsed)}"
+            sys.stdout.write(timing + "\n")
             sys.stdout.flush()
-            logger.log_only(f"           Done in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)}", timestamp=True)
+            logger.log_only(f"  {prefix} {dim_str}  {local_path}{timing}", timestamp=True)
 
             consecutive_failures = 0
             processed_paths.add(local_path)
@@ -991,10 +989,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             img_elapsed        = time.time() - img_start
             grand_elapsed      = time.time() - grand_start - pause.paused_seconds
             consecutive_failures += 1
-            # Clear the status line first, then print failure visibly
-            _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
-            sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()
-            logger.tee(f"           FAILED in {fmt_mmss(img_elapsed)} | Total elapsed: {fmt_hhmmss(grand_elapsed)} -- {e}", timestamp=True)
+            timing = f" | FAILED {fmt_mmss(img_elapsed)} | Total: {fmt_hhmmss(grand_elapsed)} -- {e}"
+            sys.stdout.write(timing + "\n")
+            sys.stdout.flush()
+            logger.log_only(f"  {prefix} {dim_str}  {local_path}{timing}", timestamp=True)
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
