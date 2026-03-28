@@ -2,7 +2,7 @@
 AI-leveraged image alteration toolbox. Rescale, describe, rename files based on a variety of parameters, using local and remote AI models.
 
 ## WARNING: This toolbox is work-in-progress. Do NOT use it on important data. Always test with a small sample before committing to your precious files!
-## I am not reponsible for data loss. Use this tool at your own risk.
+## I am not responsible for data loss. Use this tool at your own risk.
 
 This is a set of tools created to help with upscaling, describing and renaming image files. Useful to enhance your personal image collection and improve old pictures which were taken using older cameras. 
 
@@ -61,7 +61,7 @@ Terminal output example for one folder:
   Folder done in 3m 25s
 ```
 
-- **Clear, detailed session summary**: When the session ends (or is interrupted), the tool displays a detailed activity summary. The "Folder" and Log path entries are all clickable, and open using the default local method for each type.
+- **Clear, detailed session summary**: When the session ends (or is interrupted), the tool displays a detailed activity summary. The "Folder" column's rows and Log path entries are all clickable, and open using the default local method for each type.
 
 Terminal output example of session summary:
 
@@ -86,3 +86,5 @@ Open PowerShell in the folder where the python file has been saved.
 - Using specific parameters: `python .\batch_upscale.py X:\source\path\ Z:\destination\path`.
 
 **Known issues**:
+
+- On long batch runs (24+ hours) *and* at least one batch process pause (with VRAM re-use by a different tool, such as another Ai process or a demanding game), ComfyUI occasionally locks up. Resuming the batch upscale script might work for a while, then it would not be able to connect to ComfyUI any more. Restarting ComfyUI does not solve the problem. This issue seems to be caused by either VRAM fragmentation or ComfyUI sub-process hanging. The simplest workaround is to restart the OS.
