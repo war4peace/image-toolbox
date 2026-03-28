@@ -962,7 +962,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # Print without newline — timing will be appended on the same line when done
         sys.stdout.write(f"{_ts} |   {prefix} {dim_str}  {linked_path}")
         sys.stdout.flush()
-        logger.log_only(f"  {prefix} {dim_str}  {local_path}", timestamp=True)
+        # Log is written only after completion (with timing) — not here
 
         try:
             comfy_name    = upload_image(local_path)
