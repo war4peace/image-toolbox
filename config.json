@@ -1,9 +1,9 @@
 ﻿{
     "comfyui":  {
                     "url":  "http://127.0.0.1:8000",
-                    "venv_python":  "C:\\Users\\Eduard Baniceru\\Documents\\ComfyUI\\.venv\\Scripts\\python.exe",
-                    "custom_nodes_dir":  "C:\\Users\\Eduard Baniceru\\Documents\\ComfyUI\\custom_nodes",
-                    "models_dir":  "C:\\Users\\Eduard Baniceru\\Documents\\ComfyUI\\models"
+                    "venv_python":  "C:\\Users\\username\\Documents\\ComfyUI\\.venv\\Scripts\\python.exe",
+                    "custom_nodes_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\custom_nodes",
+                    "models_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\models"
                 },
     "ollama":  {
                    "url":  "http://127.0.0.1:11434",
