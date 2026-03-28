@@ -49,7 +49,7 @@ This is a set of tools created to help with upscaling, describing and renaming i
   4. *The checkmark character*: Opens the upscaled file in the default image viewer.
 
 Terminal output example for one folder:
-
+```
 📁  !Canon A430\2007-05-17
 2026-03-28 | 16:58:19 |   [2/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3868.jpg 📁 ✓ | 00:28 | Total: 00:00:28
 2026-03-28 | 16:58:48 |   [3/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3869.jpg 📁 ✓ | 00:27 | Total: 00:00:56
@@ -59,8 +59,9 @@ Terminal output example for one folder:
 2026-03-28 | 17:00:43 |   [7/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3873.jpg 📁 ✓ | 00:27 | Total: 00:02:52
 2026-03-28 | 17:01:12 |   [8/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3874.jpg 📁 ✓ | 00:31 | Total: 00:03:24
   Folder done in 3m 25s
+```
 
-- **Clear, detailed session summary**: When the session ends (or is interrupted), the tool displays a detailed activity summary. The *italic* entries are all clickable, and open using the default local method for each type.
+- **Clear, detailed session summary**: When the session ends (or is interrupted), the tool displays a detailed activity summary. The "Folder" and Log path entries are all clickable, and open using the default local method for each type.
 
 Terminal output example of session summary:
 
