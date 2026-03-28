@@ -15,7 +15,9 @@ This is a set of tools created to help with upscaling, describing and renaming i
 
 ## Files in this repository:
 
-1. setup.ps1 (configuration script)
-2. batch_upscale.py (image upscale script)
-3. config.json (configuration file)
-4. tag_and_rename.py (describes and renames images)
+1. [setup.ps1](https://github.com/war4peace/image-toolbox/blob/main/setup.ps1) (configuration script)
+2. [batch_upscale.py](https://github.com/war4peace/image-toolbox/blob/main/batch_upscale.py) (image upscale script)
+3. [config.json](https://github.com/war4peace/image-toolbox/blob/main/config.json) (configuration file)
+4. [tag_and_rename.py](https://github.com/war4peace/image-toolbox/blob/main/tag_and_rename.py) (describes and renames images)
+5. [seedvr2_upscale_workflow.json](https://github.com/war4peace/image-toolbox/blob/main/workflows/seedvr2_upscale_workflow.json) (ComfyUI Upscale workflow)
+
