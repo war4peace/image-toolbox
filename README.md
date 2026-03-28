@@ -64,7 +64,7 @@ Terminal output example for one folder:
 
 Terminal output example of session summary:
 
-=============================================================================================
+`=============================================================================================
   Folder                        Total  Processed  Skipped  Corrupt  Failed  Elapsed
 ---------------------------------------------------------------------------------------------
   *!Canon A430\!Samsung A5 2016*      1          0        0        1       0       0s
@@ -74,11 +74,14 @@ Terminal output example of session summary:
   TOTAL                            48         47        0        1       0  00:22:30
 =============================================================================================
   (47 processed, 0 already done, 0 too large, 1 corrupted, 0 failed)
-*Log written to: X:\Work\AI\image-toolbox\logs\batch_upscale_2026-03-28_17-19-01.log*
+*Log written to: X:\Work\AI\image-toolbox\logs\batch_upscale_2026-03-28_17-19-01.log*`
 
 
 **How to run the Batch Upscale tool**:
 Open PowerShell in the folder where the python file has been saved.
 - Using defaults: `python .\batch_upscale.py X:\source\path\`. The tool will ask for target path; press Enter to use the default value ("__upscaled__" subfolder)
 - Using specific parameters: `python .\batch_upscale.py X:\source\path\ Z:\destination\path`.
+
+**Known issues**:
+
 
