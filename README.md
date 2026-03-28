@@ -1,7 +1,7 @@
 # image-toolbox
 AI-leveraged image alteration toolbox. Rescale, describe, rename files based on a variety of parameters, using local and remote AI models.
 
-## WARNING: ==This toolbox is work-in-progress. Do NOT use it on important data. Always test with a small sample before committing to your precious files!==
+## WARNING: This toolbox is work-in-progress. Do NOT use it on important data. Always test with a small sample before committing to your precious files!
 
 This is a set of tools created to help with upscaling, describing and renaming image files. Useful to enhance your personal image collection and improve old pictures which were taken using older cameras. 
 
