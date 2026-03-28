@@ -1,6 +1,8 @@
 # image-toolbox
 AI-leveraged image alteration toolbox. Rescale, describe, rename files based on a variety of parameters, using local and remote AI models.
 
+##WARNING: ==This toolbox is work-in-progress. Do NOT use it on important data. Always test with a small sample before committing to your precious files!==
+
 This is a set of tools created to help with upscaling, describing and renaming image files. Useful to enhance your personal image collection and improve old pictures which were taken using older cameras. 
 
 ## Prerequisite software:
@@ -13,7 +15,7 @@ This is a set of tools created to help with upscaling, describing and renaming i
 
 ## Files in this repository:
 
-1. setup.ps1
-2. batch_upscale.py
-3. config.json
-4. 
+1. setup.ps1 (configuration script)
+2. batch_upscale.py (image upscale script)
+3. config.json (configuration file)
+4. tag_and_rename.py (describes and renames images)

@@ -1,4 +1,4 @@
-{
+﻿{
     "comfyui":  {
                     "url":  "http://127.0.0.1:8000",
                     "venv_python":  "C:\\Users\\Eduard Baniceru\\Documents\\ComfyUI\\.venv\\Scripts\\python.exe",
@@ -24,7 +24,7 @@
                     "encode_tile_size":  1024,
                     "decode_tile_size":  1024,
                     "outage_threshold":  3,
-                    "discord_webhook_url":  "https://discord.com/api/webhooks/1429833028569665768/QtEwcMgezLAWYCglCX5i--6Q-oM0lJXKHinjqy0hwNETh6reuQbMUF0cyt9jWtwOxn7U",
+                    "discord_webhook_url":  "",
                     "upscale_cutoff_pct":  66
                 },
     "tagging":  {
