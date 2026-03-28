@@ -960,7 +960,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
         # Print without newline — timing will be appended on the same line when done
-        sys.stdout.write(f"{_ts} |   {prefix} {dim_str}  {linked_path}")
+        src_folder_link = _osc8_link(dirpath).replace(dirpath, "📁")
+        sys.stdout.write(f"{_ts} |   {prefix} {dim_str} {src_folder_link} {linked_path}")
         sys.stdout.flush()
         # Log is written only after completion (with timing) — not here
 
@@ -972,10 +973,13 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
-            timing = f" | {fmt_mmss(img_elapsed)} | Total: {fmt_hhmmss(grand_elapsed)}"
-            sys.stdout.write(timing + "\n")
+            timing          = f" | {fmt_mmss(img_elapsed)} | Total: {fmt_hhmmss(grand_elapsed)}"
+            out_full        = os.path.join(output_dir, out_name)
+            out_folder_link = _osc8_link(output_dir).replace(output_dir, "📁")
+            checkmark       = _osc8_link(out_full).replace(out_full, "✓")
+            sys.stdout.write(f" {out_folder_link} {checkmark}{timing}\n")
             sys.stdout.flush()
-            logger.log_only(f"  {prefix} {dim_str}  {local_path}{timing}", timestamp=True)
+            logger.log_only(f"  {prefix} {dim_str}  {local_path} 📁 ✓{timing}", timestamp=True)
 
             consecutive_failures = 0
             processed_paths.add(local_path)
@@ -1321,8 +1325,10 @@ def main():
 
     col_path = min(60, max(len("Folder"),
         max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)))
+    col_totl = len("Total")
     col_proc = len("Processed")
     col_skip = len("Skipped")
+    col_corr = len("Corrupt")
     col_fail = len("Failed")
     col_time = max(len("Elapsed"),
         max((len(fmt_duration(v["elapsed"])) for v in folder_stats.values()), default=7))
@@ -1330,25 +1336,38 @@ def main():
     def trunc(s, n):
         return s if len(s) <= n else "..." + s[-(n - 3):]
 
-    sep = "=" * (col_path + col_proc + col_skip + col_fail + col_time + 16)
-    row = f"  {{:<{col_path}}}  {{:>{col_proc}}}  {{:>{col_skip}}}  {{:>{col_fail}}}  {{:>{col_time}}}"
+    _w = col_path + col_totl + col_proc + col_skip + col_corr + col_fail + col_time + 24
+    sep = "=" * _w
+    row = (f"  {{:<{col_path}}}  {{:>{col_totl}}}  {{:>{col_proc}}}  {{:>{col_skip}}}"
+           f"  {{:>{col_corr}}}  {{:>{col_fail}}}  {{:>{col_time}}}")
 
     logger.tee("")
     logger.tee(sep)
-    logger.tee(row.format("Folder", "Processed", "Skipped", "Failed", "Elapsed"))
-    logger.tee("-" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    logger.tee(row.format("Folder", "Total", "Processed", "Skipped", "Corrupt", "Failed", "Elapsed"))
+    logger.tee("-" * _w)
 
     for dp, stats in folder_stats.items():
         rel = os.path.relpath(dp, root) if dp != root else "."
         total_skipped_folder = stats["skipped_done"] + stats["skipped_size"]
-        logger.tee(row.format(trunc(rel, col_path),
-                              stats["processed"], total_skipped_folder,
-                              stats["failed"], fmt_duration(stats["elapsed"])))
+        folder_total = (stats["processed"] + total_skipped_folder +
+                        stats["skipped_corrupt"] + stats["skipped_missing"] +
+                        stats["failed"])
+        rel_truncated = trunc(rel, col_path)
+        plain_row = row.format(rel_truncated, folder_total,
+                               stats["processed"], total_skipped_folder,
+                               stats["skipped_corrupt"], stats["failed"],
+                               fmt_duration(stats["elapsed"]))
+        # Terminal: replace the plain folder name with a clickable link
+        linked_folder = _osc8_link(dp).replace(dp, rel_truncated)
+        term_row = plain_row.replace(rel_truncated, linked_folder, 1)
+        logger.log_only(plain_row)
+        print(term_row)
 
-    logger.tee("=" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    logger.tee("=" * _w)
     total_skipped = total_skipped_done + total_skipped_size
-    logger.tee(row.format("TOTAL", total_processed, total_skipped,
-                          total_failed, fmt_hhmmss(grand_elapsed)))
+    grand_total = total_processed + total_skipped + total_skipped_corrupt + total_skipped_missing + total_failed
+    logger.tee(row.format("TOTAL", grand_total, total_processed, total_skipped,
+                          total_skipped_corrupt, total_failed, fmt_hhmmss(grand_elapsed)))
     logger.tee(sep)
     parts = [f"{total_processed} processed", f"{total_skipped_done} already done",
              f"{total_skipped_size} too large"]
@@ -1357,7 +1376,9 @@ def main():
     if total_failed          > 0: parts.append(f"{total_failed} failed")
     else: parts.append("0 failed")
     logger.tee(f"  ({', '.join(parts)})")
-    logger.tee(f"Log written to: {logger.path}")
+    log_link = _osc8_link(logger.path)
+    logger.log_only(f"Log written to: {logger.path}")
+    print(f"Log written to: {log_link}")
     logger.close()
 
 
