@@ -11,3 +11,9 @@ This is a set of tools created to help with upscaling, describing and renaming i
 4. [Git for Windows](https://gitforwindows.org)
 5. [NVIDIA CUDA Toolkit 12.4](https://developer.nvidia.com/cuda-12-4-0-download-archive?target_os=Windows&target_arch=x86_64)
 
+## Files in this repository:
+
+1. setup.ps1
+2. batch_upscale.py
+3. config.json
+4. 
