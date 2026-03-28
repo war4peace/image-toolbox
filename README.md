@@ -43,7 +43,7 @@ This is a set of tools created to help with upscaling, describing and renaming i
 
 Terminal output example for one folder:
 
-`📁  !Canon A430\2007-05-17
+📁  !Canon A430\2007-05-17
 2026-03-28 | 16:58:19 |   [2/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3868.jpg 📁 ✓ | 00:28 | Total: 00:00:28
 2026-03-28 | 16:58:48 |   [3/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3869.jpg 📁 ✓ | 00:27 | Total: 00:00:56
 2026-03-28 | 16:59:17 |   [4/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3870.jpg 📁 ✓ | 00:27 | Total: 00:01:25
@@ -51,7 +51,7 @@ Terminal output example for one folder:
 2026-03-28 | 17:00:15 |   [6/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3872.jpg 📁 ✓ | 00:27 | Total: 00:02:23
 2026-03-28 | 17:00:43 |   [7/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3873.jpg 📁 ✓ | 00:27 | Total: 00:02:52
 2026-03-28 | 17:01:12 |   [8/39688] 800x600px -> 2880x2160px 📁 X:\Personale\Poze\!Canon A430\2007-05-17\IMG_3874.jpg 📁 ✓ | 00:31 | Total: 00:03:24
-  Folder done in 3m 25s`
+  Folder done in 3m 25s
 
 
 How to run the Batch Upscale tool:
