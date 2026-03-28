@@ -54,6 +54,8 @@ Terminal output example for one folder:
   Folder done in 3m 25s`
 
 
+
+
 How to run the Batch Upscale tool:
 Open PowerShell in the folder where the python file has been saved.
 - Using defaults: `python .\batch_upscale.py X:\source\path\`. The tool will ask for target path; press Enter to use the default value ("__upscaled__" subfolder)
