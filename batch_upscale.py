@@ -67,7 +67,27 @@ _U   = _CFG.get("upscale", {})
 
 COMFYUI_URL              = _C.get("url",              "http://127.0.0.1:8000")
 _comfy_models_dir        = _C.get("models_dir",        "")
-COMFYUI_OUTPUT_DIR       = os.path.normpath(os.path.join(_comfy_models_dir, "..", "output")) if _comfy_models_dir else ""
+_comfy_venv_python       = _C.get("venv_python",       "")
+
+# Derive the ComfyUI output folder from the venv path (more reliable than
+# models_dir, which may contain a stale username from a previous install).
+# venv is at <comfyui_data>/.venv/Scripts/python.exe, so output is
+# <comfyui_data>/output — three levels up from python.exe.
+def _derive_comfyui_output():
+    if _comfy_venv_python and os.path.exists(_comfy_venv_python):
+        candidate = os.path.normpath(
+            os.path.join(_comfy_venv_python, "..", "..", "..", "output")
+        )
+        if os.path.isdir(candidate):
+            return candidate
+    # Fallback: use models_dir if venv path is unavailable
+    if _comfy_models_dir:
+        candidate = os.path.normpath(os.path.join(_comfy_models_dir, "..", "output"))
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
+
+COMFYUI_OUTPUT_DIR = _derive_comfyui_output()
 IMAGE_EXTS               = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 POLL_INTERVAL            = _U.get("poll_interval",    3)
 POLL_TIMEOUT             = _U.get("poll_timeout",     600)
@@ -179,16 +199,27 @@ def _osc8_link(path):
 class Logger:
     """
     Writes timestamped lines to both the terminal and a log file.
-    Log file is created next to the script:
-        batch_upscale_YYYY-MM-DD_HH-MM-SS.log
-    Skipped files are NOT written to the log (counted silently instead).
+
+    Log file is keyed by source root so all sessions for the same source
+    folder append to the same file:
+        logs/log_<12-char hash of source root>.log
+
+    Each session opens with a header line so individual runs are
+    distinguishable within the file.
     """
-    def __init__(self):
-        ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    def __init__(self, source_root):
+        digest   = hashlib.sha256(source_root.encode("utf-8")).hexdigest()[:12]
         log_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         os.makedirs(log_dir, exist_ok=True)
-        self.path = os.path.join(log_dir, f"batch_upscale_{ts}.log")
-        self._fh  = open(self.path, "w", encoding="utf-8", buffering=1)
+        self.path = os.path.join(log_dir, f"log_{digest}.log")
+        # Append mode — preserves previous sessions
+        self._fh  = open(self.path, "a", encoding="utf-8", buffering=1)
+        # Write a session start marker so runs are distinguishable in the file
+        ts = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+        self._fh.write(f"\n{'=' * 64}\n")
+        self._fh.write(f"Session started: {ts}\n")
+        self._fh.write(f"Source: {source_root}\n")
+        self._fh.write(f"{'=' * 64}\n")
 
     def _ts(self):
         return datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
@@ -243,7 +274,7 @@ class EligibilityCache:
         self.output_root = output_root
 
         # Derive a short hash from the two roots for a unique filename
-        key      = f"{source_root}|{output_root}".encode("utf-8")
+        key      = source_root.encode("utf-8")
         digest   = hashlib.sha256(key).hexdigest()[:12]
         scans_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans")
         os.makedirs(scans_dir, exist_ok=True)
@@ -415,6 +446,31 @@ def _read_webp_dimensions(f):
     raise ValueError("Unknown WebP sub-format")
 
 
+def _read_tiff_dimensions(f):
+    """Read width/height from a TIFF file header (supports little and big endian)."""
+    header = f.read(4)
+    if header[:2] == b"II":
+        endian = "<"
+    elif header[:2] == b"MM":
+        endian = ">"
+    else:
+        raise ValueError("Not a TIFF file")
+    ifd_offset = struct.unpack(endian + "I", f.read(4))[0]
+    f.seek(ifd_offset)
+    num_entries = struct.unpack(endian + "H", f.read(2))[0]
+    w = h = 0
+    for _ in range(num_entries):
+        tag, typ, count, val_raw = struct.unpack(endian + "HHI4s", f.read(12))
+        if typ in (3, 4):  # SHORT or LONG
+            fmt = endian + ("H" if typ == 3 else "I")
+            val = struct.unpack(fmt, val_raw[:struct.calcsize(fmt)])[0]
+            if tag == 256:   w = val   # ImageWidth
+            elif tag == 257: h = val   # ImageLength
+        if w and h:
+            break
+    return w, h
+
+
 def get_image_dimensions(path):
     ext = os.path.splitext(path)[1].lower()
     with open(path, "rb") as f:
@@ -427,6 +483,8 @@ def get_image_dimensions(path):
                 return _read_bmp_dimensions(f)
             elif ext == ".webp":
                 return _read_webp_dimensions(f)
+            elif ext in (".tif", ".tiff"):
+                return _read_tiff_dimensions(f)
             else:
                 return (0, 0)
         except Exception:
@@ -674,13 +732,27 @@ def _delete_comfyui_output(filename, subfolder, img_type):
     except Exception:
         pass
 
-    # Fallback: delete any __batch__*.png files in the output root
-    # ComfyUI names batch outputs as __batch___00001_.png etc.
+    # Fallback: glob-delete all __batch__*.png files anywhere under output dir
+    # ComfyUI Desktop may use subdirectories under output
     if deleted == 0:
-        for stale in glob.glob(os.path.join(comfy_output_dir, "__batch__*.png")):
+        for stale in glob.glob(os.path.join(comfy_output_dir, "**", "__batch__*.png"),
+                               recursive=True):
             try:
                 os.remove(stale)
                 deleted += 1
+            except Exception:
+                pass
+
+    # Last resort: delete ALL .png files under output dir that are newer than
+    # 5 minutes — catches any naming scheme ComfyUI might use
+    if deleted == 0:
+        cutoff = time.time() - 300
+        for stale in glob.glob(os.path.join(comfy_output_dir, "**", "*.png"),
+                               recursive=True):
+            try:
+                if os.path.getmtime(stale) > cutoff:
+                    os.remove(stale)
+                    deleted += 1
             except Exception:
                 pass
 
@@ -945,7 +1017,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # Unreadable dimensions = corrupted/unsupported file — skip without
         # counting as a ComfyUI failure or incrementing the outage counter.
         if w == 0 or h == 0:
-            logger.tee(f"  {prefix} SKIP (unreadable image — file may be corrupted)  {local_path}", timestamp=True)
+            import datetime as _dt
+            _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+            src_folder_link = _osc8_link(dirpath).replace(dirpath, "📁")
+            linked_path     = _osc8_link(local_path)
+            print(f"{_ts} |   {prefix} SKIP (unreadable) {src_folder_link} {linked_path}")
+            logger.log_only(f"  {prefix} SKIP (unreadable image — file may be corrupted)  {local_path}", timestamp=True)
             folder_stats[dirpath]["skipped_corrupt"] += 1
             total_skipped_corrupt += 1
             continue
@@ -1134,8 +1211,10 @@ def main():
         print("Make sure ComfyUI is running before starting this script.")
         sys.exit(1)
 
-    logger = Logger()
-    logger.tee(f"Log file: {logger.path}")
+    logger = Logger(root)
+    # Print log path to terminal only — it's already written to the session header
+    log_link = _osc8_link(logger.path)
+    print(f"Log file: {log_link}")
     logger.tee(f"Source:   {root}")
     logger.tee(f"Output:   {output_root}")
     logger.tee(f"Cutoff:   {UPSCALE_CUTOFF_PCT}% (skip images >= {UPSCALE_CUTOFF_PCT}% of target resolution)")
@@ -1376,9 +1455,9 @@ def main():
     if total_failed          > 0: parts.append(f"{total_failed} failed")
     else: parts.append("0 failed")
     logger.tee(f"  ({', '.join(parts)})")
-    log_link = _osc8_link(logger.path)
-    logger.log_only(f"Log written to: {logger.path}")
-    print(f"Log written to: {log_link}")
+    _log_link = _osc8_link(logger.path)
+    logger.log_only(f"Session ended: {datetime.datetime.now().strftime('%Y-%m-%d | %H:%M:%S')}")
+    print(f"Log file: {_log_link}")
     logger.close()
 
 
