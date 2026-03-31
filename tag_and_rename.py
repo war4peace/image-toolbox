@@ -462,13 +462,14 @@ def build_new_path(original_path, condensed):
 #  DIRECTORY SCANNER
 # ─────────────────────────────────────────────────────────────
 
-def collect_work_items(root):
+def collect_work_items(root, force_tag=False):
     """
     Walk root recursively and return a list of qualifying image paths.
 
     Inside an "upscaled/" subfolder:  all images qualify.
     Outside an "upscaled/" subfolder: only images meeting the resolution
-                                      threshold qualify.
+                                      threshold qualify, unless force_tag=True.
+    force_tag=True: all image files qualify regardless of resolution.
     """
     items = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -480,7 +481,7 @@ def collect_work_items(root):
             if ext not in IMAGE_EXTS:
                 continue
             full_path = os.path.join(dirpath, filename)
-            if is_upscaled_dir:
+            if force_tag or is_upscaled_dir:
                 items.append(full_path)
             else:
                 w, h = get_image_dimensions(full_path)
@@ -541,14 +542,39 @@ def main():
         print(f"    ollama pull {OLLAMA_MODEL}")
         print()
         print("  Usage:")
-        print("    python tag_and_rename.py <directory>")
+        print("    python tag_and_rename.py <directory> [-ftag] [-frename]")
+        print()
+        print("  Force flags (can be combined):")
+        print("    -ftag     Tag all images regardless of resolution or prior tagging")
+        print("    -frename  Rename all images regardless of filename pattern")
+        print()
+        print("  Examples:")
+        print(r"    python tag_and_rename.py X:\Photos                 # normal mode")
+        print(r"    python tag_and_rename.py X:\Photos -ftag           # tag everything")
+        print(r"    python tag_and_rename.py X:\Photos -frename        # rename everything")
+        print(r"    python tag_and_rename.py X:\Photos -ftag -frename  # force both")
         print()
         sys.exit(0)
 
-    root = os.path.abspath(sys.argv[1])
+    # Parse flags from remaining args
+    args       = sys.argv[1:]
+    force_tag    = "-ftag"    in args
+    force_rename = "-frename" in args
+    args         = [a for a in args if a not in ("-ftag", "-frename")]
+
+    if not args:
+        print("ERROR: No directory specified.")
+        sys.exit(1)
+
+    root = os.path.abspath(args[0])
     if not os.path.isdir(root):
         print(f"ERROR: '{root}' is not a valid directory.")
         sys.exit(1)
+
+    if force_tag:
+        print("  [!] Force tag mode: all images will be tagged regardless of resolution or prior tagging.")
+    if force_rename:
+        print("  [!] Force rename mode: all images will be renamed regardless of filename pattern.")
 
     # ── Pre-flight ───────────────────────────────────────────
     print()
@@ -575,7 +601,7 @@ def main():
 
     # ── Scan ─────────────────────────────────────────────────
     print(f"  Scanning '{root}' ...\n")
-    work_items = collect_work_items(root)
+    work_items = collect_work_items(root, force_tag=force_tag)
 
     if not work_items:
         print("  No qualifying images found.")
@@ -615,7 +641,7 @@ def main():
             print(f"\n[DIR]  {rel_folder}\n")
 
         # ── Already processed? ───────────────────────────────
-        if is_already_processed(path):
+        if not force_tag and is_already_processed(path):
             print(f"  {prefix} SKIP (already tagged)  {path}")
             folder_stats[dirpath]["skipped"] += 1
             total_skipped += 1
@@ -635,7 +661,7 @@ def main():
             write_exif(path, long_desc, filename)
 
             # 3. Rename if camera default name
-            will_rename = has_camera_default_name(filename)
+            will_rename = force_rename or has_camera_default_name(filename)
             if will_rename:
                 new_path    = build_new_path(path, condensed)
                 os.rename(path, new_path)
