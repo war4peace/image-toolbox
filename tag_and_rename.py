@@ -21,8 +21,19 @@ Renaming:
   - Only files whose stem matches a CAMERA_FILENAME_PATTERNS pattern are
     renamed. Files with human-readable names are tagged only.
 
+Undo support:
+  - A cache file (trcache/<md5>.cache) records the original filename and
+    EXIF state of every scanned file before any modification is made.
+  - Undo can be run at any time to revert renames, EXIF changes, or both.
+
 Usage:
-    python tag_and_rename.py <directory>
+    python tag_and_rename.py <directory>                          # normal run
+    python tag_and_rename.py <directory> -ftag                   # force-tag all
+    python tag_and_rename.py <directory> -frename                # force-rename all
+    python tag_and_rename.py <directory> --undo-all              # undo renames + EXIF
+    python tag_and_rename.py <directory> --undo-all --names-only # undo renames only
+    python tag_and_rename.py <directory> --undo-all --exif-only  # undo EXIF only
+    python tag_and_rename.py <directory> --undo <file>           # undo one file
 
 Requirements:
     pip install piexif pillow
@@ -36,6 +47,7 @@ import json
 import time
 import struct
 import base64
+import hashlib
 import unicodedata
 import urllib.request
 import urllib.error
@@ -86,6 +98,103 @@ CONDENSED_MAX_WORDS = _T.get("condensed_max_words", 5)
 OLLAMA_TIMEOUT      = _T.get("ollama_timeout",      120)
 OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
 PROCESSED_MARKER    = "TaggedBy:tag_and_rename"
+
+
+# ─────────────────────────────────────────────────────────────
+#  DEPENDENCY CHECK
+# ─────────────────────────────────────────────────────────────
+
+def check_dependencies():
+    """
+    Verify that piexif and Pillow are importable.
+    Prints a clear, actionable error and exits if either is missing.
+    Called once at startup, before any prompts or Ollama checks.
+    """
+    missing = []
+    try:
+        import piexif   # noqa: F401
+    except ImportError:
+        missing.append("piexif")
+    try:
+        from PIL import Image   # noqa: F401
+    except ImportError:
+        missing.append("Pillow")
+
+    if missing:
+        print()
+        print("  ERROR: Required package(s) not found: " + ", ".join(missing))
+        print()
+        print("  Install them with:")
+        print(f"    pip install {' '.join(missing)}")
+        print()
+        print("  If you are using a virtual environment, activate it first.")
+        print("  If pip installs to a different Python than the one running")
+        print("  this script, use:")
+        print(f"    python -m pip install {' '.join(missing)}")
+        print()
+        sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────
+#  CACHE CONSTANTS
+# ─────────────────────────────────────────────────────────────
+
+# Cache files live in a "trcache" subfolder next to this script.
+# Each source folder gets its own cache file named after the MD5 of the
+# normalised absolute path, e.g.  trcache/ab4531c2f8d9.cache
+CACHE_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trcache")
+CACHE_SCHEMA_VERSION = 1
+
+# ─────────────────────────────────────────────────────────────
+#  LANGUAGE SUPPORT
+# ─────────────────────────────────────────────────────────────
+
+# ISO 639-1 two-letter codes → full English names used in the Ollama prompt.
+# Any unrecognised value is passed through as-is, so "--language:Klingon" works too.
+_ISO_639_NAMES = {
+    "AF": "Afrikaans",  "SQ": "Albanian",   "AR": "Arabic",     "HY": "Armenian",
+    "AZ": "Azerbaijani","EU": "Basque",      "BE": "Belarusian", "BN": "Bengali",
+    "BS": "Bosnian",    "BG": "Bulgarian",   "CA": "Catalan",    "ZH": "Chinese",
+    "HR": "Croatian",   "CS": "Czech",       "DA": "Danish",     "NL": "Dutch",
+    "EN": "English",    "ET": "Estonian",    "FI": "Finnish",    "FR": "French",
+    "GL": "Galician",   "KA": "Georgian",    "DE": "German",     "EL": "Greek",
+    "HE": "Hebrew",     "HI": "Hindi",       "HU": "Hungarian",  "IS": "Icelandic",
+    "ID": "Indonesian", "GA": "Irish",       "IT": "Italian",    "JA": "Japanese",
+    "KK": "Kazakh",     "KO": "Korean",      "LV": "Latvian",    "LT": "Lithuanian",
+    "MK": "Macedonian", "MS": "Malay",       "MT": "Maltese",    "NB": "Norwegian",
+    "FA": "Persian",    "PL": "Polish",      "PT": "Portuguese", "RO": "Romanian",
+    "RU": "Russian",    "SR": "Serbian",     "SK": "Slovak",     "SL": "Slovenian",
+    "ES": "Spanish",    "SW": "Swahili",     "SV": "Swedish",    "TH": "Thai",
+    "TR": "Turkish",    "UK": "Ukrainian",   "UR": "Urdu",       "VI": "Vietnamese",
+    "CY": "Welsh",
+}
+
+
+def resolve_language(code_or_name):
+    """
+    Convert a language specifier to a full name for use in the Ollama prompt.
+    Accepts ISO 639-1 codes (case-insensitive, e.g. 'RO', 'fr') or full names
+    (e.g. 'Romanian', 'french').  Unrecognised values are returned title-cased.
+    """
+    stripped = code_or_name.strip()
+    upper    = stripped.upper()
+    if upper in _ISO_639_NAMES:
+        return _ISO_639_NAMES[upper]
+    # Check if it's already a full name that matches a value (e.g. "romanian")
+    lower = stripped.lower()
+    for name in _ISO_639_NAMES.values():
+        if name.lower() == lower:
+            return name
+    # Unknown – pass through as-is (title-cased for neatness)
+    return stripped.title()
+
+
+# The three EXIF fields this script writes – all are tracked for undo.
+_TRACKED_EXIF_FIELDS = {
+    "ImageDescription": ("0th",  270),    # piexif.ImageIFD.ImageDescription
+    "XPComment":        ("0th",  40092),  # Windows XP Comment (UTF-16LE)
+    "UserComment":      ("Exif", 37510),  # piexif.ExifIFD.UserComment
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -221,11 +330,14 @@ _compiled_patterns = [re.compile(p, re.IGNORECASE) for p in CAMERA_FILENAME_PATT
 def has_camera_default_name(filename):
     """
     Return True if the filename stem looks like a camera-generated default.
-    Strips _upscaled suffix before matching so e.g. '6_upscaled.jpg'
-    is treated the same as '6.jpg'.
+    Strips known camera-added suffixes before pattern matching:
+      _upscaled   – added by upscaling tools, e.g. '6_upscaled.jpg'
+      (N)         – added by cameras for same-second duplicates,
+                    e.g. '20181018_163120(0).jpg'
     """
     stem = os.path.splitext(filename)[0]
     stem = re.sub(r"_upscaled$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"\(\d+\)$", "", stem)          # strip trailing (0), (1), (00) …
     return any(p.match(stem) for p in _compiled_patterns)
 
 
@@ -258,21 +370,29 @@ def check_ollama():
         return False, f"Ollama check failed: {e}"
 
 
-def analyse_image(path):
+def analyse_image(path, language="English"):
     """
     Send the image to Ollama and return (long_description, condensed_title).
+    language controls the language of LINE 1 (the EXIF description).
+    LINE 2 (the filename title) is always in English so filenames stay ASCII-safe.
     Raises RuntimeError on failure.
     """
     with open(path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("ascii")
 
+    # For non-English, append a language directive to the LINE 1 instruction.
+    # LINE 2 is kept in English regardless — filenames must survive ASCII sanitisation.
+    if language.lower() == "english":
+        lang_note = ""
+    else:
+        lang_note = f" Write this sentence in {language}."
+
     prompt = (
         "You are an image analysis assistant. Look at this image carefully "
         "and respond with EXACTLY two lines and nothing else:\n"
         "LINE 1: A single natural-language sentence (20-40 words) describing "
-        "the main subject, setting, mood, and any notable details. Be specific "
-        "and factual.\n"
-        "LINE 2: A condensed 4-5 word title suitable for a filename "
+        f"the main subject, setting, and any notable details. Be specific and factual.{lang_note}\n"
+        "LINE 2: A condensed 4-5 word title in English suitable for a filename "
         "(Title_Case_With_Underscores, no punctuation, no articles like "
         "a/an/the). Example: Romanian_Street_Night_Scene\n"
         "Do not include labels like 'LINE 1:' or 'LINE 2:' in your response."
@@ -459,6 +579,311 @@ def build_new_path(original_path, condensed):
 
 
 # ─────────────────────────────────────────────────────────────
+#  CACHE MANAGEMENT
+# ─────────────────────────────────────────────────────────────
+
+def get_cache_path(source_root):
+    """
+    Return the .cache file path for source_root.
+    Uses the first 12 hex chars of the MD5 of the normalised absolute path,
+    e.g.  trcache/ab4531c2f8d9.cache
+    """
+    norm     = os.path.normcase(os.path.abspath(source_root))
+    hash_str = hashlib.md5(norm.encode("utf-8")).hexdigest()[:12]
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, f"{hash_str}.cache")
+
+
+def load_cache(source_root):
+    """
+    Load the cache for source_root from disk, or create a fresh empty cache.
+    The original-state snapshots are never overwritten on subsequent loads.
+    """
+    cache_path = get_cache_path(source_root)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("schema_version") == CACHE_SCHEMA_VERSION:
+                return data
+            print("  WARNING: Cache schema mismatch — starting a fresh cache.")
+        except Exception as exc:
+            print(f"  WARNING: Could not read cache ({exc}) — starting a fresh cache.")
+    return {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "source_root":    os.path.abspath(source_root),
+        "created_at":     time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "last_updated":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "files":          {},
+    }
+
+
+def save_cache(cache, source_root):
+    """Persist the cache dict to disk."""
+    cache["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with open(get_cache_path(source_root), "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+def _snapshot_exif(path):
+    """
+    Snapshot the three tracked EXIF fields from a file.
+    Returns a dict  { field_name: base64(raw_bytes) | None }.
+    None means the field was absent in the file.
+    Raw bytes are base64-encoded so they survive JSON round-trips safely.
+    """
+    snap = {name: None for name in _TRACKED_EXIF_FIELDS}
+    try:
+        exif = _load_exif_safe(path)
+        for name, (ifd, tag) in _TRACKED_EXIF_FIELDS.items():
+            raw = exif.get(ifd, {}).get(tag)
+            if raw is not None:
+                snap[name] = base64.b64encode(raw).decode("ascii")
+    except Exception:
+        pass
+    return snap
+
+
+def _find_entry(cache, source_root, abs_path):
+    """
+    Locate a cache entry for the given absolute path.
+    Searches by original_rel_path first (cache key), then by current_rel_path.
+    Returns (cache_key, entry_dict) or (None, None).
+    """
+    rel = os.path.relpath(abs_path, source_root)
+    # Direct key match (original path, or file was never renamed)
+    if rel in cache["files"]:
+        return rel, cache["files"][rel]
+    # Search by current path (file was renamed in a previous run)
+    rel_norm = os.path.normcase(rel)
+    for key, entry in cache["files"].items():
+        if os.path.normcase(entry.get("current_rel_path", "")) == rel_norm:
+            return key, entry
+    return None, None
+
+
+def ensure_cache_entry(cache, source_root, abs_path):
+    """
+    Ensure abs_path has a cache entry with an original-state snapshot.
+    If the entry already exists (from a prior run), it is left untouched so
+    the original snapshot is never overwritten.
+    Returns the cache key (always the original_rel_path).
+    """
+    key, entry = _find_entry(cache, source_root, abs_path)
+    if entry is not None:
+        return key  # original snapshot already preserved
+
+    rel  = os.path.relpath(abs_path, source_root)
+    snap = _snapshot_exif(abs_path)
+    cache["files"][rel] = {
+        "original_rel_path": rel,
+        "current_rel_path":  rel,
+        "original_exif":     snap,
+        "current_exif":      snap.copy(),
+        "was_renamed":       False,
+        "first_seen_at":     time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "last_processed_at": None,
+        "status":            "scanned",
+    }
+    return rel
+
+
+def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
+    """
+    Update a cache entry after a file has been processed.
+    orig_abs_path  = path of the file before renaming (may equal new_abs_path)
+    new_abs_path   = final path after all EXIF writes and optional rename
+    status         = "processed" | "failed" | "skipped"
+    """
+    key, entry = _find_entry(cache, source_root, orig_abs_path)
+    if entry is None:
+        return  # safety guard – should not happen
+
+    new_rel = os.path.relpath(new_abs_path, source_root)
+    entry["current_rel_path"]  = new_rel
+    entry["was_renamed"]       = (
+        os.path.normcase(entry["original_rel_path"]) != os.path.normcase(new_rel)
+    )
+    entry["current_exif"]      = _snapshot_exif(new_abs_path)
+    entry["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # Only advance status if it's a "more final" state
+    if entry.get("status") not in ("undone",):
+        entry["status"] = status
+
+
+# ─────────────────────────────────────────────────────────────
+#  UNDO
+# ─────────────────────────────────────────────────────────────
+
+def _restore_exif_fields(path, original_snap):
+    """
+    Restore the three tracked EXIF fields to their original state.
+    Fields that were absent originally (None in snapshot) are deleted.
+    Fields that existed are written back from the stored raw bytes.
+    Only saves the file if at least one field actually changed.
+    Returns True on success, False on error.
+
+    Note: uses _save_with_exif which re-encodes as JPEG at quality=95,
+    consistent with how the fields were written in the first place.
+    """
+    try:
+        exif    = _load_exif_safe(path)
+        changed = False
+        for name, (ifd, tag) in _TRACKED_EXIF_FIELDS.items():
+            orig_b64 = original_snap.get(name)
+            ifd_dict = exif.setdefault(ifd, {})
+            if orig_b64 is None:
+                # Field should not exist — remove it if present
+                if tag in ifd_dict:
+                    del ifd_dict[tag]
+                    changed = True
+            else:
+                raw = base64.b64decode(orig_b64)
+                if ifd_dict.get(tag) != raw:
+                    ifd_dict[tag] = raw
+                    changed = True
+        if changed:
+            _save_with_exif(path, exif)
+        return True
+    except Exception as exc:
+        print(f"           EXIF restore error: {exc}")
+        return False
+
+
+def _undo_entry(entry, source_root, undo_names, undo_exif):
+    """
+    Perform the undo operation for a single cache entry.
+    undo_names – if True, rename the file back to its original name
+    undo_exif  – if True, restore the three tracked EXIF fields
+
+    Returns (success: bool, summary_message: str).
+    The entry dict is mutated in-place on success to reflect the new state.
+    """
+    curr_abs = os.path.join(source_root, entry["current_rel_path"])
+    orig_abs = os.path.join(source_root, entry["original_rel_path"])
+
+    if not os.path.exists(curr_abs):
+        return False, f"file not found: {curr_abs}"
+
+    notes     = []
+    exif_ok   = True
+    rename_ok = True
+
+    # ── Step 1: restore EXIF fields (while file is at its current path) ──
+    if undo_exif:
+        orig_snap = entry.get("original_exif") or {}
+        if all(v is None for v in orig_snap.values()):
+            notes.append("EXIF: nothing to restore (original had no tracked fields)")
+        else:
+            exif_ok = _restore_exif_fields(curr_abs, orig_snap)
+            if exif_ok:
+                entry["current_exif"] = orig_snap.copy()
+                notes.append("EXIF restored")
+            else:
+                notes.append("EXIF restore FAILED")
+
+    # ── Step 2: rename back to original filename ──────────────────────
+    if undo_names:
+        if not entry.get("was_renamed"):
+            notes.append("rename: nothing to undo (file was not renamed by this script)")
+        elif os.path.exists(orig_abs) and os.path.normcase(orig_abs) != os.path.normcase(curr_abs):
+            rename_ok = False
+            notes.append(f"rename skipped — target already exists: {os.path.basename(orig_abs)}")
+        else:
+            try:
+                os.makedirs(os.path.dirname(orig_abs), exist_ok=True)
+                os.rename(curr_abs, orig_abs)
+                entry["current_rel_path"] = entry["original_rel_path"]
+                entry["was_renamed"]      = False
+                notes.append(f"renamed back to {os.path.basename(orig_abs)}")
+            except Exception as exc:
+                rename_ok = False
+                notes.append(f"rename FAILED: {exc}")
+
+    success = exif_ok and rename_ok
+    if success:
+        entry["status"] = "undone"
+
+    return success, ", ".join(notes) if notes else "nothing to undo"
+
+
+def run_undo(root, target, undo_names, undo_exif):
+    """
+    Main undo dispatcher.
+
+    root        – absolute path to the source folder
+    target      – "all", or a file specifier (absolute path, path relative to
+                  root, or just the filename — matched against both original and
+                  current names in the cache)
+    undo_names  – whether to revert renames
+    undo_exif   – whether to revert EXIF fields
+    """
+    cache = load_cache(root)
+    if not cache["files"]:
+        print("  No cache found for this folder. Run the script normally first.")
+        return
+
+    what = []
+    if undo_names: what.append("file renames")
+    if undo_exif:  what.append("EXIF fields")
+    print(f"  Undoing: {', '.join(what)}")
+    print(f"  Cache:   {get_cache_path(root)}")
+    print()
+
+    # ── Collect entries to undo ───────────────────────────────
+    entries_to_undo = []
+
+    if target == "all":
+        # All entries that have something to undo (not already "undone" or "scanned")
+        for entry in cache["files"].values():
+            entries_to_undo.append(entry)
+    else:
+        # Resolve the target specifier against cache entries.
+        # We try:  (a) exact match on original_rel_path or current_rel_path,
+        #          (b) filename-only match (basename) on either.
+        target_abs  = os.path.abspath(target)
+        target_rel  = os.path.normcase(os.path.relpath(target_abs, root))
+        target_base = os.path.normcase(os.path.basename(target))
+
+        for entry in cache["files"].values():
+            orig_nc = os.path.normcase(entry.get("original_rel_path", ""))
+            curr_nc = os.path.normcase(entry.get("current_rel_path", ""))
+            if (
+                orig_nc == target_rel
+                or curr_nc == target_rel
+                or os.path.normcase(os.path.basename(entry.get("original_rel_path", ""))) == target_base
+                or os.path.normcase(os.path.basename(entry.get("current_rel_path",  ""))) == target_base
+            ):
+                entries_to_undo.append(entry)
+
+        if not entries_to_undo:
+            print(f"  No cache entry found matching: {target}")
+            print(f"  Tip: use --undo-all to undo everything, or check the cache file.")
+            return
+
+    # ── Process ──────────────────────────────────────────────
+    ok_count   = 0
+    fail_count = 0
+
+    for entry in entries_to_undo:
+        display = entry.get("current_rel_path") or entry.get("original_rel_path", "?")
+        print(f"  {display}")
+        success, msg = _undo_entry(entry, root, undo_names, undo_exif)
+        print(f"           -> {msg}")
+        if success:
+            ok_count += 1
+        else:
+            fail_count += 1
+
+    save_cache(cache, root)
+
+    print()
+    print(f"  Undo complete — {ok_count} OK, {fail_count} failed.")
+    if fail_count:
+        print("  (Cache has been updated for successful undos.)")
+
+
+# ─────────────────────────────────────────────────────────────
 #  DIRECTORY SCANNER
 # ─────────────────────────────────────────────────────────────
 
@@ -529,6 +954,11 @@ def main():
         print(f"    After {OUTAGE_THRESHOLD} consecutive failures the script pauses")
         print("    and waits for Enter before retrying.")
         print()
+        print("  Undo support:")
+        print("    Every run saves a cache of original filenames and EXIF data to:")
+        print(f"    {CACHE_DIR}\\<folderhash>.cache")
+        print("    This lets you reverse renames, EXIF changes, or both at any time.")
+        print()
         print("  Configuration (edit config.json in the same directory as this script):")
         print(f"    OLLAMA_URL                {OLLAMA_URL}")
         print(f"    OLLAMA_MODEL              {OLLAMA_MODEL}")
@@ -542,25 +972,70 @@ def main():
         print(f"    ollama pull {OLLAMA_MODEL}")
         print()
         print("  Usage:")
-        print("    python tag_and_rename.py <directory> [-ftag] [-frename]")
+        print("    python tag_and_rename.py <directory> [-ftag] [-frename] [--language:XX]")
+        print("    python tag_and_rename.py <directory> --undo-all [--names-only | --exif-only]")
+        print("    python tag_and_rename.py <directory> --undo <file> [--names-only | --exif-only]")
         print()
-        print("  Force flags (can be combined):")
-        print("    -ftag     Tag all images regardless of resolution or prior tagging")
-        print("    -frename  Rename all images regardless of filename pattern")
+        print("  Processing flags (can be combined):")
+        print("    -ftag              Tag all images regardless of resolution or prior tagging")
+        print("    -frename           Rename all images regardless of filename pattern")
+        print("    --language:XX      Language for EXIF descriptions. XX can be an ISO 639-1")
+        print("                       code (e.g. RO, FR, DE) or a full name (e.g. Romanian).")
+        print("                       Default: English. Filenames are always in English.")
+        print()
+        print("  Undo flags:")
+        print("    --undo-all         Undo all processed files in the folder")
+        print("    --undo <file>      Undo a single file (by current or original name / path)")
+        print("    --names-only       Undo renames only (skip EXIF restore)")
+        print("    --exif-only        Undo EXIF changes only (skip rename restore)")
         print()
         print("  Examples:")
-        print(r"    python tag_and_rename.py X:\Photos                 # normal mode")
-        print(r"    python tag_and_rename.py X:\Photos -ftag           # tag everything")
-        print(r"    python tag_and_rename.py X:\Photos -frename        # rename everything")
-        print(r"    python tag_and_rename.py X:\Photos -ftag -frename  # force both")
+        print(r"    python tag_and_rename.py X:\Photos                          # normal mode")
+        print(r"    python tag_and_rename.py X:\Photos -ftag                    # tag everything")
+        print(r"    python tag_and_rename.py X:\Photos -frename                 # rename everything")
+        print(r"    python tag_and_rename.py X:\Photos --language:RO            # descriptions in Romanian")
+        print(r"    python tag_and_rename.py X:\Photos --language:FR -ftag      # French, force-tag all")
+        print(r"    python tag_and_rename.py X:\Photos --undo-all               # undo everything")
+        print(r"    python tag_and_rename.py X:\Photos --undo-all --names-only  # undo renames only")
+        print(r"    python tag_and_rename.py X:\Photos --undo IMG_3548_Sunset.jpg")
         print()
         sys.exit(0)
 
-    # Parse flags from remaining args
-    args       = sys.argv[1:]
-    force_tag    = "-ftag"    in args
-    force_rename = "-frename" in args
-    args         = [a for a in args if a not in ("-ftag", "-frename")]
+    # ── Parse flags ──────────────────────────────────────────
+    args = sys.argv[1:]
+
+    force_tag    = "-ftag"        in args
+    force_rename = "-frename"     in args
+    undo_all     = "--undo-all"   in args
+    names_only   = "--names-only" in args
+    exif_only    = "--exif-only"  in args
+
+    # --undo <file>  (single-file undo, distinct from --undo-all)
+    undo_target = None
+    if "--undo" in args:
+        idx = args.index("--undo")
+        if idx + 1 < len(args) and not args[idx + 1].startswith("-"):
+            undo_target = args[idx + 1]
+            args = args[:idx] + args[idx + 2:]
+        else:
+            print("ERROR: --undo requires a file path argument.")
+            print("       Use --undo-all to undo the entire folder.")
+            sys.exit(1)
+
+    # --language:XX  (e.g. --language:RO, --language:French)
+    language = "English"
+    lang_args = [a for a in args if a.lower().startswith("--language:")]
+    if lang_args:
+        raw_lang = lang_args[-1].split(":", 1)[1]   # take the last one if repeated
+        language = resolve_language(raw_lang)
+        if not language:
+            print(f"ERROR: --language value is empty.")
+            sys.exit(1)
+
+    # Strip all recognised flags so only the directory remains
+    args = [a for a in args if a not in (
+        "-ftag", "-frename", "--undo-all", "--names-only", "--exif-only"
+    ) and not a.lower().startswith("--language:")]
 
     if not args:
         print("ERROR: No directory specified.")
@@ -571,10 +1046,26 @@ def main():
         print(f"ERROR: '{root}' is not a valid directory.")
         sys.exit(1)
 
+    # ── Dependency check (before any prompts or Ollama calls) ───
+    check_dependencies()
+
+    # Undo scope: default is both names + EXIF; flags narrow it down
+    undo_names = not exif_only    # True unless --exif-only
+    undo_exif  = not names_only   # True unless --names-only
+
+    # ── Undo mode ────────────────────────────────────────────
+    if undo_all or undo_target is not None:
+        target = "all" if undo_all else undo_target
+        run_undo(root, target, undo_names, undo_exif)
+        sys.exit(0)
+
     if force_tag:
         print("  [!] Force tag mode: all images will be tagged regardless of resolution or prior tagging.")
     if force_rename:
         print("  [!] Force rename mode: all images will be renamed regardless of filename pattern.")
+    if language.lower() != "english":
+        print(f"  [!] Language: EXIF descriptions will be written in {language}."
+              f" Filenames remain in English.")
 
     # ── Pre-flight ───────────────────────────────────────────
     print()
@@ -610,6 +1101,22 @@ def main():
     total = len(work_items)
     print(f"  Found {total} qualifying image(s).\n")
 
+    # ── Cache: snapshot original state of every scanned file ─
+    # This is done BEFORE any processing so that even a mid-run crash leaves
+    # the original filenames and EXIF values safely recorded.
+    print("  Building undo cache ...")
+    cache = load_cache(root)
+    new_entries = 0
+    for item_path in work_items:
+        key = ensure_cache_entry(cache, root, item_path)
+        if cache["files"][key]["status"] == "scanned":
+            new_entries += 1
+    save_cache(cache, root)
+    cache_path_display = get_cache_path(root)
+    print(f"  Cache ready — {new_entries} new entr{'y' if new_entries == 1 else 'ies'} "
+          f"({len(cache['files'])} total).")
+    print(f"  Cache file: {cache_path_display}\n")
+
     # ── Stats ────────────────────────────────────────────────
     folder_stats = defaultdict(lambda: {
         "processed": 0, "skipped": 0, "failed": 0, "elapsed": 0.0
@@ -643,6 +1150,11 @@ def main():
         # ── Already processed? ───────────────────────────────
         if not force_tag and is_already_processed(path):
             print(f"  {prefix} SKIP (already tagged)  {path}")
+            # Mark as skipped in cache only if it hasn't been fully processed before
+            _key, _entry = _find_entry(cache, root, path)
+            if _entry and _entry.get("status") == "scanned":
+                _entry["status"] = "skipped"
+                save_cache(cache, root)
             folder_stats[dirpath]["skipped"] += 1
             total_skipped += 1
             continue
@@ -655,7 +1167,7 @@ def main():
 
         try:
             # 1. Analyse
-            long_desc, condensed = analyse_image(path)
+            long_desc, condensed = analyse_image(path, language=language)
 
             # 2. Write EXIF description + original filename
             write_exif(path, long_desc, filename)
@@ -674,6 +1186,10 @@ def main():
 
             # 4. Write processing marker (uses final path after rename)
             write_processed_marker(new_path)
+
+            # 5. Update cache with final state
+            update_cache_entry(cache, root, path, new_path, "processed")
+            save_cache(cache, root)
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start
@@ -694,6 +1210,10 @@ def main():
             print(f"           Error: {type(e).__name__}: {e}")
             traceback.print_exc()
             print()
+
+            update_cache_entry(cache, root, path, path, "failed")
+            save_cache(cache, root)
+
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
@@ -758,6 +1278,7 @@ def main():
     ))
     print(sep)
     print(f"\n  ({total_failed} failed, {total_skipped} already tagged)\n")
+    print(f"  Undo cache: {cache_path_display}\n")
 
 
 if __name__ == "__main__":
