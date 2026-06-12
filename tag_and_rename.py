@@ -77,6 +77,7 @@ def _gui_event(kind, payload):
       IMG|<path>      – image now being processed (preview strip)
       QUEUE|<json>    – ordered list of queued image paths
       LOG|<path>      – session log file location
+      RENAME|<json>   – [old_path, new_path]: a queued file changed name
     Written to the raw stdout so markers never end up in the session log.
     """
     if GUI_MODE:
@@ -226,7 +227,10 @@ CAMERA_FILENAME_PATTERNS = _T.get("camera_filename_patterns", [
 CONDENSED_MAX_WORDS = _T.get("condensed_max_words", 5)
 OLLAMA_TIMEOUT      = _T.get("ollama_timeout",      120)
 OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
-PROCESSED_MARKER    = "TaggedBy:tag_and_rename"
+PROCESSED_MARKER    = "TaggedBy:Image Toolbox (https://github.com/war4peace/image-toolbox)"
+# Marker written by older versions — still recognised so photos tagged before
+# the rebrand are not re-processed after an upgrade.
+LEGACY_MARKERS      = ("TaggedBy:tag_and_rename",)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -677,7 +681,7 @@ def write_exif(path, long_description, original_filename):
 def write_processed_marker(path):
     """
     Write a processing timestamp into EXIF Exif.UserComment.
-    Format: "TaggedBy:tag_and_rename @ 2026-03-24 23:15:42"
+    Format: "TaggedBy:Image Toolbox (https://github.com/war4peace/image-toolbox) @ 2026-03-24 23:15:42"
     """
     import piexif
 
@@ -704,7 +708,7 @@ def is_already_processed(path):
             return False
         # Skip the 8-byte charset header, decode remaining ASCII
         text = raw[8:].decode("ascii", "ignore").strip()
-        return text.startswith(PROCESSED_MARKER)
+        return text.startswith((PROCESSED_MARKER,) + LEGACY_MARKERS)
     except Exception:
         return False
 
@@ -975,6 +979,7 @@ def _undo_entry(entry, source_root, undo_names, undo_exif):
             try:
                 os.makedirs(os.path.dirname(orig_abs), exist_ok=True)
                 os.rename(curr_abs, orig_abs)
+                _gui_event("RENAME", json.dumps([curr_abs, orig_abs]))
                 entry["current_rel_path"] = entry["original_rel_path"]
                 entry["was_renamed"]      = False
                 notes.append(f"renamed back to {os.path.basename(orig_abs)}")
@@ -1047,9 +1052,15 @@ def run_undo(root, target, undo_names, undo_exif):
     ok_count   = 0
     fail_count = 0
 
+    _gui_event("QUEUE", json.dumps([
+        os.path.join(root, e.get("current_rel_path") or e.get("original_rel_path", ""))
+        for e in entries_to_undo
+    ]))
+
     for entry in entries_to_undo:
         display = entry.get("current_rel_path") or entry.get("original_rel_path", "?")
         print(f"  {display}")
+        _gui_event("IMG", os.path.join(root, display))
         success, msg = _undo_entry(entry, root, undo_names, undo_exif)
         print(f"           -> {msg}")
         if success:
@@ -1390,6 +1401,7 @@ def main():
                 new_path    = build_new_path(path, condensed,
                                              base_stem=os.path.splitext(original_name)[0])
                 os.rename(path, new_path)
+                _gui_event("RENAME", json.dumps([path, new_path]))
                 result_name = os.path.basename(new_path)
                 print(f"           -> {result_name}  (renamed)")
             else:

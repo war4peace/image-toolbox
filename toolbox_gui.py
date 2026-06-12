@@ -496,6 +496,14 @@ class ToolTab(ttk.Frame):
         elif kind == "IMG" and payload:
             self.preview_name.set(os.path.basename(payload))
             self.strip.set_current(payload)
+        elif kind == "RENAME" and payload:
+            try:
+                old, new = json.loads(payload)
+            except (ValueError, TypeError):
+                return
+            self.strip.rename(old, new)
+            if self.preview_name.get() == os.path.basename(old):
+                self.preview_name.set(os.path.basename(new))
         elif kind == "LOG" and payload:
             self._log_path = payload
             self.viewlog_btn.configure(state="normal")
@@ -614,6 +622,7 @@ class FilmStrip(ttk.Frame):
         self._rows    = {}        # path -> (row frame, label)
         self._photos  = {}        # path -> PhotoImage (kept or Tk drops them)
         self._current = None
+        self._renamed = {}        # old path -> new path (files renamed mid-run)
         self._gen     = 0         # invalidates stale loader threads
         self._q       = queue.Queue()
 
@@ -625,13 +634,47 @@ class FilmStrip(ttk.Frame):
     def set_queue(self, paths):
         self._paths = [p.strip() for p in paths if p.strip()]
         self._index = {p: i for i, p in enumerate(self._paths)}
+        self._renamed = {}
         self._batch = None              # force a rebuild on the next IMG event
 
     def clear(self):
         self._gen += 1
         self._paths, self._index = [], {}
         self._batch, self._current = None, None
+        self._renamed = {}
         self._build_rows([])
+
+    def rename(self, old, new):
+        """
+        A queued file changed name on disk (tag rename or undo revert).
+        Remap every reference so highlighting, double-click-to-open and
+        late-arriving thumbnails all follow the file to its new path.
+        """
+        if old == new or old not in self._index:
+            return
+        i = self._index.pop(old)
+        self._paths[i] = new
+        self._index[new] = i
+        self._renamed[old] = new
+        if self._current == old:
+            self._current = new
+        if old in self._order:
+            self._order[self._order.index(old)] = new
+        row = self._rows.pop(old, None)
+        if row is not None:
+            self._rows[new] = row
+            frame, lbl = row
+            for w in (frame, lbl):
+                w.bind("<Double-Button-1>", lambda e, p=new: self._open(p))
+            if not lbl.cget("image"):           # thumbnail not decoded yet
+                txt = lbl.cget("text")
+                if txt.startswith("…"):
+                    lbl.configure(text="…  " + os.path.basename(new))
+                elif txt.startswith("(no preview)"):
+                    lbl.configure(text="(no preview)\n" + os.path.basename(new))
+        photo = self._photos.pop(old, None)
+        if photo is not None:
+            self._photos[new] = photo
 
     def set_current(self, path):
         if path not in self._index:     # rescan oddity — still show the image
@@ -720,6 +763,12 @@ class FilmStrip(ttk.Frame):
                 gen, p, img = self._q.get_nowait()
             except queue.Empty:
                 return
+            # The file may have been renamed while its thumbnail was decoding
+            for _ in range(8):
+                if p in self._renamed:
+                    p = self._renamed[p]
+                else:
+                    break
             if gen != self._gen or p not in self._rows:
                 continue
             lbl = self._rows[p][1]
