@@ -10,4 +10,5 @@ gui_settings.json
 __pycache__/
 trcache/
 .setup_complete
+bootstrap.log
 installer/Output/

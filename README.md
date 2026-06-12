@@ -14,9 +14,11 @@ The simplest way to get started — no Git, no Python knowledge required:
 2. **Run it** and click through the installer (no administrator rights needed).
 3. **Double-click** the *Image Toolbox* shortcut on your desktop.
 
-The first launch opens a setup window that downloads the required components (Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the app. The first upscale you run additionally downloads the AI model weights (~16 GB) automatically.
+The first launch opens a setup window that downloads the required components (Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the app. It also offers to install [Ollama](https://ollama.com) and download the vision model used by the Tag & Rename feature (~20 GB; optional — upscaling works without it, and you can decline both questions). The first upscale you run additionally downloads the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved to `bootstrap.log` next to the app for later review.
 
-**Requirements:** Windows 10/11 (64-bit), an NVIDIA GPU with current drivers, an internet connection, and ~25 GB of free disk space. The Tag & Rename tab additionally needs [Ollama](https://ollama.com) with a vision model (e.g. `ollama pull llava:34b`) — optional if you only upscale.
+> **Windows SmartScreen note:** because the installer is a new, unsigned download, Windows may show *"Windows protected your PC — Unknown publisher"*. Click **More info → Run anyway**. The installer is built automatically from the public source in this repository by GitHub Actions; you can verify the build on the repository's Actions tab.
+
+**Requirements:** Windows 10/11 (64-bit), an NVIDIA GPU with current drivers, an internet connection, and ~25 GB of free disk space (plus ~20 GB if you install the tagging model).
 
 *(Maintainers: the installer is built by the `build-installer` GitHub Actions workflow from `installer/ImageToolbox.iss` whenever a `v*` tag is pushed.)*
 

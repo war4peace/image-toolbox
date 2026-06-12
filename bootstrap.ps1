@@ -23,6 +23,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+# Everything shown below is also saved to bootstrap.log for later review.
+try { Start-Transcript -Path (Join-Path $root "bootstrap.log") -Append | Out-Null } catch {}
+
 $PYTHON_VERSION = "3.12.9"
 $PYTHON_URL     = "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-amd64.exe"
 $SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/refs/heads/main.zip"
@@ -50,6 +53,19 @@ function Invoke-Pip {
     param([string[]]$PipArgs)
     & ".venv\Scripts\python.exe" -m pip @PipArgs
     if ($LASTEXITCODE -ne 0) { throw "pip failed: pip $($PipArgs -join ' ')" }
+}
+
+function Find-Ollama {
+    $cmd = Get-Command ollama -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $candidate = "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe"
+    if (Test-Path $candidate) { return $candidate }
+    return $null
+}
+
+function Confirm-Yes($prompt) {
+    $answer = Read-Host "$prompt [Y/n]"
+    return ($answer -eq "" -or $answer -match "^[Yy]")
 }
 
 try {
@@ -118,18 +134,83 @@ try {
     Step "Installing the remaining components"
     Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif")
 
+    # -- 6. Ollama (optional - powers the Tag & Rename feature) ---------------
+    Step "Checking for Ollama (used by the Tag & Rename feature)"
+    $ollamaExe = Find-Ollama
+    if ($ollamaExe) {
+        Write-Host "  Found: $ollamaExe"
+    } else {
+        Write-Host "  Ollama is not installed. It is OPTIONAL - only the"
+        Write-Host "  Tag & Rename feature needs it; upscaling works without it."
+        if (Confirm-Yes "  Install Ollama now (~1 GB download)?") {
+            $tmp = Join-Path $env:TEMP "OllamaSetup.exe"
+            Write-Host "  Downloading Ollama ..."
+            Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $tmp -UseBasicParsing
+            Write-Host "  Installing Ollama (this can take a minute) ..."
+            Start-Process -Wait $tmp -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+            $ollamaExe = Find-Ollama
+            if ($ollamaExe) { Write-Host "  Installed: $ollamaExe" }
+            else { Write-Host "  WARNING: Ollama installation did not complete - skipping." -ForegroundColor Yellow }
+        } else {
+            Write-Host "  Skipped. You can install it later from https://ollama.com"
+        }
+    }
+
+    if ($ollamaExe) {
+        # The vision model the toolbox is configured to use (config.json)
+        $model = "llava:34b"
+        try {
+            $cfg = Get-Content (Join-Path $root "config.json") -Raw | ConvertFrom-Json
+            if ($cfg.ollama.model) { $model = $cfg.ollama.model }
+        } catch {}
+
+        # Make sure the Ollama background service is running before talking to it
+        $list = cmd /c "`"$ollamaExe`" list 2>nul"
+        if ($LASTEXITCODE -ne 0) {
+            $app = Join-Path (Split-Path $ollamaExe) "ollama app.exe"
+            if (Test-Path $app) {
+                Start-Process $app | Out-Null
+                Start-Sleep -Seconds 8
+                $list = cmd /c "`"$ollamaExe`" list 2>nul"
+            }
+        }
+
+        $base = ($model -split ":")[0]
+        if ($LASTEXITCODE -eq 0 -and "$list" -match [regex]::Escape($base)) {
+            Write-Host "  Vision model '$model' is already available."
+        } else {
+            Write-Host "  The Tag & Rename feature uses the vision model '$model'."
+            Write-Host "  It is a LARGE download (roughly 20 GB) and needs a strong GPU."
+            if (Confirm-Yes "  Download '$model' now?") {
+                & $ollamaExe pull $model
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "  WARNING: the model download did not finish." -ForegroundColor Yellow
+                    Write-Host "  You can retry later with:  ollama pull $model" -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host "  Skipped. You can download it later with:  ollama pull $model"
+            }
+        }
+    }
+
     # -- Done -------------------------------------------------------------------
     Set-Content -Path ".setup_complete" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Encoding utf8
     Step "Setup complete - launching Image Toolbox"
     Write-Host "  Note: the first upscale you run will download the AI model"
     Write-Host "  weights (~16 GB). The app shows progress while this happens."
-    Start-Sleep -Seconds 2
     Start-Process (Join-Path $root ".venv\Scripts\pythonw.exe") -ArgumentList "`"$(Join-Path $root 'toolbox_gui.py')`""
+    Write-Host ""
+    Write-Host "  A full copy of this output was saved to bootstrap.log"
+    try { Stop-Transcript | Out-Null } catch {}
+    Read-Host "Image Toolbox is starting - press Enter to close this window"
 }
 catch {
     Write-Host ""
     Write-Host "SETUP FAILED: $_" -ForegroundColor Red
     Write-Host "You can safely run Image Toolbox again to retry - completed steps are skipped." -ForegroundColor Yellow
+    Write-Host "A full copy of this output was saved to bootstrap.log" -ForegroundColor Yellow
+    try { Stop-Transcript | Out-Null } catch {}
     Read-Host "Press Enter to close"
     exit 1
 }
