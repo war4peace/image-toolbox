@@ -1,7 +1,7 @@
 {
     "seedvr2":  {
                     "repo_dir":  "seedvr2",
-                    "model_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\models\\SEEDVR2",
+                    "model_dir":  "%USERPROFILE%\\Documents\\ComfyUI\\models\\SEEDVR2",
                     "venv_python":  ".venv\\Scripts\\python.exe"
                 },
     "ollama":  {

@@ -57,7 +57,7 @@ CFG = _load_config()
 
 def _resolve_python():
     """Interpreter used to run the tools — the toolbox venv's python."""
-    venv_py = CFG.get("seedvr2", {}).get("venv_python", "")
+    venv_py = os.path.expandvars(CFG.get("seedvr2", {}).get("venv_python", ""))
     if venv_py:
         p = venv_py if os.path.isabs(venv_py) else os.path.join(SCRIPT_DIR, venv_py)
         if os.path.exists(p):

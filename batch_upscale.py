@@ -66,8 +66,12 @@ _U   = _CFG.get("upscale", {})
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def _resolve_path(value, default_rel):
-    """Resolve a config path; relative paths are anchored at this script's dir."""
-    p = value or default_rel
+    """
+    Resolve a config path; relative paths are anchored at this script's dir.
+    Environment variables (%USERPROFILE%, %USERNAME%, …) are expanded, so
+    config.json stays portable between machines and users.
+    """
+    p = os.path.expandvars(value or default_rel)
     return p if os.path.isabs(p) else os.path.normpath(os.path.join(_SCRIPT_DIR, p))
 
 SEEDVR2_REPO_DIR    = _resolve_path(_S.get("repo_dir", ""),  "seedvr2")
