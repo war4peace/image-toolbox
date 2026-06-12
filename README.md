@@ -6,6 +6,45 @@ AI-leveraged image alteration toolbox. Rescale, describe, rename files based on 
 
 This is a set of tools created to help with upscaling, describing and renaming image files. Useful to enhance your personal image collection and improve old pictures which were taken using older cameras. 
 
+## NEW: Standalone mode (no ComfyUI required)
+
+`batch_upscale.py` now runs the SeedVR2 pipeline directly in-process. ComfyUI is no longer needed — no server to start, no HTTP polling, and the DiT/VAE models stay loaded between images (roughly 35% faster per image than the ComfyUI flow).
+
+**Quickstart:**
+
+```powershell
+# 1. Clone this repository and the SeedVR2 engine into it
+git clone https://github.com/war4peace/image-toolbox
+cd image-toolbox
+git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
+
+# 2. Create the Python environment (Python 3.12, NVIDIA GPU required)
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif
+
+# 3. Run (model weights ~16 GB are downloaded automatically on first use;
+#    if you have an existing ComfyUI SeedVR2 install, point "seedvr2.model_dir"
+#    in config.json at its models\SEEDVR2 folder to reuse the weights)
+.venv\Scripts\python.exe batch_upscale.py "X:\Your\Photos"
+```
+
+config.json changes: the `comfyui` section is replaced by a `seedvr2` section (`repo_dir`, `model_dir`); `poll_interval`/`poll_timeout` are gone. Upscaled images are now saved as real JPEG (quality 95, no chroma subsampling) or PNG matching the source extension, written atomically.
+
+*NOTE: setup.ps1 and the remote-*.ps1 scripts still describe the previous ComfyUI-based flow and will be updated in a future release. The sections below referring to ComfyUI apply to the legacy setup.*
+
+## NEW: Graphical interface
+
+`toolbox_gui.py` provides a Windows GUI with two tabs — **Batch Upscaler** and **Tag & Rename** — so the tools can be used without a terminal. Pick a folder, press Start, and watch live progress; pause/resume and graceful stop are buttons instead of keyboard shortcuts. The Tag & Rename tab also exposes the description language, force-tag/force-rename options, and one-click undo (names, descriptions, or both).
+
+Launch it by double-clicking **`Image Toolbox.cmd`**, or with:
+
+```powershell
+.venv\Scripts\pythonw.exe toolbox_gui.py
+```
+
+The GUI is pure Python standard library (tkinter) — no extra packages needed. It runs the same `batch_upscale.py` / `tag_and_rename.py` scripts underneath, so logs, caches and undo data are identical whether you use the GUI or the command line.
+
 ## NOTE: These tools were written using Claude Sonnet 4.6. I am not a trained developer. As such, the code present in this repository contains results of what's known as *"Vibecoding"*, which is frowned upon by many members of the software development extended community. This is a personal project that I am using and is shared with everyone to use, at no cost.
 
 ## Table of Contents

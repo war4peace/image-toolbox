@@ -1,9 +1,8 @@
-﻿{
-    "comfyui":  {
-                    "url":  "http://127.0.0.1:8000",
-                    "venv_python":  "C:\\Users\\username\\Documents\\ComfyUI\\.venv\\Scripts\\python.exe",
-                    "custom_nodes_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\custom_nodes",
-                    "models_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\models"
+{
+    "seedvr2":  {
+                    "repo_dir":  "seedvr2",
+                    "model_dir":  "C:\\Users\\username\\Documents\\ComfyUI\\models\\SEEDVR2",
+                    "venv_python":  ".venv\\Scripts\\python.exe"
                 },
     "ollama":  {
                    "url":  "http://127.0.0.1:11434",
@@ -12,8 +11,6 @@
     "upscale":  {
                     "resolution":  2160,
                     "max_resolution":  3840,
-                    "poll_interval":  3,
-                    "poll_timeout":  600,
                     "attention_mode":  "sdpa",
                     "color_correction":  "lab",
                     "dit_model":  "seedvr2_ema_7b_fp16.safetensors",

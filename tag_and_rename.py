@@ -52,7 +52,136 @@ import unicodedata
 import urllib.request
 import urllib.error
 import traceback
+import threading
 from collections import defaultdict
+
+
+# ─────────────────────────────────────────────────────────────
+#  GUI INTEGRATION  (event lines + session log)
+# ─────────────────────────────────────────────────────────────
+
+def _stdin_is_piped():
+    """True when stdin is a pipe — i.e. we are driven by toolbox_gui.py."""
+    try:
+        return sys.stdin is not None and not sys.stdin.isatty()
+    except Exception:
+        return False
+
+GUI_MODE   = _stdin_is_piped()
+GUI_MARKER = "@@TBX@@"
+
+
+def _gui_event(kind, payload):
+    """
+    Emit one event line for the GUI (no-op outside GUI mode):
+      IMG|<path>      – image now being processed (preview strip)
+      QUEUE|<json>    – ordered list of queued image paths
+      LOG|<path>      – session log file location
+    Written to the raw stdout so markers never end up in the session log.
+    """
+    if GUI_MODE:
+        out = sys.stdout
+        raw = getattr(out, "raw", out)
+        raw.write(f"{GUI_MARKER}{kind}|{payload}\n")
+        raw.flush()
+
+
+class _TeeOutput:
+    """Mirrors everything written to stdout into the session log file."""
+
+    def __init__(self, stream, fh):
+        self.raw = stream     # _gui_event writes markers here, bypassing the log
+        self._fh = fh
+
+    def write(self, data):
+        self.raw.write(data)
+        try:
+            self._fh.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        self.raw.flush()
+        try:
+            self._fh.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return self.raw.isatty()
+
+
+def _setup_session_log(root):
+    """
+    Mirror all terminal output into  logs/tag_<12-char hash of root>.log
+    (append mode, one file per source folder — same scheme as the upscaler).
+    Returns the log file path.
+    """
+    norm    = os.path.normcase(os.path.abspath(root))
+    digest  = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:12]
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"tag_{digest}.log")
+    fh = open(path, "a", encoding="utf-8", buffering=1)
+    fh.write(f"\n{'=' * 64}\n")
+    fh.write(f"Session started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    fh.write(f"Source: {root}\n")
+    fh.write(f"{'=' * 64}\n")
+    sys.stdout = _TeeOutput(sys.stdout, fh)
+    return path
+
+
+# ─────────────────────────────────────────────────────────────
+#  REMOTE CONTROL  (GUI integration)
+# ─────────────────────────────────────────────────────────────
+
+class RemoteControl:
+    """
+    Line-based control over piped stdin, used when this script runs as a
+    child of toolbox_gui.py (stdin is a pipe, not a console):
+
+        "q"            → stop gracefully after the current image
+        any other line → resume after an outage pause
+
+    Inactive (no thread, no stdin reads) when stdin is an interactive
+    console, so normal terminal usage is unchanged.
+    """
+
+    def __init__(self):
+        self.active  = False
+        self._stop   = threading.Event()
+        self._resume = threading.Event()
+        try:
+            if sys.stdin is not None and not sys.stdin.isatty():
+                self.active = True
+                threading.Thread(target=self._watch, daemon=True).start()
+        except Exception:
+            pass
+
+    def _watch(self):
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() in ("q", "quit"):
+                    self._stop.set()
+                else:
+                    self._resume.set()
+        except Exception:
+            pass
+        # EOF — the controlling process is gone; stop gracefully.
+        self._stop.set()
+        self._resume.set()
+
+    @property
+    def stop_requested(self):
+        return self._stop.is_set()
+
+    def wait_resume(self):
+        """Block until a resume line arrives. Returns False if stop instead."""
+        self._resume.clear()
+        while not self._resume.wait(0.5):
+            if self._stop.is_set():
+                return False
+        return not self._stop.is_set()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -559,16 +688,20 @@ def is_already_processed(path):
 #  RENAME LOGIC
 # ─────────────────────────────────────────────────────────────
 
-def build_new_path(original_path, condensed):
+def build_new_path(original_path, condensed, base_stem=None):
     """
-    Build: ORIGINAL_STEM_Condensed.ext
-    Appends _2, _3 etc. on collision.
+    Build: BASE_STEM_Condensed.ext
+    base_stem defaults to the current filename's stem; pass the ORIGINAL
+    stem when re-tagging an already-renamed file so the new description
+    REPLACES the old one instead of being appended to it.
+    Appends _2, _3 etc. on collision (the file's own current name is not
+    a collision — re-tagging may produce the same name again).
     """
     dir_  = os.path.dirname(original_path)
-    stem  = os.path.splitext(os.path.basename(original_path))[0]
+    stem  = base_stem if base_stem is not None else os.path.splitext(os.path.basename(original_path))[0]
     ext   = os.path.splitext(original_path)[1]
     new   = os.path.join(dir_, f"{stem}_{condensed}{ext}")
-    if not os.path.exists(new):
+    if os.path.normcase(new) == os.path.normcase(original_path) or not os.path.exists(new):
         return new
     counter = 2
     while True:
@@ -576,6 +709,28 @@ def build_new_path(original_path, condensed):
         if not os.path.exists(candidate):
             return candidate
         counter += 1
+
+
+def get_original_name(path, cache, source_root):
+    """
+    The file's original name from before any rename by this script.
+    Sources, in order: the undo cache entry; the EXIF XPComment field
+    (where the original filename was stored when first tagged); failing
+    both, the current name.
+    """
+    _key, entry = _find_entry(cache, source_root, path)
+    if entry is not None and entry.get("original_rel_path"):
+        return os.path.basename(entry["original_rel_path"])
+    try:
+        exif = _load_exif_safe(path)
+        raw  = exif.get("0th", {}).get(40092)   # XPComment, UTF-16LE
+        if raw:
+            name = bytes(raw).decode("utf-16-le", "ignore").rstrip("\x00").strip()
+            if name and os.path.splitext(name)[1].lower() == os.path.splitext(path)[1].lower():
+                return name
+    except Exception:
+        pass
+    return os.path.basename(path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -706,9 +861,9 @@ def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
     )
     entry["current_exif"]      = _snapshot_exif(new_abs_path)
     entry["last_processed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    # Only advance status if it's a "more final" state
-    if entry.get("status") not in ("undone",):
-        entry["status"] = status
+    # Always reflect the latest outcome — a file that was undone and then
+    # re-tagged is "processed" again, not stuck at "undone".
+    entry["status"] = status
 
 
 # ─────────────────────────────────────────────────────────────
@@ -718,10 +873,11 @@ def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
 def _restore_exif_fields(path, original_snap):
     """
     Restore the three tracked EXIF fields to their original state.
-    Fields that were absent originally (None in snapshot) are deleted.
+    Fields that were absent originally (None in snapshot) are DELETED — this
+    includes the processed marker, so an undone file is re-taggable.
     Fields that existed are written back from the stored raw bytes.
     Only saves the file if at least one field actually changed.
-    Returns True on success, False on error.
+    Returns (success, changed).
 
     Note: uses _save_with_exif which re-encodes as JPEG at quality=95,
     consistent with how the fields were written in the first place.
@@ -744,10 +900,10 @@ def _restore_exif_fields(path, original_snap):
                     changed = True
         if changed:
             _save_with_exif(path, exif)
-        return True
+        return True, changed
     except Exception as exc:
         print(f"           EXIF restore error: {exc}")
-        return False
+        return False, False
 
 
 def _undo_entry(entry, source_root, undo_names, undo_exif):
@@ -770,17 +926,18 @@ def _undo_entry(entry, source_root, undo_names, undo_exif):
     rename_ok = True
 
     # ── Step 1: restore EXIF fields (while file is at its current path) ──
+    # NOTE: an all-None snapshot is NOT "nothing to do" — it means the
+    # original had none of the tracked fields, so the ones this script
+    # added (including the processed marker) must be deleted. Skipping
+    # this used to leave undone files marked as "already tagged".
     if undo_exif:
         orig_snap = entry.get("original_exif") or {}
-        if all(v is None for v in orig_snap.values()):
-            notes.append("EXIF: nothing to restore (original had no tracked fields)")
+        exif_ok, exif_changed = _restore_exif_fields(curr_abs, orig_snap)
+        if not exif_ok:
+            notes.append("EXIF restore FAILED")
         else:
-            exif_ok = _restore_exif_fields(curr_abs, orig_snap)
-            if exif_ok:
-                entry["current_exif"] = orig_snap.copy()
-                notes.append("EXIF restored")
-            else:
-                notes.append("EXIF restore FAILED")
+            entry["current_exif"] = orig_snap.copy()
+            notes.append("EXIF restored" if exif_changed else "EXIF already original")
 
     # ── Step 2: rename back to original filename ──────────────────────
     if undo_names:
@@ -982,6 +1139,8 @@ def main():
         print("    --language:XX      Language for EXIF descriptions. XX can be an ISO 639-1")
         print("                       code (e.g. RO, FR, DE) or a full name (e.g. Romanian).")
         print("                       Default: English. Filenames are always in English.")
+        print("    --no-prompt        Skip the 'Press Enter when ready' pre-flight prompt")
+        print("                       (used by the GUI; also handy for scripted runs).")
         print()
         print("  Undo flags:")
         print("    --undo-all         Undo all processed files in the folder")
@@ -1009,6 +1168,7 @@ def main():
     undo_all     = "--undo-all"   in args
     names_only   = "--names-only" in args
     exif_only    = "--exif-only"  in args
+    no_prompt    = "--no-prompt"  in args   # GUI mode: skip the pre-flight Enter prompt
 
     # --undo <file>  (single-file undo, distinct from --undo-all)
     undo_target = None
@@ -1034,20 +1194,26 @@ def main():
 
     # Strip all recognised flags so only the directory remains
     args = [a for a in args if a not in (
-        "-ftag", "-frename", "--undo-all", "--names-only", "--exif-only"
+        "-ftag", "-frename", "--undo-all", "--names-only", "--exif-only", "--no-prompt"
     ) and not a.lower().startswith("--language:")]
 
     if not args:
         print("ERROR: No directory specified.")
         sys.exit(1)
 
-    root = os.path.abspath(args[0])
+    # Strip stray quotes — PowerShell turns a trailing backslash before a
+    # closing quote into a literal quote (e.g. "X:\Photos\" -> X:\Photos").
+    root = os.path.abspath(args[0].strip().strip('"').strip("'"))
     if not os.path.isdir(root):
         print(f"ERROR: '{root}' is not a valid directory.")
         sys.exit(1)
 
     # ── Dependency check (before any prompts or Ollama calls) ───
     check_dependencies()
+
+    # ── Session log: everything printed below also lands in the log file ──
+    log_path = _setup_session_log(root)
+    _gui_event("LOG", log_path)
 
     # Undo scope: default is both names + EXIF; flags narrow it down
     undo_names = not exif_only    # True unless --exif-only
@@ -1067,21 +1233,25 @@ def main():
         print(f"  [!] Language: EXIF descriptions will be written in {language}."
               f" Filenames remain in English.")
 
+    # ── Remote control (active only when stdin is piped, e.g. GUI mode) ──
+    control = RemoteControl()
+
     # ── Pre-flight ───────────────────────────────────────────
-    print()
-    print("  +-----------------------------------------------------+")
-    print("  |  PREPARATION                                         |")
-    print("  |                                                       |")
-    print("  |  Make sure Ollama is running before continuing.      |")
-    print("  |  If it is not, open a new terminal and run:          |")
-    print("  |                                                       |")
-    print("  |      ollama serve                                     |")
-    print("  |                                                       |")
-    print("  |  Also ensure no other VRAM-heavy workload is active.  |")
-    print("  +-----------------------------------------------------+")
-    print()
-    input("  Press Enter when ready to continue ...")
-    print()
+    if not (no_prompt or control.active):
+        print()
+        print("  +-----------------------------------------------------+")
+        print("  |  PREPARATION                                         |")
+        print("  |                                                       |")
+        print("  |  Make sure Ollama is running before continuing.      |")
+        print("  |  If it is not, open a new terminal and run:          |")
+        print("  |                                                       |")
+        print("  |      ollama serve                                     |")
+        print("  |                                                       |")
+        print("  |  Also ensure no other VRAM-heavy workload is active.  |")
+        print("  +-----------------------------------------------------+")
+        print()
+        input("  Press Enter when ready to continue ...")
+        print()
 
     print("  Checking Ollama ...")
     ok, msg = check_ollama()
@@ -1100,6 +1270,7 @@ def main():
 
     total = len(work_items)
     print(f"  Found {total} qualifying image(s).\n")
+    _gui_event("QUEUE", json.dumps(work_items))
 
     # ── Cache: snapshot original state of every scanned file ─
     # This is done BEFORE any processing so that even a mid-run crash leaves
@@ -1131,6 +1302,10 @@ def main():
     folder_start      = None
 
     for idx, path in enumerate(work_items, 1):
+        if control.stop_requested:
+            print("\n  Stop requested — stopping before the next image.")
+            break
+
         dirpath  = os.path.dirname(path)
         filename = os.path.basename(path)
         prefix   = f"[{idx}/{total}]"
@@ -1161,21 +1336,29 @@ def main():
 
         w, h    = get_image_dimensions(path)
         dim_str = f"{w}x{h}px" if w else "?x?px"
+        _gui_event("IMG", path)    # GUI preview strip: current image
         print(f"  {prefix} {dim_str}  {path}")
 
         img_start = time.time()
+
+        # The name from before any rename by this script — keeps re-tagging
+        # idempotent: the descriptive suffix is rebuilt from the ORIGINAL
+        # stem (replacing the previous description), never appended to it,
+        # and EXIF XPComment always keeps the true original filename.
+        original_name = get_original_name(path, cache, root)
 
         try:
             # 1. Analyse
             long_desc, condensed = analyse_image(path, language=language)
 
             # 2. Write EXIF description + original filename
-            write_exif(path, long_desc, filename)
+            write_exif(path, long_desc, original_name)
 
             # 3. Rename if camera default name
-            will_rename = force_rename or has_camera_default_name(filename)
+            will_rename = force_rename or has_camera_default_name(original_name)
             if will_rename:
-                new_path    = build_new_path(path, condensed)
+                new_path    = build_new_path(path, condensed,
+                                             base_stem=os.path.splitext(original_name)[0])
                 os.rename(path, new_path)
                 result_name = os.path.basename(new_path)
                 print(f"           -> {result_name}  (renamed)")
@@ -1220,8 +1403,14 @@ def main():
             # ── Outage detection ─────────────────────────────
             if consecutive_fails >= OUTAGE_THRESHOLD:
                 print(f"  WARNING: {consecutive_fails} consecutive failures.")
-                print("  Restart Ollama if needed, then press Enter to resume.")
-                input("  Press Enter to resume ...")
+                if control.active:
+                    print("  Restart Ollama if needed, then press Resume in the app.")
+                    if not control.wait_resume():
+                        print("  Stop requested — exiting.")
+                        break
+                else:
+                    print("  Restart Ollama if needed, then press Enter to resume.")
+                    input("  Press Enter to resume ...")
                 ok, msg = check_ollama()
                 if not ok:
                     print(f"  ERROR: {msg}")

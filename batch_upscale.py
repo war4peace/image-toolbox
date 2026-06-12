@@ -1,9 +1,9 @@
 """
-comfyui_batch_upscale.py
-------------------------
-Batch-upscales every JPG/PNG in a source directory (recursively) using
-ComfyUI + SeedVR2. Upscaled images are saved to an "upscaled" subfolder
-inside each processed directory, preserving the original folder structure.
+batch_upscale.py
+----------------
+Batch-upscales every image in a source directory (recursively) using the
+SeedVR2 pipeline directly in-process — no ComfyUI required. Upscaled images
+are saved to the destination folder, preserving the original folder structure.
 
 Skips images where EITHER dimension already meets or exceeds the target:
   - width  >= MAX_RESOLUTION  (3840 by default)
@@ -15,15 +15,16 @@ in height even if its width hasn't reached 3840px yet.
 
 Timing is reported per image, per folder, and in a final summary table.
 
-Usage:
-    python comfyui_batch_upscale.py "X:\\Personale\\Poze\\04-01-2004"
+Usage (from the toolbox folder, inside its venv):
+    .venv\\Scripts\\python.exe batch_upscale.py "X:\\Personale\\Poze\\04-01-2004"
 
 Requirements:
-    - ComfyUI must be running locally (default: http://127.0.0.1:8188)
-    - No extra Python packages needed (uses stdlib only)
+    - The cloned SeedVR2 repository (see config.json "seedvr2.repo_dir")
+    - A venv with PyTorch (CUDA) + seedvr2/requirements.txt + pillow
+    - Model weights are downloaded automatically on first run
 
 Configuration:
-    Edit the CONFIG block below if your setup differs.
+    config.json in the same directory as this script (run setup.ps1).
 """
 
 import sys
@@ -34,9 +35,6 @@ import struct
 import urllib.request
 import urllib.parse
 import urllib.error
-import mimetypes
-import random
-import uuid
 from collections import defaultdict
 import threading
 import datetime
@@ -62,40 +60,54 @@ def _load_config():
         return _json.load(_f)
 
 _CFG = _load_config()
-_C   = _CFG.get("comfyui", {})
+_S   = _CFG.get("seedvr2", {})
 _U   = _CFG.get("upscale", {})
 
-COMFYUI_URL              = _C.get("url",              "http://127.0.0.1:8000")
-_comfy_models_dir        = _C.get("models_dir",        "")
-_comfy_venv_python       = _C.get("venv_python",       "")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Derive the ComfyUI output folder from the venv path (more reliable than
-# models_dir, which may contain a stale username from a previous install).
-# venv is at <comfyui_data>/.venv/Scripts/python.exe, so output is
-# <comfyui_data>/output — three levels up from python.exe.
-def _derive_comfyui_output():
-    if _comfy_venv_python and os.path.exists(_comfy_venv_python):
-        candidate = os.path.normpath(
-            os.path.join(_comfy_venv_python, "..", "..", "..", "output")
-        )
-        if os.path.isdir(candidate):
-            return candidate
-    # Fallback: use models_dir if venv path is unavailable
-    if _comfy_models_dir:
-        candidate = os.path.normpath(os.path.join(_comfy_models_dir, "..", "output"))
-        if os.path.isdir(candidate):
-            return candidate
-    return ""
+def _resolve_path(value, default_rel):
+    """Resolve a config path; relative paths are anchored at this script's dir."""
+    p = value or default_rel
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(_SCRIPT_DIR, p))
 
-COMFYUI_OUTPUT_DIR = _derive_comfyui_output()
-IMAGE_EXTS               = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
-POLL_INTERVAL            = _U.get("poll_interval",    3)
-POLL_TIMEOUT             = _U.get("poll_timeout",     600)
-OUTPUT_SUBDIR            = _U.get("output_subdir",    "upscaled")
-RESOLUTION               = _U.get("resolution",       2160)
-MAX_RESOLUTION           = _U.get("max_resolution",   3840)
-DISCORD_WEBHOOK_URL      = _U.get("discord_webhook_url", "")
-COMFYUI_OUTAGE_THRESHOLD = _U.get("outage_threshold", 3)
+SEEDVR2_REPO_DIR    = _resolve_path(_S.get("repo_dir", ""),  "seedvr2")
+SEEDVR2_MODEL_DIR   = _resolve_path(_S.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
+
+IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+OUTPUT_SUBDIR       = _U.get("output_subdir",    "upscaled")
+RESOLUTION          = _U.get("resolution",       2160)
+MAX_RESOLUTION      = _U.get("max_resolution",   3840)
+DISCORD_WEBHOOK_URL = _U.get("discord_webhook_url", "")
+OUTAGE_THRESHOLD    = _U.get("outage_threshold", 3)
+
+# The SeedVR2 engine — created in main() after CLI validation so that
+# `python batch_upscale.py` (usage help) stays instant.
+ENGINE = None
+
+
+def _stdin_is_piped():
+    """True when stdin is a pipe — i.e. we are driven by toolbox_gui.py."""
+    try:
+        return sys.stdin is not None and not sys.stdin.isatty()
+    except Exception:
+        return False
+
+# GUI mode: control arrives as stdin lines instead of keypresses, and
+# machine-readable event lines keep the GUI's preview strip in sync.
+GUI_MODE = _stdin_is_piped()
+
+# Marker prefix the GUI intercepts (never shown to the user there).
+GUI_MARKER = "@@TBX@@"
+
+
+def _gui_event(kind, payload):
+    """
+    Emit one event line for the GUI (no-op outside GUI mode).
+      IMG|<path>      – image now being processed
+      QUEUE|<json>    – ordered list of queued image paths for this pass
+    """
+    if GUI_MODE:
+        print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
 
 # Images whose shortest dimension is already >= this fraction of the target
 # will be skipped. Default 66% means a 2538x1428 image (66% of 3840x2160)
@@ -179,6 +191,17 @@ def send_discord_notification(title, description, color, fields=None):
 # ─────────────────────────────────────────────
 #  TERMINAL HELPERS
 # ─────────────────────────────────────────────
+
+def _terminal_width():
+    """
+    Terminal width capped at 200, minus one. Falls back to 119 when stdout
+    is not a console (redirected output, scheduled runs).
+    """
+    try:
+        return min(os.get_terminal_size().columns, 200) - 1
+    except (OSError, ValueError):
+        return 119
+
 
 def _osc8_link(path):
     """
@@ -357,13 +380,17 @@ class EligibilityCache:
             self._data[rel]["already_done"] = True
             self._dirty = True
 
-    def remove_missing(self, source_root, progress_cb=None):
+    def remove_missing(self, source_root, progress_cb=None, abort_check=None):
         """
         Remove entries for files that no longer exist on disk.
-        progress_cb: optional callable(current_path) called for each entry checked.
+        progress_cb:  optional callable(current_path) called for each entry checked.
+        abort_check:  optional callable; when it returns True the check stops
+                      early (removals confirmed so far are still applied).
         """
         to_remove = []
         for rel in self._data:
+            if abort_check is not None and abort_check():
+                break
             full_path = os.path.join(source_root, rel)
             if progress_cb:
                 progress_cb(os.path.dirname(full_path))
@@ -554,211 +581,6 @@ def compute_seedvr2_resolution(w, h):
 
 
 # ─────────────────────────────────────────────
-#  PROMPT TEMPLATE
-# ─────────────────────────────────────────────
-
-def build_prompt(image_filename, w, h):
-    """
-    w, h are the source image dimensions, used to compute the correct
-    SeedVR2 'resolution' (short side) that respects both axis limits.
-    """
-    seedvr2_resolution = compute_seedvr2_resolution(w, h)
-    return {
-        "1": {
-            "class_type": "LoadImage",
-            "inputs": {"image": image_filename, "upload": "image"}
-        },
-        "3": {
-            "class_type": "SeedVR2LoadDiTModel",
-            "inputs": {
-                "model":              _U.get("dit_model", "seedvr2_ema_7b_fp16.safetensors"),
-                "device":             "cuda:0",
-                 "blocks_to_swap":     _U.get("blocks_to_swap", 0),
-                "swap_io_components": False,
-                "offload_device":     "none",
-                "cache_model":        False,
-                "attention_mode":     _U.get("attention_mode", "sdpa")
-            }
-        },
-        "4": {
-            "class_type": "SeedVR2LoadVAEModel",
-            "inputs": {
-                "model":               _U.get("vae_model", "ema_vae_fp16.safetensors"),
-                "device":              "cuda:0",
-                 "encode_tiled":        _U.get("encode_tiled", False),
-                 "encode_tile_size":    _U.get("encode_tile_size", 1024),
-                "encode_tile_overlap": 128,
-                 "decode_tiled":        _U.get("decode_tiled", False),
-                 "decode_tile_size":    _U.get("decode_tile_size", 1024),
-                "decode_tile_overlap": 128,
-                "tile_debug":          "false",
-                "offload_device":      "none",
-                "cache_model":         False
-            }
-        },
-        "7": {
-            "class_type": "SeedVR2VideoUpscaler",
-            "inputs": {
-                "image":              ["1", 0],
-                "dit":                ["3", 0],
-                "vae":                ["4", 0],
-                "seed":               random.randint(0, 2**32 - 1),
-                "resolution":         seedvr2_resolution,
-                "max_resolution":     MAX_RESOLUTION,
-                "batch_size":         5,
-                "uniform_batch_size": False,
-                "color_correction":   "lab",
-                "temporal_overlap":   0,
-                "prepend_frames":     0,
-                "input_noise_scale":  0.0,
-                "latent_noise_scale": 0.0,
-                "offload_device":     "none",
-                "enable_debug":       False
-            }
-        },
-        "8": {
-            "class_type": "SaveImage",
-            "inputs": {"images": ["7", 0], "filename_prefix": "__batch__"}
-        }
-    }
-
-
-# ─────────────────────────────────────────────
-#  COMFYUI API HELPERS
-# ─────────────────────────────────────────────
-
-def api(path, data=None, content_type="application/json"):
-    url = f"{COMFYUI_URL}{path}"
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": content_type})
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
-
-
-def upload_image(local_path):
-    filename  = os.path.basename(local_path)
-    mime_type = mimetypes.guess_type(filename)[0] or "image/jpeg"
-    boundary  = uuid.uuid4().hex
-    with open(local_path, "rb") as f:
-        file_data = f.read()
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
-        f"Content-Type: {mime_type}\r\n\r\n"
-    ).encode() + file_data + f"\r\n--{boundary}--\r\n".encode()
-    req = urllib.request.Request(
-        f"{COMFYUI_URL}/upload/image", data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())["name"]
-
-
-def submit_prompt(prompt):
-    payload = json.dumps({"prompt": prompt, "client_id": uuid.uuid4().hex}).encode()
-    return api("/prompt", data=payload)["prompt_id"]
-
-
-def wait_for_completion(prompt_id):
-    deadline = time.time() + POLL_TIMEOUT
-    while time.time() < deadline:
-        try:
-            history = api(f"/history/{prompt_id}")
-        except urllib.error.HTTPError:
-            time.sleep(POLL_INTERVAL)
-            continue
-        if prompt_id in history:
-            entry  = history[prompt_id]
-            status = entry.get("status", {})
-            if status.get("completed") or status.get("status_str") == "success":
-                return entry
-            for msg_type, msg_data in status.get("messages", []):
-                if msg_type == "execution_error":
-                    raise RuntimeError(f"ComfyUI execution error: {msg_data}")
-        time.sleep(POLL_INTERVAL)
-    raise TimeoutError(f"Timed out waiting for prompt {prompt_id}")
-
-
-def fetch_output_image(history_entry, output_dir, dest_name):
-    for _, node_output in history_entry.get("outputs", {}).items():
-        images = node_output.get("images", [])
-        if images:
-            img       = images[0]
-            subfolder = img.get("subfolder", "")
-            filename  = img["filename"]
-            img_type  = img.get("type", "output")
-
-            params = urllib.parse.urlencode({
-                "filename":  filename,
-                "subfolder": subfolder,
-                "type":      img_type,
-            })
-
-            os.makedirs(output_dir, exist_ok=True)
-            dest_path = os.path.join(output_dir, dest_name)
-
-            # Download from ComfyUI output folder to our destination
-            with urllib.request.urlopen(f"{COMFYUI_URL}/view?{params}") as resp:
-                with open(dest_path, "wb") as f:
-                    f.write(resp.read())
-
-            # Delete from ComfyUI output folder to prevent accumulation
-            _delete_comfyui_output(filename, subfolder, img_type)
-
-            return dest_path
-    raise RuntimeError("No output image found in history entry.")
-
-
-def _delete_comfyui_output(filename, subfolder, img_type):
-    """
-    Remove the file from ComfyUI's output folder after we have copied it.
-    Uses direct filesystem deletion via the configured ComfyUI output path.
-    Silently ignores failures — deletion is best-effort.
-    """
-    import glob
-
-    comfy_output_dir = COMFYUI_OUTPUT_DIR
-    if not comfy_output_dir or not os.path.isdir(comfy_output_dir):
-        return
-
-    deleted = 0
-
-    # Primary: delete the exact file ComfyUI reported
-    target_dir = os.path.join(comfy_output_dir, subfolder) if subfolder else comfy_output_dir
-    comfy_file = os.path.join(target_dir, filename)
-    try:
-        if os.path.exists(comfy_file):
-            os.remove(comfy_file)
-            deleted += 1
-    except Exception:
-        pass
-
-    # Fallback: glob-delete all __batch__*.png files anywhere under output dir
-    # ComfyUI Desktop may use subdirectories under output
-    if deleted == 0:
-        for stale in glob.glob(os.path.join(comfy_output_dir, "**", "__batch__*.png"),
-                               recursive=True):
-            try:
-                os.remove(stale)
-                deleted += 1
-            except Exception:
-                pass
-
-    # Last resort: delete ALL .png files under output dir that are newer than
-    # 5 minutes — catches any naming scheme ComfyUI might use
-    if deleted == 0:
-        cutoff = time.time() - 300
-        for stale in glob.glob(os.path.join(comfy_output_dir, "**", "*.png"),
-                               recursive=True):
-            try:
-                if os.path.getmtime(stale) > cutoff:
-                    os.remove(stale)
-                    deleted += 1
-            except Exception:
-                pass
-
-
-
-# ─────────────────────────────────────────────
 #  PAUSE / QUIT CONTROLLER
 #  Runs a background thread that watches for keypresses.
 #
@@ -787,40 +609,83 @@ class PauseController:
         self._available      = False
         self._pause_start    = None   # wall time when current pause began
         self._paused_total   = 0.0   # accumulated seconds spent paused
+        # Real terminal stream, captured before the engine redirects
+        # sys.stdout during upscales — keypress feedback must reach the
+        # terminal even while the redirect is active in the main thread.
+        self._term           = sys.stdout
 
         try:
             import msvcrt
             self._msvcrt = msvcrt
-            self._available = True
-            t = threading.Thread(target=self._watch, daemon=True)
-            t.start()
         except ImportError:
-            pass   # non-Windows — no keyboard control, script runs normally
+            self._msvcrt = None   # non-Windows
+
+        piped = False
+        try:
+            piped = sys.stdin is not None and not sys.stdin.isatty()
+        except Exception:
+            pass
+
+        if piped:
+            # GUI / pipe mode: line commands on stdin replace the keyboard
+            # ("p" toggles pause, "q" quits — see toolbox_gui.py).
+            self._available = True
+            threading.Thread(target=self._watch_stdin, daemon=True).start()
+        elif self._msvcrt is not None:
+            self._available = True
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _handle_key(self, key):
+        """Apply a control command: space/p toggles pause, q requests quit."""
+        with self._lock:
+            if key in (" ", "p"):
+                self._paused = not self._paused
+                if self._paused:
+                    self._pause_start = time.time()
+                    if GUI_MODE:
+                        print("\n  ⏸  PAUSED — click Resume to continue, or Stop to finish after the current image …",
+                              file=self._term, flush=True)
+                    else:
+                        print("\n  ⏸  PAUSED — press Space or P to resume, Q to quit after current image …",
+                              file=self._term, flush=True)
+                else:
+                    if self._pause_start is not None:
+                        self._paused_total += time.time() - self._pause_start
+                        self._pause_start   = None
+                    print("\n  ▶  RESUMED\n", file=self._term, flush=True)
+            elif key == "q":
+                self._quit   = True
+                self._paused = False
+                if self._pause_start is not None:
+                    self._paused_total += time.time() - self._pause_start
+                    self._pause_start   = None
+                print("\n  ⏹  QUIT REQUESTED — finishing current image then stopping …\n",
+                      file=self._term, flush=True)
 
     def _watch(self):
-        """Background thread: poll for keypresses at ~10 Hz."""
+        """Background thread: poll the console for keypresses at ~10 Hz."""
         while True:
             if self._msvcrt.kbhit():
-                key = self._msvcrt.getwch().lower()
-                with self._lock:
-                    if key in (" ", "p"):
-                        self._paused = not self._paused
-                        if self._paused:
-                            self._pause_start = time.time()
-                            print("\n  ⏸  PAUSED — press Space or P to resume, Q to quit after current image …")
-                        else:
-                            if self._pause_start is not None:
-                                self._paused_total += time.time() - self._pause_start
-                                self._pause_start   = None
-                            print("\n  ▶  RESUMED\n")
-                    elif key == "q":
-                        self._quit   = True
-                        self._paused = False
-                        if self._pause_start is not None:
-                            self._paused_total += time.time() - self._pause_start
-                            self._pause_start   = None
-                        print("\n  ⏹  QUIT REQUESTED — finishing current image then stopping …\n")
+                self._handle_key(self._msvcrt.getwch().lower())
             time.sleep(0.1)
+
+    def _watch_stdin(self):
+        """
+        Background thread for GUI/pipe mode: one command per stdin line.
+        EOF means the controlling process is gone — stop gracefully so the
+        run never continues unattended after the GUI closes.
+        """
+        try:
+            for line in sys.stdin:
+                cmd = line.strip().lower()
+                if cmd in ("p", "pause", "resume"):
+                    self._handle_key("p")
+                elif cmd in ("q", "quit"):
+                    self._handle_key("q")
+        except Exception:
+            pass
+        if not self._quit:
+            self._handle_key("q")
 
     def check(self):
         """
@@ -847,6 +712,12 @@ class PauseController:
             time.sleep(0.5)
 
     @property
+    def quit_requested(self):
+        """True once a graceful quit/cancel has been requested."""
+        with self._lock:
+            return self._quit
+
+    @property
     def paused_seconds(self):
         """Total wall-clock seconds spent in pause (excluding any active pause)."""
         with self._lock:
@@ -864,22 +735,26 @@ class PauseController:
 #  DIRECTORY SCANNER  (recursive)
 # ─────────────────────────────────────────────
 
-def collect_work_items(root, output_root, already_done=None):
+def collect_work_items(root, output_root, already_done=None, abort_check=None):
     """
     Walk root recursively.
     Returns (items, folder_count) where items is a list of
     (dirpath, local_path, output_dir, out_name).
     Never descends into output_root.
     already_done: optional set of local_path strings to skip (used for rescan).
+    abort_check:  optional callable; when it returns True the walk stops early
+                  and the partial result is returned (caller decides what to do).
     """
     already_done = already_done or set()
     items = []
     folder_count = 0
     output_root_norm = os.path.normcase(os.path.normpath(output_root))
 
-    _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+    _tw = _terminal_width()
 
     for dirpath, dirnames, filenames in os.walk(root):
+        if abort_check is not None and abort_check():
+            break
         # Skip the output root entirely when scanning
         dirnames[:] = [
             d for d in dirnames
@@ -952,6 +827,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     """
     consecutive_failures = 0
 
+    # GUI preview strip: announce the full ordered queue for this pass
+    if GUI_MODE:
+        _gui_event("QUEUE", json.dumps([item[1] for item in work_items]))
+
     folder_stats = defaultdict(lambda: {
         "processed": 0, "skipped_done": 0, "skipped_size": 0,
         "skipped_missing": 0, "skipped_corrupt": 0, "failed": 0, "elapsed": 0.0
@@ -1015,7 +894,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         img_start = time.time()
 
         # Unreadable dimensions = corrupted/unsupported file — skip without
-        # counting as a ComfyUI failure or incrementing the outage counter.
+        # counting as an engine failure or incrementing the outage counter.
         if w == 0 or h == 0:
             import datetime as _dt
             _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
@@ -1033,6 +912,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
 
         os.makedirs(output_dir, exist_ok=True)
+        _gui_event("IMG", local_path)    # GUI preview strip: current image
         linked_path = _osc8_link(local_path)
         import datetime as _dt
         _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
@@ -1043,10 +923,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # Log is written only after completion (with timing) — not here
 
         try:
-            comfy_name    = upload_image(local_path)
-            prompt_id     = submit_prompt(build_prompt(comfy_name, w, h))
-            history       = wait_for_completion(prompt_id)
-            fetch_output_image(history, output_dir, out_name)
+            ENGINE.upscale(local_path, out_path, compute_seedvr2_resolution(w, h))
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
@@ -1077,17 +954,18 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
-            if consecutive_failures >= COMFYUI_OUTAGE_THRESHOLD:
+            if consecutive_failures >= OUTAGE_THRESHOLD:
                 outage_msg = (
                     f"{consecutive_failures} consecutive image(s) failed. "
-                    f"ComfyUI may be down or unresponsive.\n"
+                    f"The GPU pipeline may be in a bad state (out of VRAM, "
+                    f"driver issue) or these files may be unreadable.\n"
                     f"Last error: {e}"
                 )
                 logger.tee(f"  WARNING: OUTAGE DETECTED ({consecutive_failures} consecutive failures) -- pausing.")
-                logger.tee(f"  Repair ComfyUI, then press Space or P to resume.")
+                logger.tee(f"  Check the log / free up VRAM, then press Space or P to resume.")
 
                 send_discord_notification(
-                    title       = "Upscale Script -- ComfyUI Outage Detected",
+                    title       = "Upscale Script -- Repeated Failures Detected",
                     description = outage_msg,
                     color       = 15548997,
                     fields      = [
@@ -1144,6 +1022,23 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 #  MAIN
 # ─────────────────────────────────────────────
 
+def _clean_path_arg(p):
+    """
+    Sanitize a path passed on the command line or typed at a prompt.
+
+    PowerShell/cmd treat a trailing backslash before a closing quote as an
+    escape, so  "D:\\photos\\23 August 2005\\"  arrives as
+    D:\\photos\\23 August 2005"  (literal trailing quote). Copy-pasted paths
+    may also keep their surrounding quotes. Strip both before resolving.
+    """
+    p = p.strip().strip('"').strip("'")
+    # A bare drive letter ("D:") would resolve to that drive's current
+    # directory — restore the root backslash instead.
+    if len(p) == 2 and p[1] == ":":
+        p += "\\"
+    return p
+
+
 def main():
     global UPSCALE_CUTOFF_PCT
     if len(sys.argv) < 2:
@@ -1165,7 +1060,7 @@ def main():
         print("    python batch_upscale.py \"X:\\Photos\\old\" \"\" 50  # empty string = use default output path")
         sys.exit(0)
 
-    root = os.path.abspath(sys.argv[1])
+    root = os.path.abspath(_clean_path_arg(sys.argv[1]))
     if not os.path.isdir(root):
         print(f"ERROR: Source directory not found: '{root}'")
         sys.exit(1)
@@ -1174,8 +1069,9 @@ def main():
     default_output = os.path.join(root, "__upscaled__")
 
     if len(sys.argv) >= 3:
-        # Output path provided as second argument
-        output_root = os.path.abspath(sys.argv[2])
+        # Output path provided as second argument (empty string = default)
+        out_arg     = _clean_path_arg(sys.argv[2])
+        output_root = os.path.abspath(out_arg) if out_arg else default_output
         print(f"Output directory: {output_root}")
     else:
         # Prompt with default
@@ -1184,7 +1080,7 @@ def main():
         print(f"  Press Enter to use default, or type an absolute path:")
         print(f"  Default: {default_output}")
         print(f"")
-        user_input = input("  Output path: ").strip()
+        user_input = _clean_path_arg(input("  Output path: "))
         if user_input:
             output_root = os.path.abspath(user_input)
         else:
@@ -1204,14 +1100,36 @@ def main():
     # Create output root if needed
     os.makedirs(output_root, exist_ok=True)
 
+    # ── Initialize the SeedVR2 engine (replaces the ComfyUI server) ──────────
+    print("")
+    print("  Loading SeedVR2 engine (first run may download model weights) ...")
+    _gui_event("STATUS", "Loading the AI engine …")
+    global ENGINE
     try:
-        api("/system_stats")
+        from upscale_engine import UpscaleEngine
+        # debug=true in config.json's "upscale" section restores the verbose
+        # SeedVR2 pipeline output in the terminal.
+        ENGINE = UpscaleEngine(SEEDVR2_REPO_DIR, SEEDVR2_MODEL_DIR, _U,
+                               debug=bool(_U.get("debug", False)))
     except Exception as e:
-        print(f"ERROR: Cannot reach ComfyUI at {COMFYUI_URL}\n  -> {e}")
-        print("Make sure ComfyUI is running before starting this script.")
+        print(f"ERROR: Could not initialize the SeedVR2 engine.\n  -> {e}")
+        print("Make sure this script runs inside the toolbox venv, e.g.:")
+        print(f"  {os.path.join(_SCRIPT_DIR, '.venv', 'Scripts', 'python.exe')} batch_upscale.py <source_dir>")
         sys.exit(1)
+    print(f"  Engine ready on {ENGINE.device_name}.")
+
+    # Created before the long preparation phases so a quit request ("q" from
+    # the GUI, or Q on the keyboard) can cancel scanning / eligibility checks.
+    pause = PauseController()
+
+    def _cancelled():
+        return pause.quit_requested
 
     logger = Logger(root)
+    # SeedVR2 pipeline output (phase banners, progress bars) goes to the log
+    # file only — the terminal shows just the per-image status lines.
+    ENGINE.log_sink = logger._fh
+    _gui_event("LOG", logger.path)
     # Print log path to terminal only — it's already written to the session header
     log_link = _osc8_link(logger.path)
     print(f"Log file: {log_link}")
@@ -1219,7 +1137,13 @@ def main():
     logger.tee(f"Output:   {output_root}")
     logger.tee(f"Cutoff:   {UPSCALE_CUTOFF_PCT}% (skip images >= {UPSCALE_CUTOFF_PCT}% of target resolution)")
     logger.tee(f"Scanning '{root}' recursively ...")
-    all_items, total_folders = collect_work_items(root, output_root)
+    _gui_event("STATUS", "Scanning for images …")
+    all_items, total_folders = collect_work_items(root, output_root, abort_check=_cancelled)
+
+    if pause.quit_requested:
+        logger.tee("  Cancelled at user request during scanning.")
+        logger.close()
+        sys.exit(0)
 
     if not all_items:
         logger.tee("No images found.")
@@ -1232,6 +1156,7 @@ def main():
     if cache.entry_count > 0:
         logger.tee(f"Loaded eligibility cache: {cache.entry_count} entries ({cache.path})")
         print("  Verifying cached entries against disk (may take a moment on network drives) ...", flush=True)
+        _gui_event("STATUS", "Verifying cached entries …")
 
         _last_folder = [""]
         _folder_idx  = [0]
@@ -1241,12 +1166,19 @@ def main():
                 _folder_idx[0] += 1
                 pct     = int(_folder_idx[0] / max(total_folders, 1) * 100)
                 display = f"{pct}% ({_folder_idx[0]}/{total_folders}) | {folder}"
-                _tw = (min(os.get_terminal_size().columns, 200) - 1) if hasattr(os, "get_terminal_size") else 119
+                _tw = _terminal_width()
                 sys.stdout.write(display[:_tw].ljust(_tw) + chr(13))
                 sys.stdout.flush()
+                _gui_event("PROG", f"{_folder_idx[0]}|{total_folders}")
 
-        removed = cache.remove_missing(root, progress_cb=_verify_progress)
-        _tw = min(os.get_terminal_size().columns - 1, 200) if hasattr(os, "get_terminal_size") else 119; sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()  # clear the folder line
+        removed = cache.remove_missing(root, progress_cb=_verify_progress,
+                                       abort_check=_cancelled)
+        _tw = _terminal_width(); sys.stdout.write(" " * _tw + chr(13)); sys.stdout.flush()  # clear the folder line
+        if pause.quit_requested:
+            logger.tee("  Cancelled at user request during cache verification.")
+            cache.save()
+            logger.close()
+            sys.exit(0)
         if removed:
             logger.tee(f"  Removed {removed} stale entries (files no longer on disk).")
         else:
@@ -1255,6 +1187,7 @@ def main():
         logger.tee(f"No cache found — full eligibility check required.")
 
     logger.tee(f"Checking eligibility (this may take a while) ...")
+    _gui_event("STATUS", "Checking image eligibility …")
 
     # ── Eligibility pre-check (cache-aware) ───────────────────────────────────
     work_items     = []
@@ -1264,6 +1197,9 @@ def main():
     total_all      = len(all_items)
 
     for i, item in enumerate(all_items, 1):
+        if pause.quit_requested:
+            break
+
         dirpath, local_path, output_dir, out_name = item
         out_path = os.path.join(output_dir, out_name)
 
@@ -1272,6 +1208,7 @@ def main():
             pct = int(i / total_all * 100)
             sys.stdout.write("  Checking eligibility ... %d%% (%d/%d) | cache hits: %d    " % (
                 pct, i, total_all, cache_hits) + chr(13)); sys.stdout.flush()
+            _gui_event("PROG", f"{i}|{total_all}")
 
         cached = cache.get(local_path)
 
@@ -1303,7 +1240,13 @@ def main():
         work_items.append(item)
 
     print()  # newline after progress indicator
-    cache.save()
+    cache.save()   # keep results checked so far — also on cancellation
+
+    if pause.quit_requested:
+        logger.tee("  Cancelled at user request during eligibility check.")
+        logger.tee("  (Results checked so far were saved to the cache.)")
+        logger.close()
+        sys.exit(0)
 
     logger.tee(f"Found {len(work_items)} eligible file(s) "
                f"({pre_done} already done, {pre_too_large} too large — "
@@ -1313,11 +1256,11 @@ def main():
         logger.tee("Nothing to process.")
         sys.exit(0)
 
-    pause = PauseController()
-    if pause.available:
+    if pause.available and not GUI_MODE:
         logger.tee("  Keyboard control active: Space/P = pause, Q = quit after current image.")
     logger.tee("")
     logger.tee("Processing ...")
+    _gui_event("STATUS", "Processing images …")
 
     # ── Run first pass ──────────────────────────────────────────────────────
     grand_start     = time.time()
@@ -1333,7 +1276,10 @@ def main():
     else:
         logger.tee("")
         logger.tee("  Rescanning source directory for any new or renamed files ...")
-        rescan_items, _ = collect_work_items(root, output_root, already_done=processed_paths)
+        _gui_event("STATUS", "Rescanning for new or renamed files …")
+        rescan_items, _ = collect_work_items(root, output_root,
+                                             already_done=processed_paths,
+                                             abort_check=_cancelled)
 
         # Eligibility filter for new items — check resolution and already-done
         eligible_rescan = []
@@ -1362,6 +1308,7 @@ def main():
             logger.tee(f"  Found {len(rescan_items)} new item(s) — processing second pass.")
             logger.tee("")
             logger.tee("Processing new items ...")
+            _gui_event("STATUS", "Processing new items …")
             grand_start2 = time.time()
             stats2 = run_pass(rescan_items, root, output_root, grand_start2,
                               pause, logger, processed_paths, cache=cache, pass_label="")
