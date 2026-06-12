@@ -27,6 +27,7 @@ import queue
 import codecs
 import threading
 import subprocess
+import urllib.request
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -65,6 +66,29 @@ def _resolve_python():
     return sys.executable
 
 PYTHON_EXE = _resolve_python()
+
+
+def _ollama_release_vram():
+    """
+    Best-effort backup: ask Ollama to unload the tagging model so VRAM is
+    freed even if tag_and_rename.py was killed before its own unload ran.
+    Checks /api/ps first so it never triggers a load of an unloaded model.
+    Runs in a background thread; all failures are silently ignored.
+    """
+    try:
+        o     = CFG.get("ollama", {})
+        url   = o.get("url", "http://127.0.0.1:11434")
+        model = o.get("model", "llava:34b")
+        with urllib.request.urlopen(f"{url}/api/ps", timeout=5) as resp:
+            loaded = [m.get("name", "") for m in json.loads(resp.read()).get("models", [])]
+        if not any(model.split(":")[0] in name for name in loaded):
+            return
+        payload = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+        req = urllib.request.Request(f"{url}/api/generate", data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=30)
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -981,8 +1005,9 @@ class TagTab(ToolTab):
         self.start_btn  = ttk.Button(btns, text="Start tagging", command=self._start)
         self.resume_btn = ttk.Button(btns, text="Resume after error", command=self._resume, state="disabled")
         self.stop_btn   = ttk.Button(btns, text="Stop after current image", command=self._stop, state="disabled")
+        self.open_btn    = ttk.Button(btns, text="Open photo folder", command=self._open_dir)
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
-        for b in (self.start_btn, self.resume_btn, self.stop_btn, self.viewlog_btn):
+        for b in (self.start_btn, self.resume_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
@@ -1004,6 +1029,13 @@ class TagTab(ToolTab):
         folder = filedialog.askdirectory(title="Choose the folder with photos to tag")
         if folder:
             self.dir_var.set(os.path.normpath(folder))
+
+    def _open_dir(self):
+        folder = self.dir_var.get().strip()
+        if folder and os.path.isdir(folder):
+            os.startfile(folder)
+        else:
+            messagebox.showinfo(APP_TITLE, "Please choose a valid photo folder first.")
 
     def _valid_dir(self):
         folder = self.dir_var.get().strip()
@@ -1081,6 +1113,9 @@ class TagTab(ToolTab):
 
     def on_exit(self, code):
         self._set_running(False)
+        # Backup VRAM release — the script unloads the model itself on a
+        # graceful exit, but not if it was killed (e.g. app closed mid-image).
+        threading.Thread(target=_ollama_release_vram, daemon=True).start()
         # Drain any strip thumbnail decodes still in flight after exit
         for delay in (250, 1000, 3000):
             self.after(delay, self._tick)

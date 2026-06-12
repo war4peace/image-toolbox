@@ -499,6 +499,31 @@ def check_ollama():
         return False, f"Ollama check failed: {e}"
 
 
+def unload_model():
+    """
+    Ask Ollama to unload the vision model immediately (keep_alive=0),
+    releasing VRAM for other workloads. Best-effort and quiet.
+    Checks /api/ps first so the call can never trigger a pointless load
+    of a model that is not in memory.
+    Returns True if an unload was actually performed.
+    """
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=5) as resp:
+            loaded = [m.get("name", "") for m in json.loads(resp.read()).get("models", [])]
+        base = OLLAMA_MODEL.split(":")[0]
+        if not any(base in name for name in loaded):
+            return False
+        payload = json.dumps({"model": OLLAMA_MODEL, "keep_alive": 0}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
 def analyse_image(path, language="English"):
     """
     Send the image to Ollama and return (long_description, condensed_title).
@@ -1260,6 +1285,11 @@ def main():
         sys.exit(1)
     print(f"  {msg}\n")
 
+    # Free VRAM no matter how this run ends (finish, stop, error, Ctrl+C):
+    # the model must never stay resident after Image Toolbox is done with it.
+    import atexit
+    atexit.register(unload_model)
+
     # ── Scan ─────────────────────────────────────────────────
     print(f"  Scanning '{root}' ...\n")
     work_items = collect_work_items(root, force_tag=force_tag)
@@ -1403,6 +1433,8 @@ def main():
             # ── Outage detection ─────────────────────────────
             if consecutive_fails >= OUTAGE_THRESHOLD:
                 print(f"  WARNING: {consecutive_fails} consecutive failures.")
+                if unload_model():
+                    print("  (Vision model unloaded while paused - VRAM released.)")
                 if control.active:
                     print("  Restart Ollama if needed, then press Resume in the app.")
                     if not control.wait_resume():
@@ -1426,6 +1458,10 @@ def main():
         elapsed = time.time() - folder_start
         folder_stats[current_folder]["elapsed"] += elapsed
         print(f"\n  Folder done in {fmt_duration(elapsed)}\n")
+
+    # ── Release VRAM: unload the vision model now that tagging is over ──
+    if unload_model():
+        print("  Ollama vision model unloaded - VRAM released.\n")
 
     # ── Summary table ─────────────────────────────────────────
     grand_elapsed = time.time() - grand_start
