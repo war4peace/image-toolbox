@@ -9,3 +9,5 @@ test_output/
 gui_settings.json
 __pycache__/
 trcache/
+.setup_complete
+installer/Output/

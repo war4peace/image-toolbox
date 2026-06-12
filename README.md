@@ -6,11 +6,25 @@ AI-leveraged image alteration toolbox. Rescale, describe, rename files based on 
 
 This is a set of tools created to help with upscaling, describing and renaming image files. Useful to enhance your personal image collection and improve old pictures which were taken using older cameras. 
 
-## NEW: Standalone mode (no ComfyUI required)
+## NEW: Easy installation (Windows installer)
 
-`batch_upscale.py` now runs the SeedVR2 pipeline directly in-process. ComfyUI is no longer needed — no server to start, no HTTP polling, and the DiT/VAE models stay loaded between images (roughly 35% faster per image than the ComfyUI flow).
+The simplest way to get started — no Git, no Python knowledge required:
 
-**Quickstart:**
+1. **Download** `ImageToolboxSetup.exe` from the [latest release](https://github.com/war4peace/image-toolbox/releases/latest).
+2. **Run it** and click through the installer (no administrator rights needed).
+3. **Double-click** the *Image Toolbox* shortcut on your desktop.
+
+The first launch opens a setup window that downloads the required components (Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the app. The first upscale you run additionally downloads the AI model weights (~16 GB) automatically.
+
+**Requirements:** Windows 10/11 (64-bit), an NVIDIA GPU with current drivers, an internet connection, and ~25 GB of free disk space. The Tag & Rename tab additionally needs [Ollama](https://ollama.com) with a vision model (e.g. `ollama pull llava:34b`) — optional if you only upscale.
+
+*(Maintainers: the installer is built by the `build-installer` GitHub Actions workflow from `installer/ImageToolbox.iss` whenever a `v*` tag is pushed.)*
+
+## Standalone mode, from source (no ComfyUI required)
+
+`batch_upscale.py` runs the SeedVR2 pipeline directly in-process. ComfyUI is no longer needed — no server to start, no HTTP polling, and the DiT/VAE models stay loaded between images (roughly 35% faster per image than the ComfyUI flow).
+
+**Quickstart** (or simply run `Image Toolbox.cmd` after cloning — it performs these steps for you):
 
 ```powershell
 # 1. Clone this repository and the SeedVR2 engine into it
