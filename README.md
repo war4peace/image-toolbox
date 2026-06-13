@@ -168,8 +168,5 @@ side-by-side and judge the upscaler's strengths and weaknesses.
 - **About the code:** these tools were written with the help of Claude (Anthropic)
   by someone who is not a trained developer — "vibecoding", as some call it. This
   is a personal project, shared for anyone to use at no cost.
-- **Legacy scripts:** `remote-image-upscale.ps1` / `remote-tag-and-rename.ps1`
-  are from the earlier ComfyUI-based RunPod workflow and are not used by the
-  current app. They are kept as a reference for a future remote-pod feature.
 - **Maintainers:** the installer is built by the `build-installer` GitHub Actions
   workflow from `installer/ImageToolbox.iss` whenever a `v*` tag is pushed.
