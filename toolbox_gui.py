@@ -81,6 +81,19 @@ def save_config(cfg=None):
         return False
 
 
+# Default folders the user pins for each tool. Stored in config.json so they
+# travel with the rest of the configuration and are shown in the Settings tab.
+#   upscale_source / upscale_output  – Batch Upscaler
+#   tag_folder                       – Tag & Rename
+def get_default_folder(key):
+    return CFG.get("defaults", {}).get(key, "")
+
+
+def set_default_folder(key, value):
+    CFG.setdefault("defaults", {})[key] = value
+    save_config()
+
+
 # ─────────────────────────────────────────────
 #  OLLAMA / DISCORD probes (used by the Settings tab)
 # ─────────────────────────────────────────────
@@ -1234,47 +1247,39 @@ class UpscaleTab(ToolTab):
         self.tool_name    = "Batch Upscaler"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
-        self.save_src_var = tk.BooleanVar(value=False)
-        self.save_out_var = tk.BooleanVar(value=False)
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
         self._phase       = ""       # current phase text (from STATUS events)
         self._build()
 
-        # Restore saved default folders, then keep the checkboxes in sync
-        s = app.settings
-        src_default = s.get("default_source", "")
+        # Restore the pinned default folders from config.json
+        src_default = get_default_folder("upscale_source")
         if src_default and os.path.isdir(src_default):
             self.src_var.set(src_default)
-            self.save_src_var.set(True)
             if not self.out_var.get().strip():
                 self.out_var.set(os.path.join(src_default, "__upscaled__"))
-        out_default = s.get("default_output", "")
+        out_default = get_default_folder("upscale_output")
         if out_default:
             self.out_var.set(out_default)
-            self.save_out_var.set(True)
-        self.src_var.trace_add("write", lambda *_: self._sync_default("src"))
-        self.out_var.trace_add("write", lambda *_: self._sync_default("out"))
-        self._sync_default("src")
-        self._sync_default("out")
+        self.src_var.trace_add("write", lambda *_: self._refresh_save_buttons())
+        self.out_var.trace_add("write", lambda *_: self._refresh_save_buttons())
+        self._refresh_save_buttons()
 
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_src).grid(row=0, column=2, pady=3)
-        self.save_src_chk = ttk.Checkbutton(
-            self, text="Save as Default", variable=self.save_src_var,
-            command=lambda: self._on_save_toggle("src"), state="disabled")
-        self.save_src_chk.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=3)
+        self.save_src_btn = ttk.Button(
+            self, text="Save as Default", command=lambda: self._save_default("src"))
+        self.save_src_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         ttk.Label(self, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.out_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_out).grid(row=1, column=2, pady=3)
-        self.save_out_chk = ttk.Checkbutton(
-            self, text="Save as Default", variable=self.save_out_var,
-            command=lambda: self._on_save_toggle("out"), state="disabled")
-        self.save_out_chk.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=3)
+        self.save_out_btn = ttk.Button(
+            self, text="Save as Default", command=lambda: self._save_default("out"))
+        self.save_out_btn.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         btns = ttk.Frame(self)
         btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
@@ -1317,38 +1322,38 @@ class UpscaleTab(ToolTab):
         else:
             super()._handle_event(kind, payload)
 
-    # ── Default-folder preferences ───────────────────────────────────────────
+    # ── Default-folder buttons ───────────────────────────────────────────────
 
-    def _sync_default(self, which):
-        """
-        Keep a Save-as-Default checkbox consistent with its path field:
-        enabled only for a valid path, and while checked the latest valid
-        path is persisted.
-        """
+    def _src_valid(self):
+        p = self.src_var.get().strip()
+        return bool(p) and os.path.isdir(p)
+
+    def _out_valid(self):
+        p = self.out_var.get().strip()
+        # The output folder is created on demand — accept it if it exists or
+        # can be created inside an existing parent.
+        return bool(p) and (os.path.isdir(p) or os.path.isdir(os.path.dirname(p)))
+
+    def _refresh_save_buttons(self):
+        self.save_src_btn.configure(state="normal" if self._src_valid() else "disabled")
+        self.save_out_btn.configure(state="normal" if self._out_valid() else "disabled")
+
+    def _save_default(self, which):
         if which == "src":
-            chk, var, key = self.save_src_chk, self.save_src_var, "default_source"
-            path  = self.src_var.get().strip()
-            valid = bool(path) and os.path.isdir(path)
+            if not self._src_valid():
+                return
+            set_default_folder("upscale_source", self.src_var.get().strip())
+            self._flash_saved(self.save_src_btn)
         else:
-            chk, var, key = self.save_out_chk, self.save_out_var, "default_output"
-            path  = self.out_var.get().strip()
-            # The output folder is created on demand — accept it if it exists
-            # or can be created inside an existing folder.
-            valid = bool(path) and (os.path.isdir(path) or
-                                    os.path.isdir(os.path.dirname(path)))
-        chk.configure(state="normal" if valid else "disabled")
-        if valid and var.get() and self.app.settings.get(key) != path:
-            self.app.settings[key] = path
-            save_settings(self.app.settings)
+            if not self._out_valid():
+                return
+            set_default_folder("upscale_output", self.out_var.get().strip())
+            self._flash_saved(self.save_out_btn)
+        self.app.sync_settings_defaults()   # mirror into the Settings tab
 
-    def _on_save_toggle(self, which):
-        key = "default_source" if which == "src" else "default_output"
-        var = self.save_src_var if which == "src" else self.save_out_var
-        if var.get():
-            self._sync_default(which)
-        elif key in self.app.settings:
-            del self.app.settings[key]
-            save_settings(self.app.settings)
+    def _flash_saved(self, btn):
+        btn.configure(text="Saved ✓")
+        self.after(1200, lambda: btn.configure(text="Save as Default"))
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -1476,10 +1481,19 @@ class TagTab(ToolTab):
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
 
+        # Restore the pinned default folder from config.json
+        tag_default = get_default_folder("tag_folder")
+        if tag_default and os.path.isdir(tag_default):
+            self.dir_var.set(tag_default)
+        self.dir_var.trace_add("write", lambda *_: self._refresh_save_button())
+        self._refresh_save_button()
+
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.dir_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_dir).grid(row=0, column=2, pady=3)
+        self.save_dir_btn = ttk.Button(self, text="Save as Default", command=self._save_default)
+        self.save_dir_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         opts = ttk.Frame(self)
         opts.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -1520,6 +1534,23 @@ class TagTab(ToolTab):
         folder = filedialog.askdirectory(title="Choose the folder with photos to tag")
         if folder:
             self.dir_var.set(os.path.normpath(folder))
+
+    # ── Default-folder button ────────────────────────────────────────────────
+
+    def _dir_valid(self):
+        p = self.dir_var.get().strip()
+        return bool(p) and os.path.isdir(p)
+
+    def _refresh_save_button(self):
+        self.save_dir_btn.configure(state="normal" if self._dir_valid() else "disabled")
+
+    def _save_default(self):
+        if not self._dir_valid():
+            return
+        set_default_folder("tag_folder", self.dir_var.get().strip())
+        self.app.sync_settings_defaults()   # mirror into the Settings tab
+        self.save_dir_btn.configure(text="Saved ✓")
+        self.after(1200, lambda: self.save_dir_btn.configure(text="Save as Default"))
 
     def _open_dir(self):
         folder = self.dir_var.get().strip()
@@ -1699,6 +1730,22 @@ class SettingsTab(ttk.Frame):
 
         ollama = CFG.get("ollama", {})
         ups    = CFG.get("upscale", {})
+        defs   = CFG.get("defaults", {})
+
+        # ── Default folders (mirrors the tabs' "Save as Default" buttons) ───────
+        sec = self._section(body, "Default folders")
+        sec.columnconfigure(1, weight=1)
+        self.default_src_var = tk.StringVar(value=defs.get("upscale_source", ""))
+        self.default_out_var = tk.StringVar(value=defs.get("upscale_output", ""))
+        self.default_tag_var = tk.StringVar(value=defs.get("tag_folder", ""))
+        for r, (text, var) in enumerate((
+                ("Batch Upscaler — Photo folder:",  self.default_src_var),
+                ("Batch Upscaler — Output folder:", self.default_out_var),
+                ("Tag & Rename — Photo folder:",    self.default_tag_var))):
+            ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+            ttk.Button(sec, text="Browse…",
+                       command=lambda v=var: self._pick_folder(v)).grid(row=r, column=2, pady=3)
 
         # ── Ollama ────────────────────────────────────────────────────────────
         sec = self._section(body, "Ollama")
@@ -1832,6 +1879,19 @@ class SettingsTab(ttk.Frame):
         ok, msg = test_discord_webhook(self.webhook_var.get())
         self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
 
+    def _pick_folder(self, var):
+        folder = filedialog.askdirectory(title="Choose a folder")
+        if folder:
+            var.set(os.path.normpath(folder))
+
+    def load_defaults(self):
+        """Refresh the default-folder fields from config (called when a tab's
+        Save-as-Default button updates them, so both views stay in sync)."""
+        defs = CFG.get("defaults", {})
+        self.default_src_var.set(defs.get("upscale_source", ""))
+        self.default_out_var.set(defs.get("upscale_output", ""))
+        self.default_tag_var.set(defs.get("tag_folder", ""))
+
     def _save(self):
         # Validate the numeric SeedVR / cutoff fields first.
         errors = []
@@ -1870,6 +1930,11 @@ class SettingsTab(ttk.Frame):
         ups["discord_webhook_url"]  = self.webhook_var.get().strip()
         ups.update(seedvr_out)
 
+        defs = CFG.setdefault("defaults", {})
+        defs["upscale_source"] = self.default_src_var.get().strip()
+        defs["upscale_output"] = self.default_out_var.get().strip()
+        defs["tag_folder"]     = self.default_tag_var.get().strip()
+
         if save_config():
             self.save_status.configure(
                 text="Saved. Changes apply to the next run.", foreground="#1a7f37")
@@ -1897,6 +1962,7 @@ class App(tk.Tk):
         self.settings = load_settings()
         self._last_normal_geo = None
         self.log_window = None          # single shared LogViewer for both tools
+        self._migrate_default_folders()
         self._restore_geometry()
 
         self.nb = ttk.Notebook(self)
@@ -1910,6 +1976,25 @@ class App(tk.Tk):
 
         self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _migrate_default_folders(self):
+        """Carry default folders saved by older builds in gui_settings.json over
+        to config.json, where they now live (one-time, before the tabs load)."""
+        defs = CFG.setdefault("defaults", {})
+        moved = False
+        for old_key, new_key in (("default_source", "upscale_source"),
+                                  ("default_output", "upscale_output")):
+            if not defs.get(new_key) and self.settings.get(old_key):
+                defs[new_key] = self.settings[old_key]
+                moved = True
+        if moved:
+            save_config()
+
+    def sync_settings_defaults(self):
+        """Push the latest default folders into the Settings tab's fields."""
+        st = getattr(self, "settings_tab", None)
+        if st is not None:
+            st.load_defaults()
 
     # ── Window geometry persistence ──────────────────────────────────────────
 
