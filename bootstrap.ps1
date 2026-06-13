@@ -159,7 +159,7 @@ try {
 
     if ($ollamaExe) {
         # The vision model the toolbox is configured to use (config.json)
-        $model = "llava:34b"
+        $model = "minicpm-v:latest"
         try {
             $cfg = Get-Content (Join-Path $root "config.json") -Raw | ConvertFrom-Json
             if ($cfg.ollama.model) { $model = $cfg.ollama.model }

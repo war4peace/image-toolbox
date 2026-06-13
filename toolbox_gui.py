@@ -169,7 +169,7 @@ def _ollama_release_vram():
     try:
         o     = CFG.get("ollama", {})
         url   = o.get("url", "http://127.0.0.1:11434")
-        model = o.get("model", "llava:34b")
+        model = o.get("model", "minicpm-v:latest")
         with urllib.request.urlopen(f"{url}/api/ps", timeout=5) as resp:
             loaded = [m.get("name", "") for m in json.loads(resp.read()).get("models", [])]
         if not any(model.split(":")[0] in name for name in loaded):
@@ -1760,7 +1760,7 @@ class SettingsTab(ttk.Frame):
         self.ollama_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
 
         ttk.Label(sec, text="Ollama model:").grid(row=2, column=0, sticky="w", pady=3)
-        self.ollama_model_var = tk.StringVar(value=ollama.get("model", "llava:34b"))
+        self.ollama_model_var = tk.StringVar(value=ollama.get("model", "minicpm-v:latest"))
         self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
         self.ollama_model_cmb.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=2, column=2, pady=3)

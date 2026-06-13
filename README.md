@@ -26,7 +26,7 @@ No Git, no Python knowledge required:
 The first launch opens a setup window that downloads the required components
 (Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the
 app. It also offers to install [Ollama](https://ollama.com) and the vision model
-used by **Tag & Rename** (~20 GB; optional — upscaling works without it, and you
+used by **Tag & Rename** (~5.5 GB; optional — upscaling works without it, and you
 can decline). The first upscale you run additionally downloads the AI upscaling
 model weights (~16 GB) automatically. Everything the setup prints is saved to
 `bootstrap.log` next to the app for later review.
@@ -39,7 +39,7 @@ model weights (~16 GB) automatically. Everything the setup prints is saved to
 
 **Requirements:** Windows 10/11 (64-bit), an NVIDIA GPU with current drivers
 (8 GB VRAM minimum), an internet connection, and ~25 GB of free disk space
-(plus ~20 GB if you install the tagging model). PyTorch ships its own CUDA
+(plus ~6 GB if you install the tagging model). PyTorch ships its own CUDA
 runtime, so a separate CUDA Toolkit install is **not** required.
 
 ---
@@ -116,6 +116,14 @@ packages) with three tabs.
 - **One-click Undo** restores file names, EXIF descriptions, or both — every
   change is recorded to an undo cache before anything is modified.
 - Already-tagged files are detected and skipped on re-runs.
+- **The vision model is your choice** (set it in **Settings**). The default is
+  [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast, light (~7.6 GB
+  VRAM, runs on an 8 GB GPU), and accurate, with a welcome habit of describing
+  only what it can clearly see instead of guessing. For the **best accuracy**
+  (reading faint on-screen text, inferring fine detail) at the cost of speed and
+  VRAM, switch to [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) (needs
+  ~16 GB VRAM, so a 16 GB+ GPU). In testing, `llava:34b` was the slowest,
+  heaviest *and* least accurate of the models tried — it's not recommended.
 
 ### Settings
 

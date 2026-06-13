@@ -209,7 +209,7 @@ _O   = _CFG.get("ollama",  {})
 _T   = _CFG.get("tagging", {})
 
 OLLAMA_URL   = _O.get("url",   "http://127.0.0.1:11434")
-OLLAMA_MODEL = _O.get("model", "llava:34b")
+OLLAMA_MODEL = _O.get("model", "minicpm-v:latest")
 
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
