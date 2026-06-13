@@ -119,6 +119,26 @@ def save_settings(settings):
         pass   # preferences are best-effort
 
 
+_GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
+
+
+def _geometry_on_screen(win, geo):
+    """True if a saved 'WxH+X+Y' string is sane and at least partly visible.
+    Guards against restoring a window onto a monitor that is no longer there."""
+    m = _GEOMETRY_RE.match(geo or "")
+    if not m:
+        return False
+    w, h, x, y = (int(g) for g in m.groups())
+    if not (300 <= w <= 10000 and 200 <= h <= 10000):
+        return False
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    # Require a ~100px sliver to remain reachable (negative x/y is valid on a
+    # secondary monitor placed to the left of / above the primary one).
+    if x > sw - 100 or y > sh - 100 or x + w < 100 or y + h < 100:
+        return False
+    return True
+
+
 # ─────────────────────────────────────────────
 #  TOOLTIP
 # ─────────────────────────────────────────────
@@ -385,10 +405,12 @@ class LogViewer(tk.Toplevel):
     itself prints.
     """
 
-    def __init__(self, master, console, title):
+    def __init__(self, master, console, title, app=None):
         super().__init__(master)
         self.title(title)
-        self.geometry("860x520")
+        self._app = app
+        geo = app.settings.get("log_geometry") if app is not None else None
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "860x520")
         self.minsize(480, 280)
         self._console = console
 
@@ -420,7 +442,13 @@ class LogViewer(tk.Toplevel):
             if self.autoscroll.get():
                 self.pane.text.see("end")
 
+    def save_geometry(self):
+        if self._app is not None and self.winfo_exists():
+            self._app.settings["log_geometry"] = self.geometry()
+            save_settings(self._app.settings)
+
     def _close(self):
+        self.save_geometry()
         self._console.remove_observer(self._on_console)
         self.destroy()
 
@@ -696,7 +724,8 @@ class ToolTab(ttk.Frame):
             self._viewer.lift()
             self._viewer.focus_set()
             return
-        self._viewer = LogViewer(self, self.console, f"{APP_TITLE} — program output")
+        self._viewer = LogViewer(self, self.console,
+                                 f"{APP_TITLE} — program output", app=self.app)
 
     def _scan_progress(self, text):
         matches = PROGRESS_RE.findall(text)
@@ -1502,7 +1531,6 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.geometry("980x720")
         self.minsize(780, 560)
         try:
             ttk.Style(self).theme_use("vista")
@@ -1510,6 +1538,8 @@ class App(tk.Tk):
             pass
 
         self.settings = load_settings()
+        self._last_normal_geo = None
+        self._restore_geometry()
 
         self.nb = ttk.Notebook(self)
         self.upscale_tab = UpscaleTab(self.nb, self)
@@ -1518,7 +1548,35 @@ class App(tk.Tk):
         self.nb.add(self.tag_tab,     text="  Tag & Rename  ")
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
 
+        self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── Window geometry persistence ──────────────────────────────────────────
+
+    def _restore_geometry(self):
+        geo = self.settings.get("main_geometry")
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
+        if self.settings.get("main_zoomed"):
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
+
+    def _track_geometry(self, event):
+        # Remember the last *restored* (non-maximised) geometry so closing while
+        # maximised still records a sensible size to come back to.
+        if event.widget is self and self.state() == "normal":
+            self._last_normal_geo = self.geometry()
+
+    def _save_geometry(self):
+        try:
+            zoomed = (self.state() == "zoomed")
+        except tk.TclError:
+            zoomed = False
+        geo = self._last_normal_geo or self.geometry()
+        self.settings["main_geometry"] = geo
+        self.settings["main_zoomed"]   = zoomed
+        save_settings(self.settings)
 
     def other_tab(self, tab):
         return self.tag_tab if tab is self.upscale_tab else self.upscale_tab
@@ -1542,6 +1600,12 @@ class App(tk.Tk):
                         t.proc.wait(timeout=5)
                     except Exception:
                         t.terminate()
+        # Persist the main window layout and any open log window's layout.
+        self._save_geometry()
+        for t in (self.upscale_tab, self.tag_tab):
+            v = getattr(t, "_viewer", None)
+            if v is not None and v.winfo_exists():
+                v.save_geometry()
         self.destroy()
 
 
