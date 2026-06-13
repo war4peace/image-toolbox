@@ -25,7 +25,6 @@ import os
 import re
 import sys
 import json
-import time
 import queue
 import codecs
 import threading
@@ -37,6 +36,9 @@ from tkinter import ttk, filedialog, messagebox
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
+# Shown in the main window title bar. On a release, set this to the tag (e.g.
+# "0.1.3") and drop the "-experimental" suffix.
+APP_VERSION = "0.1.3-experimental"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -448,10 +450,6 @@ class ToolTab(ttk.Frame):
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
         self._final_top     = ""                # summary line shown above the final message
         self._finished      = True              # True when no run is in progress
-        # ETA tracking — wall-clock estimate built from the per-image counter
-        self._eta_start     = None
-        self._eta_first     = 0
-        self._eta_last_cur  = 0
 
     # ── UI helpers ──────────────────────────────────────────────────────────
 
@@ -672,6 +670,8 @@ class ToolTab(ttk.Frame):
             self.strip.rename(old, new)
             if self.preview_name.get() == os.path.basename(old):
                 self.preview_name.set(os.path.basename(new))
+        elif kind == "ETA" and payload:
+            self._handle_eta(payload)
         elif kind == "LOG" and payload:
             self._log_path = payload
             self.viewlog_btn.configure(state="normal")
@@ -684,7 +684,6 @@ class ToolTab(ttk.Frame):
         self.console.clear()
         self.strip.clear()
         self.preview_name.set("")
-        self._eta_start = None
         self._final_top = ""
         self.eta_var.set("—")
 
@@ -708,26 +707,27 @@ class ToolTab(ttk.Frame):
             return
         self.progress.set(cur * 100 / tot)
         self.status_var.set(f"Processing image {cur} of {tot} …")
-        self._update_eta(cur, tot)
 
-    def _update_eta(self, cur, tot):
-        """Build a remaining-time estimate from how long this session's
-        completed images have taken. Resets if the counter restarts (a new
-        processing pass), and measures only images done in this session so a
-        resumed run is not skewed by work finished previously."""
-        now = time.time()
-        if self._eta_start is None or cur < self._eta_last_cur:
-            self._eta_start    = now
-            self._eta_first    = cur
-            self._eta_last_cur = cur
-            self.eta_var.set("calculating…")
+    def _handle_eta(self, payload):
+        """ETA event from the running tool: 'elapsed|processed|idx|total'.
+        Estimate = (elapsed / images actually processed this session) ×
+        images still to go. Using the processed count — not the position
+        counter, which also advances on skipped files — keeps the average
+        per-image time honest. The elapsed value is pause-excluded."""
+        try:
+            elapsed, processed, idx, total = payload.split("|")
+            elapsed   = float(elapsed)
+            processed = int(processed)
+            idx       = int(idx)
+            total     = int(total)
+        except ValueError:
             return
-        self._eta_last_cur = cur
-        done = cur - self._eta_first          # images completed this session
-        if done >= 1:
-            rate      = (now - self._eta_start) / done    # seconds per image
-            remaining = max(0, tot - cur + 1)             # incl. the current one
-            self.eta_var.set(_fmt_eta(rate * remaining))
+        if total > 0:
+            self.progress.set(idx * 100 / total)
+        if processed > 0 and total > 0:
+            avg       = elapsed / processed
+            remaining = max(0, total - idx)
+            self.eta_var.set(_fmt_eta(avg * remaining))
 
     def send(self, line):
         """Send one control line to the child's stdin."""
@@ -1170,7 +1170,6 @@ class UpscaleTab(ToolTab):
             if processing != self._processing:
                 self._processing = processing
                 if processing:                 # entering a processing pass
-                    self._eta_start = None
                     self.eta_var.set("calculating…")
                 if self.running and not self._cancelled:
                     self.pause_btn.configure(
@@ -1427,6 +1426,7 @@ class TagTab(ToolTab):
         self._mode = "tag"
         self.progress.set(0)
         self._reset_stream_state()
+        self.eta_var.set("calculating…")
         self.status_var.set("Starting — checking Ollama and scanning the folder …")
         if self.launch("tag_and_rename.py", args):
             self._set_running(True)
@@ -1501,7 +1501,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
+        self.title(f"{APP_TITLE} {APP_VERSION}")
         self.geometry("980x720")
         self.minsize(780, 560)
         try:

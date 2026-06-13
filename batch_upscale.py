@@ -885,6 +885,11 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         if os.path.exists(out_path):
             folder_stats[dirpath]["skipped_done"] += 1
             total_skipped_done += 1
+            # Self-heal the cache: the output exists but this item was still in
+            # the work list (its cached entry said not-done, e.g. the output
+            # was created by an older run). Record it so future runs exclude it.
+            if cache is not None:
+                cache.mark_done(local_path)
             continue
 
         # ── Too large? ───────────────────────────────────────────────────────
@@ -948,6 +953,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 cache.save()
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
+            # GUI ETA: pause-excluded elapsed, images actually processed this
+            # session, current position and total. The GUI averages over the
+            # processed count (NOT the counter, which also advances on skips).
+            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}")
 
         except Exception as e:
             img_elapsed        = time.time() - img_start
@@ -1003,6 +1012,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 )
 
             continue
+
+    # Persist any cache changes from this pass — including already-done marks
+    # recorded while skipping, and especially when the run ends with a Stop
+    # (per-image saves only cover images that were actually processed).
+    if cache is not None:
+        cache.save()
 
     # ── Close last folder ────────────────────────────────────────────────────
     if current_folder is not None:
