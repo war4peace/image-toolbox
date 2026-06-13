@@ -1425,6 +1425,10 @@ def main():
             consecutive_fails = 0
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
+            # GUI ETA: elapsed, images processed this session, position, total.
+            # Averaged over processed count, not the counter (which also
+            # advances on skipped/already-tagged files).
+            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}")
 
         except Exception as e:
             img_elapsed   = time.time() - img_start
