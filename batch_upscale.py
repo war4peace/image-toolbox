@@ -846,6 +846,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     total_skipped_missing = 0
     total_skipped_corrupt = 0
     total_failed          = 0
+    corrupt_files         = []      # absolute paths of unreadable/corrupt images
     total                 = len(work_items)
     current_folder        = None
     folder_start          = None
@@ -908,6 +909,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             logger.log_only(f"  {prefix} SKIP (unreadable image — file may be corrupted)  {local_path}", timestamp=True)
             folder_stats[dirpath]["skipped_corrupt"] += 1
             total_skipped_corrupt += 1
+            corrupt_files.append(local_path)
             continue
 
         scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
@@ -1018,6 +1020,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "total_skipped_missing": total_skipped_missing,
         "total_skipped_corrupt": total_skipped_corrupt,
         "total_failed":          total_failed,
+        "corrupt_files":         corrupt_files,
         "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
     }
 
@@ -1342,6 +1345,7 @@ def main():
             "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
             "total_skipped_corrupt": s1["total_skipped_corrupt"] + s2["total_skipped_corrupt"],
             "total_failed":          s1["total_failed"]          + s2["total_failed"],
+            "corrupt_files":         s1.get("corrupt_files", []) + s2.get("corrupt_files", []),
         }
 
     combined        = merge(stats1, stats2)
@@ -1352,6 +1356,7 @@ def main():
     total_skipped_missing = combined["total_skipped_missing"]
     total_skipped_corrupt = combined["total_skipped_corrupt"]
     total_failed          = combined["total_failed"]
+    corrupt_files         = combined.get("corrupt_files", [])
 
     col_path = min(60, max(len("Folder"),
         max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)))
@@ -1406,6 +1411,19 @@ def main():
     if total_failed          > 0: parts.append(f"{total_failed} failed")
     else: parts.append("0 failed")
     logger.tee(f"  ({', '.join(parts)})")
+
+    # List every corrupt/unreadable file so the user can find and review them.
+    corrupt_files = list(dict.fromkeys(corrupt_files))   # dedup, keep order
+    if corrupt_files:
+        logger.tee("")
+        logger.tee(sep)
+        logger.tee(f"  Corrupted / unreadable images ({len(corrupt_files)}) — review or recover manually:")
+        logger.tee("-" * _w)
+        for cf in corrupt_files:
+            logger.log_only(f"  {cf}")
+            print(f"  {_osc8_link(cf)}")     # terminal: clickable; GUI strips the link
+        logger.tee(sep)
+
     _log_link = _osc8_link(logger.path)
     logger.log_only(f"Session ended: {datetime.datetime.now().strftime('%Y-%m-%d | %H:%M:%S')}")
     print(f"Log file: {_log_link}")
