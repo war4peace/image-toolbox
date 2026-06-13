@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import json
+import time
 import queue
 import codecs
 import threading
@@ -180,6 +181,47 @@ def sanitize(text):
 
 
 # ─────────────────────────────────────────────
+#  PROGRESS BAR  (canvas — shows a percentage on the bar)
+# ─────────────────────────────────────────────
+
+def _fmt_eta(seconds):
+    """Format a duration as 'dd, hh, mm, ss' — e.g. '04d, 11h, 23m, 35s'."""
+    s = int(max(0, round(seconds)))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{d:02d}d, {h:02d}h, {m:02d}m, {s:02d}s"
+
+
+class ProgressBar(tk.Canvas):
+    """A determinate progress bar that draws its own percentage on the fill."""
+
+    TROUGH = "#d6d9de"
+    FILL   = "#4f9cff"
+    TEXT   = "#13233a"
+
+    def __init__(self, master, height=20, **kw):
+        super().__init__(master, height=height, highlightthickness=1,
+                         highlightbackground="#aeb4bd", bg=self.TROUGH, **kw)
+        self._pct = 0.0
+        self.bind("<Configure>", lambda _e: self._draw())
+
+    def set(self, pct):
+        self._pct = max(0.0, min(100.0, float(pct)))
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = max(self.winfo_width(), 1)
+        h = max(self.winfo_height(), 1)
+        fw = int(w * self._pct / 100.0)
+        if fw > 0:
+            self.create_rectangle(0, 0, fw, h, fill=self.FILL, width=0)
+        self.create_text(w / 2, h / 2, text=f"{int(round(self._pct))}%",
+                         fill=self.TEXT, font=("Segoe UI", 9, "bold"))
+
+
+# ─────────────────────────────────────────────
 #  LOG PANE
 # ─────────────────────────────────────────────
 
@@ -319,6 +361,14 @@ class ConsoleBuffer:
         out.reverse()
         return out
 
+    def find_last(self, pattern):
+        """The last buffered line matching a regex (stripped), or ''."""
+        rx = re.compile(pattern)
+        for line in reversed(self._lines):
+            if rx.search(line):
+                return line.strip()
+        return ""
+
 
 # ─────────────────────────────────────────────
 #  LOG VIEWER  (floating window mirroring the clean output)
@@ -396,14 +446,25 @@ class ToolTab(ttk.Frame):
         self._viewer        = None    # open LogViewer window, if any
         self.console        = ConsoleBuffer()   # clean output stream (backlog + live)
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
+        self._final_top     = ""                # summary line shown above the final message
         self._finished      = True              # True when no run is in progress
+        # ETA tracking — wall-clock estimate built from the per-image counter
+        self._eta_start     = None
+        self._eta_first     = 0
+        self._eta_last_cur  = 0
 
     # ── UI helpers ──────────────────────────────────────────────────────────
 
     def _build_output_area(self, row):
         """Progress bar + two-row status + full-width image preview wall."""
-        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
-        self.progress.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 2))
+        pf = ttk.Frame(self)
+        pf.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 2))
+        ttk.Label(pf, text="Est. Time Remaining:").pack(side="left")
+        self.eta_var = tk.StringVar(value="—")
+        ttk.Label(pf, textvariable=self.eta_var, width=20,
+                  font=("Consolas", 9)).pack(side="left", padx=(4, 12))
+        self.progress = ProgressBar(pf, width=260)
+        self.progress.pack(side="left", fill="x", expand=True)
 
         # Two-row status: the previously completed file and the current one.
         # Monospaced so the columns line up; width=1 + sticky lets the labels
@@ -465,7 +526,8 @@ class ToolTab(ttk.Frame):
             top = img[-2] if len(img) >= 2 else ""
             bot = img[-1]
         else:
-            top, bot = "", self._phase_text
+            # After a run, show the summary line (if any) above the final message.
+            top, bot = self._final_top, self._phase_text
         self.status_top.configure(text=top)
         self.status_bot.configure(text=bot)
 
@@ -622,6 +684,9 @@ class ToolTab(ttk.Frame):
         self.console.clear()
         self.strip.clear()
         self.preview_name.set("")
+        self._eta_start = None
+        self._final_top = ""
+        self.eta_var.set("—")
 
     def _tick(self):
         """Every poll cycle: display freshly decoded strip thumbnails."""
@@ -636,11 +701,33 @@ class ToolTab(ttk.Frame):
 
     def _scan_progress(self, text):
         matches = PROGRESS_RE.findall(text)
-        if matches:
-            cur, tot = (int(x) for x in matches[-1])
-            if tot > 0:
-                self.progress.configure(value=cur * 100 / tot)
-                self.status_var.set(f"Processing image {cur} of {tot} …")
+        if not matches:
+            return
+        cur, tot = (int(x) for x in matches[-1])
+        if tot <= 0:
+            return
+        self.progress.set(cur * 100 / tot)
+        self.status_var.set(f"Processing image {cur} of {tot} …")
+        self._update_eta(cur, tot)
+
+    def _update_eta(self, cur, tot):
+        """Build a remaining-time estimate from how long this session's
+        completed images have taken. Resets if the counter restarts (a new
+        processing pass), and measures only images done in this session so a
+        resumed run is not skewed by work finished previously."""
+        now = time.time()
+        if self._eta_start is None or cur < self._eta_last_cur:
+            self._eta_start    = now
+            self._eta_first    = cur
+            self._eta_last_cur = cur
+            self.eta_var.set("calculating…")
+            return
+        self._eta_last_cur = cur
+        done = cur - self._eta_first          # images completed this session
+        if done >= 1:
+            rate      = (now - self._eta_start) / done    # seconds per image
+            remaining = max(0, tot - cur + 1)             # incl. the current one
+            self.eta_var.set(_fmt_eta(rate * remaining))
 
     def send(self, line):
         """Send one control line to the child's stdin."""
@@ -680,10 +767,10 @@ class ToolTab(ttk.Frame):
 # Marker prefix batch_upscale.py uses for GUI event lines ("KIND|payload") —
 # intercepted here, never shown in the log.
 GUI_MARKER   = "@@TBX@@"
-THUMB_MASTER = 320           # px — bounding box the master thumbnail is decoded to
+THUMB_MASTER = 512           # px — bounding box the master thumbnail is decoded to
 CELL_DEFAULT = 150           # px — default square cell edge for one thumbnail
 CELL_MIN     = 90            # px — smallest cell (zoom out)
-CELL_MAX     = 300           # px — largest cell (zoom in; capped at master size)
+CELL_HARD_MAX = 1000         # px — absolute ceiling for a cell
 CELL_STEP    = 30            # px — change per +/- click
 GRID_GAP     = 10            # px — gap between cells
 BATCH_SIZE   = 100           # thumbnails decoded per batch
@@ -733,7 +820,7 @@ class FilmStrip(ttk.Frame):
         self._photo   = {}        # path -> PhotoImage at the current cell size
         self._img_id  = {}        # path -> canvas image item id
         self._current = None
-        self._cell    = max(CELL_MIN, min(CELL_MAX, int(cell)))
+        self._cell    = max(CELL_MIN, min(CELL_HARD_MAX, int(cell)))
         self._cols    = 1
         self._hl_id   = None      # highlight rectangle item id
         self._gen     = 0         # invalidates stale loader threads
@@ -751,8 +838,15 @@ class FilmStrip(ttk.Frame):
     def zoom_out(self):
         self._set_cell(self._cell - CELL_STEP)
 
+    def _max_cell(self):
+        """A cell may grow until it fills the smaller of the viewport's width
+        or height (one image fills the preview), bounded by a hard ceiling."""
+        w = max(self.canvas.winfo_width(), 1)
+        h = max(self.canvas.winfo_height(), 1)
+        return max(CELL_MIN, min(CELL_HARD_MAX, min(w, h) - 2 * GRID_GAP))
+
     def _set_cell(self, cell):
-        cell = max(CELL_MIN, min(CELL_MAX, cell))
+        cell = max(CELL_MIN, min(self._max_cell(), cell))
         if cell == self._cell:
             return
         self._cell = cell
@@ -807,9 +901,11 @@ class FilmStrip(ttk.Frame):
             self._batch = batch
             sl = self._paths[batch * BATCH_SIZE:(batch + 1) * BATCH_SIZE]
             self._build_cells(sl, first=path)
+            self.canvas.yview_moveto(0)     # new batch — start at the top
+        # The current image is only marked (highlighted); the view is NOT
+        # moved, so scrolling/browsing is never interrupted mid-run.
         self._current = path
         self._draw_highlight()
-        self.after_idle(lambda: self._scroll_to(path))
 
     # ── Layout ───────────────────────────────────────────────────────────────
 
@@ -891,17 +987,6 @@ class FilmStrip(ttk.Frame):
             x0 - 1, y0 - 1, x0 + cell + 1, y0 + cell + 1,
             outline=self.HILITE, width=3)
 
-    def _scroll_to(self, path):
-        i = self._pos.get(path)
-        if i is None:
-            return
-        _, y0 = self._cell_origin(i)
-        y_mid = y0 + self._cell / 2
-        sr = self.canvas.cget("scrollregion").split()
-        total = float(sr[3]) if len(sr) == 4 else 1.0
-        vh = max(self.canvas.winfo_height(), 1)
-        self.canvas.yview_moveto(max(0.0, (y_mid - vh / 2) / max(total, 1.0)))
-
     def _on_resize(self, _event):
         if self._resize_after is not None:
             self.after_cancel(self._resize_after)
@@ -909,7 +994,16 @@ class FilmStrip(ttk.Frame):
 
     def _do_resize(self):
         self._resize_after = None
-        if self._grid_cols() != self._cols:
+        # A shrunk viewport may no longer fit the current cell — pull it in.
+        max_cell = self._max_cell()
+        if self._cell > max_cell:
+            self._cell = max_cell
+            for p in list(self._master):
+                self._make_photo(p)
+            self._relayout(force=True)
+            if self._on_zoom:
+                self._on_zoom(self._cell)
+        elif self._grid_cols() != self._cols:
             self._relayout(force=True)
         else:
             self._update_scrollregion()
@@ -964,7 +1058,9 @@ class FilmStrip(ttk.Frame):
         m = self._master.get(p)
         if m is None:
             return
-        scale = min(self._cell / m.width, self._cell / m.height, 1.0)
+        # Fit the image to the square cell, preserving aspect. Cells larger
+        # than the decoded master upscale it (mildly soft at extreme zoom).
+        scale = min(self._cell / m.width, self._cell / m.height)
         w = max(1, int(round(m.width * scale)))
         h = max(1, int(round(m.height * scale)))
         img = m if (w == m.width and h == m.height) else m.resize((w, h), Image.LANCZOS)
@@ -1069,10 +1165,13 @@ class UpscaleTab(ToolTab):
             self._phase = payload
             if not self._cancelled:
                 self.status_var.set(payload)
-            self.progress.configure(value=0)
+            self.progress.set(0)
             processing = payload.startswith("Processing")
             if processing != self._processing:
                 self._processing = processing
+                if processing:                 # entering a processing pass
+                    self._eta_start = None
+                    self.eta_var.set("calculating…")
                 if self.running and not self._cancelled:
                     self.pause_btn.configure(
                         text="Pause" if processing else "Cancel")
@@ -1083,7 +1182,7 @@ class UpscaleTab(ToolTab):
             except ValueError:
                 return
             if tot > 0:
-                self.progress.configure(value=cur * 100 / tot)
+                self.progress.set(cur * 100 / tot)
                 if not self._cancelled:
                     self.status_var.set(f"{self._phase}  ({cur:,} / {tot:,})")
         else:
@@ -1161,7 +1260,7 @@ class UpscaleTab(ToolTab):
         if not self.confirm_gpu_overlap():
             return
 
-        self.progress.configure(value=0)
+        self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Starting — loading the AI engine (the first run can take a few minutes) …")
         if self.launch("batch_upscale.py", [src, out, str(cutoff)]):
@@ -1208,16 +1307,20 @@ class UpscaleTab(ToolTab):
         self._set_running(False)
         self._paused = False
         self.pause_btn.configure(text="Pause")
+        self.eta_var.set("—")
+        # Surface the run's tally line (e.g. "65 processed, 850 already done,
+        # 5 corrupted, …") on the top status row, above the closing message.
+        self._final_top = self.console.find_last(r"\(\d+ processed")
         # The last image's preview decode may still be in flight — the poll
         # loop has stopped, so drain the preview queue a little while longer.
         for delay in (250, 1000, 3000):
             self.after(delay, self._tick)
         if self._cancelled:
-            self.progress.configure(value=0)
+            self.progress.set(0)
             self.status_var.set("Cancelled. Progress so far was saved — "
                                 "the next run will pick up where this one left off.")
         elif code == 0:
-            self.progress.configure(value=100)
+            self.progress.set(100)
             self.status_var.set("Done. The upscaled photos are in the output folder.")
         else:
             self.status_var.set(f"Stopped with an error (code {code}) — see the messages above.")
@@ -1322,7 +1425,7 @@ class TagTab(ToolTab):
             args.append(f"--language:{lang}")
 
         self._mode = "tag"
-        self.progress.configure(value=0)
+        self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Starting — checking Ollama and scanning the folder …")
         if self.launch("tag_and_rename.py", args):
@@ -1350,7 +1453,7 @@ class TagTab(ToolTab):
             args.append("--exif-only")
 
         self._mode = "undo"
-        self.progress.configure(value=0)
+        self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Undoing previous changes …")
         if self.launch("tag_and_rename.py", args):
@@ -1373,6 +1476,7 @@ class TagTab(ToolTab):
 
     def on_exit(self, code):
         self._set_running(False)
+        self.eta_var.set("—")
         # Backup VRAM release — the script unloads the model itself on a
         # graceful exit, but not if it was killed (e.g. app closed mid-image).
         threading.Thread(target=_ollama_release_vram, daemon=True).start()
@@ -1380,7 +1484,7 @@ class TagTab(ToolTab):
         for delay in (250, 1000, 3000):
             self.after(delay, self._tick)
         if code == 0:
-            self.progress.configure(value=100)
+            self.progress.set(100)
             if self._mode == "undo":
                 self.status_var.set("Undo finished — see the summary above.")
             else:
