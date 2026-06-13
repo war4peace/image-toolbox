@@ -504,6 +504,20 @@ class LogViewer(tk.Toplevel):
         console.add_observer(self._on_console)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
+    def bind_console(self, console, title=None):
+        """Point this window at a different tab's output stream, redrawing its
+        backlog. Lets one shared log window follow whichever tool is active."""
+        if title:
+            self.title(title)
+        if console is self._console:
+            return
+        self._console.remove_observer(self._on_console)
+        self._console = console
+        self.pane.clear()
+        self.pane.feed(console.text())
+        self.pane.text.see("end")
+        console.add_observer(self._on_console)
+
     def _on_console(self, chunk):
         if not self.winfo_exists():
             return
@@ -545,7 +559,7 @@ class ToolTab(ttk.Frame):
         self._marker_buf    = None    # not None → inside a marker line
         self._hold          = ""      # ambiguous marker prefix held back
         self._log_path      = None    # current log file (from LOG events)
-        self._viewer        = None    # open LogViewer window, if any
+        self.tool_name      = "program"         # overridden by each tool tab
         self.console        = ConsoleBuffer()   # clean output stream (backlog + live)
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
         self._final_top     = ""                # summary line shown above the final message
@@ -653,6 +667,8 @@ class ToolTab(ttk.Frame):
         self._finished = False
         if hasattr(self, "viewlog_btn"):
             self.viewlog_btn.configure(state="normal")
+        # If the shared log window is open, make it follow this run's output.
+        self.app.rebind_log_if_open(self.console, self._log_title())
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
         return True
@@ -791,13 +807,13 @@ class ToolTab(ttk.Frame):
         """Every poll cycle: display freshly decoded strip thumbnails."""
         self.strip.drain()
 
+    def _log_title(self):
+        return f"{APP_TITLE} — {self.tool_name} output"
+
     def _view_log(self):
-        if self._viewer is not None and self._viewer.winfo_exists():
-            self._viewer.lift()
-            self._viewer.focus_set()
-            return
-        self._viewer = LogViewer(self, self.console,
-                                 f"{APP_TITLE} — program output", app=self.app)
+        # One shared log window for the whole app; it switches to show the
+        # output of whichever tab asked for it (or whichever tool is running).
+        self.app.show_log(self.console, self._log_title())
 
     def _scan_progress(self, text):
         matches = PROGRESS_RE.findall(text)
@@ -1195,6 +1211,7 @@ class UpscaleTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
+        self.tool_name    = "Batch Upscaler"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
         self.save_src_var = tk.BooleanVar(value=False)
@@ -1430,6 +1447,7 @@ class TagTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
+        self.tool_name  = "Tag & Rename"
         self.dir_var    = tk.StringVar()
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
@@ -1858,6 +1876,7 @@ class App(tk.Tk):
 
         self.settings = load_settings()
         self._last_normal_geo = None
+        self.log_window = None          # single shared LogViewer for both tools
         self._restore_geometry()
 
         self.nb = ttk.Notebook(self)
@@ -1906,6 +1925,22 @@ class App(tk.Tk):
         """Grey out the Tag & Rename tab while an upscale run owns the GPU."""
         self.nb.tab(self.tag_tab, state="normal" if enabled else "disabled")
 
+    # ── Shared log window ────────────────────────────────────────────────────
+
+    def show_log(self, console, title):
+        """Open (or focus) the single shared log window, bound to `console`."""
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.bind_console(console, title)
+            self.log_window.lift()
+            self.log_window.focus_set()
+        else:
+            self.log_window = LogViewer(self, console, title, app=self)
+
+    def rebind_log_if_open(self, console, title):
+        """If the log window is open, switch it to follow `console`."""
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.bind_console(console, title)
+
     def _on_close(self):
         busy = [t for t in (self.upscale_tab, self.tag_tab) if t.running]
         if busy:
@@ -1921,12 +1956,10 @@ class App(tk.Tk):
                         t.proc.wait(timeout=5)
                     except Exception:
                         t.terminate()
-        # Persist the main window layout and any open log window's layout.
+        # Persist the main window layout and the shared log window's layout.
         self._save_geometry()
-        for t in (self.upscale_tab, self.tag_tab):
-            v = getattr(t, "_viewer", None)
-            if v is not None and v.winfo_exists():
-                v.save_geometry()
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.save_geometry()
         self.destroy()
 
 
