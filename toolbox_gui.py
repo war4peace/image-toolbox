@@ -114,7 +114,12 @@ def test_discord_webhook(url, timeout=10):
     if not url:
         return False, "No webhook URL entered."
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        # Discord's Cloudflare front returns 403 to the default urllib
+        # User-Agent, so present a browser-like one (matches the send path).
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         channel = data.get("name") or data.get("channel_id") or "?"
         return True, f"Webhook OK — connected to channel: {channel}"
