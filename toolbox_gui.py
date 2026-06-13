@@ -27,9 +27,11 @@ import sys
 import json
 import queue
 import codecs
+import shutil
 import threading
 import subprocess
 import urllib.request
+import urllib.error
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -38,7 +40,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4-experimental"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -59,6 +61,71 @@ def _load_config():
         return {}
 
 CFG = _load_config()
+
+
+def save_config(cfg=None):
+    """
+    Write config.json back to disk (the Settings tab edits CFG in place, then
+    calls this). Returns True on success. The backend scripts read config.json
+    fresh at launch, so saved changes take effect on the next run.
+    """
+    if cfg is None:
+        cfg = CFG
+    path = os.path.join(SCRIPT_DIR, "config.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        return True
+    except OSError:
+        return False
+
+
+# ─────────────────────────────────────────────
+#  OLLAMA / DISCORD probes (used by the Settings tab)
+# ─────────────────────────────────────────────
+
+def ollama_installed():
+    """True if the ollama executable is found on PATH."""
+    return shutil.which("ollama") is not None
+
+
+def ollama_list_models(url, timeout=5):
+    """
+    Query a running Ollama server for its installed models.
+    Returns (ok, value): on success value is a list of model names,
+    on failure value is a short error string.
+    """
+    try:
+        endpoint = f"{url.rstrip('/')}/api/tags"
+        with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        return True, names
+    except Exception as exc:
+        return False, str(exc)
+
+
+def test_discord_webhook(url, timeout=10):
+    """
+    Verify a Discord webhook by GETting its metadata (same check setup.ps1 does).
+    Returns (ok, message) — message names the channel on success.
+    """
+    url = (url or "").strip()
+    if not url:
+        return False, "No webhook URL entered."
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        channel = data.get("name") or data.get("channel_id") or "?"
+        return True, f"Webhook OK — connected to channel: {channel}"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return False, "Invalid webhook (401 Unauthorized) — check the URL."
+        if exc.code == 404:
+            return False, "Webhook not found (404) — it may have been deleted."
+        return False, f"HTTP {exc.code} {exc.reason}"
+    except Exception as exc:
+        return False, f"Could not reach webhook: {exc}"
 
 
 def _resolve_python():
@@ -1123,10 +1190,8 @@ class UpscaleTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
-        u = CFG.get("upscale", {})
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
-        self.cutoff_var   = tk.IntVar(value=int(u.get("upscale_cutoff_pct", 66)))
         self.save_src_var = tk.BooleanVar(value=False)
         self.save_out_var = tk.BooleanVar(value=False)
         self._paused      = False
@@ -1169,14 +1234,8 @@ class UpscaleTab(ToolTab):
             command=lambda: self._on_save_toggle("out"), state="disabled")
         self.save_out_chk.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=3)
 
-        opts = ttk.Frame(self)
-        opts.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(opts, text="Skip images already at").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=99, width=4, textvariable=self.cutoff_var).pack(side="left", padx=4)
-        ttk.Label(opts, text="% of the target size or larger   (0 = upscale everything eligible)").pack(side="left")
-
         btns = ttk.Frame(self)
-        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self.start_btn = ttk.Button(btns, text="Start upscaling", command=self._start)
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._pause_or_cancel, state="disabled")
         self.stop_btn  = ttk.Button(btns, text="Stop after current image", command=self._stop, state="disabled")
@@ -1185,7 +1244,7 @@ class UpscaleTab(ToolTab):
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
 
-        self._build_output_area(row=4)
+        self._build_output_area(row=3)
 
     # ── GUI events specific to the upscaler ─────────────────────────────────
 
@@ -1280,18 +1339,14 @@ class UpscaleTab(ToolTab):
             return
         out = self.out_var.get().strip() or os.path.join(src, "__upscaled__")
         self.out_var.set(out)
-        try:
-            cutoff = max(0, min(99, int(self.cutoff_var.get())))
-        except (ValueError, tk.TclError):
-            cutoff = int(CFG.get("upscale", {}).get("upscale_cutoff_pct", 66))
-            self.cutoff_var.set(cutoff)
         if not self.confirm_gpu_overlap():
             return
 
         self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Starting — loading the AI engine (the first run can take a few minutes) …")
-        if self.launch("batch_upscale.py", [src, out, str(cutoff)]):
+        # The skip-cutoff now lives in Settings; batch_upscale reads it from config.json.
+        if self.launch("batch_upscale.py", [src, out]):
             self._paused     = False
             self._processing = False
             self._cancelled  = False
@@ -1523,6 +1578,265 @@ class TagTab(ToolTab):
 
 
 # ─────────────────────────────────────────────
+#  SETTINGS TAB
+# ─────────────────────────────────────────────
+
+# Resolution Target presets → (max_resolution, resolution)
+RESOLUTION_PRESETS = [
+    ("3840 / 2160", 3840, 2160),
+    ("2560 / 1440", 2560, 1440),
+    ("1920 / 1080", 1920, 1080),
+]
+
+# Keys in the "upscale" block that get their own dedicated controls and so are
+# NOT rendered in the generic SeedVR Settings box.
+_SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
+                   "upscale_cutoff_pct", "output_subdir", "debug"}
+
+# Friendly labels for the generic SeedVR fields.
+_SEEDVR_LABELS = {
+    "attention_mode":   "Attention mode",
+    "color_correction": "Color correction",
+    "dit_model":        "DiT model",
+    "vae_model":        "VAE model",
+    "blocks_to_swap":   "Blocks to swap",
+    "encode_tiled":     "VAE encode tiled",
+    "decode_tiled":     "VAE decode tiled",
+    "encode_tile_size": "Encode tile size",
+    "decode_tile_size": "Decode tile size",
+    "outage_threshold": "Outage threshold",
+}
+
+# Suggested values for the free-text enum fields (editable — type anything).
+_SEEDVR_CHOICES = {
+    "attention_mode":   ["sdpa", "flash_attn", "sage"],
+    "color_correction": ["lab", "wavelet", "none"],
+}
+
+
+class _ScrollFrame(ttk.Frame):
+    """A vertically scrollable container. Add child widgets to `.body`."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>",
+                       lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        # Mouse wheel scrolls only while the pointer is over this canvas.
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _wheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
+class SettingsTab(ttk.Frame):
+    """Edit the settings that previously lived only in config.json."""
+
+    def __init__(self, notebook, app):
+        super().__init__(notebook)
+        self.app = app
+        self._seedvr_vars = {}     # key -> (tk var, python type)
+        self._build()
+
+    # ── construction ─────────────────────────────────────────────────────────
+
+    def _build(self):
+        sf = _ScrollFrame(self)
+        sf.pack(fill="both", expand=True)
+        body = sf.body
+
+        ollama = CFG.get("ollama", {})
+        ups    = CFG.get("upscale", {})
+
+        # ── Ollama ────────────────────────────────────────────────────────────
+        sec = self._section(body, "Ollama")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Ollama URL:").grid(row=0, column=0, sticky="w", pady=3)
+        self.ollama_url_var = tk.StringVar(value=ollama.get("url", "http://127.0.0.1:11434"))
+        ttk.Entry(sec, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Check", command=self._check_ollama).grid(row=0, column=2, pady=3)
+
+        self.ollama_status = ttk.Label(sec, text="", foreground="#666")
+        self.ollama_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(sec, text="Ollama model:").grid(row=2, column=0, sticky="w", pady=3)
+        self.ollama_model_var = tk.StringVar(value=ollama.get("model", "llava:34b"))
+        self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
+        self.ollama_model_cmb.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=2, column=2, pady=3)
+
+        # ── Upscaling targets ──────────────────────────────────────────────────
+        sec = self._section(body, "Upscaling")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Resolution Target:").grid(row=0, column=0, sticky="w", pady=3)
+        self.restarget_var = tk.StringVar(value=self._current_preset_label(ups))
+        ttk.Combobox(sec, textvariable=self.restarget_var, state="readonly",
+                     values=[p[0] for p in RESOLUTION_PRESETS], width=16
+                     ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="(longer edge / shorter edge, in pixels)",
+                  foreground="#666").grid(row=0, column=2, sticky="w")
+
+        ttk.Label(sec, text="Skip images already at:").grid(row=1, column=0, sticky="w", pady=3)
+        cut = ttk.Frame(sec)
+        cut.grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=3)
+        self.cutoff_var = tk.IntVar(value=int(ups.get("upscale_cutoff_pct", 66)))
+        ttk.Spinbox(cut, from_=0, to=99, width=4, textvariable=self.cutoff_var).pack(side="left")
+        ttk.Label(cut, text="% of the target size or larger   (0 = upscale everything eligible)"
+                  ).pack(side="left", padx=4)
+
+        # ── SeedVR Settings (everything else in the upscale block) ──────────────
+        sec = self._section(body, "SeedVR Settings")
+        sec.columnconfigure(1, weight=1)
+        row = 0
+        for key, value in ups.items():
+            if key in _SEEDVR_EXCLUDE:
+                continue
+            label = _SEEDVR_LABELS.get(key, key.replace("_", " ").capitalize())
+            ttk.Label(sec, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
+            if isinstance(value, bool):
+                var = tk.BooleanVar(value=value)
+                ttk.Checkbutton(sec, variable=var).grid(row=row, column=1, sticky="w", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, bool)
+            elif isinstance(value, int):
+                var = tk.StringVar(value=str(value))
+                ttk.Spinbox(sec, from_=0, to=100000, width=10, textvariable=var
+                            ).grid(row=row, column=1, sticky="w", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, int)
+            else:
+                var = tk.StringVar(value=str(value))
+                if key in _SEEDVR_CHOICES:
+                    ttk.Combobox(sec, textvariable=var, values=_SEEDVR_CHOICES[key],
+                                 width=28).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+                else:
+                    ttk.Entry(sec, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, str)
+            row += 1
+
+        # ── Notifications ───────────────────────────────────────────────────────
+        sec = self._section(body, "Notifications")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Discord Webhook:").grid(row=0, column=0, sticky="w", pady=3)
+        self.webhook_var = tk.StringVar(value=ups.get("discord_webhook_url", ""))
+        ttk.Entry(sec, textvariable=self.webhook_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Test", command=self._test_webhook).grid(row=0, column=2, pady=3)
+        self.webhook_status = ttk.Label(sec, text="", foreground="#666")
+        self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
+        ttk.Label(sec, text="Optional. Notifies when a queue finishes or on errors. Leave empty to disable.",
+                  foreground="#666").grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+
+        # ── Save bar ────────────────────────────────────────────────────────────
+        bar = ttk.Frame(body, padding=(8, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
+        self.save_status = ttk.Label(bar, text="Changes apply to the next run.", foreground="#666")
+        self.save_status.pack(side="left", padx=12)
+
+    def _section(self, parent, title):
+        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
+        lf.pack(fill="x", padx=10, pady=(10, 0))
+        return lf
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _current_preset_label(self, ups):
+        mx, rs = int(ups.get("max_resolution", 3840)), int(ups.get("resolution", 2160))
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if pmx == mx and prs == rs:
+                return label
+        return RESOLUTION_PRESETS[0][0]
+
+    def _check_ollama(self):
+        url = self.ollama_url_var.get().strip()
+        installed = ollama_installed()
+        ok, value = ollama_list_models(url)
+        if ok:
+            self.ollama_model_cmb.configure(values=value)
+            inst = "installed" if installed else "not on PATH"
+            self.ollama_status.configure(
+                text=f"Reachable — {len(value)} model(s) available (ollama executable {inst}).",
+                foreground="#1a7f37")
+        else:
+            inst = "Ollama executable found on PATH." if installed else \
+                   "Ollama executable not found on PATH."
+            self.ollama_status.configure(
+                text=f"Not reachable at this URL — {value}. {inst}", foreground="#b3261e")
+
+    def _refresh_models(self):
+        url = self.ollama_url_var.get().strip()
+        ok, value = ollama_list_models(url)
+        if ok:
+            self.ollama_model_cmb.configure(values=value)
+            self.ollama_status.configure(
+                text=f"Found {len(value)} model(s)." if value else "No models installed.",
+                foreground="#1a7f37" if value else "#666")
+        else:
+            self.ollama_status.configure(text=f"Could not list models — {value}",
+                                         foreground="#b3261e")
+
+    def _test_webhook(self):
+        ok, msg = test_discord_webhook(self.webhook_var.get())
+        self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _save(self):
+        # Validate the numeric SeedVR / cutoff fields first.
+        errors = []
+        seedvr_out = {}
+        for key, (var, typ) in self._seedvr_vars.items():
+            raw = var.get()
+            if typ is int:
+                try:
+                    seedvr_out[key] = int(str(raw).strip())
+                except ValueError:
+                    errors.append(_SEEDVR_LABELS.get(key, key))
+            elif typ is bool:
+                seedvr_out[key] = bool(var.get())
+            else:
+                seedvr_out[key] = str(raw).strip()
+        try:
+            cutoff = max(0, min(99, int(self.cutoff_var.get())))
+        except (ValueError, tk.TclError):
+            errors.append("Skip images already at")
+
+        if errors:
+            messagebox.showwarning(
+                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
+            return
+
+        ollama = CFG.setdefault("ollama", {})
+        ups    = CFG.setdefault("upscale", {})
+        ollama["url"]   = self.ollama_url_var.get().strip() or "http://127.0.0.1:11434"
+        ollama["model"] = self.ollama_model_var.get().strip()
+
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if label == self.restarget_var.get():
+                ups["max_resolution"], ups["resolution"] = pmx, prs
+                break
+        ups["upscale_cutoff_pct"]   = cutoff
+        ups["discord_webhook_url"]  = self.webhook_var.get().strip()
+        ups.update(seedvr_out)
+
+        if save_config():
+            self.save_status.configure(
+                text="Saved. Changes apply to the next run.", foreground="#1a7f37")
+        else:
+            self.save_status.configure(
+                text="Could not write config.json (check file permissions).",
+                foreground="#b3261e")
+
+
+# ─────────────────────────────────────────────
 #  APP WINDOW
 # ─────────────────────────────────────────────
 
@@ -1542,10 +1856,12 @@ class App(tk.Tk):
         self._restore_geometry()
 
         self.nb = ttk.Notebook(self)
-        self.upscale_tab = UpscaleTab(self.nb, self)
-        self.tag_tab     = TagTab(self.nb, self)
-        self.nb.add(self.upscale_tab, text="  Batch Upscaler  ")
-        self.nb.add(self.tag_tab,     text="  Tag & Rename  ")
+        self.upscale_tab  = UpscaleTab(self.nb, self)
+        self.tag_tab      = TagTab(self.nb, self)
+        self.settings_tab = SettingsTab(self.nb, self)
+        self.nb.add(self.upscale_tab,  text="  Batch Upscaler  ")
+        self.nb.add(self.tag_tab,      text="  Tag & Rename  ")
+        self.nb.add(self.settings_tab, text="  Settings  ")
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.bind("<Configure>", self._track_geometry)

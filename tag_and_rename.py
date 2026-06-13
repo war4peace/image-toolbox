@@ -232,6 +232,39 @@ PROCESSED_MARKER    = "TaggedBy:Image Toolbox (https://github.com/war4peace/imag
 # the rebrand are not re-processed after an upgrade.
 LEGACY_MARKERS      = ("TaggedBy:tag_and_rename",)
 
+# Discord webhook is shared with the upscaler — it lives in the "upscale"
+# section of config.json (kept there for backward compatibility with setup.ps1
+# and the remote PowerShell scripts).
+DISCORD_WEBHOOK_URL = _CFG.get("upscale", {}).get("discord_webhook_url", "")
+
+
+def send_discord_notification(title, description, color, fields=None):
+    """
+    Send an embed message to the configured Discord webhook.
+    Silently does nothing if DISCORD_WEBHOOK_URL is empty.
+    color: integer (e.g. 15548997 = red, 16776960 = yellow, 3066993 = green).
+    """
+    if not DISCORD_WEBHOOK_URL:
+        return
+    embed = {"title": title, "description": description,
+             "color": color, "fields": fields or []}
+    payload = json.dumps({"username": "Tag & Rename Bot", "embeds": [embed]}).encode()
+    try:
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            })
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try: body = exc.read().decode("utf-8", "replace")
+        except Exception: pass
+        print(f"  [Discord] Failed to send notification: HTTP {exc.code} {exc.reason} -- {body}")
+    except Exception as exc:
+        print(f"  [Discord] Failed to send notification: {exc}")
+
 
 # ─────────────────────────────────────────────────────────────
 #  DEPENDENCY CHECK
@@ -1341,10 +1374,12 @@ def main():
     grand_start       = time.time()
     current_folder    = None
     folder_start      = None
+    stop_reason       = None      # "user" or "ollama" when the run ends early
 
     for idx, path in enumerate(work_items, 1):
         if control.stop_requested:
             print("\n  Stop requested — stopping before the next image.")
+            stop_reason = "user"
             break
 
         dirpath  = os.path.dirname(path)
@@ -1449,12 +1484,25 @@ def main():
             # ── Outage detection ─────────────────────────────
             if consecutive_fails >= OUTAGE_THRESHOLD:
                 print(f"  WARNING: {consecutive_fails} consecutive failures.")
+                send_discord_notification(
+                    title       = "Tag & Rename -- Repeated Failures Detected",
+                    description = (f"{consecutive_fails} consecutive image(s) failed. "
+                                   f"Ollama may be unreachable or the model unloaded.\n"
+                                   f"Last error: {type(e).__name__}: {e}"),
+                    color       = 15548997,   # red
+                    fields      = [
+                        {"name": "Last failed image", "value": path},
+                        {"name": "Progress",          "value": f"{idx}/{total}"},
+                        {"name": "Machine",           "value": os.environ.get("COMPUTERNAME", "unknown")},
+                    ],
+                )
                 if unload_model():
                     print("  (Vision model unloaded while paused - VRAM released.)")
                 if control.active:
                     print("  Restart Ollama if needed, then press Resume in the app.")
                     if not control.wait_resume():
                         print("  Stop requested — exiting.")
+                        stop_reason = "user"
                         break
                 else:
                     print("  Restart Ollama if needed, then press Enter to resume.")
@@ -1463,6 +1511,7 @@ def main():
                 if not ok:
                     print(f"  ERROR: {msg}")
                     print("  Exiting. Restart Ollama and run the script again.")
+                    stop_reason = "ollama"
                     break
                 print(f"  {msg}\n")
                 consecutive_fails = 0
@@ -1520,6 +1569,26 @@ def main():
     print(sep)
     print(f"\n  ({total_failed} failed, {total_skipped} already tagged)\n")
     print(f"  Undo cache: {cache_path_display}\n")
+
+    # ── Discord: queue finished / stopped ────────────────────────────────────
+    if stop_reason == "ollama":
+        notif_title, notif_color = "Tag & Rename -- Stopped (Ollama Unreachable)", 15548997   # red
+    elif total_failed > 0:
+        notif_title, notif_color = "Tag & Rename -- Finished with Failures", 16776960          # yellow
+    elif stop_reason == "user":
+        notif_title, notif_color = "Tag & Rename -- Stopped by User", 16776960                 # yellow
+    else:
+        notif_title, notif_color = "Tag & Rename -- Finished", 3066993                         # green
+    send_discord_notification(
+        title       = notif_title,
+        description = f"{total_processed} processed, {total_skipped} already tagged, {total_failed} failed",
+        color       = notif_color,
+        fields      = [
+            {"name": "Folder",        "value": root},
+            {"name": "Total elapsed", "value": fmt_hhmmss(grand_elapsed)},
+            {"name": "Machine",       "value": os.environ.get("COMPUTERNAME", "unknown")},
+        ],
+    )
 
 
 if __name__ == "__main__":
