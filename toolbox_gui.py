@@ -24,6 +24,7 @@ Requires only the Python standard library (tkinter).
 import os
 import re
 import sys
+import time
 import json
 import queue
 import codecs
@@ -1154,20 +1155,39 @@ class FilmStrip(ttk.Frame):
         threading.Thread(target=self._load_batch,
                          args=(list(paths), self._gen), daemon=True).start()
 
+    def _resolve_renamed(self, p):
+        """Follow any rename(s) recorded for `p` to its latest on-disk path.
+        The undo pass renames each file back to its original right after we
+        start decoding, so the path captured at batch start may be stale."""
+        seen = 0
+        while p in self._renamed and seen < 8:
+            p = self._renamed[p]
+            seen += 1
+        return p
+
     def _load_batch(self, paths, gen):
         from PIL import Image, ImageOps
         for p in paths:
             if gen != self._gen:
                 return                  # batch changed — abandon
             img = None
-            try:
-                with Image.open(p) as f:
-                    f.draft("RGB", (THUMB_MASTER, THUMB_MASTER))
-                    f = ImageOps.exif_transpose(f)
-                    f.thumbnail((THUMB_MASTER, THUMB_MASTER), Image.LANCZOS)
-                    img = f.convert("RGB")
-            except Exception:
-                img = None
+            # Decode the current on-disk path. A rename can land mid-decode
+            # (file vanishes from under us), so re-resolve and retry a few
+            # times before giving up — otherwise that thumbnail stays blank.
+            for attempt in range(4):
+                src = self._resolve_renamed(p)
+                try:
+                    with Image.open(src) as f:
+                        f.draft("RGB", (THUMB_MASTER, THUMB_MASTER))
+                        f = ImageOps.exif_transpose(f)
+                        f.thumbnail((THUMB_MASTER, THUMB_MASTER), Image.LANCZOS)
+                        img = f.convert("RGB")
+                    break
+                except Exception:
+                    img = None
+                    if gen != self._gen:
+                        return
+                    time.sleep(0.05)    # let a pending rename event land
             self._q.put((gen, p, img))
 
     def _make_photo(self, p):
