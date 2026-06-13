@@ -24,12 +24,15 @@ Requires only the Python standard library (tkinter).
 import os
 import re
 import sys
+import time
 import json
 import queue
 import codecs
+import shutil
 import threading
 import subprocess
 import urllib.request
+import urllib.error
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -38,7 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -59,6 +62,89 @@ def _load_config():
         return {}
 
 CFG = _load_config()
+
+
+def save_config(cfg=None):
+    """
+    Write config.json back to disk (the Settings tab edits CFG in place, then
+    calls this). Returns True on success. The backend scripts read config.json
+    fresh at launch, so saved changes take effect on the next run.
+    """
+    if cfg is None:
+        cfg = CFG
+    path = os.path.join(SCRIPT_DIR, "config.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        return True
+    except OSError:
+        return False
+
+
+# Default folders the user pins for each tool. Stored in config.json so they
+# travel with the rest of the configuration and are shown in the Settings tab.
+#   upscale_source / upscale_output  – Batch Upscaler
+#   tag_folder                       – Tag & Rename
+def get_default_folder(key):
+    return CFG.get("defaults", {}).get(key, "")
+
+
+def set_default_folder(key, value):
+    CFG.setdefault("defaults", {})[key] = value
+    save_config()
+
+
+# ─────────────────────────────────────────────
+#  OLLAMA / DISCORD probes (used by the Settings tab)
+# ─────────────────────────────────────────────
+
+def ollama_installed():
+    """True if the ollama executable is found on PATH."""
+    return shutil.which("ollama") is not None
+
+
+def ollama_list_models(url, timeout=5):
+    """
+    Query a running Ollama server for its installed models.
+    Returns (ok, value): on success value is a list of model names,
+    on failure value is a short error string.
+    """
+    try:
+        endpoint = f"{url.rstrip('/')}/api/tags"
+        with urllib.request.urlopen(endpoint, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        return True, names
+    except Exception as exc:
+        return False, str(exc)
+
+
+def test_discord_webhook(url, timeout=10):
+    """
+    Verify a Discord webhook by GETting its metadata (same check setup.ps1 does).
+    Returns (ok, message) — message names the channel on success.
+    """
+    url = (url or "").strip()
+    if not url:
+        return False, "No webhook URL entered."
+    try:
+        # Discord's Cloudflare front returns 403 to the default urllib
+        # User-Agent, so present a browser-like one (matches the send path).
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        channel = data.get("name") or data.get("channel_id") or "?"
+        return True, f"Webhook OK — connected to channel: {channel}"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return False, "Invalid webhook (401 Unauthorized) — check the URL."
+        if exc.code == 404:
+            return False, "Webhook not found (404) — it may have been deleted."
+        return False, f"HTTP {exc.code} {exc.reason}"
+    except Exception as exc:
+        return False, f"Could not reach webhook: {exc}"
 
 
 def _resolve_python():
@@ -432,6 +518,20 @@ class LogViewer(tk.Toplevel):
         console.add_observer(self._on_console)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
+    def bind_console(self, console, title=None):
+        """Point this window at a different tab's output stream, redrawing its
+        backlog. Lets one shared log window follow whichever tool is active."""
+        if title:
+            self.title(title)
+        if console is self._console:
+            return
+        self._console.remove_observer(self._on_console)
+        self._console = console
+        self.pane.clear()
+        self.pane.feed(console.text())
+        self.pane.text.see("end")
+        console.add_observer(self._on_console)
+
     def _on_console(self, chunk):
         if not self.winfo_exists():
             return
@@ -473,7 +573,7 @@ class ToolTab(ttk.Frame):
         self._marker_buf    = None    # not None → inside a marker line
         self._hold          = ""      # ambiguous marker prefix held back
         self._log_path      = None    # current log file (from LOG events)
-        self._viewer        = None    # open LogViewer window, if any
+        self.tool_name      = "program"         # overridden by each tool tab
         self.console        = ConsoleBuffer()   # clean output stream (backlog + live)
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
         self._final_top     = ""                # summary line shown above the final message
@@ -581,6 +681,8 @@ class ToolTab(ttk.Frame):
         self._finished = False
         if hasattr(self, "viewlog_btn"):
             self.viewlog_btn.configure(state="normal")
+        # If the shared log window is open, make it follow this run's output.
+        self.app.rebind_log_if_open(self.console, self._log_title())
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
         return True
@@ -719,13 +821,13 @@ class ToolTab(ttk.Frame):
         """Every poll cycle: display freshly decoded strip thumbnails."""
         self.strip.drain()
 
+    def _log_title(self):
+        return f"{APP_TITLE} — {self.tool_name} output"
+
     def _view_log(self):
-        if self._viewer is not None and self._viewer.winfo_exists():
-            self._viewer.lift()
-            self._viewer.focus_set()
-            return
-        self._viewer = LogViewer(self, self.console,
-                                 f"{APP_TITLE} — program output", app=self.app)
+        # One shared log window for the whole app; it switches to show the
+        # output of whichever tab asked for it (or whichever tool is running).
+        self.app.show_log(self.console, self._log_title())
 
     def _scan_progress(self, text):
         matches = PROGRESS_RE.findall(text)
@@ -1066,20 +1168,39 @@ class FilmStrip(ttk.Frame):
         threading.Thread(target=self._load_batch,
                          args=(list(paths), self._gen), daemon=True).start()
 
+    def _resolve_renamed(self, p):
+        """Follow any rename(s) recorded for `p` to its latest on-disk path.
+        The undo pass renames each file back to its original right after we
+        start decoding, so the path captured at batch start may be stale."""
+        seen = 0
+        while p in self._renamed and seen < 8:
+            p = self._renamed[p]
+            seen += 1
+        return p
+
     def _load_batch(self, paths, gen):
         from PIL import Image, ImageOps
         for p in paths:
             if gen != self._gen:
                 return                  # batch changed — abandon
             img = None
-            try:
-                with Image.open(p) as f:
-                    f.draft("RGB", (THUMB_MASTER, THUMB_MASTER))
-                    f = ImageOps.exif_transpose(f)
-                    f.thumbnail((THUMB_MASTER, THUMB_MASTER), Image.LANCZOS)
-                    img = f.convert("RGB")
-            except Exception:
-                img = None
+            # Decode the current on-disk path. A rename can land mid-decode
+            # (file vanishes from under us), so re-resolve and retry a few
+            # times before giving up — otherwise that thumbnail stays blank.
+            for attempt in range(4):
+                src = self._resolve_renamed(p)
+                try:
+                    with Image.open(src) as f:
+                        f.draft("RGB", (THUMB_MASTER, THUMB_MASTER))
+                        f = ImageOps.exif_transpose(f)
+                        f.thumbnail((THUMB_MASTER, THUMB_MASTER), Image.LANCZOS)
+                        img = f.convert("RGB")
+                    break
+                except Exception:
+                    img = None
+                    if gen != self._gen:
+                        return
+                    time.sleep(0.05)    # let a pending rename event land
             self._q.put((gen, p, img))
 
     def _make_photo(self, p):
@@ -1123,60 +1244,45 @@ class UpscaleTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
-        u = CFG.get("upscale", {})
+        self.tool_name    = "Batch Upscaler"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
-        self.cutoff_var   = tk.IntVar(value=int(u.get("upscale_cutoff_pct", 66)))
-        self.save_src_var = tk.BooleanVar(value=False)
-        self.save_out_var = tk.BooleanVar(value=False)
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
         self._phase       = ""       # current phase text (from STATUS events)
         self._build()
 
-        # Restore saved default folders, then keep the checkboxes in sync
-        s = app.settings
-        src_default = s.get("default_source", "")
+        # Restore the pinned default folders from config.json
+        src_default = get_default_folder("upscale_source")
         if src_default and os.path.isdir(src_default):
             self.src_var.set(src_default)
-            self.save_src_var.set(True)
             if not self.out_var.get().strip():
                 self.out_var.set(os.path.join(src_default, "__upscaled__"))
-        out_default = s.get("default_output", "")
+        out_default = get_default_folder("upscale_output")
         if out_default:
             self.out_var.set(out_default)
-            self.save_out_var.set(True)
-        self.src_var.trace_add("write", lambda *_: self._sync_default("src"))
-        self.out_var.trace_add("write", lambda *_: self._sync_default("out"))
-        self._sync_default("src")
-        self._sync_default("out")
+        self.src_var.trace_add("write", lambda *_: self._refresh_save_buttons())
+        self.out_var.trace_add("write", lambda *_: self._refresh_save_buttons())
+        self._refresh_save_buttons()
 
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_src).grid(row=0, column=2, pady=3)
-        self.save_src_chk = ttk.Checkbutton(
-            self, text="Save as Default", variable=self.save_src_var,
-            command=lambda: self._on_save_toggle("src"), state="disabled")
-        self.save_src_chk.grid(row=0, column=3, sticky="w", padx=(8, 0), pady=3)
+        self.save_src_btn = ttk.Button(
+            self, text="Save as Default", command=lambda: self._save_default("src"))
+        self.save_src_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         ttk.Label(self, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.out_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_out).grid(row=1, column=2, pady=3)
-        self.save_out_chk = ttk.Checkbutton(
-            self, text="Save as Default", variable=self.save_out_var,
-            command=lambda: self._on_save_toggle("out"), state="disabled")
-        self.save_out_chk.grid(row=1, column=3, sticky="w", padx=(8, 0), pady=3)
-
-        opts = ttk.Frame(self)
-        opts.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(opts, text="Skip images already at").pack(side="left")
-        ttk.Spinbox(opts, from_=0, to=99, width=4, textvariable=self.cutoff_var).pack(side="left", padx=4)
-        ttk.Label(opts, text="% of the target size or larger   (0 = upscale everything eligible)").pack(side="left")
+        self.save_out_btn = ttk.Button(
+            self, text="Save as Default", command=lambda: self._save_default("out"))
+        self.save_out_btn.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         btns = ttk.Frame(self)
-        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self.start_btn = ttk.Button(btns, text="Start upscaling", command=self._start)
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._pause_or_cancel, state="disabled")
         self.stop_btn  = ttk.Button(btns, text="Stop after current image", command=self._stop, state="disabled")
@@ -1185,7 +1291,7 @@ class UpscaleTab(ToolTab):
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
 
-        self._build_output_area(row=4)
+        self._build_output_area(row=3)
 
     # ── GUI events specific to the upscaler ─────────────────────────────────
 
@@ -1216,38 +1322,38 @@ class UpscaleTab(ToolTab):
         else:
             super()._handle_event(kind, payload)
 
-    # ── Default-folder preferences ───────────────────────────────────────────
+    # ── Default-folder buttons ───────────────────────────────────────────────
 
-    def _sync_default(self, which):
-        """
-        Keep a Save-as-Default checkbox consistent with its path field:
-        enabled only for a valid path, and while checked the latest valid
-        path is persisted.
-        """
+    def _src_valid(self):
+        p = self.src_var.get().strip()
+        return bool(p) and os.path.isdir(p)
+
+    def _out_valid(self):
+        p = self.out_var.get().strip()
+        # The output folder is created on demand — accept it if it exists or
+        # can be created inside an existing parent.
+        return bool(p) and (os.path.isdir(p) or os.path.isdir(os.path.dirname(p)))
+
+    def _refresh_save_buttons(self):
+        self.save_src_btn.configure(state="normal" if self._src_valid() else "disabled")
+        self.save_out_btn.configure(state="normal" if self._out_valid() else "disabled")
+
+    def _save_default(self, which):
         if which == "src":
-            chk, var, key = self.save_src_chk, self.save_src_var, "default_source"
-            path  = self.src_var.get().strip()
-            valid = bool(path) and os.path.isdir(path)
+            if not self._src_valid():
+                return
+            set_default_folder("upscale_source", self.src_var.get().strip())
+            self._flash_saved(self.save_src_btn)
         else:
-            chk, var, key = self.save_out_chk, self.save_out_var, "default_output"
-            path  = self.out_var.get().strip()
-            # The output folder is created on demand — accept it if it exists
-            # or can be created inside an existing folder.
-            valid = bool(path) and (os.path.isdir(path) or
-                                    os.path.isdir(os.path.dirname(path)))
-        chk.configure(state="normal" if valid else "disabled")
-        if valid and var.get() and self.app.settings.get(key) != path:
-            self.app.settings[key] = path
-            save_settings(self.app.settings)
+            if not self._out_valid():
+                return
+            set_default_folder("upscale_output", self.out_var.get().strip())
+            self._flash_saved(self.save_out_btn)
+        self.app.sync_settings_defaults()   # mirror into the Settings tab
 
-    def _on_save_toggle(self, which):
-        key = "default_source" if which == "src" else "default_output"
-        var = self.save_src_var if which == "src" else self.save_out_var
-        if var.get():
-            self._sync_default(which)
-        elif key in self.app.settings:
-            del self.app.settings[key]
-            save_settings(self.app.settings)
+    def _flash_saved(self, btn):
+        btn.configure(text="Saved ✓")
+        self.after(1200, lambda: btn.configure(text="Save as Default"))
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -1280,18 +1386,14 @@ class UpscaleTab(ToolTab):
             return
         out = self.out_var.get().strip() or os.path.join(src, "__upscaled__")
         self.out_var.set(out)
-        try:
-            cutoff = max(0, min(99, int(self.cutoff_var.get())))
-        except (ValueError, tk.TclError):
-            cutoff = int(CFG.get("upscale", {}).get("upscale_cutoff_pct", 66))
-            self.cutoff_var.set(cutoff)
         if not self.confirm_gpu_overlap():
             return
 
         self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Starting — loading the AI engine (the first run can take a few minutes) …")
-        if self.launch("batch_upscale.py", [src, out, str(cutoff)]):
+        # The skip-cutoff now lives in Settings; batch_upscale reads it from config.json.
+        if self.launch("batch_upscale.py", [src, out]):
             self._paused     = False
             self._processing = False
             self._cancelled  = False
@@ -1370,6 +1472,7 @@ class TagTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
+        self.tool_name  = "Tag & Rename"
         self.dir_var    = tk.StringVar()
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
@@ -1378,10 +1481,19 @@ class TagTab(ToolTab):
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
 
+        # Restore the pinned default folder from config.json
+        tag_default = get_default_folder("tag_folder")
+        if tag_default and os.path.isdir(tag_default):
+            self.dir_var.set(tag_default)
+        self.dir_var.trace_add("write", lambda *_: self._refresh_save_button())
+        self._refresh_save_button()
+
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.dir_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_dir).grid(row=0, column=2, pady=3)
+        self.save_dir_btn = ttk.Button(self, text="Save as Default", command=self._save_default)
+        self.save_dir_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         opts = ttk.Frame(self)
         opts.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -1422,6 +1534,23 @@ class TagTab(ToolTab):
         folder = filedialog.askdirectory(title="Choose the folder with photos to tag")
         if folder:
             self.dir_var.set(os.path.normpath(folder))
+
+    # ── Default-folder button ────────────────────────────────────────────────
+
+    def _dir_valid(self):
+        p = self.dir_var.get().strip()
+        return bool(p) and os.path.isdir(p)
+
+    def _refresh_save_button(self):
+        self.save_dir_btn.configure(state="normal" if self._dir_valid() else "disabled")
+
+    def _save_default(self):
+        if not self._dir_valid():
+            return
+        set_default_folder("tag_folder", self.dir_var.get().strip())
+        self.app.sync_settings_defaults()   # mirror into the Settings tab
+        self.save_dir_btn.configure(text="Saved ✓")
+        self.after(1200, lambda: self.save_dir_btn.configure(text="Save as Default"))
 
     def _open_dir(self):
         folder = self.dir_var.get().strip()
@@ -1523,6 +1652,299 @@ class TagTab(ToolTab):
 
 
 # ─────────────────────────────────────────────
+#  SETTINGS TAB
+# ─────────────────────────────────────────────
+
+# Resolution Target presets → (max_resolution, resolution)
+RESOLUTION_PRESETS = [
+    ("3840 / 2160", 3840, 2160),
+    ("2560 / 1440", 2560, 1440),
+    ("1920 / 1080", 1920, 1080),
+]
+
+# Keys in the "upscale" block that get their own dedicated controls and so are
+# NOT rendered in the generic SeedVR Settings box.
+_SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
+                   "upscale_cutoff_pct", "output_subdir", "debug"}
+
+# Friendly labels for the generic SeedVR fields.
+_SEEDVR_LABELS = {
+    "attention_mode":   "Attention mode",
+    "color_correction": "Color correction",
+    "dit_model":        "DiT model",
+    "vae_model":        "VAE model",
+    "blocks_to_swap":   "Blocks to swap",
+    "encode_tiled":     "VAE encode tiled",
+    "decode_tiled":     "VAE decode tiled",
+    "encode_tile_size": "Encode tile size",
+    "decode_tile_size": "Decode tile size",
+    "outage_threshold": "Outage threshold",
+}
+
+# Suggested values for the free-text enum fields (editable — type anything).
+_SEEDVR_CHOICES = {
+    "attention_mode":   ["sdpa", "flash_attn", "sage"],
+    "color_correction": ["lab", "wavelet", "none"],
+}
+
+
+class _ScrollFrame(ttk.Frame):
+    """A vertically scrollable container. Add child widgets to `.body`."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>",
+                       lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        # Mouse wheel scrolls only while the pointer is over this canvas.
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _wheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+
+class SettingsTab(ttk.Frame):
+    """Edit the settings that previously lived only in config.json."""
+
+    def __init__(self, notebook, app):
+        super().__init__(notebook)
+        self.app = app
+        self._seedvr_vars = {}     # key -> (tk var, python type)
+        self._build()
+
+    # ── construction ─────────────────────────────────────────────────────────
+
+    def _build(self):
+        sf = _ScrollFrame(self)
+        sf.pack(fill="both", expand=True)
+        body = sf.body
+
+        ollama = CFG.get("ollama", {})
+        ups    = CFG.get("upscale", {})
+        defs   = CFG.get("defaults", {})
+
+        # ── Default folders (mirrors the tabs' "Save as Default" buttons) ───────
+        sec = self._section(body, "Default folders")
+        sec.columnconfigure(1, weight=1)
+        self.default_src_var = tk.StringVar(value=defs.get("upscale_source", ""))
+        self.default_out_var = tk.StringVar(value=defs.get("upscale_output", ""))
+        self.default_tag_var = tk.StringVar(value=defs.get("tag_folder", ""))
+        for r, (text, var) in enumerate((
+                ("Batch Upscaler — Photo folder:",  self.default_src_var),
+                ("Batch Upscaler — Output folder:", self.default_out_var),
+                ("Tag & Rename — Photo folder:",    self.default_tag_var))):
+            ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+            ttk.Button(sec, text="Browse…",
+                       command=lambda v=var: self._pick_folder(v)).grid(row=r, column=2, pady=3)
+
+        # ── Ollama ────────────────────────────────────────────────────────────
+        sec = self._section(body, "Ollama")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Ollama URL:").grid(row=0, column=0, sticky="w", pady=3)
+        self.ollama_url_var = tk.StringVar(value=ollama.get("url", "http://127.0.0.1:11434"))
+        ttk.Entry(sec, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Check", command=self._check_ollama).grid(row=0, column=2, pady=3)
+
+        self.ollama_status = ttk.Label(sec, text="", foreground="#666")
+        self.ollama_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(sec, text="Ollama model:").grid(row=2, column=0, sticky="w", pady=3)
+        self.ollama_model_var = tk.StringVar(value=ollama.get("model", "llava:34b"))
+        self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
+        self.ollama_model_cmb.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=2, column=2, pady=3)
+
+        # ── Upscaling targets ──────────────────────────────────────────────────
+        sec = self._section(body, "Upscaling")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Resolution Target:").grid(row=0, column=0, sticky="w", pady=3)
+        self.restarget_var = tk.StringVar(value=self._current_preset_label(ups))
+        ttk.Combobox(sec, textvariable=self.restarget_var, state="readonly",
+                     values=[p[0] for p in RESOLUTION_PRESETS], width=16
+                     ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="(longer edge / shorter edge, in pixels)",
+                  foreground="#666").grid(row=0, column=2, sticky="w")
+
+        ttk.Label(sec, text="Skip images already at:").grid(row=1, column=0, sticky="w", pady=3)
+        cut = ttk.Frame(sec)
+        cut.grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=3)
+        self.cutoff_var = tk.IntVar(value=int(ups.get("upscale_cutoff_pct", 66)))
+        ttk.Spinbox(cut, from_=0, to=99, width=4, textvariable=self.cutoff_var).pack(side="left")
+        ttk.Label(cut, text="% of the target size or larger   (0 = upscale everything eligible)"
+                  ).pack(side="left", padx=4)
+
+        # ── SeedVR Settings (everything else in the upscale block) ──────────────
+        sec = self._section(body, "SeedVR Settings")
+        sec.columnconfigure(1, weight=1)
+        row = 0
+        for key, value in ups.items():
+            if key in _SEEDVR_EXCLUDE:
+                continue
+            label = _SEEDVR_LABELS.get(key, key.replace("_", " ").capitalize())
+            ttk.Label(sec, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
+            if isinstance(value, bool):
+                var = tk.BooleanVar(value=value)
+                ttk.Checkbutton(sec, variable=var).grid(row=row, column=1, sticky="w", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, bool)
+            elif isinstance(value, int):
+                var = tk.StringVar(value=str(value))
+                ttk.Spinbox(sec, from_=0, to=100000, width=10, textvariable=var
+                            ).grid(row=row, column=1, sticky="w", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, int)
+            else:
+                var = tk.StringVar(value=str(value))
+                if key in _SEEDVR_CHOICES:
+                    ttk.Combobox(sec, textvariable=var, values=_SEEDVR_CHOICES[key],
+                                 width=28).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+                else:
+                    ttk.Entry(sec, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
+                self._seedvr_vars[key] = (var, str)
+            row += 1
+
+        # ── Notifications ───────────────────────────────────────────────────────
+        sec = self._section(body, "Notifications")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, text="Discord Webhook:").grid(row=0, column=0, sticky="w", pady=3)
+        self.webhook_var = tk.StringVar(value=ups.get("discord_webhook_url", ""))
+        ttk.Entry(sec, textvariable=self.webhook_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Test", command=self._test_webhook).grid(row=0, column=2, pady=3)
+        self.webhook_status = ttk.Label(sec, text="", foreground="#666")
+        self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
+        ttk.Label(sec, text="Optional. Notifies when a queue finishes or on errors. Leave empty to disable.",
+                  foreground="#666").grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+
+        # ── Save bar ────────────────────────────────────────────────────────────
+        bar = ttk.Frame(body, padding=(8, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
+        self.save_status = ttk.Label(bar, text="Changes apply to the next run.", foreground="#666")
+        self.save_status.pack(side="left", padx=12)
+
+    def _section(self, parent, title):
+        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
+        lf.pack(fill="x", padx=10, pady=(10, 0))
+        return lf
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _current_preset_label(self, ups):
+        mx, rs = int(ups.get("max_resolution", 3840)), int(ups.get("resolution", 2160))
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if pmx == mx and prs == rs:
+                return label
+        return RESOLUTION_PRESETS[0][0]
+
+    def _check_ollama(self):
+        url = self.ollama_url_var.get().strip()
+        installed = ollama_installed()
+        ok, value = ollama_list_models(url)
+        if ok:
+            self.ollama_model_cmb.configure(values=value)
+            inst = "installed" if installed else "not on PATH"
+            self.ollama_status.configure(
+                text=f"Reachable — {len(value)} model(s) available (ollama executable {inst}).",
+                foreground="#1a7f37")
+        else:
+            inst = "Ollama executable found on PATH." if installed else \
+                   "Ollama executable not found on PATH."
+            self.ollama_status.configure(
+                text=f"Not reachable at this URL — {value}. {inst}", foreground="#b3261e")
+
+    def _refresh_models(self):
+        url = self.ollama_url_var.get().strip()
+        ok, value = ollama_list_models(url)
+        if ok:
+            self.ollama_model_cmb.configure(values=value)
+            self.ollama_status.configure(
+                text=f"Found {len(value)} model(s)." if value else "No models installed.",
+                foreground="#1a7f37" if value else "#666")
+        else:
+            self.ollama_status.configure(text=f"Could not list models — {value}",
+                                         foreground="#b3261e")
+
+    def _test_webhook(self):
+        ok, msg = test_discord_webhook(self.webhook_var.get())
+        self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _pick_folder(self, var):
+        folder = filedialog.askdirectory(title="Choose a folder")
+        if folder:
+            var.set(os.path.normpath(folder))
+
+    def load_defaults(self):
+        """Refresh the default-folder fields from config (called when a tab's
+        Save-as-Default button updates them, so both views stay in sync)."""
+        defs = CFG.get("defaults", {})
+        self.default_src_var.set(defs.get("upscale_source", ""))
+        self.default_out_var.set(defs.get("upscale_output", ""))
+        self.default_tag_var.set(defs.get("tag_folder", ""))
+
+    def _save(self):
+        # Validate the numeric SeedVR / cutoff fields first.
+        errors = []
+        seedvr_out = {}
+        for key, (var, typ) in self._seedvr_vars.items():
+            raw = var.get()
+            if typ is int:
+                try:
+                    seedvr_out[key] = int(str(raw).strip())
+                except ValueError:
+                    errors.append(_SEEDVR_LABELS.get(key, key))
+            elif typ is bool:
+                seedvr_out[key] = bool(var.get())
+            else:
+                seedvr_out[key] = str(raw).strip()
+        try:
+            cutoff = max(0, min(99, int(self.cutoff_var.get())))
+        except (ValueError, tk.TclError):
+            errors.append("Skip images already at")
+
+        if errors:
+            messagebox.showwarning(
+                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
+            return
+
+        ollama = CFG.setdefault("ollama", {})
+        ups    = CFG.setdefault("upscale", {})
+        ollama["url"]   = self.ollama_url_var.get().strip() or "http://127.0.0.1:11434"
+        ollama["model"] = self.ollama_model_var.get().strip()
+
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if label == self.restarget_var.get():
+                ups["max_resolution"], ups["resolution"] = pmx, prs
+                break
+        ups["upscale_cutoff_pct"]   = cutoff
+        ups["discord_webhook_url"]  = self.webhook_var.get().strip()
+        ups.update(seedvr_out)
+
+        defs = CFG.setdefault("defaults", {})
+        defs["upscale_source"] = self.default_src_var.get().strip()
+        defs["upscale_output"] = self.default_out_var.get().strip()
+        defs["tag_folder"]     = self.default_tag_var.get().strip()
+
+        if save_config():
+            self.save_status.configure(
+                text="Saved. Changes apply to the next run.", foreground="#1a7f37")
+        else:
+            self.save_status.configure(
+                text="Could not write config.json (check file permissions).",
+                foreground="#b3261e")
+
+
+# ─────────────────────────────────────────────
 #  APP WINDOW
 # ─────────────────────────────────────────────
 
@@ -1539,17 +1961,40 @@ class App(tk.Tk):
 
         self.settings = load_settings()
         self._last_normal_geo = None
+        self.log_window = None          # single shared LogViewer for both tools
+        self._migrate_default_folders()
         self._restore_geometry()
 
         self.nb = ttk.Notebook(self)
-        self.upscale_tab = UpscaleTab(self.nb, self)
-        self.tag_tab     = TagTab(self.nb, self)
-        self.nb.add(self.upscale_tab, text="  Batch Upscaler  ")
-        self.nb.add(self.tag_tab,     text="  Tag & Rename  ")
+        self.upscale_tab  = UpscaleTab(self.nb, self)
+        self.tag_tab      = TagTab(self.nb, self)
+        self.settings_tab = SettingsTab(self.nb, self)
+        self.nb.add(self.upscale_tab,  text="  Batch Upscaler  ")
+        self.nb.add(self.tag_tab,      text="  Tag & Rename  ")
+        self.nb.add(self.settings_tab, text="  Settings  ")
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _migrate_default_folders(self):
+        """Carry default folders saved by older builds in gui_settings.json over
+        to config.json, where they now live (one-time, before the tabs load)."""
+        defs = CFG.setdefault("defaults", {})
+        moved = False
+        for old_key, new_key in (("default_source", "upscale_source"),
+                                  ("default_output", "upscale_output")):
+            if not defs.get(new_key) and self.settings.get(old_key):
+                defs[new_key] = self.settings[old_key]
+                moved = True
+        if moved:
+            save_config()
+
+    def sync_settings_defaults(self):
+        """Push the latest default folders into the Settings tab's fields."""
+        st = getattr(self, "settings_tab", None)
+        if st is not None:
+            st.load_defaults()
 
     # ── Window geometry persistence ──────────────────────────────────────────
 
@@ -1585,6 +2030,22 @@ class App(tk.Tk):
         """Grey out the Tag & Rename tab while an upscale run owns the GPU."""
         self.nb.tab(self.tag_tab, state="normal" if enabled else "disabled")
 
+    # ── Shared log window ────────────────────────────────────────────────────
+
+    def show_log(self, console, title):
+        """Open (or focus) the single shared log window, bound to `console`."""
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.bind_console(console, title)
+            self.log_window.lift()
+            self.log_window.focus_set()
+        else:
+            self.log_window = LogViewer(self, console, title, app=self)
+
+    def rebind_log_if_open(self, console, title):
+        """If the log window is open, switch it to follow `console`."""
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.bind_console(console, title)
+
     def _on_close(self):
         busy = [t for t in (self.upscale_tab, self.tag_tab) if t.running]
         if busy:
@@ -1600,12 +2061,10 @@ class App(tk.Tk):
                         t.proc.wait(timeout=5)
                     except Exception:
                         t.terminate()
-        # Persist the main window layout and any open log window's layout.
+        # Persist the main window layout and the shared log window's layout.
         self._save_geometry()
-        for t in (self.upscale_tab, self.tag_tab):
-            v = getattr(t, "_viewer", None)
-            if v is not None and v.winfo_exists():
-                v.save_geometry()
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.save_geometry()
         self.destroy()
 
 

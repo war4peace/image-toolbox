@@ -1137,6 +1137,12 @@ def main():
         print(f"ERROR: Could not initialize the SeedVR2 engine.\n  -> {e}")
         print("Make sure this script runs inside the toolbox venv, e.g.:")
         print(f"  {os.path.join(_SCRIPT_DIR, '.venv', 'Scripts', 'python.exe')} batch_upscale.py <source_dir>")
+        send_discord_notification(
+            title       = "Upscale Script -- Engine Failed to Start",
+            description = f"Could not initialize the SeedVR2 engine.\n{e}",
+            color       = 15548997,   # red
+            fields      = [{"name": "Machine", "value": os.environ.get("COMPUTERNAME", "unknown")}],
+        )
         sys.exit(1)
     print(f"  Engine ready on {ENGINE.device_name}.")
 
@@ -1438,6 +1444,25 @@ def main():
             logger.log_only(f"  {cf}")
             print(f"  {_osc8_link(cf)}")     # terminal: clickable; GUI strips the link
         logger.tee(sep)
+
+    # ── Discord: queue finished / stopped ───────────────────────────────────
+    user_quit = bool(stats1.get("user_quit")) or (stats2 is not None and bool(stats2.get("user_quit")))
+    if total_failed > 0:
+        notif_title, notif_color = "Upscale Queue -- Finished with Failures", 16776960   # yellow
+    elif user_quit:
+        notif_title, notif_color = "Upscale Queue -- Stopped by User", 16776960          # yellow
+    else:
+        notif_title, notif_color = "Upscale Queue -- Finished", 3066993                  # green
+    send_discord_notification(
+        title       = notif_title,
+        description = ", ".join(parts),
+        color       = notif_color,
+        fields      = [
+            {"name": "Source",        "value": root},
+            {"name": "Total elapsed", "value": fmt_hhmmss(grand_elapsed)},
+            {"name": "Machine",       "value": os.environ.get("COMPUTERNAME", "unknown")},
+        ],
+    )
 
     _log_link = _osc8_link(logger.path)
     logger.log_only(f"Session ended: {datetime.datetime.now().strftime('%Y-%m-%d | %H:%M:%S')}")
