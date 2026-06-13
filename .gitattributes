@@ -1,0 +1,6 @@
+# Never let a live Discord webhook reach a commit. The clean filter blanks
+# discord_webhook_url when config.json is staged. Activate the filter locally:
+#   git config filter.tbx-webhook.clean "python tools/git-clean-webhook.py"
+# (see tools/git-clean-webhook.py). Without that local config the line is a
+# harmless no-op, so clones/CI are unaffected.
+config.json filter=tbx-webhook
