@@ -31,6 +31,8 @@
         "condensed_max_words": 5,
         "ollama_timeout": 120,
         "outage_threshold": 3,
+        "auto_straighten": true,
+        "straighten_min_confidence": 0.9,
         "camera_filename_patterns": [
             "^IMG_\\d+",
             "^DSC\\d+",

@@ -132,7 +132,7 @@ try {
     Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
     Step "Installing the remaining components"
-    Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif")
+    Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm")
 
     # -- 6. Ollama (optional - powers the Tag & Rename feature) ---------------
     Step "Checking for Ollama (used by the Tag & Rename feature)"

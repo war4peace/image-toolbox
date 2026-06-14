@@ -35,6 +35,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "..\toolbox_gui.py";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\batch_upscale.py";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tag_and_rename.py";   DestDir: "{app}"; Flags: ignoreversion
+Source: "..\orientation.py";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\upscale_engine.py";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion

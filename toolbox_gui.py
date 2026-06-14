@@ -41,7 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -1731,6 +1731,7 @@ class SettingsTab(ttk.Frame):
         ollama = CFG.get("ollama", {})
         ups    = CFG.get("upscale", {})
         defs   = CFG.get("defaults", {})
+        tag    = CFG.get("tagging", {})
 
         # ── Default folders (mirrors the tabs' "Save as Default" buttons) ───────
         sec = self._section(body, "Default folders")
@@ -1764,6 +1765,29 @@ class SettingsTab(ttk.Frame):
         self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
         self.ollama_model_cmb.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=2, column=2, pady=3)
+
+        # ── Tag & Rename ───────────────────────────────────────────────────────
+        sec = self._section(body, "Tag & Rename")
+        sec.columnconfigure(1, weight=1)
+
+        self.straighten_var = tk.BooleanVar(value=bool(tag.get("auto_straighten", True)))
+        ttk.Checkbutton(sec, text="Auto-straighten rotated photos",
+                        variable=self.straighten_var).grid(row=0, column=0, columnspan=3,
+                                                            sticky="w", pady=3)
+        ttk.Label(sec, text="Detects sideways photos and rotates them upright before tagging. "
+                            "Only confident calls are acted on; ambiguous ones are left alone.",
+                  foreground="#666", wraplength=520, justify="left").grid(
+                      row=1, column=0, columnspan=3, sticky="w", padx=18)
+
+        ttk.Label(sec, text="Confidence threshold:").grid(row=2, column=0, sticky="w", pady=3)
+        conf = ttk.Frame(sec)
+        conf.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=3)
+        self.straighten_conf_var = tk.DoubleVar(
+            value=float(tag.get("straighten_min_confidence", 0.9)))
+        ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+                    textvariable=self.straighten_conf_var).pack(side="left")
+        ttk.Label(conf, text="0.50–1.00   (higher = fewer, safer rotations)",
+                  foreground="#666").pack(side="left", padx=4)
 
         # ── Upscaling targets ──────────────────────────────────────────────────
         sec = self._section(body, "Upscaling")
@@ -1934,6 +1958,14 @@ class SettingsTab(ttk.Frame):
         defs["upscale_source"] = self.default_src_var.get().strip()
         defs["upscale_output"] = self.default_out_var.get().strip()
         defs["tag_folder"]     = self.default_tag_var.get().strip()
+
+        tag = CFG.setdefault("tagging", {})
+        tag["auto_straighten"] = bool(self.straighten_var.get())
+        try:
+            conf = round(float(self.straighten_conf_var.get()), 2)
+        except (ValueError, tk.TclError):
+            conf = 0.9
+        tag["straighten_min_confidence"] = min(1.0, max(0.5, conf))
 
         if save_config():
             self.save_status.configure(

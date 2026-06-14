@@ -59,7 +59,7 @@ git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
 # 2. Create the Python environment (Python 3.12, NVIDIA GPU required).
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif
+.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm
 
 # 3. Launch the GUI (model weights ~16 GB download automatically on first use).
 .venv\Scripts\pythonw.exe toolbox_gui.py
@@ -112,6 +112,12 @@ packages) with three tabs.
 
 - Analyses each image with a local Ollama vision model, writes a description into
   EXIF, and renames the file to `OriginalName_Condensed_Description.ext`.
+- **Auto-straighten** (on by default): a small local CNN detects photos shot with
+  the camera held sideways and rotates them upright *before* tagging — which also
+  improves the descriptions. Only confident calls are acted on; upside-down and
+  ambiguous images are left alone and logged, so a photo is never wrongly rotated.
+  Toggle it and tune the confidence threshold in **Settings**; rotations are
+  reverted by **Undo** like everything else.
 - **Selectable description language**, plus force-tag / force-rename options.
 - **One-click Undo** restores file names, EXIF descriptions, or both — every
   change is recorded to an undo cache before anything is modified.
@@ -131,6 +137,7 @@ Everything that used to require hand-editing `config.json` is here:
 
 - **Ollama URL** with a reachability check, and a **model** picklist populated
   from the models installed on your machine.
+- **Auto-straighten** toggle and confidence threshold for Tag & Rename.
 - **Resolution Target** (4K / 2K / 1080p) and the **skip-cutoff** percentage.
 - **SeedVR settings** (attention mode, color correction, models, tiling, etc.).
 - **Discord webhook** with a **Test** button.

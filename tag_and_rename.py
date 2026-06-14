@@ -227,6 +227,12 @@ CAMERA_FILENAME_PATTERNS = _T.get("camera_filename_patterns", [
 CONDENSED_MAX_WORDS = _T.get("condensed_max_words", 5)
 OLLAMA_TIMEOUT      = _T.get("ollama_timeout",      120)
 OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
+
+# Auto-straighten: detect sideways photos with a small CNN and rotate them
+# upright before tagging. Only confident 90/270 calls are acted on (see
+# orientation.py); 180 and low-confidence calls are left alone and logged.
+AUTO_STRAIGHTEN        = bool(_T.get("auto_straighten", True))
+STRAIGHTEN_CONFIDENCE  = float(_T.get("straighten_min_confidence", 0.9))
 PROCESSED_MARKER    = "TaggedBy:Image Toolbox (https://github.com/war4peace/image-toolbox)"
 # Marker written by older versions — still recognised so photos tagged before
 # the rebrand are not re-processed after an upgrade.
@@ -747,6 +753,67 @@ def is_already_processed(path):
 
 
 # ─────────────────────────────────────────────────────────────
+#  AUTO-STRAIGHTEN
+# ─────────────────────────────────────────────────────────────
+
+_STRAIGHTEN_DISABLED = False   # set True after a hard failure, to stop retrying
+
+
+def warm_up_straighten():
+    """Load the orientation model up-front (downloads ~82 MB once) so the cost
+    is paid before the queue starts, not mid-first-image. Disables the feature
+    cleanly if torch/timm are unavailable."""
+    global _STRAIGHTEN_DISABLED
+    if not AUTO_STRAIGHTEN:
+        return
+    try:
+        import orientation
+        if not orientation.is_available():
+            print("  Auto-straighten: torch/timm not available — feature disabled.")
+            _STRAIGHTEN_DISABLED = True
+            return
+        print("  Auto-straighten: loading orientation model "
+              "(first run downloads ~82 MB) ...")
+        orientation._get_model()
+        print("  Auto-straighten: ready.\n")
+    except Exception as exc:
+        print(f"  Auto-straighten: could not initialise ({exc}) — feature disabled.")
+        _STRAIGHTEN_DISABLED = True
+
+
+def straighten_if_needed(path):
+    """Detect orientation and rotate `path` upright if confidently sideways.
+
+    Returns the clockwise degrees applied (+90 / -90), or 0 if nothing changed.
+    All failures are non-fatal: tagging proceeds on the un-rotated image.
+    """
+    if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
+        return 0
+    try:
+        import orientation
+        deg, conf = orientation.analyse(path)
+    except Exception as exc:
+        print(f"           orientation check skipped: {exc}")
+        return 0
+
+    if not orientation.should_rotate(deg, conf, STRAIGHTEN_CONFIDENCE):
+        if deg != 0:
+            why = "180deg" if deg == 180 else f"below {STRAIGHTEN_CONFIDENCE:.2f} confidence"
+            print(f"           orientation: {deg}deg @ {conf:.2f} — left as-is ({why})")
+        return 0
+
+    try:
+        cw = orientation.straighten(path, deg)
+        direction = "clockwise" if cw > 0 else "counter-clockwise"
+        print(f"           straightened: rotated 90deg {direction} "
+              f"(detected {deg}deg @ {conf:.2f})")
+        return cw
+    except Exception as exc:
+        print(f"           straighten FAILED: {exc}")
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────
 #  RENAME LOGIC
 # ─────────────────────────────────────────────────────────────
 
@@ -898,6 +965,7 @@ def ensure_cache_entry(cache, source_root, abs_path):
         "original_exif":     snap,
         "current_exif":      snap.copy(),
         "was_renamed":       False,
+        "rotation":          0,   # net clockwise degrees auto-straighten applied
         "first_seen_at":     time.strftime("%Y-%m-%dT%H:%M:%S"),
         "last_processed_at": None,
         "status":            "scanned",
@@ -986,6 +1054,21 @@ def _undo_entry(entry, source_root, undo_names, undo_exif):
     notes     = []
     exif_ok   = True
     rename_ok = True
+    rotate_ok = True
+
+    # ── Step 0: revert auto-straighten rotation (content change, reverted
+    #    alongside EXIF; names-only undo leaves pixels untouched). ──
+    if undo_exif:
+        net = entry.get("rotation", 0) % 360
+        if net:
+            try:
+                import orientation
+                orientation.unrotate(curr_abs, net)
+                entry["rotation"] = 0
+                notes.append(f"rotation reverted ({net}deg)")
+            except Exception as exc:
+                rotate_ok = False
+                notes.append(f"rotation revert FAILED: {exc}")
 
     # ── Step 1: restore EXIF fields (while file is at its current path) ──
     # NOTE: an all-None snapshot is NOT "nothing to do" — it means the
@@ -1020,7 +1103,7 @@ def _undo_entry(entry, source_root, undo_names, undo_exif):
                 rename_ok = False
                 notes.append(f"rename FAILED: {exc}")
 
-    success = exif_ok and rename_ok
+    success = exif_ok and rename_ok and rotate_ok
     if success:
         entry["status"] = "undone"
 
@@ -1362,6 +1445,9 @@ def main():
           f"({len(cache['files'])} total).")
     print(f"  Cache file: {cache_path_display}\n")
 
+    # ── Auto-straighten: load the orientation model before the queue starts ──
+    warm_up_straighten()
+
     # ── Stats ────────────────────────────────────────────────
     folder_stats = defaultdict(lambda: {
         "processed": 0, "skipped": 0, "failed": 0, "elapsed": 0.0
@@ -1410,11 +1496,6 @@ def main():
             total_skipped += 1
             continue
 
-        w, h    = get_image_dimensions(path)
-        dim_str = f"{w}x{h}px" if w else "?x?px"
-        _gui_event("IMG", path)    # GUI preview strip: current image
-        print(f"  {prefix} {dim_str}  {path}")
-
         img_start = time.time()
 
         # The name from before any rename by this script — keeps re-tagging
@@ -1422,6 +1503,22 @@ def main():
         # stem (replacing the previous description), never appended to it,
         # and EXIF XPComment always keeps the true original filename.
         original_name = get_original_name(path, cache, root)
+
+        # ── 0. Auto-straighten (before tagging, so the description is generated
+        #       on the corrected image and the preview shows it upright). ──
+        rotation_cw = straighten_if_needed(path)
+        if rotation_cw:
+            _rk, _re = _find_entry(cache, root, path)
+            if _re is not None:
+                _re["rotation"] = (_re.get("rotation", 0) + rotation_cw) % 360
+                # Persist immediately so a mid-image crash can't orphan a
+                # rotated file from its undo record.
+                save_cache(cache, root)
+
+        w, h    = get_image_dimensions(path)
+        dim_str = f"{w}x{h}px" if w else "?x?px"
+        _gui_event("IMG", path)    # GUI preview strip: current (now upright) image
+        print(f"  {prefix} {dim_str}  {path}")
 
         try:
             # 1. Analyse
