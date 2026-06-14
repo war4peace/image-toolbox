@@ -1385,6 +1385,13 @@ def main():
         print(f"  [!] Language: EXIF descriptions will be written in {language}."
               f" Filenames remain in English.")
 
+    # ── Auto-straighten: load the orientation model now, in the MAIN thread,
+    #    BEFORE RemoteControl starts its stdin-reader thread. Importing torch
+    #    (a heavy C extension) while a background thread is already blocked in
+    #    stdin.readline() deadlocks on the Windows loader lock — so the import
+    #    must happen here, before any other thread exists. ──
+    warm_up_straighten()
+
     # ── Remote control (active only when stdin is piped, e.g. GUI mode) ──
     control = RemoteControl()
 
@@ -1444,9 +1451,6 @@ def main():
     print(f"  Cache ready — {new_entries} new entr{'y' if new_entries == 1 else 'ies'} "
           f"({len(cache['files'])} total).")
     print(f"  Cache file: {cache_path_display}\n")
-
-    # ── Auto-straighten: load the orientation model before the queue starts ──
-    warm_up_straighten()
 
     # ── Stats ────────────────────────────────────────────────
     folder_stats = defaultdict(lambda: {
