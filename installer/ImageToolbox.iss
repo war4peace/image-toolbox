@@ -44,6 +44,13 @@ Source: "toolbox.ico";            DestDir: "{app}"; Flags: ignoreversion
 ; Never overwrite the user's configuration on upgrades, never delete it on uninstall
 Source: "..\config.json";         DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 
+[InstallDelete]
+; Remove the first-launch marker on every (re)install so the bootstrap re-runs
+; after an upgrade and installs any newly added Python dependencies (e.g. timm
+; for auto-straighten). Bootstrap is idempotent — already-present components
+; (Python, the venv, torch, the SeedVR2 engine) are detected and skipped.
+Type: files; Name: "{app}\.setup_complete"
+
 [Icons]
 Name: "{autoprograms}\Image Toolbox"; Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"
 Name: "{autodesktop}\Image Toolbox";  Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"; Tasks: desktopicon
