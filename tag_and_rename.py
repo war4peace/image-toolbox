@@ -78,6 +78,7 @@ def _gui_event(kind, payload):
       QUEUE|<json>    – ordered list of queued image paths
       LOG|<path>      – session log file location
       RENAME|<json>   – [old_path, new_path]: a queued file changed name
+      REFRESH|<path>  – the file's pixels changed (rotation); re-decode its thumb
     Written to the raw stdout so markers never end up in the session log.
     """
     if GUI_MODE:
@@ -1551,6 +1552,12 @@ def main():
             # 5. Update cache with final state
             update_cache_entry(cache, root, path, new_path, "processed")
             save_cache(cache, root)
+
+            # An auto-straightened image was rotated on disk AFTER its strip
+            # thumbnail was first decoded, so that thumbnail is stale. Ask the
+            # GUI to re-decode it for the final (post-rename) path.
+            if rotation_cw:
+                _gui_event("REFRESH", new_path)
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start

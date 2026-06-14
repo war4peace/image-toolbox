@@ -800,6 +800,8 @@ class ToolTab(ttk.Frame):
             self.strip.rename(old, new)
             if self.preview_name.get() == os.path.basename(old):
                 self.preview_name.set(os.path.basename(new))
+        elif kind == "REFRESH" and payload:
+            self.strip.refresh(payload)
         elif kind == "ETA" and payload:
             self._handle_eta(payload)
         elif kind == "LOG" and payload:
@@ -1021,6 +1023,21 @@ class FilmStrip(ttk.Frame):
         for d in (self._master, self._photo, self._img_id):
             if old in d:
                 d[new] = d.pop(old)
+
+    def refresh(self, path):
+        """Re-decode one thumbnail whose file changed on disk (e.g. after an
+        auto-straighten rotation), so the strip shows the corrected pixels.
+
+        Reuses the background loader: the decode runs off-thread and the
+        result is placed by the regular drain() tick. Dropping the cached
+        photo first guards against a stale image lingering if the file is
+        outside the currently displayed batch."""
+        p = (path or "").strip()
+        if not p:
+            return
+        self._photo.pop(p, None)
+        threading.Thread(target=self._load_batch,
+                         args=([p], self._gen), daemon=True).start()
 
     def set_current(self, path):
         if path not in self._index:     # rescan oddity — still show the image
