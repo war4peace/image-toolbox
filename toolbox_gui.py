@@ -41,7 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -1612,9 +1612,9 @@ class TagTab(ToolTab):
             return
         scope = self.scope_var.get()
         scope_text = {
-            "all":   "file names AND embedded descriptions",
+            "all":   "file names, embedded descriptions, and auto-straighten rotations",
             "names": "file names only",
-            "exif":  "embedded descriptions only",
+            "exif":  "embedded descriptions and auto-straighten rotations",
         }[scope]
         if not messagebox.askyesno(
                 APP_TITLE,

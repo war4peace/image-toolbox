@@ -785,33 +785,33 @@ def warm_up_straighten():
 def straighten_if_needed(path):
     """Detect orientation and rotate `path` upright if confidently sideways.
 
-    Returns the clockwise degrees applied (+90 / -90), or 0 if nothing changed.
-    All failures are non-fatal: tagging proceeds on the un-rotated image.
+    Returns (clockwise_degrees_applied, log_message). The message is returned
+    rather than printed so the caller can log it next to the per-image result
+    (the rotation physically happens before tagging, but reads more naturally
+    in the log just above the "Done in" line). All failures are non-fatal:
+    tagging proceeds on the un-rotated image.
     """
     if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
-        return 0
+        return 0, ""
     try:
         import orientation
         deg, conf = orientation.analyse(path)
     except Exception as exc:
-        print(f"           orientation check skipped: {exc}")
-        return 0
+        return 0, f"orientation check skipped: {exc}"
 
     if not orientation.should_rotate(deg, conf, STRAIGHTEN_CONFIDENCE):
         if deg != 0:
             why = "180deg" if deg == 180 else f"below {STRAIGHTEN_CONFIDENCE:.2f} confidence"
-            print(f"           orientation: {deg}deg @ {conf:.2f} — left as-is ({why})")
-        return 0
+            return 0, f"orientation: {deg}deg @ {conf:.2f} — left as-is ({why})"
+        return 0, ""
 
     try:
         cw = orientation.straighten(path, deg)
         direction = "clockwise" if cw > 0 else "counter-clockwise"
-        print(f"           straightened: rotated 90deg {direction} "
-              f"(detected {deg}deg @ {conf:.2f})")
-        return cw
+        return cw, (f"straightened: rotated 90deg {direction} "
+                    f"(detected {deg}deg @ {conf:.2f})")
     except Exception as exc:
-        print(f"           straighten FAILED: {exc}")
-        return 0
+        return 0, f"straighten FAILED: {exc}"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1455,10 +1455,11 @@ def main():
 
     # ── Stats ────────────────────────────────────────────────
     folder_stats = defaultdict(lambda: {
-        "processed": 0, "skipped": 0, "failed": 0, "elapsed": 0.0
+        "processed": 0, "rotated": 0, "skipped": 0, "failed": 0, "elapsed": 0.0
     })
 
     total_processed   = 0
+    total_rotated     = 0
     total_skipped     = 0
     total_failed      = 0
     consecutive_fails = 0
@@ -1510,9 +1511,12 @@ def main():
         original_name = get_original_name(path, cache, root)
 
         # ── 0. Auto-straighten (before tagging, so the description is generated
-        #       on the corrected image and the preview shows it upright). ──
-        rotation_cw = straighten_if_needed(path)
+        #       on the corrected image and the preview shows it upright). The
+        #       log message is deferred and printed next to the result below. ──
+        rotation_cw, straighten_msg = straighten_if_needed(path)
         if rotation_cw:
+            total_rotated += 1
+            folder_stats[dirpath]["rotated"] += 1
             _rk, _re = _find_entry(cache, root, path)
             if _re is not None:
                 _re["rotation"] = (_re.get("rotation", 0) + rotation_cw) % 360
@@ -1562,6 +1566,8 @@ def main():
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start
             print(f"           -> \"{long_desc}\"")
+            if straighten_msg:
+                print(f"           {straighten_msg}")
             print(f"           Done in {fmt_mmss(img_elapsed)} | "
                   f"Total elapsed: {fmt_hhmmss(grand_elapsed)}\n")
 
@@ -1577,6 +1583,8 @@ def main():
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start
             consecutive_fails += 1
+            if straighten_msg:
+                print(f"           {straighten_msg}")
             print(f"           FAILED in {fmt_mmss(img_elapsed)} | "
                   f"Total elapsed: {fmt_hhmmss(grand_elapsed)}")
             print(f"           Error: {type(e).__name__}: {e}")
@@ -1644,6 +1652,7 @@ def main():
         max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)
     ))
     col_proc = len("Processed")
+    col_rot  = len("Rotated")
     col_skip = len("Skipped")
     col_fail = len("Failed")
     col_time = max(
@@ -1654,28 +1663,30 @@ def main():
     def trunc(s, n):
         return s if len(s) <= n else "..." + s[-(n - 3):]
 
-    sep = "=" * (col_path + col_proc + col_skip + col_fail + col_time + 16)
-    row = f"  {{:<{col_path}}}  {{:>{col_proc}}}  {{:>{col_skip}}}  {{:>{col_fail}}}  {{:>{col_time}}}"
+    width = col_path + col_proc + col_rot + col_skip + col_fail + col_time + 18
+    sep = "=" * width
+    row = (f"  {{:<{col_path}}}  {{:>{col_proc}}}  {{:>{col_rot}}}  "
+           f"{{:>{col_skip}}}  {{:>{col_fail}}}  {{:>{col_time}}}")
 
     print("\n" + sep)
-    print(row.format("Folder", "Processed", "Skipped", "Failed", "Elapsed"))
-    print("-" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    print(row.format("Folder", "Processed", "Rotated", "Skipped", "Failed", "Elapsed"))
+    print("-" * width)
 
     for dp, stats in folder_stats.items():
         rel = os.path.relpath(dp, root) if dp != root else "."
         print(row.format(
             trunc(rel, col_path),
-            stats["processed"], stats["skipped"],
+            stats["processed"], stats["rotated"], stats["skipped"],
             stats["failed"], fmt_duration(stats["elapsed"])
         ))
 
-    print("=" * (col_path + col_proc + col_skip + col_fail + col_time + 16))
+    print(sep)
     print(row.format(
-        "TOTAL", total_processed, total_skipped,
+        "TOTAL", total_processed, total_rotated, total_skipped,
         total_failed, fmt_hhmmss(grand_elapsed)
     ))
     print(sep)
-    print(f"\n  ({total_failed} failed, {total_skipped} already tagged)\n")
+    print(f"\n  ({total_rotated} rotated, {total_failed} failed, {total_skipped} already tagged)\n")
     print(f"  Undo cache: {cache_path_display}\n")
 
     # ── Discord: queue finished / stopped ────────────────────────────────────
@@ -1689,7 +1700,7 @@ def main():
         notif_title, notif_color = "Tag & Rename -- Finished", 3066993                         # green
     send_discord_notification(
         title       = notif_title,
-        description = f"{total_processed} processed, {total_skipped} already tagged, {total_failed} failed",
+        description = f"{total_processed} processed, {total_rotated} rotated, {total_skipped} already tagged, {total_failed} failed",
         color       = notif_color,
         fields      = [
             {"name": "Folder",        "value": root},
