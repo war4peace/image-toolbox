@@ -181,7 +181,7 @@ try {
             Write-Host "  Vision model '$model' is already available."
         } else {
             Write-Host "  The Tag & Rename feature uses the vision model '$model'."
-            Write-Host "  It is a LARGE download (roughly 20 GB) and needs a strong GPU."
+            Write-Host "  It is a large download (about 6 GB) and needs a capable GPU (~16 GB VRAM)."
             if (Confirm-Yes "  Download '$model' now?") {
                 & $ollamaExe pull $model
                 if ($LASTEXITCODE -ne 0) {
