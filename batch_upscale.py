@@ -40,6 +40,8 @@ import threading
 import datetime
 import hashlib
 
+import db
+
 # ─────────────────────────────────────────────
 #  CONFIG  –  loaded from config.json
 # ─────────────────────────────────────────────
@@ -286,59 +288,66 @@ class EligibilityCache:
     """
     Persists per-file eligibility results to avoid re-scanning on every run.
 
-    Cache file location:
-        <script_dir>/scans/cache_<src_hash>_<out_hash>.json
-
-    Each entry is keyed by the file's path relative to the source root and
-    stores mtime, size, eligible flag, already_done flag, and skip_reason.
-    The mtime+size fingerprint detects changes to source files between runs.
+    Backed by the shared SQLite database (db/cache.db, tables upscale_roots /
+    upscale_files); the per-folder JSON files in scans/ are no longer written.
+    Entries for this run's source root are loaded into memory; writes are
+    flushed incrementally on save() (only changed/removed rows), keyed by the
+    file's path relative to the source root. The mtime+size fingerprint detects
+    changes to source files between runs.
     """
-
-    VERSION = 1
 
     def __init__(self, source_root, output_root):
         self.source_root = source_root
         self.output_root = output_root
+        self.path        = db.DB_PATH      # shown in log messages
 
-        # Derive a short hash from the two roots for a unique filename
-        key      = source_root.encode("utf-8")
-        digest   = hashlib.sha256(key).hexdigest()[:12]
-        scans_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans")
-        os.makedirs(scans_dir, exist_ok=True)
-        self.path = os.path.join(scans_dir, f"cache_{digest}.json")
-
-        self._data   = {}   # rel_path -> entry dict
-        self._dirty  = False
+        self._conn    = db.get_conn()
+        self._root_id = db.get_upscale_root_id(self._conn, source_root, output_root)
+        self._data    = {}            # rel_path -> entry dict
+        self._dirty   = set()         # rel_paths needing upsert
+        self._removed = set()         # rel_paths needing delete
         self._load()
 
     def _load(self):
-        if not os.path.exists(self.path):
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if raw.get("version") != self.VERSION:
-                return   # incompatible version — start fresh
-            if raw.get("source_root") != self.source_root:
-                return   # wrong source root — start fresh
-            self._data = raw.get("entries", {})
-        except Exception:
-            self._data = {}
+        for row in self._conn.execute(
+                "SELECT rel_path, mtime, size, eligible, already_done, skip_reason "
+                "FROM upscale_files WHERE root_id = ?", (self._root_id,)):
+            self._data[row["rel_path"]] = {
+                "mtime":        row["mtime"],
+                "size":         row["size"],
+                "eligible":     bool(row["eligible"]),
+                "already_done": bool(row["already_done"]),
+                "skip_reason":  row["skip_reason"],
+            }
 
     def save(self):
-        if not self._dirty:
+        if not self._dirty and not self._removed:
             return
-        payload = {
-            "version":     self.VERSION,
-            "source_root": self.source_root,
-            "output_root": self.output_root,
-            "saved_at":    datetime.datetime.now().isoformat(),
-            "entries":     self._data,
-        }
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-            self._dirty = False
+            with self._conn:   # one transaction; rolls back on error
+                if self._removed:
+                    self._conn.executemany(
+                        "DELETE FROM upscale_files WHERE root_id = ? AND rel_path = ?",
+                        [(self._root_id, rel) for rel in self._removed])
+                if self._dirty:
+                    rows = []
+                    for rel in self._dirty:
+                        e = self._data.get(rel)
+                        if e is None:
+                            continue
+                        rows.append((self._root_id, rel, e["mtime"], e["size"],
+                                     1 if e["eligible"] else 0,
+                                     1 if e["already_done"] else 0,
+                                     e["skip_reason"]))
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO upscale_files "
+                        "(root_id, rel_path, mtime, size, eligible, already_done, skip_reason) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                self._conn.execute(
+                    "UPDATE upscale_roots SET output_root = ?, saved_at = ? WHERE id = ?",
+                    (self.output_root, datetime.datetime.now().isoformat(), self._root_id))
+            self._dirty.clear()
+            self._removed.clear()
         except Exception:
             pass   # non-fatal — cache is best-effort
 
@@ -375,14 +384,15 @@ class EligibilityCache:
             "already_done": already_done,
             "skip_reason":  skip_reason,
         }
-        self._dirty = True
+        self._dirty.add(rel)
+        self._removed.discard(rel)
 
     def mark_done(self, local_path):
         """Mark a file as already_done=True after successful processing."""
         rel = os.path.relpath(local_path, self.source_root)
         if rel in self._data:
             self._data[rel]["already_done"] = True
-            self._dirty = True
+            self._dirty.add(rel)
 
     def remove_missing(self, source_root, progress_cb=None, abort_check=None):
         """
@@ -402,8 +412,8 @@ class EligibilityCache:
                 to_remove.append(rel)
         for rel in to_remove:
             del self._data[rel]
-        if to_remove:
-            self._dirty = True
+            self._removed.add(rel)
+            self._dirty.discard(rel)
         return len(to_remove)
 
     @property

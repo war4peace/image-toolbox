@@ -55,6 +55,8 @@ import traceback
 import threading
 from collections import defaultdict
 
+import db
+
 
 # ─────────────────────────────────────────────────────────────
 #  GUI INTEGRATION  (event lines + session log)
@@ -210,7 +212,7 @@ _O   = _CFG.get("ollama",  {})
 _T   = _CFG.get("tagging", {})
 
 OLLAMA_URL   = _O.get("url",   "http://127.0.0.1:11434")
-OLLAMA_MODEL = _O.get("model", "minicpm-v:latest")
+OLLAMA_MODEL = _O.get("model", "qwen2.5vl:7b")
 
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
@@ -868,46 +870,72 @@ def get_original_name(path, cache, source_root):
 # ─────────────────────────────────────────────────────────────
 
 def get_cache_path(source_root):
-    """
-    Return the .cache file path for source_root.
-    Uses the first 12 hex chars of the MD5 of the normalised absolute path,
-    e.g.  trcache/ab4531c2f8d9.cache
-    """
-    norm     = os.path.normcase(os.path.abspath(source_root))
-    hash_str = hashlib.md5(norm.encode("utf-8")).hexdigest()[:12]
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, f"{hash_str}.cache")
+    """Return a label for the cache backing store (shown in log messages).
+    The cache now lives in the shared SQLite database, not a per-folder file."""
+    return db.DB_PATH
 
 
 def load_cache(source_root):
     """
-    Load the cache for source_root from disk, or create a fresh empty cache.
-    The original-state snapshots are never overwritten on subsequent loads.
+    Load the cache for source_root from the shared database, or build a fresh
+    empty cache. The in-memory shape is unchanged from the old JSON format
+    ({schema_version, source_root, created_at, last_updated, files: {key: entry}})
+    so the rest of the module is untouched. The original-state snapshots are
+    never overwritten — entries are read as last persisted.
     """
-    cache_path = get_cache_path(source_root)
-    if os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("schema_version") == CACHE_SCHEMA_VERSION:
-                return data
-            print("  WARNING: Cache schema mismatch — starting a fresh cache.")
-        except Exception as exc:
-            print(f"  WARNING: Could not read cache ({exc}) — starting a fresh cache.")
-    return {
+    conn = db.get_conn()
+    root = db.find_tag_root(conn, source_root)
+    now  = time.strftime("%Y-%m-%dT%H:%M:%S")
+    cache = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "source_root":    os.path.abspath(source_root),
-        "created_at":     time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "last_updated":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "created_at":     now,
+        "last_updated":   now,
         "files":          {},
     }
+    if root is None:
+        return cache
+    meta = conn.execute("SELECT created_at, last_updated FROM tag_roots WHERE id = ?",
+                        (root["id"],)).fetchone()
+    if meta is not None:
+        cache["created_at"]   = meta["created_at"] or now
+        cache["last_updated"] = meta["last_updated"] or now
+    for row in conn.execute(
+            "SELECT original_rel_path, entry_json FROM tag_files WHERE root_id = ?",
+            (root["id"],)):
+        try:
+            cache["files"][row["original_rel_path"]] = json.loads(row["entry_json"])
+        except Exception:
+            pass
+    return cache
 
 
 def save_cache(cache, source_root):
-    """Persist the cache dict to disk."""
+    """Persist the cache dict to the shared database (atomic, full rewrite of
+    this root's rows)."""
     cache["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(get_cache_path(source_root), "w", encoding="utf-8") as f:
-        json.dump(cache, f, indent=2, ensure_ascii=False)
+    conn    = db.get_conn()
+    root_id = db.get_tag_root_id(conn, os.path.abspath(source_root),
+                                 created_at=cache.get("created_at"))
+    rows = []
+    for key, entry in cache["files"].items():
+        rows.append((root_id,
+                     entry.get("original_rel_path", key),
+                     entry.get("current_rel_path"),
+                     entry.get("status"),
+                     json.dumps(entry, ensure_ascii=False)))
+    try:
+        with conn:   # one transaction; rolls back on error
+            conn.execute("DELETE FROM tag_files WHERE root_id = ?", (root_id,))
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO tag_files "
+                    "(root_id, original_rel_path, current_rel_path, status, entry_json) "
+                    "VALUES (?, ?, ?, ?, ?)", rows)
+            conn.execute("UPDATE tag_roots SET last_updated = ? WHERE id = ?",
+                         (cache["last_updated"], root_id))
+    except Exception as exc:
+        print(f"  WARNING: Could not save cache to database ({exc}).")
 
 
 def _snapshot_exif(path):

@@ -26,7 +26,7 @@ No Git, no Python knowledge required:
 The first launch opens a setup window that downloads the required components
 (Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the
 app. It also offers to install [Ollama](https://ollama.com) and the vision model
-used by **Tag & Rename** (~5.5 GB; optional — upscaling works without it, and you
+used by **Tag & Rename** (~6 GB; optional — upscaling works without it, and you
 can decline). The first upscale you run additionally downloads the AI upscaling
 model weights (~16 GB) automatically. Everything the setup prints is saved to
 `bootstrap.log` next to the app for later review.
@@ -74,17 +74,18 @@ You can also run the tools headless from PowerShell:
 .venv\Scripts\python.exe batch_upscale.py "X:\Your\Photos"               # upscale
 .venv\Scripts\python.exe batch_upscale.py "X:\Your\Photos" "Z:\Output"   # custom output
 .venv\Scripts\python.exe tag_and_rename.py "X:\Your\Photos"              # tag & rename
+.venv\Scripts\python.exe conciliate.py "X:\Your\Photos" "Z:\Output"     # conciliate (archive)
 ```
 
-The GUI and the scripts share the same logs, caches and undo data, so you can mix
-and match freely.
+The GUI and the scripts share the same logs and cache database (`db/cache.db`),
+so you can mix and match freely.
 
 ---
 
 ## The app
 
 `toolbox_gui.py` is a Windows GUI (pure Python standard-library tkinter — no extra
-packages) with three tabs.
+packages) with four tabs.
 
 ### Batch Upscaler
 
@@ -97,8 +98,9 @@ packages) with three tabs.
 - **Skip-cutoff:** images already close to the target are skipped (default 66% of
   the target on either axis — i.e. anything that would gain less than ~1.5×).
   Set it to 0 in Settings to upscale everything eligible.
-- **Resilient long runs:** a file cache (in `scans/`) lets a stopped batch resume
-  where it left off; corrupt and missing files are detected, logged and skipped
+- **Resilient long runs:** a cache (in the local SQLite database `db/cache.db`)
+  lets a stopped batch resume where it left off; corrupt and missing files are
+  detected, logged and skipped
   (corrupt files are listed at the end so you can review them); a **second pass**
   re-scans the source when the batch finishes and processes anything new that
   appeared while it ran.
@@ -123,13 +125,35 @@ packages) with three tabs.
   change is recorded to an undo cache before anything is modified.
 - Already-tagged files are detected and skipped on re-runs.
 - **The vision model is your choice** (set it in **Settings**). The default is
-  [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast, light (~7.6 GB
-  VRAM, runs on an 8 GB GPU), and accurate, with a welcome habit of describing
-  only what it can clearly see instead of guessing. For the **best accuracy**
-  (reading faint on-screen text, inferring fine detail) at the cost of speed and
-  VRAM, switch to [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) (needs
-  ~16 GB VRAM, so a 16 GB+ GPU). In testing, `llava:34b` was the slowest,
+  [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) — the most accurate of
+  the models tried, reading faint on-screen text and inferring fine detail; it
+  needs ~16 GB VRAM (a 16 GB+ GPU). If you have less VRAM, switch to
+  [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast and light (~7.6 GB
+  VRAM, runs on an 8 GB GPU), with a welcome habit of describing only what it can
+  clearly see instead of guessing. In testing, `llava:34b` was the slowest,
   heaviest *and* least accurate of the models tried — it's not recommended.
+
+### Conciliation
+
+Once you're happy with the upscaled (and optionally tagged & renamed) results,
+**Conciliation** moves them back into your original folder tree so the originals
+are replaced by their high-quality versions — no manual shuffling.
+
+- Pick an **Original Photos** folder and a **Processed Photos** folder, then
+  **Scan / Preview**. Nothing is touched until you click **Run**: the preview
+  shows a per-folder summary (how many will be *replaced*, how many images have
+  *no match*, and how many non-image files are *kept*).
+- Each original is matched to its processed counterpart using the cache
+  database, falling back to filename matching when there's no cache — so it works
+  for both upscaled-only and upscaled-then-tagged/renamed files.
+- Two operations: **Archive originals** (default — moves each original into an
+  `__Archive__` subfolder) or **Delete originals** (permanent, with an extra
+  confirmation). The processed file then takes the original's place, keeping its
+  descriptive name if it was tagged.
+- **Safety first:** an original with no processed counterpart is never touched,
+  and non-image files are never touched. After a run, emptied processed folders
+  (e.g. a leftover `__upscaled__`) are cleaned up. The tab is locked while the
+  Upscaler or Tag & Rename is running, since they may share the same folders.
 
 ### Settings
 

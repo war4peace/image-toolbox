@@ -1,6 +1,7 @@
 # Local-only: logs, caches, environments, engine clone, test artifacts
 logs/
 scans/
+db/
 .venv/
 seedvr2/
 models/

@@ -6,7 +6,7 @@
     },
     "ollama": {
         "url": "http://127.0.0.1:11434",
-        "model": "minicpm-v:latest"
+        "model": "qwen2.5vl:7b"
     },
     "upscale": {
         "resolution": 2160,

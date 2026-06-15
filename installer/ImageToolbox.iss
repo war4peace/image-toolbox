@@ -37,6 +37,8 @@ Source: "..\batch_upscale.py";    DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tag_and_rename.py";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\orientation.py";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\upscale_engine.py";   DestDir: "{app}"; Flags: ignoreversion
+Source: "..\conciliate.py";       DestDir: "{app}"; Flags: ignoreversion
+Source: "..\db.py";               DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
@@ -66,6 +68,7 @@ Type: filesandordirs; Name: "{app}\seedvr2"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\scans"
 Type: filesandordirs; Name: "{app}\trcache"
+Type: filesandordirs; Name: "{app}\db"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files; Name: "{app}\.setup_complete"
 Type: files; Name: "{app}\gui_settings.json"
