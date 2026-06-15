@@ -739,7 +739,8 @@ class PauseController:
 #  DIRECTORY SCANNER  (recursive)
 # ─────────────────────────────────────────────
 
-def collect_work_items(root, output_root, already_done=None, abort_check=None):
+def collect_work_items(root, output_root, already_done=None, abort_check=None,
+                       status_prefix="Scanning for images …"):
     """
     Walk root recursively.
     Returns (items, folder_count) where items is a list of
@@ -748,6 +749,8 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None):
     already_done: optional set of local_path strings to skip (used for rescan).
     abort_check:  optional callable; when it returns True the walk stops early
                   and the partial result is returned (caller decides what to do).
+    status_prefix: leading text for the live GUI status line; the running folder
+                  and image counts are appended so the user sees scan progress.
     """
     already_done = already_done or set()
     items = []
@@ -755,6 +758,12 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None):
     output_root_norm = os.path.normcase(os.path.normpath(output_root))
 
     _tw = _terminal_width()
+    _last_status = 0.0          # throttle GUI status updates to a few per second
+
+    def _emit_status():
+        _gui_event(
+            "STATUS",
+            f"{status_prefix} {folder_count} folder(s) and {len(items)} image(s) found")
 
     for dirpath, dirnames, filenames in os.walk(root):
         if abort_check is not None and abort_check():
@@ -788,9 +797,17 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None):
         sys.stdout.write(display[:_tw].ljust(_tw) + chr(13))
         sys.stdout.flush()
 
+        # Mirror the same live counts to the GUI status line, throttled so a
+        # huge tree doesn't flood the event pipe.
+        now = time.time()
+        if now - _last_status >= 0.25:
+            _last_status = now
+            _emit_status()
+
     # Clear the progress line — final count printed by caller
     sys.stdout.write(" " * _tw + chr(13))
     sys.stdout.flush()
+    _emit_status()                       # final exact totals
 
     return items, folder_count
 
@@ -1188,6 +1205,7 @@ def main():
 
         _last_folder = [""]
         _folder_idx  = [0]
+        _verify_start = time.time()      # for the GUI "time remaining" estimate
         def _verify_progress(folder):
             if folder != _last_folder[0]:
                 _last_folder[0] = folder
@@ -1198,6 +1216,11 @@ def main():
                 sys.stdout.write(display[:_tw].ljust(_tw) + chr(13))
                 sys.stdout.flush()
                 _gui_event("PROG", f"{_folder_idx[0]}|{total_folders}")
+                # Feed the GUI's ETA handler (elapsed|processed|idx|total);
+                # folders are verified at a roughly uniform rate, so
+                # processed == idx.
+                _gui_event("ETA", f"{time.time() - _verify_start:.3f}|"
+                                  f"{_folder_idx[0]}|{_folder_idx[0]}|{total_folders}")
 
         removed = cache.remove_missing(root, progress_cb=_verify_progress,
                                        abort_check=_cancelled)
@@ -1223,6 +1246,7 @@ def main():
     pre_too_large  = 0
     cache_hits     = 0
     total_all      = len(all_items)
+    elig_start     = time.time()        # for the GUI "time remaining" estimate
 
     for i, item in enumerate(all_items, 1):
         if pause.quit_requested:
@@ -1237,6 +1261,9 @@ def main():
             sys.stdout.write("  Checking eligibility ... %d%% (%d/%d) | cache hits: %d    " % (
                 pct, i, total_all, cache_hits) + chr(13)); sys.stdout.flush()
             _gui_event("PROG", f"{i}|{total_all}")
+            # Reuse the GUI's ETA handler (elapsed|processed|idx|total): every
+            # item is examined at a roughly uniform rate, so processed == idx.
+            _gui_event("ETA", f"{time.time() - elig_start:.3f}|{i}|{i}|{total_all}")
 
         cached = cache.get(local_path)
 
@@ -1307,7 +1334,8 @@ def main():
         _gui_event("STATUS", "Rescanning for new or renamed files …")
         rescan_items, _ = collect_work_items(root, output_root,
                                              already_done=processed_paths,
-                                             abort_check=_cancelled)
+                                             abort_check=_cancelled,
+                                             status_prefix="Rescanning for new or renamed files …")
 
         # Eligibility filter for new items — check resolution and already-done
         eligible_rescan = []
