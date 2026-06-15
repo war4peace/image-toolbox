@@ -41,7 +41,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -293,12 +293,17 @@ def sanitize(text):
 # ─────────────────────────────────────────────
 
 def _fmt_eta(seconds):
-    """Format a duration as 'dd, hh, mm, ss' — e.g. '04d, 11h, 23m, 35s'."""
+    """Format a duration, dropping leading zero day/hour fields.
+    e.g. '04d, 11h, 23m, 35s'; '11h, 36m, 39s'; '39m, 18s'; '18s'."""
     s = int(max(0, round(seconds)))
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
-    return f"{d:02d}d, {h:02d}h, {m:02d}m, {s:02d}s"
+    parts = [(d, "d"), (h, "h"), (m, "m"), (s, "s")]
+    # Trim leading all-zero units, but always keep at least the seconds field.
+    while len(parts) > 1 and parts[0][0] == 0:
+        parts.pop(0)
+    return ", ".join(f"{v:02d}{suffix}" for v, suffix in parts)
 
 
 class ProgressBar(tk.Canvas):
@@ -587,7 +592,7 @@ class ToolTab(ttk.Frame):
         pf.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 2))
         ttk.Label(pf, text="Est. Time Remaining:").pack(side="left")
         self.eta_var = tk.StringVar(value="—")
-        ttk.Label(pf, textvariable=self.eta_var, width=20,
+        ttk.Label(pf, textvariable=self.eta_var, width=20, anchor="e",
                   font=("Consolas", 9)).pack(side="left", padx=(4, 12))
         self.progress = ProgressBar(pf, width=260)
         self.progress.pack(side="left", fill="x", expand=True)
@@ -1354,6 +1359,13 @@ class UpscaleTab(ToolTab):
     def _refresh_save_buttons(self):
         self.save_src_btn.configure(state="normal" if self._src_valid() else "disabled")
         self.save_out_btn.configure(state="normal" if self._out_valid() else "disabled")
+        # "Open output folder" is meaningless with no output path entered.
+        self.open_btn.configure(
+            state="normal" if self.out_var.get().strip() else "disabled")
+        # No source folder, nothing to upscale — but never re-enable mid-run.
+        if not self.running:
+            self.start_btn.configure(
+                state="normal" if self.src_var.get().strip() else "disabled")
 
     def _save_default(self, which):
         if which == "src":
@@ -1444,7 +1456,9 @@ class UpscaleTab(ToolTab):
         self.status_var.set("Stopping — finishes the current image first …")
 
     def _set_running(self, running):
-        self.start_btn.configure(state="disabled" if running else "normal")
+        has_src = bool(self.src_var.get().strip())
+        self.start_btn.configure(
+            state="normal" if (not running and has_src) else "disabled")
         self.pause_btn.configure(state="normal"   if running else "disabled")
         self.stop_btn.configure(state="normal"    if running else "disabled")
         # VRAM is fully committed during an upscale run — lock out the other tool
@@ -1484,6 +1498,14 @@ LANGUAGES = [
     "Finnish",
 ]
 
+# Undo scopes for Tag & Rename, as (menu label, backend code) pairs.
+# The first entry is the default selection.
+UNDO_SCOPES = [
+    ("Undo everything",   "all"),
+    ("File names only",   "names"),
+    ("Descriptions only", "exif"),
+]
+
 
 class TagTab(ToolTab):
 
@@ -1494,7 +1516,7 @@ class TagTab(ToolTab):
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
         self.fren_var   = tk.BooleanVar(value=False)
-        self.scope_var  = tk.StringVar(value="all")
+        self.scope_var  = tk.StringVar(value=UNDO_SCOPES[0][0])
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
 
@@ -1502,8 +1524,8 @@ class TagTab(ToolTab):
         tag_default = get_default_folder("tag_folder")
         if tag_default and os.path.isdir(tag_default):
             self.dir_var.set(tag_default)
-        self.dir_var.trace_add("write", lambda *_: self._refresh_save_button())
-        self._refresh_save_button()
+        self.dir_var.trace_add("write", lambda *_: self._refresh_dir_buttons())
+        self._refresh_dir_buttons()
 
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
@@ -1517,9 +1539,9 @@ class TagTab(ToolTab):
         ttk.Label(opts, text="Description language:").pack(side="left")
         ttk.Combobox(opts, textvariable=self.lang_var, values=LANGUAGES,
                      width=14).pack(side="left", padx=(4, 16))
-        ttk.Checkbutton(opts, text="Tag all images (ignore size and previous tags)",
+        ttk.Checkbutton(opts, text="Force Tag all images",
                         variable=self.ftag_var).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(opts, text="Rename all images (not just camera names)",
+        ttk.Checkbutton(opts, text="Force Rename all images",
                         variable=self.fren_var).pack(side="left")
 
         btns = ttk.Frame(self)
@@ -1534,12 +1556,9 @@ class TagTab(ToolTab):
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
         undo.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        ttk.Radiobutton(undo, text="Undo everything", value="all",
-                        variable=self.scope_var).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(undo, text="File names only", value="names",
-                        variable=self.scope_var).pack(side="left", padx=(0, 10))
-        ttk.Radiobutton(undo, text="Descriptions only", value="exif",
-                        variable=self.scope_var).pack(side="left", padx=(0, 16))
+        ttk.Label(undo, text="Scope:").pack(side="left", padx=(0, 4))
+        ttk.Combobox(undo, textvariable=self.scope_var, state="readonly", width=18,
+                     values=[label for label, _ in UNDO_SCOPES]).pack(side="left", padx=(0, 16))
         self.undo_btn = ttk.Button(undo, text="Undo this folder…", command=self._undo)
         self.undo_btn.pack(side="left")
 
@@ -1558,8 +1577,17 @@ class TagTab(ToolTab):
         p = self.dir_var.get().strip()
         return bool(p) and os.path.isdir(p)
 
-    def _refresh_save_button(self):
+    def _refresh_dir_buttons(self):
+        has_dir = bool(self.dir_var.get().strip())
         self.save_dir_btn.configure(state="normal" if self._dir_valid() else "disabled")
+        # "Open photo folder" and "Undo this folder…" are meaningless with no
+        # folder entered. Undo additionally stays locked while a run is active.
+        self.open_btn.configure(state="normal" if has_dir else "disabled")
+        self.undo_btn.configure(
+            state="normal" if (has_dir and not self.running) else "disabled")
+        # No photo folder, nothing to tag — but never re-enable mid-run.
+        if not self.running:
+            self.start_btn.configure(state="normal" if has_dir else "disabled")
 
     def _save_default(self):
         if not self._dir_valid():
@@ -1610,7 +1638,7 @@ class TagTab(ToolTab):
         folder = self._valid_dir()
         if not folder:
             return
-        scope = self.scope_var.get()
+        scope = dict(UNDO_SCOPES).get(self.scope_var.get(), "all")
         scope_text = {
             "all":   "file names, embedded descriptions, and auto-straighten rotations",
             "names": "file names only",
@@ -1644,10 +1672,15 @@ class TagTab(ToolTab):
         self.status_var.set("Stopping — finishes the current image first …")
 
     def _set_running(self, running):
-        self.start_btn.configure(state="disabled"  if running else "normal")
-        self.undo_btn.configure(state="disabled"   if running else "normal")
         self.resume_btn.configure(state="normal"   if running else "disabled")
         self.stop_btn.configure(state="normal"     if running else "disabled")
+        # Start and Undo are locked while running; otherwise they follow the
+        # folder state (no folder entered → nothing to act on).
+        has_dir = bool(self.dir_var.get().strip())
+        self.start_btn.configure(
+            state="normal" if (not running and has_dir) else "disabled")
+        self.undo_btn.configure(
+            state="normal" if (not running and has_dir) else "disabled")
 
     def on_exit(self, code):
         self._set_running(False)
@@ -1774,84 +1807,106 @@ class SettingsTab(ttk.Frame):
         ttk.Entry(sec, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(sec, text="Check", command=self._check_ollama).grid(row=0, column=2, pady=3)
 
-        self.ollama_status = ttk.Label(sec, text="", foreground="#666")
-        self.ollama_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
-
-        ttk.Label(sec, text="Ollama model:").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(sec, text="Ollama model:").grid(row=1, column=0, sticky="w", pady=3)
         self.ollama_model_var = tk.StringVar(value=ollama.get("model", "minicpm-v:latest"))
         self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
-        self.ollama_model_cmb.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=2, column=2, pady=3)
+        self.ollama_model_cmb.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=1, column=2, pady=3)
+
+        self.ollama_status = ttk.Label(sec, text="", foreground="#666")
+        self.ollama_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
 
         # ── Tag & Rename ───────────────────────────────────────────────────────
         sec = self._section(body, "Tag & Rename")
         sec.columnconfigure(1, weight=1)
 
         self.straighten_var = tk.BooleanVar(value=bool(tag.get("auto_straighten", True)))
-        ttk.Checkbutton(sec, text="Auto-straighten rotated photos",
-                        variable=self.straighten_var).grid(row=0, column=0, columnspan=3,
-                                                            sticky="w", pady=3)
-        ttk.Label(sec, text="Detects sideways photos and rotates them upright before tagging. "
-                            "Only confident calls are acted on; ambiguous ones are left alone.",
-                  foreground="#666", wraplength=520, justify="left").grid(
-                      row=1, column=0, columnspan=3, sticky="w", padx=18)
+        chk = ttk.Checkbutton(sec, text="Auto-straighten rotated photos",
+                              variable=self.straighten_var)
+        chk.grid(row=0, column=0, sticky="w", pady=3)
+        Tooltip(chk, "Detects sideways photos and rotates them upright before tagging. "
+                     "Only confident calls are acted on; ambiguous ones are left alone.")
 
-        ttk.Label(sec, text="Confidence threshold:").grid(row=2, column=0, sticky="w", pady=3)
         conf = ttk.Frame(sec)
-        conf.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=3)
+        conf.grid(row=0, column=1, sticky="w", padx=18, pady=3)
+        ttk.Label(conf, text="Confidence threshold:").pack(side="left", padx=(0, 4))
         self.straighten_conf_var = tk.DoubleVar(
             value=float(tag.get("straighten_min_confidence", 0.9)))
-        ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
-                    textvariable=self.straighten_conf_var).pack(side="left")
-        ttk.Label(conf, text="0.50–1.00   (higher = fewer, safer rotations)",
-                  foreground="#666").pack(side="left", padx=4)
+        spin = ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+                           textvariable=self.straighten_conf_var)
+        spin.pack(side="left")
+        Tooltip(spin, "0.50–1.00   (higher = fewer, safer rotations)")
 
         # ── Upscaling targets ──────────────────────────────────────────────────
         sec = self._section(body, "Upscaling")
         sec.columnconfigure(1, weight=1)
 
-        ttk.Label(sec, text="Resolution Target:").grid(row=0, column=0, sticky="w", pady=3)
-        self.restarget_var = tk.StringVar(value=self._current_preset_label(ups))
-        ttk.Combobox(sec, textvariable=self.restarget_var, state="readonly",
-                     values=[p[0] for p in RESOLUTION_PRESETS], width=16
-                     ).grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        ttk.Label(sec, text="(longer edge / shorter edge, in pixels)",
-                  foreground="#666").grid(row=0, column=2, sticky="w")
+        strip = ttk.Frame(sec)
+        strip.grid(row=0, column=0, columnspan=2, sticky="w", pady=3)
 
-        ttk.Label(sec, text="Skip images already at:").grid(row=1, column=0, sticky="w", pady=3)
-        cut = ttk.Frame(sec)
-        cut.grid(row=1, column=1, columnspan=2, sticky="w", padx=6, pady=3)
+        ttk.Label(strip, text="Resolution Target:").pack(side="left", padx=(0, 4))
+        self.restarget_var = tk.StringVar(value=self._current_preset_label(ups))
+        restarget_cmb = ttk.Combobox(strip, textvariable=self.restarget_var, state="readonly",
+                                     values=[p[0] for p in RESOLUTION_PRESETS], width=16)
+        restarget_cmb.pack(side="left")
+        Tooltip(restarget_cmb, "longer edge / shorter edge, in pixels")
+
+        ttk.Label(strip, text="Skip images over:").pack(side="left", padx=(24, 4))
         self.cutoff_var = tk.IntVar(value=int(ups.get("upscale_cutoff_pct", 66)))
-        ttk.Spinbox(cut, from_=0, to=99, width=4, textvariable=self.cutoff_var).pack(side="left")
-        ttk.Label(cut, text="% of the target size or larger   (0 = upscale everything eligible)"
-                  ).pack(side="left", padx=4)
+        cut_spin = ttk.Spinbox(strip, from_=0, to=99, width=4, textvariable=self.cutoff_var)
+        cut_spin.pack(side="left")
+        ttk.Label(strip, text="% of target resolution").pack(side="left", padx=(4, 0))
+        Tooltip(cut_spin, "Percentage of the target resolution.   (0 = upscale everything eligible)")
 
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
         sec = self._section(body, "SeedVR Settings")
-        sec.columnconfigure(1, weight=1)
+        present = {k: v for k, v in ups.items() if k not in _SEEDVR_EXCLUDE}
+
+        def _lbl(key):
+            return _SEEDVR_LABELS.get(key, key.replace("_", " ").capitalize())
+
+        # Controls grouped onto shared rows for a compact layout.
+        seedvr_rows = [
+            ["attention_mode", "color_correction"],
+            ["dit_model", "vae_model"],
+            ["blocks_to_swap", "outage_threshold"],
+            ["encode_tiled", "decode_tiled", "encode_tile_size", "decode_tile_size"],
+        ]
+
+        placed = set()
         row = 0
-        for key, value in ups.items():
-            if key in _SEEDVR_EXCLUDE:
+        for group in seedvr_rows:
+            keys = [k for k in group if k in present]
+            if not keys:
                 continue
-            label = _SEEDVR_LABELS.get(key, key.replace("_", " ").capitalize())
-            ttk.Label(sec, text=f"{label}:").grid(row=row, column=0, sticky="w", pady=3)
-            if isinstance(value, bool):
-                var = tk.BooleanVar(value=value)
-                ttk.Checkbutton(sec, variable=var).grid(row=row, column=1, sticky="w", padx=6, pady=3)
-                self._seedvr_vars[key] = (var, bool)
-            elif isinstance(value, int):
-                var = tk.StringVar(value=str(value))
-                ttk.Spinbox(sec, from_=0, to=100000, width=10, textvariable=var
-                            ).grid(row=row, column=1, sticky="w", padx=6, pady=3)
-                self._seedvr_vars[key] = (var, int)
+            # Rows with more than a simple pair are packed tightly to the left in
+            # their own frame, so they don't inherit the wide column alignment of
+            # the two-control rows above.
+            if len(keys) > 2:
+                strip = ttk.Frame(sec)
+                strip.grid(row=row, column=0, columnspan=4, sticky="w", pady=3)
+                for i, key in enumerate(keys):
+                    ttk.Label(strip, text=f"{_lbl(key)}:").pack(
+                        side="left", padx=(0 if i == 0 else 24, 4))
+                    self._make_seedvr_control(strip, key, present[key]).pack(side="left")
+                    placed.add(key)
             else:
-                var = tk.StringVar(value=str(value))
-                if key in _SEEDVR_CHOICES:
-                    ttk.Combobox(sec, textvariable=var, values=_SEEDVR_CHOICES[key],
-                                 width=28).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
-                else:
-                    ttk.Entry(sec, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6, pady=3)
-                self._seedvr_vars[key] = (var, str)
+                col = 0
+                for key in keys:
+                    ttk.Label(sec, text=f"{_lbl(key)}:").grid(
+                        row=row, column=col, sticky="w", pady=3, padx=(0 if col == 0 else 14, 4))
+                    self._make_seedvr_control(sec, key, present[key]).grid(
+                        row=row, column=col + 1, sticky="w", pady=3)
+                    placed.add(key)
+                    col += 2
+            row += 1
+
+        # Any unrecognised keys fall back to one-per-row generic controls.
+        for key, value in present.items():
+            if key in placed:
+                continue
+            ttk.Label(sec, text=f"{_lbl(key)}:").grid(row=row, column=0, sticky="w", pady=3, padx=(0, 4))
+            self._make_seedvr_control(sec, key, value).grid(row=row, column=1, sticky="w", pady=3)
             row += 1
 
         # ── Notifications ───────────────────────────────────────────────────────
@@ -1860,19 +1915,45 @@ class SettingsTab(ttk.Frame):
 
         ttk.Label(sec, text="Discord Webhook:").grid(row=0, column=0, sticky="w", pady=3)
         self.webhook_var = tk.StringVar(value=ups.get("discord_webhook_url", ""))
-        ttk.Entry(sec, textvariable=self.webhook_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        webhook_entry = ttk.Entry(sec, textvariable=self.webhook_var)
+        webhook_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(webhook_entry,
+                "Optional. Notifies when a queue finishes or on errors. Leave empty to disable.")
         ttk.Button(sec, text="Test", command=self._test_webhook).grid(row=0, column=2, pady=3)
         self.webhook_status = ttk.Label(sec, text="", foreground="#666")
         self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
-        ttk.Label(sec, text="Optional. Notifies when a queue finishes or on errors. Leave empty to disable.",
-                  foreground="#666").grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
 
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
         ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
-        self.save_status = ttk.Label(bar, text="Changes apply to the next run.", foreground="#666")
+        self.save_status = ttk.Label(bar, text="", foreground="#666")
         self.save_status.pack(side="left", padx=12)
+
+        # Probe the saved Ollama URL in the background so the status text already
+        # reflects reachability by the time the user opens the Settings tab.
+        self._check_ollama()
+
+    def _make_seedvr_control(self, parent, key, value):
+        """Build the editable control for a SeedVR field and register its var.
+        Returns the widget (caller positions it with .grid)."""
+        if isinstance(value, bool):
+            var = tk.BooleanVar(value=value)
+            widget = ttk.Checkbutton(parent, variable=var)
+            self._seedvr_vars[key] = (var, bool)
+        elif isinstance(value, int):
+            var = tk.StringVar(value=str(value))
+            widget = ttk.Spinbox(parent, from_=0, to=100000, width=8, textvariable=var)
+            self._seedvr_vars[key] = (var, int)
+        else:
+            var = tk.StringVar(value=str(value))
+            if key in _SEEDVR_CHOICES:
+                widget = ttk.Combobox(parent, textvariable=var,
+                                      values=_SEEDVR_CHOICES[key], width=16)
+            else:
+                widget = ttk.Entry(parent, textvariable=var, width=22)
+            self._seedvr_vars[key] = (var, str)
+        return widget
 
     def _section(self, parent, title):
         lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
@@ -1889,9 +1970,18 @@ class SettingsTab(ttk.Frame):
         return RESOLUTION_PRESETS[0][0]
 
     def _check_ollama(self):
+        """Probe the Ollama URL off the UI thread and report reachability."""
         url = self.ollama_url_var.get().strip()
-        installed = ollama_installed()
-        ok, value = ollama_list_models(url)
+        self.ollama_status.configure(text="Checking Ollama…", foreground="#666")
+
+        def work():
+            installed = ollama_installed()
+            ok, value = ollama_list_models(url)
+            self.after(0, lambda: self._apply_ollama_check(ok, value, installed))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_ollama_check(self, ok, value, installed):
         if ok:
             self.ollama_model_cmb.configure(values=value)
             inst = "installed" if installed else "not on PATH"
@@ -1906,7 +1996,15 @@ class SettingsTab(ttk.Frame):
 
     def _refresh_models(self):
         url = self.ollama_url_var.get().strip()
-        ok, value = ollama_list_models(url)
+        self.ollama_status.configure(text="Refreshing models…", foreground="#666")
+
+        def work():
+            ok, value = ollama_list_models(url)
+            self.after(0, lambda: self._apply_refresh_models(ok, value))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_refresh_models(self, ok, value):
         if ok:
             self.ollama_model_cmb.configure(values=value)
             self.ollama_status.configure(
@@ -1951,7 +2049,7 @@ class SettingsTab(ttk.Frame):
         try:
             cutoff = max(0, min(99, int(self.cutoff_var.get())))
         except (ValueError, tk.TclError):
-            errors.append("Skip images already at")
+            errors.append("Skip images over")
 
         if errors:
             messagebox.showwarning(
@@ -1986,7 +2084,7 @@ class SettingsTab(ttk.Frame):
 
         if save_config():
             self.save_status.configure(
-                text="Saved. Changes apply to the next run.", foreground="#1a7f37")
+                text="Saved.", foreground="#1a7f37")
         else:
             self.save_status.configure(
                 text="Could not write config.json (check file permissions).",
