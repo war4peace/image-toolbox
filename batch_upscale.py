@@ -394,6 +394,20 @@ class EligibilityCache:
             self._data[rel]["already_done"] = True
             self._dirty.add(rel)
 
+    def record_lineage(self, src_path, out_path):
+        """
+        Hash the source and its freshly-written upscaled output and link them in
+        the lineage table, so the pair can be re-matched by content after either
+        tree is moved or renamed. Best-effort: never fails an upscale.
+        """
+        try:
+            src_hash = db.hash_file_cached(self._conn, src_path)
+            out_hash = db.hash_file_cached(self._conn, out_path)
+            db.record_upscale_lineage(self._conn, src_hash, out_hash,
+                                      src_path, out_path)
+        except Exception:
+            pass
+
     def remove_missing(self, source_root, progress_cb=None, abort_check=None):
         """
         Remove entries for files that no longer exist on disk.
@@ -977,6 +991,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             processed_paths.add(local_path)
             if cache is not None:
                 cache.mark_done(local_path)
+                cache.record_lineage(local_path, out_path)
                 cache.save()
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1

@@ -1538,6 +1538,11 @@ def main():
         # and EXIF XPComment always keeps the true original filename.
         original_name = get_original_name(path, cache, root)
 
+        # Hash the file in its pre-tag state (== the upscaled output, if this
+        # tree came from the upscaler) BEFORE auto-straighten/EXIF/rename change
+        # its bytes. This is the join key back to the upscale lineage.
+        in_hash = db.hash_file_cached(db.get_conn(), path)
+
         # ── 0. Auto-straighten (before tagging, so the description is generated
         #       on the corrected image and the preview shows it upright). The
         #       log message is deferred and printed next to the result below. ──
@@ -1584,6 +1589,14 @@ def main():
             # 5. Update cache with final state
             update_cache_entry(cache, root, path, new_path, "processed")
             save_cache(cache, root)
+
+            # 5b. Link the tagged result back to its upscaled input by content
+            # hash, so conciliation can match it even after a folder move.
+            try:
+                out_hash = db.hash_file_cached(db.get_conn(), new_path)
+                db.record_tag_lineage(db.get_conn(), in_hash, out_hash, new_path)
+            except Exception:
+                pass
 
             # An auto-straightened image was rotated on disk AFTER its strip
             # thumbnail was first decoded, so that thumbnail is stale. Ask the

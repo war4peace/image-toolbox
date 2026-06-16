@@ -5,10 +5,18 @@ Single SQLite cache database for the toolbox, at db/cache.db.
 
 Replaces the per-folder JSON cache files that used to live in scans/ (the
 upscale eligibility cache) and trcache/ (the tag & rename cache). One database,
-two pairs of tables:
+two pairs of cache tables plus the content-hash lineage:
 
     upscale_roots / upscale_files   – eligibility cache (batch_upscale.py)
     tag_roots     / tag_files       – tag & rename cache (tag_and_rename.py)
+    lineage                         – source→upscaled→tagged links by content
+                                      hash (batch_upscale.py, tag_and_rename.py;
+                                      read by conciliate.py)
+    file_hashes                     – memoised file content hashes, shared
+
+The lineage table is the relationship that lets conciliation re-match a source
+photo to its processed counterpart by content even after the user moves or
+renames folders. See docs/content-hash-lineage.md.
 
 Logs are intentionally NOT stored here — they stay as human-readable text files
 in logs/.
@@ -26,6 +34,7 @@ practice; WAL keeps concurrent readers safe regardless.
 import os
 import json
 import sqlite3
+import hashlib
 import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +71,35 @@ CREATE TABLE IF NOT EXISTS tag_files (
     status            TEXT,
     entry_json        TEXT NOT NULL,
     PRIMARY KEY (root_id, original_rel_path)
+);
+
+-- Content-hash lineage: links a source photo to its upscaled output and, in
+-- turn, to its tagged & renamed result. Each stage rewrites the bytes (the
+-- upscaler is non-deterministic; tag&rename edits EXIF in place), so the three
+-- hashes are unrelated and the chain MUST be recorded here as the files are
+-- produced. The hashes then re-identify each file by content even after the
+-- user moves or renames folders, which is what conciliation relies on.
+CREATE TABLE IF NOT EXISTS lineage (
+    id            INTEGER PRIMARY KEY,
+    src_hash      TEXT,   -- H0: hash of the source photo
+    upscaled_hash TEXT,   -- H1: hash of the upscaled output
+    tagged_hash   TEXT,   -- H2: hash of the tagged & renamed result (NULL if untagged)
+    src_path      TEXT,   -- last known absolute paths (informational only)
+    upscaled_path TEXT,
+    tagged_path   TEXT,
+    updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lineage_src      ON lineage(src_hash);
+CREATE INDEX IF NOT EXISTS idx_lineage_upscaled ON lineage(upscaled_hash);
+CREATE INDEX IF NOT EXISTS idx_lineage_tagged   ON lineage(tagged_hash);
+
+-- Memoised file content hashes, shared by every tool. Keyed by absolute path
+-- and validated by (mtime, size) so an unchanged file is hashed only once.
+CREATE TABLE IF NOT EXISTS file_hashes (
+    path  TEXT PRIMARY KEY,
+    mtime REAL,
+    size  INTEGER,
+    hash  TEXT
 );
 """
 
@@ -146,6 +184,116 @@ def find_tag_root(conn, source_root):
         if _norm(row["source_root"]) == target:
             return row
     return None
+
+
+# ─────────────────────────────────────────────
+#  CONTENT HASHING  (file identity that survives moves/renames)
+# ─────────────────────────────────────────────
+
+def content_hash(path, _bufsize=1 << 20):
+    """Return the blake2b-256 hex digest of a file's bytes, or None if it can't
+    be read. blake2b is in the standard library and faster than SHA-256."""
+    try:
+        h = hashlib.blake2b(digest_size=32)
+        with open(path, "rb", buffering=0) as f:
+            for chunk in iter(lambda: f.read(_bufsize), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def hash_file_cached(conn, path):
+    """
+    Content hash of `path`, memoised in file_hashes by (path, mtime, size); the
+    file is re-read only when that fingerprint changes. Does NOT commit — the
+    caller commits (so a big rescan flushes once). Returns the hex digest or None.
+    """
+    norm = _norm(path)
+    try:
+        st = os.stat(path)
+        mtime, size = round(st.st_mtime, 3), st.st_size
+    except OSError:
+        return None
+    row = conn.execute(
+        "SELECT mtime, size, hash FROM file_hashes WHERE path = ?", (norm,)).fetchone()
+    if row is not None and row["mtime"] == mtime and row["size"] == size and row["hash"]:
+        return row["hash"]
+    digest = content_hash(path)
+    if digest is None:
+        return None
+    conn.execute(
+        "INSERT OR REPLACE INTO file_hashes (path, mtime, size, hash) VALUES (?, ?, ?, ?)",
+        (norm, mtime, size, digest))
+    return digest
+
+
+# ─────────────────────────────────────────────
+#  LINEAGE  (source → upscaled → tagged, by content hash)
+# ─────────────────────────────────────────────
+
+def record_upscale_lineage(conn, src_hash, upscaled_hash, src_path=None, upscaled_path=None):
+    """
+    Link a source photo to its upscaled output. Keyed on src_hash: re-upscaling
+    the same source updates the row (and clears any stale tagged_hash, since the
+    previous tagging applied to the old, now-replaced upscaled file).
+    """
+    if not src_hash or not upscaled_hash:
+        return
+    now = datetime.datetime.now().isoformat()
+    row = conn.execute("SELECT id FROM lineage WHERE src_hash = ?", (src_hash,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO lineage (src_hash, upscaled_hash, src_path, upscaled_path, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (src_hash, upscaled_hash, src_path, upscaled_path, now))
+    else:
+        conn.execute(
+            "UPDATE lineage SET upscaled_hash = ?, src_path = ?, upscaled_path = ?, "
+            "tagged_hash = NULL, tagged_path = NULL, updated_at = ? WHERE id = ?",
+            (upscaled_hash, src_path, upscaled_path, now, row["id"]))
+    conn.commit()
+
+
+def record_tag_lineage(conn, in_hash, tagged_hash, tagged_path=None):
+    """
+    Link a tagged & renamed file back to the upscaled file it was made from
+    (matched by content hash == in_hash). If the input is not a known upscaled
+    output (a tag-only tree), a standalone row is created with the input as both
+    source and upscaled base so conciliation can still match it by content.
+    """
+    if not in_hash or not tagged_hash:
+        return
+    now = datetime.datetime.now().isoformat()
+    row = conn.execute("SELECT id FROM lineage WHERE upscaled_hash = ?", (in_hash,)).fetchone()
+    if row is not None:
+        conn.execute(
+            "UPDATE lineage SET tagged_hash = ?, tagged_path = ?, updated_at = ? WHERE id = ?",
+            (tagged_hash, tagged_path, now, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO lineage (src_hash, upscaled_hash, tagged_hash, tagged_path, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (in_hash, in_hash, tagged_hash, tagged_path, now))
+    conn.commit()
+
+
+def lineage_final_hash(conn, src_hash):
+    """
+    Given a source photo's content hash, return the content hash of its final
+    processed counterpart (tagged if tagged, otherwise upscaled), or None.
+    """
+    row = conn.execute(
+        "SELECT upscaled_hash, tagged_hash FROM lineage WHERE src_hash = ?",
+        (src_hash,)).fetchone()
+    if row is None:
+        return None
+    return row["tagged_hash"] or row["upscaled_hash"]
+
+
+def lineage_has_rows(conn):
+    """True if any lineage has been recorded (lets callers skip hashing work)."""
+    return conn.execute("SELECT 1 FROM lineage LIMIT 1").fetchone() is not None
 
 
 # ─────────────────────────────────────────────

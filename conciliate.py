@@ -8,10 +8,11 @@ Runs in two phases, driven over stdin by toolbox_gui.py (or interactively from
 a terminal):
 
   1. SCAN  — match each original image to its processed counterpart. Matching
-             uses the upscale cache (scans/) and the tag/rename cache (trcache/)
-             when they exist, falling back to mirrored-name matching otherwise.
-             Emits a per-folder preview (replaced / skipped / kept). NOTHING on
-             disk is touched in this phase.
+             prefers content-hash lineage (db.lineage), which is independent of
+             paths and so survives moving or renaming either tree; it falls back
+             to mirrored-name matching (using the tag/rename cache) for files
+             with no recorded lineage. Emits a per-folder preview (replaced /
+             skipped / kept). NOTHING on disk is touched in this phase.
   2. RUN   — once the user confirms, perform the chosen operation per matched
              pair:
                archive — move the original into  <original>/__Archive__/<rel>,
@@ -112,28 +113,6 @@ class Logger:
 #  CACHE DISCOVERY
 # ─────────────────────────────────────────────
 
-def find_upscale_cache(original_root):
-    """
-    Locate the eligibility cache whose source_root matches original_root in the
-    shared database. Returns (entries_dict, output_root) or (None, None).
-    Matched by the stored path (case-insensitive).
-    """
-    conn = db.get_conn()
-    root = db.find_upscale_root(conn, original_root)
-    if root is None:
-        return None, None
-    entries = {}
-    for r in conn.execute(
-            "SELECT rel_path, eligible, already_done, skip_reason "
-            "FROM upscale_files WHERE root_id = ?", (root["id"],)):
-        entries[r["rel_path"]] = {
-            "eligible":     bool(r["eligible"]),
-            "already_done": bool(r["already_done"]),
-            "skip_reason":  r["skip_reason"],
-        }
-    return entries, root["output_root"]
-
-
 def find_tr_cache(processed_root):
     """
     Locate the tag&rename cache whose source_root matches processed_root in the
@@ -160,16 +139,52 @@ def find_tr_cache(processed_root):
 #  MATCHING
 # ─────────────────────────────────────────────
 
-def resolve_processed(o_rel, processed_root, tr_index):
+def build_processed_hash_index(processed_root, conn, abort=None):
     """
-    Return the absolute path of the processed counterpart for an original file
-    (given by its path relative to the original root), or None if none exists
-    on disk.
+    Map content-hash -> absolute path for every image in the processed tree.
+    Hashes are memoised in the DB (db.hash_file_cached), so this is cheap on
+    repeat scans of an unchanged tree. The first matching path for a hash wins.
+    """
+    index = {}
+    for dirpath, dirnames, filenames in os.walk(processed_root):
+        if abort is not None and abort():
+            break
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+                continue
+            p_abs = os.path.join(dirpath, fn)
+            h = db.hash_file_cached(conn, p_abs)
+            if h:
+                index.setdefault(h, p_abs)
+    conn.commit()   # flush the freshly-computed file_hashes rows
+    return index
 
-    The upscaler keeps the source filename with a lowercased extension and
-    mirrors the tree, so the upscaled file lives at <dir>/<stem><ext.lower()>.
-    If that file was later tagged & renamed, the tag/rename cache maps it to its
-    current name.
+
+def resolve_by_lineage(o_abs, conn, get_index):
+    """
+    Match an original file to its processed counterpart by content-hash lineage,
+    independent of any path. Hash the original (H0), look up the final hash of
+    its lineage (tagged, else upscaled), then locate that hash in the processed
+    tree. Returns the absolute processed path or None.
+    """
+    h0 = db.hash_file_cached(conn, o_abs)
+    if not h0:
+        return None
+    final = db.lineage_final_hash(conn, h0)
+    if not final:
+        return None
+    hit = get_index().get(final)
+    if hit and os.path.isfile(hit):
+        return hit
+    return None
+
+
+def resolve_by_name(o_rel, processed_root, tr_index):
+    """
+    Fallback matching when no hash lineage exists: the upscaler mirrors the tree
+    and keeps the source filename with a lowercased extension, so the upscaled
+    file lives at <dir>/<stem><ext.lower()>. If it was later tagged & renamed,
+    the tag/rename cache maps it to its current name. Returns abs path or None.
     """
     stem, ext    = os.path.splitext(o_rel)
     upscaled_rel = stem + ext.lower()           # same dir, lowercased extension
@@ -195,9 +210,15 @@ def resolve_processed(o_rel, processed_root, tr_index):
     return None
 
 
-def build_plan(original_root, processed_root, tr_index, abort=None):
+def build_plan(original_root, processed_root, tr_index, conn=None,
+               abort=None, status_cb=None):
     """
     Walk the original tree and pair each image with its processed counterpart.
+
+    Matching prefers content-hash lineage (path-independent — survives moving or
+    renaming either tree); it falls back to mirrored-name matching for files
+    that have no recorded lineage (e.g. older data). The processed-tree hash
+    index is built lazily, only once a lineage match is actually needed.
 
     Returns (plan, folders):
       plan    — list of (original_abs, processed_abs, original_rel) to act on.
@@ -211,6 +232,17 @@ def build_plan(original_root, processed_root, tr_index, abort=None):
     folders      = []
     archive_abs  = _norm(os.path.join(original_root, ARCHIVE_DIRNAME))
     processed_ab = _norm(processed_root)
+
+    has_lineage = bool(conn is not None and db.lineage_has_rows(conn))
+    _index_cache = {}   # built on first lineage hit
+
+    def get_index():
+        if "v" not in _index_cache:
+            if status_cb is not None:
+                status_cb("Hashing processed files …")
+            _index_cache["v"] = build_processed_hash_index(
+                processed_root, conn, abort=abort)
+        return _index_cache["v"]
 
     for dirpath, dirnames, filenames in os.walk(original_root):
         if abort is not None and abort():
@@ -227,7 +259,11 @@ def build_plan(original_root, processed_root, tr_index, abort=None):
                 kept += 1
                 continue
             o_rel = os.path.relpath(abs_f, original_root)
-            p_abs = resolve_processed(o_rel, processed_root, tr_index)
+            p_abs = None
+            if has_lineage:
+                p_abs = resolve_by_lineage(abs_f, conn, get_index)
+            if p_abs is None:
+                p_abs = resolve_by_name(o_rel, processed_root, tr_index)
             if p_abs is None:
                 skipped += 1
                 continue
@@ -237,6 +273,8 @@ def build_plan(original_root, processed_root, tr_index, abort=None):
         rel_dir = os.path.relpath(dirpath, original_root)
         if replaced or skipped:
             folders.append((rel_dir, replaced, skipped, kept))
+    if conn is not None:
+        conn.commit()   # flush file_hashes computed for original files
     return plan, folders
 
 
@@ -398,18 +436,20 @@ def main():
 
     # ── Locate caches ─────────────────────────────────────────────────────────
     _gui_event("STATUS", "Reading caches …")
-    up_entries, up_output = find_upscale_cache(original_root)
+    conn = db.get_conn()
+    has_lineage = db.lineage_has_rows(conn)
     tr_index = find_tr_cache(processed_root)
     log.tee("")
-    log.tee(f"  Upscale cache:    {'found' if up_entries is not None else 'not found (using mirrored-name matching)'}")
+    log.tee(f"  Hash lineage:     {'available (path-independent matching)' if has_lineage else 'none (using mirrored-name matching)'}")
     log.tee(f"  Tag/rename cache: {'found' if tr_index is not None else 'not found'}")
 
     # ── Scan / build the plan ─────────────────────────────────────────────────
     _gui_event("STATUS", "Scanning the original folder …")
     log.tee("")
     log.tee("Scanning …")
-    plan, folders = build_plan(original_root, processed_root, tr_index,
-                               abort=_quit_evt.is_set)
+    plan, folders = build_plan(original_root, processed_root, tr_index, conn=conn,
+                               abort=_quit_evt.is_set,
+                               status_cb=lambda m: _gui_event("STATUS", m))
     if _quit_evt.is_set():
         log.tee("Cancelled during scan.")
         log.close()
