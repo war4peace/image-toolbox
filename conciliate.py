@@ -220,16 +220,20 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     that have no recorded lineage (e.g. older data). The processed-tree hash
     index is built lazily, only once a lineage match is actually needed.
 
-    Returns (plan, folders):
-      plan    — list of (original_abs, processed_abs, original_rel) to act on.
-      folders — list of (rel_dir, replaced, skipped, kept) per folder, for the
-                preview. 'kept' counts non-image files (never touched); 'skipped'
-                counts images with no processed counterpart (never touched).
+    Returns (plan, folders, kept_files):
+      plan       — list of (original_abs, processed_abs, original_rel) to act on.
+      folders    — list of (rel_dir, replaced, skipped, kept) per folder, for the
+                   preview. 'kept' counts non-image files (never touched);
+                   'skipped' counts images with no processed counterpart.
+      kept_files — absolute paths of the non-image files that were kept, so the
+                   preview can list exactly what was left untouched (e.g. a
+                   hidden Thumbs.db that Explorer doesn't show).
     Skips the __Archive__ subfolder and the processed tree if it is nested
     inside the original tree.
     """
     plan         = []
     folders      = []
+    kept_files   = []
     archive_abs  = _norm(os.path.join(original_root, ARCHIVE_DIRNAME))
     processed_ab = _norm(processed_root)
 
@@ -257,6 +261,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
             abs_f = os.path.join(dirpath, fn)
             if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
                 kept += 1
+                kept_files.append(abs_f)
                 continue
             o_rel = os.path.relpath(abs_f, original_root)
             p_abs = None
@@ -275,7 +280,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
             folders.append((rel_dir, replaced, skipped, kept))
     if conn is not None:
         conn.commit()   # flush file_hashes computed for original files
-    return plan, folders
+    return plan, folders, kept_files
 
 
 # ─────────────────────────────────────────────
@@ -447,9 +452,9 @@ def main():
     _gui_event("STATUS", "Scanning the original folder …")
     log.tee("")
     log.tee("Scanning …")
-    plan, folders = build_plan(original_root, processed_root, tr_index, conn=conn,
-                               abort=_quit_evt.is_set,
-                               status_cb=lambda m: _gui_event("STATUS", m))
+    plan, folders, kept_files = build_plan(original_root, processed_root, tr_index,
+                                           conn=conn, abort=_quit_evt.is_set,
+                                           status_cb=lambda m: _gui_event("STATUS", m))
     if _quit_evt.is_set():
         log.tee("Cancelled during scan.")
         log.close()
@@ -467,6 +472,14 @@ def main():
          "kept": total_kept, "mode": mode}))
 
     _print_preview_table(folders, log)
+    # List the kept non-image files by full path. These are easy to miss in
+    # Explorer (e.g. a hidden Thumbs.db), so spell them out to make clear
+    # exactly what was left untouched and why the "kept" count is non-zero.
+    if kept_files:
+        log.tee("")
+        log.tee("Non-image files: ")
+        for p in kept_files:
+            log.tee(p)
     log.tee("")
     log.tee(f"  Total: {total_replaced} image(s) to replace, "
             f"{total_skipped} without a match (left untouched), "
