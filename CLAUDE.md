@@ -39,15 +39,17 @@ are left alone and logged. Selectable description language, force-tag /
 force-rename, and **one-click Undo** (every change is recorded before anything is
 modified). Already-tagged files are skipped on re-runs.
 
-**Conciliation** (experimental, 0.2.0) — replaces original photos with their
+**Conciliation** (experimental, 0.2.1) — replaces original photos with their
 processed (upscaled, optionally tagged & renamed) counterparts. Two phases:
 **Scan/Preview** builds a per-folder plan (replaced / no-match / non-image-kept
-counts) and touches nothing; **Run** then either archives originals into an
-`__Archive__` subfolder or deletes them (delete needs an extra confirmation),
-moving the processed files into the original tree. Matching uses the upscale and
-tag/rename caches when present, falling back to mirrored-name matching.
-Originals without a processed counterpart, and non-image files, are never
-touched.
+counts, and lists the kept non-image files by path) and touches nothing; **Run**
+then either archives originals into an `__Archive__` subfolder or deletes them
+(delete needs an extra confirmation), moving the processed files into the
+original tree. Matching prefers the **content-hash lineage** (0.2.1) recorded as
+files are produced, so a source still matches its processed counterpart after
+folders are moved or renamed; it falls back to mirrored-name matching for files
+with no recorded lineage. Originals without a processed counterpart, and
+non-image files, are never touched.
 
 **Settings** — Ollama URL (with reachability check) and model picklist;
 auto-straighten toggle/threshold; Resolution Target and skip-cutoff; SeedVR
