@@ -147,11 +147,26 @@ try {
             Write-Host "  Downloading Ollama ..."
             Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $tmp -UseBasicParsing
             Write-Host "  Installing Ollama (this can take a minute) ..."
-            Start-Process -Wait $tmp -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+            # The Ollama installer auto-launches its desktop app at the end and,
+            # via its Inno Setup [Run] entry, does NOT return until that window is
+            # closed -- so a blocking '-Wait' hangs the bootstrap here until the
+            # user manually closes Ollama. Start it non-blocking instead and
+            # detect completion by the appearance of ollama.exe, with a timeout.
+            $proc = Start-Process $tmp -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -PassThru
+            $deadline = (Get-Date).AddMinutes(5)
+            do {
+                Start-Sleep -Seconds 2
+                $ollamaExe = Find-Ollama
+            } until ($ollamaExe -or $proc.HasExited -or (Get-Date) -gt $deadline)
+            Start-Sleep -Seconds 1
+            $ollamaExe = Find-Ollama          # final re-check (covers exit/copy races)
             Remove-Item $tmp -ErrorAction SilentlyContinue
-            $ollamaExe = Find-Ollama
-            if ($ollamaExe) { Write-Host "  Installed: $ollamaExe" }
-            else { Write-Host "  WARNING: Ollama installation did not complete - skipping." -ForegroundColor Yellow }
+            if ($ollamaExe) {
+                Write-Host "  Installed: $ollamaExe"
+                Write-Host "  (You can close the Ollama window that just opened; setup continues here.)"
+            } else {
+                Write-Host "  WARNING: Ollama installation did not complete - skipping." -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  Skipped. You can install it later from https://ollama.com"
         }
