@@ -68,6 +68,24 @@ function Confirm-Yes($prompt) {
     return ($answer -eq "" -or $answer -match "^[Yy]")
 }
 
+function Close-Countdown($seconds, $message) {
+    # Count down on a single rewritten line, then return so the window closes.
+    # Any key press closes immediately. Falls back to a plain wait when there
+    # is no interactive console (e.g. output redirected).
+    try {
+        for ($s = $seconds; $s -gt 0; $s--) {
+            Write-Host -NoNewline ("`r" + ($message -f $s))
+            for ($i = 0; $i -lt 10; $i++) {
+                if ([Console]::KeyAvailable) { $null = [Console]::ReadKey($true); Write-Host ""; return }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } catch {
+        Start-Sleep -Seconds $seconds
+    }
+    Write-Host ""
+}
+
 try {
     Write-Host "=========================================" -ForegroundColor Green
     Write-Host "  Image Toolbox - first-launch setup"      -ForegroundColor Green
@@ -132,7 +150,7 @@ try {
     Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
     Step "Installing the remaining components"
-    Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm")
+    Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt")
 
     # -- 6. Ollama (optional - powers the Tag & Rename feature) ---------------
     Step "Checking for Ollama (used by the Tag & Rename feature)"
@@ -218,7 +236,7 @@ try {
     Write-Host ""
     Write-Host "  A full copy of this output was saved to bootstrap.log"
     try { Stop-Transcript | Out-Null } catch {}
-    Read-Host "Image Toolbox is starting - press Enter to close this window"
+    Close-Countdown 10 "  Image Toolbox is starting - this window closes in {0,2}s (press a key to close now) "
 }
 catch {
     Write-Host ""

@@ -57,6 +57,20 @@ pipeline options; Discord webhook (with Test); default folders per tool.
 
 **Notifications** — Discord webhook on queue completion and on errors.
 
+**Home Assistant (MQTT)** (0.2.4) — optional, opt-in integration that publishes
+app state to an MQTT broker for Home Assistant / MQTT Explorer. No separate
+enable toggle: MQTT activates whenever a broker **host** is configured in
+Settings (clear the host to disable). A persistent client keeps the connection
+up for the app's lifetime, verifies connectivity on startup, auto-reconnects,
+and sets an availability **LWT** (`image-toolbox/availability` → online/offline)
+so HA always knows if the app is alive. Retained topics: `version`, `update`,
+`latest_version`, `last_run` (JSON summary), `last_used`, plus live `task/*`
+state (`name` = idle/upscaling/tagging/conciliating, `details`, `runtime`,
+`progress` = X/Y, `eta`, `average_processing_time`, `last_processing_time`).
+Settings has host/port/username/password/client-id fields, a "Test" button, and
+a "Publish now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`);
+the import is lazy so older venvs still launch. See `mqtt_publisher.py`.
+
 **Updates** (0.2.3) — in-app update check against the GitHub Releases API.
 Checks on startup (opt-out) and on demand from Settings; when a newer release
 exists it shows the patch notes and can download `ImageToolboxSetup.exe`, launch
@@ -77,12 +91,15 @@ Top-level Python (the actual app — note line counts give a sense of weight):
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename — see `docs/content-hash-lineage.md`); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools). `get_conn()` opens once per process; on first creation it imports the legacy `scans/*.json` and `trcache/*.cache` files whose source folder still exists (stale ones skipped). Logs are deliberately NOT in the DB. |
 | `orientation.py` (~170 lines) | Auto-straighten: a small pretrained CNN (`ternaus/check_orientation`) detects sideways photos and losslessly rotates them upright; fails safe (leaves ambiguous/upside-down alone). Heavy imports are lazy. |
 | `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
+| `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 
 Configuration & state:
 
 - `config.json` — persistent settings: `seedvr2`, `ollama`, `upscale`,
-  `tagging`, `defaults` sections. Edited via the Settings tab; preserved across
-  installer upgrades. **Don't hand-edit in normal flow.**
+  `tagging`, `defaults`, `mqtt`, `updates` sections. Edited via the Settings tab;
+  preserved across installer upgrades. **Don't hand-edit in normal flow**, and
+  the tracked copy is a credential-free template — never commit real `mqtt`
+  broker credentials.
 - `gui_settings.json` — GUI-only state (window geometry, thumbnail size).
 - `db/cache.db` — the single SQLite cache (eligibility + tag/rename), see
   `db.py`. **This replaces the old per-folder JSON caches.** The legacy `scans/`
@@ -98,7 +115,9 @@ Engine, packaging & CI:
   itself is not needed). Treat as vendored/third-party.
 - `.venv/` — the Python 3.12 environment (PyTorch CUDA + seedvr2 requirements).
 - `bootstrap.ps1` — first-launch bootstrapper: downloads Python, PyTorch CUDA,
-  the SeedVR2 engine. Idempotent. `Image Toolbox.cmd` launches it + the app.
+  the SeedVR2 engine, and `paho-mqtt`. Idempotent. `Image Toolbox.cmd` launches
+  it + the app. The final "starting" window auto-closes on a 10-second countdown
+  (press any key to close early).
 - `installer/ImageToolbox.iss` — Inno Setup script; ships only the scripts +
   bootstrap (heavy components download on first launch). Built by
   `.github/workflows/build-installer.yml` on `v*` tags → GitHub Releases.

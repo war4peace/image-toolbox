@@ -53,18 +53,44 @@ self-updates.
 ## 3. Home Assistant integration — Medium
 Statistics, cache file state, application status.
 
-- **What helps:** the data is all readable — app status (is a subprocess
-  running), cache/scan state (`scans/`), processed counts.
-- **The hard part is transport:** there is no long-running server today.
-  Easiest path is MQTT discovery (publish sensors HA auto-discovers) or pushing
-  to HA's REST API, driven by a small background publisher thread in the GUI.
-- **Work needed:** an MQTT dependency (the app is currently proudly
-  dependency-light) or hand-rolled REST pushes; a config section; a publisher
-  that samples state.
+> **Status: implemented (0.2.4).** See `mqtt_publisher.py` and the
+> "Home Assistant (MQTT)" section in `toolbox_gui.py`'s Settings tab. MQTT is a
+> deliberate, opt-in dependency (`paho-mqtt`, installed by `bootstrap.ps1`); it
+> stays disabled until a broker host is configured (no separate enable toggle).
+> A persistent `MqttClient` keeps the connection up for the app's lifetime, sets
+> an availability LWT (`image-toolbox/availability` → online/offline), verifies
+> connectivity on startup, and publishes retained topics: `version`, `update`,
+> `latest_version`, `last_run` (JSON), `last_used`, and live `task/*` state
+> (`name`, `details`, `runtime`, `progress`, `eta`, `average_processing_time`,
+> `last_processing_time`). A "Test" button checks the broker from Settings.
+
+- **What helped:** the data is all readable — app status (is a subprocess
+  running), cache/scan state, processed counts; the existing `@@TBX@@` GUI-event
+  seam surfaces live task phase/progress/ETA, which the publisher mirrors.
+- **Transport chosen:** MQTT (retained topics + LWT) driven by a background
+  publisher in the GUI — no long-running HTTP server needed.
 - **Coupling:** if the HTTP interface (#5) is built first, HA can simply scrape
-  it and this collapses to near-trivial.
-- **Risks:** introduces a networking dependency and a persistent background loop
-  into a currently simple app.
+  it; MQTT was the cheaper path given no server exists today.
+- **Risks accepted:** a networking dependency and a persistent background loop —
+  kept contained (lazy import, disabled until configured, best-effort publishes).
+
+### 3a. System telemetry sampler (follow-up to #3) — Easy–Medium
+Display CPU usage, GPU VRAM usage and GPU temperature in-app, and publish them to
+MQTT on a timer (~every 30 s).
+
+- **Why now:** natural extension of #3 — once the MQTT publisher exists, adding
+  periodic gauges is mostly a sampling loop plus a few extra retained topics
+  (e.g. `image-toolbox/system/cpu`, `/gpu_vram`, `/gpu_temp`) and a small in-app
+  readout.
+- **Work needed:** a background sampler thread (reuse the publisher's loop);
+  read CPU via stdlib/`psutil`, and NVIDIA GPU VRAM/temperature via `nvidia-smi`
+  (already on a CUDA box) or NVML (`pynvml`); throttle to ~30 s; render a compact
+  status row in the GUI.
+- **Decisions to make:** whether to take on `psutil`/`pynvml` or shell out to
+  `nvidia-smi` to stay dependency-light; sample cadence; whether to publish
+  Home Assistant MQTT discovery configs so the sensors appear automatically.
+- **Risks:** low — read-only telemetry; main watch-item is not spawning
+  `nvidia-smi` too often or blocking the UI thread.
 
 ## 4. Remote upscaling (RunPod) — Hard
 Spin up a runpod.io pod, point the application to the pod, install requirements
@@ -122,11 +148,12 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1 and #2 are independent quick wins** — they can ship anytime, need no new
-  dependencies, and don't change the process model.
-- **#6 depends on #5** (headless needs a web UI), and **#3 is dramatically
-  cheaper if #5 lands first.** If the web direction is on the roadmap, sequence
-  **#5 → #3 → #6** to avoid duplicated work.
+- **#1, #2 and #3 are shipped** (0.2.0–0.2.4). #1 and #2 were independent quick
+  wins; #3 took MQTT rather than waiting on #5, accepting a contained networking
+  dependency. #3a (telemetry sampler) is the natural next increment on top of #3.
+- **#6 depends on #5** (headless needs a web UI). With #3 already done over MQTT,
+  the **#5 → #3** coupling no longer drives sequencing; #5 and #6 remain the
+  large milestones.
 - **Architectural watch-item:** the app is currently dependency-light and
   Windows-only. #3, #5, and #6 each push it toward extra packages, a
   long-running server, and cross-platform support — adopt those deliberately.

@@ -57,6 +57,18 @@
     "defaults": {
         "upscale_source": "",
         "upscale_output": "",
-        "tag_folder": ""
+        "tag_folder": "",
+        "conciliate_original": "",
+        "conciliate_processed": ""
+    },
+    "mqtt": {
+        "host": "",
+        "port": 1883,
+        "username": "",
+        "password": "",
+        "client_id": "image-toolbox-beededbe"
+    },
+    "updates": {
+        "auto_check": true
     }
 }

@@ -29,6 +29,7 @@ import json
 import queue
 import codecs
 import shutil
+import datetime
 import threading
 import subprocess
 import webbrowser
@@ -36,6 +37,7 @@ import urllib.request
 import urllib.error
 
 import updater
+import mqtt_publisher
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -44,7 +46,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -118,6 +120,20 @@ def update_skipped_version():
 def set_update_skipped_version(version):
     CFG.setdefault("updates", {})["skip_version"] = version or ""
     save_config()
+
+
+# ─────────────────────────────────────────────
+#  MQTT / HOME ASSISTANT  (config.json "mqtt" section)
+# ─────────────────────────────────────────────
+
+def mqtt_config():
+    return CFG.get("mqtt", {})
+
+
+def mqtt_enabled():
+    """MQTT is active whenever a broker host is configured — no separate toggle.
+    Clear the host in Settings to disable publishing."""
+    return bool((mqtt_config().get("host") or "").strip())
 
 
 # ─────────────────────────────────────────────
@@ -609,6 +625,10 @@ class ToolTab(ttk.Frame):
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
         self._final_top     = ""                # summary line shown above the final message
         self._finished      = True              # True when no run is in progress
+        self.mqtt_task_name = "task"            # MQTT task/name label (overridden)
+        self._last_done     = None              # last DONE payload (for MQTT last_run)
+        self._mqtt_prev_elapsed   = 0.0         # for last-image processing time
+        self._mqtt_prev_processed = 0
 
     # ── UI helpers ──────────────────────────────────────────────────────────
 
@@ -674,6 +694,10 @@ class ToolTab(ttk.Frame):
     def _on_phase_change(self):
         self._phase_text = self.status_var.get()
         self._refresh_status()
+        # Mirror the phase line to MQTT as the task's detailed status. (No-op
+        # until the MQTT client exists, so the construction-time "Ready." is
+        # never published.)
+        self.app.mqtt_publish({mqtt_publisher.TASK_DETAILS_TOPIC: self._phase_text})
 
     def _refresh_status(self):
         if not hasattr(self, "status_bot"):
@@ -714,6 +738,17 @@ class ToolTab(ttk.Frame):
             self.viewlog_btn.configure(state="normal")
         # If the shared log window is open, make it follow this run's output.
         self.app.rebind_log_if_open(self.console, self._log_title())
+        # MQTT: a task is now active — reset timing and announce it.
+        self._last_done = None
+        self._mqtt_prev_elapsed   = 0.0
+        self._mqtt_prev_processed = 0
+        self.app.mqtt_publish({
+            mqtt_publisher.TASK_NAME_TOPIC:     self.mqtt_task_name,
+            mqtt_publisher.TASK_DETAILS_TOPIC:  "starting",
+            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
+            mqtt_publisher.TASK_ETA_TOPIC:      "",
+            mqtt_publisher.TASK_RUNTIME_TOPIC:  "0",
+        })
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
         return True
@@ -838,6 +873,8 @@ class ToolTab(ttk.Frame):
         elif kind == "LOG" and payload:
             self._log_path = payload
             self.viewlog_btn.configure(state="normal")
+        elif kind == "DONE":
+            self._last_done = payload   # JSON summary; published to MQTT on exit
 
     def _reset_stream_state(self):
         """Reset the marker parser, console and preview strip before a new run."""
@@ -871,6 +908,7 @@ class ToolTab(ttk.Frame):
             return
         self.progress.set(cur * 100 / tot)
         self.status_var.set(f"Processing image {cur} of {tot} …")
+        self.app.mqtt_publish({mqtt_publisher.TASK_PROGRESS_TOPIC: f"{cur}/{tot}"})
 
     def _handle_eta(self, payload):
         """ETA event from the running tool: 'elapsed|processed|idx|total'.
@@ -888,10 +926,24 @@ class ToolTab(ttk.Frame):
             return
         if total > 0:
             self.progress.set(idx * 100 / total)
+        mqtt_values = {
+            mqtt_publisher.TASK_RUNTIME_TOPIC:  str(int(elapsed)),
+            mqtt_publisher.TASK_PROGRESS_TOPIC: f"{idx}/{total}",
+        }
         if processed > 0 and total > 0:
             avg       = elapsed / processed
             remaining = max(0, total - idx)
             self.eta_var.set(_fmt_eta(avg * remaining))
+            mqtt_values[mqtt_publisher.TASK_ETA_TOPIC] = _fmt_eta(avg * remaining)
+            mqtt_values[mqtt_publisher.TASK_AVG_TOPIC] = f"{avg:.1f}"
+            # Last-image time = work done since the previous ETA tick.
+            d_proc = processed - self._mqtt_prev_processed
+            if d_proc > 0:
+                last = (elapsed - self._mqtt_prev_elapsed) / d_proc
+                mqtt_values[mqtt_publisher.TASK_LAST_TOPIC] = f"{max(0.0, last):.1f}"
+        self._mqtt_prev_elapsed   = elapsed
+        self._mqtt_prev_processed = processed
+        self.app.mqtt_publish(mqtt_values)
 
     def send(self, line):
         """Send one control line to the child's stdin."""
@@ -921,7 +973,28 @@ class ToolTab(ttk.Frame):
         return True
 
     def on_exit(self, code):
-        """Override in subclasses."""
+        """Subclasses override for their own UI, then call super().on_exit(code)
+        so the shared MQTT 'task finished' state is published once."""
+        self._publish_task_idle()
+
+    def _publish_task_idle(self):
+        """MQTT: the task ended — go idle and publish a last_run summary."""
+        if self.app.mqtt is None:
+            return
+        values = {
+            mqtt_publisher.TASK_NAME_TOPIC:     "idle",
+            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
+            mqtt_publisher.TASK_ETA_TOPIC:      "",
+        }
+        if self._last_done:
+            try:
+                summary = json.loads(self._last_done)
+            except (ValueError, TypeError):
+                summary = {"raw": self._last_done}
+            summary.setdefault("tool", self.mqtt_task_name)
+            summary["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+            values[mqtt_publisher.LAST_RUN_TOPIC] = json.dumps(summary)
+        self.app.mqtt_publish(values)
 
 
 # ─────────────────────────────────────────────
@@ -1292,7 +1365,8 @@ class UpscaleTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
-        self.tool_name    = "Batch Upscaler"
+        self.tool_name      = "Batch Upscaler"
+        self.mqtt_task_name = "upscaling"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
         self._paused      = False
@@ -1512,6 +1586,7 @@ class UpscaleTab(ToolTab):
             self.status_var.set("Done. The upscaled photos are in the output folder.")
         else:
             self.status_var.set(f"Stopped with an error (code {code}) — see the messages above.")
+        super().on_exit(code)
 
 
 # ─────────────────────────────────────────────
@@ -1538,7 +1613,8 @@ class TagTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
-        self.tool_name  = "Tag & Rename"
+        self.tool_name      = "Tag & Rename"
+        self.mqtt_task_name = "tagging"
         self.dir_var    = tk.StringVar()
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
@@ -1727,6 +1803,7 @@ class TagTab(ToolTab):
                 self.status_var.set("Done. Descriptions written and files renamed where applicable.")
         else:
             self.status_var.set(f"Stopped with an error (code {code}) — see the messages above.")
+        super().on_exit(code)
 
 
 # ─────────────────────────────────────────────
@@ -1973,6 +2050,47 @@ class SettingsTab(ttk.Frame):
         self.update_status = ttk.Label(sec, text="", foreground="#666")
         self.update_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
 
+        # ── Home Assistant (MQTT) ───────────────────────────────────────────────
+        mqtt = CFG.get("mqtt", {})
+        sec = self._section(body, "Home Assistant (MQTT)")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, wraplength=560, foreground="#666",
+                  text=("Publishes status to an MQTT broker (e.g. Home Assistant's "
+                        "Mosquitto). Enabled automatically whenever a broker host is "
+                        "set below — clear the host to disable. The app verifies the "
+                        "connection on startup.")
+                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+
+        self.mqtt_host_var = tk.StringVar(value=mqtt.get("host", ""))
+        self.mqtt_port_var = tk.StringVar(value=str(mqtt.get("port", 1883)))
+        self.mqtt_user_var = tk.StringVar(value=mqtt.get("username", ""))
+        self.mqtt_pass_var = tk.StringVar(value=mqtt.get("password", ""))
+        self.mqtt_cid_var  = tk.StringVar(
+            value=mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
+
+        ttk.Label(sec, text="Broker host:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(sec, textvariable=self.mqtt_host_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Label(sec, text="Port:").grid(row=1, column=2, sticky="e", pady=3)
+        ttk.Spinbox(sec, from_=1, to=65535, width=7,
+                    textvariable=self.mqtt_port_var).grid(row=1, column=3, sticky="w", padx=6, pady=3)
+
+        ttk.Label(sec, text="Username:").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(sec, textvariable=self.mqtt_user_var).grid(row=2, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Label(sec, text="Password:").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(sec, textvariable=self.mqtt_pass_var, show="•").grid(
+            row=3, column=1, sticky="ew", padx=6, pady=3)
+        self.mqtt_test_btn = ttk.Button(sec, text="Test", command=self._test_mqtt)
+        self.mqtt_test_btn.grid(row=3, column=2, columnspan=2, sticky="e", padx=6, pady=3)
+
+        ttk.Label(sec, text="Client ID:").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Entry(sec, textvariable=self.mqtt_cid_var).grid(row=4, column=1, sticky="ew", padx=6, pady=3)
+
+        ttk.Button(sec, text="Publish now", command=self._publish_mqtt).grid(
+            row=4, column=2, columnspan=2, sticky="e", padx=6, pady=3)
+        self.mqtt_status = ttk.Label(sec, text="", foreground="#666")
+        self.mqtt_status.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
@@ -2092,6 +2210,57 @@ class SettingsTab(ttk.Frame):
         else:
             self.update_status.configure(text=payload, foreground="#b3261e")
 
+    def _mqtt_fields(self):
+        """The MQTT settings currently in the form (so Test works pre-Save)."""
+        try:
+            port = int(self.mqtt_port_var.get())
+        except (ValueError, tk.TclError):
+            port = 1883
+        return {
+            "host":      self.mqtt_host_var.get().strip(),
+            "port":      port,
+            "username":  self.mqtt_user_var.get().strip(),
+            "password":  self.mqtt_pass_var.get(),
+            "client_id": self.mqtt_cid_var.get().strip() or mqtt_publisher.DEFAULT_CLIENT_ID,
+        }
+
+    def _test_mqtt(self):
+        cfg = self._mqtt_fields()
+        if not cfg["host"]:
+            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
+            return
+        self.mqtt_test_btn.configure(state="disabled")
+        self.mqtt_status.configure(text="Testing connection…", foreground="#666")
+
+        def work():
+            ok, msg = mqtt_publisher.test_connection(cfg)
+            def apply():
+                self.mqtt_test_btn.configure(state="normal")
+                self.mqtt_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _publish_mqtt(self):
+        cfg = self._mqtt_fields()
+        if not cfg["host"]:
+            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
+            return
+        self.mqtt_status.configure(text="Publishing…", foreground="#666")
+
+        def work():
+            status, payload = updater.check_for_update(APP_VERSION)
+            update_available = (status == "update")
+            ok, msg = mqtt_publisher.publish_state(cfg, {
+                mqtt_publisher.VERSION_TOPIC:        APP_VERSION,
+                mqtt_publisher.UPDATE_TOPIC:         "yes" if update_available else "no",
+                mqtt_publisher.LATEST_VERSION_TOPIC: payload.version if update_available else APP_VERSION,
+            })
+            self.after(0, lambda: self.mqtt_status.configure(
+                text=msg, foreground="#1a7f37" if ok else "#b3261e"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _pick_folder(self, var):
         folder = filedialog.askdirectory(title="Choose a folder")
         if folder:
@@ -2162,7 +2331,13 @@ class SettingsTab(ttk.Frame):
 
         CFG.setdefault("updates", {})["auto_check"] = bool(self.auto_update_var.get())
 
+        mqtt = CFG.setdefault("mqtt", {})
+        mqtt.pop("enabled", None)        # MQTT is now gated by host being set
+        mqtt.update(self._mqtt_fields())
+
         if save_config():
+            # Apply MQTT changes immediately (connect/disconnect/reconfigure).
+            self.app.restart_mqtt()
             self.save_status.configure(
                 text="Saved.", foreground="#1a7f37")
         else:
@@ -2192,7 +2367,8 @@ class ConciliateTab(ToolTab):
 
     def __init__(self, notebook, app):
         super().__init__(notebook, app)
-        self.tool_name = "Conciliation"
+        self.tool_name      = "Conciliation"
+        self.mqtt_task_name = "conciliating"
         self.orig_var  = tk.StringVar()
         self.proc_var  = tk.StringVar()
         self.mode_var  = tk.StringVar(value=CONCILIATE_MODES[0][0])
@@ -2311,6 +2487,8 @@ class ConciliateTab(ToolTab):
     def _handle_event(self, kind, payload):
         if kind == "STATUS":
             self.status_lbl.configure(text=payload)
+            if self.running:
+                self.app.mqtt_publish({mqtt_publisher.TASK_DETAILS_TOPIC: payload})
         elif kind == "FOLDER":
             try:
                 d = json.loads(payload)
@@ -2339,7 +2517,9 @@ class ConciliateTab(ToolTab):
             if tot > 0:
                 self.progress.grid()
                 self.progress.set(cur * 100 / tot)
+                self.app.mqtt_publish({mqtt_publisher.TASK_PROGRESS_TOPIC: f"{cur}/{tot}"})
         elif kind == "DONE":
+            self._last_done = payload     # for MQTT last_run (published on exit)
             try:
                 self._result = json.loads(payload)
             except ValueError:
@@ -2505,6 +2685,10 @@ class ConciliateTab(ToolTab):
         else:
             self.status_lbl.configure(
                 text=f"Stopped with an error (code {code}) — see the log.")
+        # Conciliate uses its own status label (not status_var), so publish the
+        # final details line explicitly before going idle.
+        self.app.mqtt_publish({mqtt_publisher.TASK_DETAILS_TOPIC: self.status_lbl.cget("text")})
+        super().on_exit(code)
 
 
 # ─────────────────────────────────────────────
@@ -2705,11 +2889,19 @@ class App(tk.Tk):
         self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Check GitHub for a newer release shortly after the window is up (off
-        # the UI thread). Skipped versions and the opt-out are respected.
+        # Persistent MQTT client (Home Assistant integration). Starts here so the
+        # availability LWT is registered before anything else happens.
+        self.mqtt = None
+        if mqtt_enabled():
+            self.start_mqtt()
+
+        # Shortly after the window is up, run the startup checks off the UI
+        # thread: one GitHub release check feeds both the update prompt (if the
+        # auto-check is on) and the MQTT version/update topics (if enabled).
         self._update_dialog = None
-        if update_auto_check_enabled():
-            self.after(1500, self._startup_update_check)
+        if update_auto_check_enabled() or mqtt_enabled():
+            self.after(1500, lambda: threading.Thread(
+                target=self._startup_worker, daemon=True).start())
 
     def _migrate_default_folders(self):
         """Carry default folders saved by older builds in gui_settings.json over
@@ -2788,13 +2980,77 @@ class App(tk.Tk):
 
     # ── Updates ──────────────────────────────────────────────────────────────
 
-    def _startup_update_check(self):
-        """Background check on launch; only prompts for a not-skipped update."""
-        def work():
-            status, payload = updater.check_for_update(APP_VERSION)
-            if status == "update" and payload.version != update_skipped_version():
-                self.after(0, lambda: self.show_update_dialog(payload))
-        threading.Thread(target=work, daemon=True).start()
+    def _startup_worker(self):
+        """
+        Launch-time background task (off the UI thread): check GitHub once, then
+        prompt for a not-skipped update (if the auto-check is on) and/or publish
+        the version snapshot to MQTT (if enabled).
+        """
+        status, payload = updater.check_for_update(APP_VERSION)
+        update_available = (status == "update")
+        latest = payload.version if update_available else APP_VERSION
+
+        if self.mqtt is not None:
+            self.mqtt.publish_many({
+                mqtt_publisher.VERSION_TOPIC:        APP_VERSION,
+                mqtt_publisher.UPDATE_TOPIC:         "yes" if update_available else "no",
+                mqtt_publisher.LATEST_VERSION_TOPIC: latest,
+            })
+
+        if (update_auto_check_enabled() and update_available
+                and payload.version != update_skipped_version()):
+            self.after(0, lambda: self.show_update_dialog(payload))
+
+    # ── MQTT (Home Assistant) ────────────────────────────────────────────────
+
+    def start_mqtt(self):
+        """Start the persistent MQTT client from the saved config and verify the
+        connection (the result is reported via _on_mqtt_state). Best-effort."""
+        if not mqtt_enabled():
+            return
+        if not mqtt_publisher.mqtt_available():
+            self._on_mqtt_state(False, "paho-mqtt is not installed.")
+            return
+        client = mqtt_publisher.MqttClient(mqtt_config(), status_cb=self._on_mqtt_state)
+        ok, msg = client.start()
+        if ok:
+            self.mqtt = client
+            self._set_mqtt_status("Connecting…", None)
+        else:
+            self.mqtt = None
+            self._set_mqtt_status(msg, False)
+
+    def _set_mqtt_status(self, text, connected):
+        st = getattr(self, "settings_tab", None)
+        if st is not None and hasattr(st, "mqtt_status"):
+            color = "#666" if connected is None else ("#1a7f37" if connected else "#b3261e")
+            st.mqtt_status.configure(text=f"MQTT: {text}", foreground=color)
+
+    def _on_mqtt_state(self, connected, message):
+        """Connection-state callback (runs on the MQTT thread) → update the UI."""
+        try:
+            self.after(0, lambda: self._set_mqtt_status(message, connected))
+        except Exception:
+            pass
+
+    def stop_mqtt(self, last_used=None):
+        if self.mqtt is not None:
+            self.mqtt.stop(last_used=last_used)
+            self.mqtt = None
+
+    def restart_mqtt(self):
+        """Apply changed MQTT settings: drop any existing client and re-start."""
+        self.stop_mqtt()
+        if mqtt_enabled():
+            self.start_mqtt()
+
+    def mqtt_publish(self, values):
+        """Publish a {topic: payload} mapping if the client is running (no-op
+        otherwise). Called from the tool tabs as task state changes. Uses getattr
+        because the tabs are constructed before self.mqtt is assigned."""
+        client = getattr(self, "mqtt", None)
+        if client is not None:
+            client.publish_many(values)
 
     def show_update_dialog(self, info):
         """Open (or focus) the single update dialog for the given UpdateInfo."""
@@ -2823,6 +3079,8 @@ class App(tk.Tk):
         self._save_geometry()
         if self.log_window is not None and self.log_window.winfo_exists():
             self.log_window.save_geometry()
+        # Record last-used time and announce going offline before we exit.
+        self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))
         self.destroy()
 
 

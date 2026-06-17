@@ -1730,6 +1730,17 @@ def main():
     print(f"\n  ({total_rotated} rotated, {total_failed} failed, {total_skipped} already tagged)\n")
     print(f"  Undo cache: {cache_path_display}\n")
 
+    # GUI: machine-readable run summary (drives the MQTT last_run topic).
+    _gui_event("DONE", json.dumps({
+        "tool":            "tag",
+        "processed":       total_processed,
+        "rotated":         total_rotated,
+        "skipped":         total_skipped,
+        "failed":          total_failed,
+        "elapsed_seconds": round(grand_elapsed, 1),
+        "stop_reason":     stop_reason or "completed",
+    }))
+
     # ── Discord: queue finished / stopped ────────────────────────────────────
     if stop_reason == "ollama":
         notif_title, notif_color = "Tag & Rename -- Stopped (Ollama Unreachable)", 15548997   # red

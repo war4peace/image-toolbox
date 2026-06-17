@@ -1500,6 +1500,17 @@ def main():
 
     # ── Discord: queue finished / stopped ───────────────────────────────────
     user_quit = bool(stats1.get("user_quit")) or (stats2 is not None and bool(stats2.get("user_quit")))
+
+    # GUI: machine-readable run summary (drives the MQTT last_run topic).
+    _gui_event("DONE", json.dumps({
+        "tool":            "upscale",
+        "processed":       total_processed,
+        "skipped":         total_skipped + total_skipped_missing + total_skipped_corrupt,
+        "corrupt":         total_skipped_corrupt,
+        "failed":          total_failed,
+        "elapsed_seconds": round(grand_elapsed, 1),
+        "stopped_by_user": user_quit,
+    }))
     if total_failed > 0:
         notif_title, notif_color = "Upscale Queue -- Finished with Failures", 16776960   # yellow
     elif user_quit:
