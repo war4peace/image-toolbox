@@ -39,6 +39,7 @@ Source: "..\orientation.py";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\upscale_engine.py";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\conciliate.py";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\db.py";               DestDir: "{app}"; Flags: ignoreversion
+Source: "..\updater.py";          DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion

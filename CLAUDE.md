@@ -57,6 +57,12 @@ pipeline options; Discord webhook (with Test); default folders per tool.
 
 **Notifications** — Discord webhook on queue completion and on errors.
 
+**Updates** (0.2.3) — in-app update check against the GitHub Releases API.
+Checks on startup (opt-out) and on demand from Settings; when a newer release
+exists it shows the patch notes and can download `ImageToolboxSetup.exe`, launch
+it and quit so Inno Setup replaces the app in place. "Skip this version" is
+remembered. Pure stdlib (`urllib`); see `updater.py`.
+
 ## Codebase structure
 
 Top-level Python (the actual app — note line counts give a sense of weight):
@@ -70,6 +76,7 @@ Top-level Python (the actual app — note line counts give a sense of weight):
 | `conciliate.py` (~430 lines) | Conciliation runner (CLI + GUI-driven). Two phases over stdin (`run`/`q`): scan builds the original→processed plan (matching by content-hash lineage first — path-independent, survives folder moves — then falling back to mirrored-name matching), then run archives/deletes originals and moves processed files into the original tree. No GPU/heavy imports — pure file I/O. |
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename — see `docs/content-hash-lineage.md`); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools). `get_conn()` opens once per process; on first creation it imports the legacy `scans/*.json` and `trcache/*.cache` files whose source folder still exists (stale ones skipped). Logs are deliberately NOT in the DB. |
 | `orientation.py` (~170 lines) | Auto-straighten: a small pretrained CNN (`ternaus/check_orientation`) detects sideways photos and losslessly rotates them upright; fails safe (leaves ambiguous/upside-down alone). Heavy imports are lazy. |
+| `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
 
 Configuration & state:
 

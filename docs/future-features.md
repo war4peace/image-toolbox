@@ -32,6 +32,12 @@ an archive folder of choice, or removes them.
 The application checks for updates, displays patch notes, prompts to update, and
 self-updates.
 
+> **Status: implemented (0.2.3).** See `updater.py` and `UpdateDialog` /
+> the Settings "Updates" section in `toolbox_gui.py`. Checks the GitHub Releases
+> API on startup (opt-out) and on demand; downloads `ImageToolboxSetup.exe`,
+> launches it and quits so Inno Setup replaces the app in place. "Skip this
+> version" is remembered in `config.json` (`updates` section).
+
 - **What's in place:** `APP_VERSION` in `toolbox_gui.py`; distribution is the
   GitHub-Releases installer built by CI on `v*` tags; `urllib` is already used.
 - **Work needed:** query the GitHub Releases API for the latest tag, compare to
