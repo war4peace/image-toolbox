@@ -78,6 +78,23 @@ Statistics, cache file state, application status.
 Display CPU usage, GPU VRAM usage and GPU temperature in-app, and publish them to
 MQTT on a timer (~every 30 s).
 
+> **Status: implemented (0.2.5).** See `system_telemetry.py` (CPU via Windows
+> `GetSystemTimes`, RAM via `GlobalMemoryStatusEx` — both `ctypes`; GPU
+> VRAM+temperature via `nvidia-smi` — stayed dependency-light, no psutil/pynvml)
+> and `TelemetryRow` / `App.sample_telemetry` in `toolbox_gui.py`. A compact
+> readout (CPU · RAM · VRAM · GPU temp) sits below the image carousel on each
+> tool tab, with the percentage values colour-banded by load (blue ≤25 % · green
+> ≤65 % · dark yellow ≤85 % · red >85 %). Sampling is task-driven, not a fixed wall-clock timer: during
+> **upscaling** GPU VRAM/temp (and CPU, synced) are read 5 s *after each image
+> starts* — past the load/ramp, so the reading is steady-state work rather than
+> the dip between images; during **Tag & Rename** and **Conciliation** every
+> 30 s; and while **idle** every 60 s (so the user can watch VRAM free up before
+> starting a run — e.g. after closing another GPU app). The idle sampler steps
+> aside whenever a task is running. Samples run off the UI thread (a lock
+> prevents overlapping `nvidia-smi` calls) and publish retained topics
+> `image-toolbox/system/cpu`, `/ram`, `/ram_total`, `/gpu_vram`,
+> `/gpu_vram_total`, `/gpu_temp`.
+
 - **Why now:** natural extension of #3 — once the MQTT publisher exists, adding
   periodic gauges is mostly a sampling loop plus a few extra retained topics
   (e.g. `image-toolbox/system/cpu`, `/gpu_vram`, `/gpu_temp`) and a small in-app

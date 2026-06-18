@@ -53,7 +53,11 @@ non-image files, are never touched.
 
 **Settings** — Ollama URL (with reachability check) and model picklist;
 auto-straighten toggle/threshold; Resolution Target and skip-cutoff; SeedVR
-pipeline options; Discord webhook (with Test); default folders per tool.
+pipeline options; Discord webhook (with Test); default folders per tool. Settings
+take effect only on **Save**; an **unsaved-changes guard** compares the form
+against `config.json` and shows a Save / Don't save / Cancel prompt when leaving
+the Settings tab or closing the app with pending edits (`SettingsTab.is_dirty` /
+`_collect` / `revert`).
 
 **Notifications** — Discord webhook on queue completion and on errors.
 
@@ -70,6 +74,20 @@ state (`name` = idle/upscaling/tagging/conciliating, `details`, `runtime`,
 Settings has host/port/username/password/client-id fields, a "Test" button, and
 a "Publish now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`);
 the import is lazy so older venvs still launch. See `mqtt_publisher.py`.
+
+**System telemetry** (Feature #3a) — a compact, read-only status row below the
+image carousel on each tool tab showing **CPU usage, RAM, GPU VRAM and GPU
+temperature**, also published to MQTT as retained `image-toolbox/system/*`
+topics (`cpu`, `ram`, `ram_total`, `gpu_vram`, `gpu_vram_total`, `gpu_temp`). The
+percentage readouts are colour-banded by load (blue ≤25 % · green ≤65 % · dark
+yellow ≤85 % · red >85 %). Dependency-light: CPU via Windows `GetSystemTimes` and
+RAM via `GlobalMemoryStatusEx` (both `ctypes`, no psutil), GPU from `nvidia-smi`
+(no pynvml). Cadence: during upscaling, 5 s after each image starts
+(past the load/ramp, avoiding the dip between images); every 30 s during Tag &
+Rename and Conciliation; and every 60 s while **idle** (so the user can watch
+VRAM free up before starting a run). The idle sampler steps aside whenever a task
+is running. Samples run off the UI thread (a lock prevents overlapping
+`nvidia-smi` calls). See `system_telemetry.py`.
 
 **Updates** (0.2.3) — in-app update check against the GitHub Releases API.
 Checks on startup (opt-out) and on demand from Settings; when a newer release
@@ -91,6 +109,7 @@ Top-level Python (the actual app — note line counts give a sense of weight):
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename — see `docs/content-hash-lineage.md`); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools). `get_conn()` opens once per process; on first creation it imports the legacy `scans/*.json` and `trcache/*.cache` files whose source folder still exists (stale ones skipped). Logs are deliberately NOT in the DB. |
 | `orientation.py` (~170 lines) | Auto-straighten: a small pretrained CNN (`ternaus/check_orientation`) detects sideways photos and losslessly rotates them upright; fails safe (leaves ambiguous/upside-down alone). Heavy imports are lazy. |
 | `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
+| `system_telemetry.py` (~180 lines) | System telemetry sampler (Feature #3a). Stdlib-only, read-only, best-effort: `CpuSampler` reads CPU usage from Windows `GetSystemTimes` (`ctypes`) as a delta between calls; `sample_ram()` reads physical RAM via `GlobalMemoryStatusEx`; `sample_gpu()` shells out to `nvidia-smi` for VRAM used/total and temperature. All fail safe to `None`. The GPU query blocks (spawns a process), so the GUI samples from a background thread. |
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 
 Configuration & state:

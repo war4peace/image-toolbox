@@ -38,6 +38,7 @@ import urllib.error
 
 import updater
 import mqtt_publisher
+import system_telemetry
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -46,7 +47,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -377,6 +378,92 @@ class ProgressBar(tk.Canvas):
 
 
 # ─────────────────────────────────────────────
+#  SYSTEM TELEMETRY ROW  (Feature #3a)
+# ─────────────────────────────────────────────
+
+class TelemetryRow(ttk.Frame):
+    """
+    Compact, single-line readout of live system telemetry — CPU usage, RAM, GPU
+    VRAM and GPU temperature — shown below the image carousel. Pushed in by
+    App.sample_telemetry frequently while a task runs (task-driven cadence) and
+    every 60 s while the app is idle (so the user can watch VRAM free up before
+    starting a run).
+
+    Each segment is its own label so the percentage readouts (CPU / RAM / VRAM)
+    can be colour-coded by load band; static fields (GPU temp, separators) stay
+    neutral grey.
+    """
+
+    IDLE  = "System: sampling…"
+    GREY  = "#7f8a99"
+    SEP   = "   ·   "
+    FONT  = ("Consolas", 9)
+
+    # Percentage → colour band: blue 0–25, green 26–65, dark yellow 66–85,
+    # red 86–100 (compared against the rounded value that is displayed).
+    @classmethod
+    def _band(cls, pct):
+        if pct <= 25:
+            return "#3a86ff"   # blue
+        if pct <= 65:
+            return "#1a9e4b"   # green
+        if pct <= 85:
+            return "#b58900"   # dark yellow
+        return "#d11a2a"       # red
+
+    def __init__(self, master):
+        super().__init__(master)
+        self._labels = []
+        self._set([(self.IDLE, self.GREY)])
+
+    def _set(self, segments):
+        """Replace the row with [(text, colour), …], joined by grey separators."""
+        for w in self._labels:
+            w.destroy()
+        self._labels = []
+        for i, (text, color) in enumerate(segments):
+            if i:
+                sep = tk.Label(self, text=self.SEP, font=self.FONT, fg=self.GREY)
+                sep.pack(side="left")
+                self._labels.append(sep)
+            lbl = tk.Label(self, text=text, font=self.FONT, fg=color)
+            lbl.pack(side="left")
+            self._labels.append(lbl)
+
+    @staticmethod
+    def _gb(used_mb, total_mb):
+        pct = round(used_mb * 100.0 / total_mb)
+        return f"{used_mb/1024:.1f}/{total_mb/1024:.1f} GB ({pct}%)", pct
+
+    def show(self, sample):
+        """Render a telemetry sample dict (any field may be None)."""
+        segs = []
+        cpu = sample.get("cpu")
+        if cpu is not None:
+            c = round(cpu)
+            segs.append((f"CPU {c}%", self._band(c)))
+        else:
+            segs.append(("CPU —", self.GREY))
+
+        ru, rt = sample.get("ram_used_mb"), sample.get("ram_total_mb")
+        if ru is not None and rt:
+            text, pct = self._gb(ru, rt)
+            segs.append((f"RAM {text}", self._band(pct)))
+
+        vu, vt = sample.get("gpu_used_mb"), sample.get("gpu_total_mb")
+        temp   = sample.get("gpu_temp_c")
+        if vu is not None and vt:
+            text, pct = self._gb(vu, vt)
+            segs.append((f"VRAM {text}", self._band(pct)))
+        if temp is not None:
+            segs.append((f"GPU {temp}°C", self.GREY))
+        if vu is None and temp is None:
+            segs.append(("GPU: n/a", self.GREY))
+
+        self._set(segs)
+
+
+# ─────────────────────────────────────────────
 #  LOG PANE
 # ─────────────────────────────────────────────
 
@@ -629,6 +716,14 @@ class ToolTab(ttk.Frame):
         self._last_done     = None              # last DONE payload (for MQTT last_run)
         self._mqtt_prev_elapsed   = 0.0         # for last-image processing time
         self._mqtt_prev_processed = 0
+        # System telemetry (Feature #3a). Periodic tabs set an interval; the
+        # upscaler leaves it None and samples per image instead (see launch /
+        # _on_image_started). The row widget is created by whichever build path
+        # the tab uses.
+        self.telemetry_row          = None
+        self.telemetry_interval_ms  = None      # set by periodic tabs (Tag/Conciliate)
+        self._telemetry_job         = None      # periodic sampler `after` id
+        self._telemetry_img_job     = None      # upscaler per-image sample `after` id
 
     # ── UI helpers ──────────────────────────────────────────────────────────
 
@@ -684,6 +779,11 @@ class ToolTab(ttk.Frame):
         self.strip.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         Tooltip(self.strip.canvas,
                 "Double-click an image to open it • use +/– to resize")
+
+        # Compact system-telemetry row, just below the carousel (Feature #3a).
+        self.telemetry_row = TelemetryRow(self)
+        self.telemetry_row.grid(row=row + 3, column=0, columnspan=4,
+                                sticky="ew", pady=(4, 0))
 
     def _save_cell(self, cell):
         self.app.settings["thumb_cell"] = cell
@@ -749,6 +849,7 @@ class ToolTab(ttk.Frame):
             mqtt_publisher.TASK_ETA_TOPIC:      "",
             mqtt_publisher.TASK_RUNTIME_TOPIC:  "0",
         })
+        self._start_telemetry()
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
         return True
@@ -858,6 +959,7 @@ class ToolTab(ttk.Frame):
         elif kind == "IMG" and payload:
             self.preview_name.set(os.path.basename(payload))
             self.strip.set_current(payload)
+            self._on_image_started(payload)
         elif kind == "RENAME" and payload:
             try:
                 old, new = json.loads(payload)
@@ -975,6 +1077,11 @@ class ToolTab(ttk.Frame):
     def on_exit(self, code):
         """Subclasses override for their own UI, then call super().on_exit(code)
         so the shared MQTT 'task finished' state is published once."""
+        self._stop_telemetry()
+        # One immediate idle sample so the row reflects VRAM freeing up right
+        # after the run, rather than waiting for the next idle tick. The proc is
+        # already cleared by this point, so this counts as an idle reading.
+        self.app.sample_telemetry()
         self._publish_task_idle()
 
     def _publish_task_idle(self):
@@ -995,6 +1102,36 @@ class ToolTab(ttk.Frame):
             summary["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
             values[mqtt_publisher.LAST_RUN_TOPIC] = json.dumps(summary)
         self.app.mqtt_publish(values)
+
+    # ── System telemetry (Feature #3a) ───────────────────────────────────────
+
+    def _on_image_started(self, path):
+        """Hook: an image just began processing. Overridden by the upscaler to
+        sample telemetry a few seconds in (past the load/ramp); no-op here."""
+
+    def _start_telemetry(self):
+        """Begin sampling for this run. Periodic tabs poll on a fixed interval;
+        the upscaler is event-driven (per image), so it has no interval set."""
+        self._stop_telemetry()
+        if self.telemetry_interval_ms:
+            self._telemetry_tick()
+
+    def _telemetry_tick(self):
+        self.app.sample_telemetry()
+        self._telemetry_job = self.after(self.telemetry_interval_ms,
+                                         self._telemetry_tick)
+
+    def _stop_telemetry(self):
+        """Cancel this run's sampler timers. The app's idle sampler keeps the
+        row updated between runs, so it is not blanked here."""
+        for attr in ("_telemetry_job", "_telemetry_img_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
 
 # ─────────────────────────────────────────────
@@ -1444,6 +1581,21 @@ class UpscaleTab(ToolTab):
         else:
             super()._handle_event(kind, payload)
 
+    def _on_image_started(self, path):
+        """Sample telemetry 5 s after an image starts upscaling — past the
+        load/ramp, so the reading reflects steady-state work, not the dip
+        between images. A fresh image cancels any still-pending sample."""
+        if self._telemetry_img_job is not None:
+            try:
+                self.after_cancel(self._telemetry_img_job)
+            except Exception:
+                pass
+        self._telemetry_img_job = self.after(5000, self._sample_after_image)
+
+    def _sample_after_image(self):
+        self._telemetry_img_job = None
+        self.app.sample_telemetry()
+
     # ── Default-folder buttons ───────────────────────────────────────────────
 
     def _src_valid(self):
@@ -1615,6 +1767,7 @@ class TagTab(ToolTab):
         super().__init__(notebook, app)
         self.tool_name      = "Tag & Rename"
         self.mqtt_task_name = "tagging"
+        self.telemetry_interval_ms = 30000      # sample every 30 s while running
         self.dir_var    = tk.StringVar()
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
@@ -2098,6 +2251,10 @@ class SettingsTab(ttk.Frame):
         self.save_status = ttk.Label(bar, text="", foreground="#666")
         self.save_status.pack(side="left", padx=12)
 
+        # Baseline for unsaved-changes detection: a snapshot of the form as it
+        # mirrors config.json right now. Re-taken on every successful save/revert.
+        self._baseline = self._snapshot()
+
         # Probe the saved Ollama URL in the background so the status text already
         # reflects reachability by the time the user opens the Settings tab.
         self._check_ollama()
@@ -2276,8 +2433,11 @@ class SettingsTab(ttk.Frame):
         self.default_corig_var.set(defs.get("conciliate_original", ""))
         self.default_cproc_var.set(defs.get("conciliate_processed", ""))
 
-    def _save(self):
-        # Validate the numeric SeedVR / cutoff fields first.
+    def _collect(self):
+        """Build the config sections the form currently describes, without
+        touching CFG. Returns (sections, errors): `sections` maps section name →
+        proposed {key: value}; `errors` names any field that failed validation.
+        Shared by _save (apply) and the unsaved-changes detection (compare)."""
         errors = []
         seedvr_out = {}
         for key, (var, typ) in self._seedvr_vars.items():
@@ -2291,59 +2451,114 @@ class SettingsTab(ttk.Frame):
                 seedvr_out[key] = bool(var.get())
             else:
                 seedvr_out[key] = str(raw).strip()
+
+        ups = {}
         try:
-            cutoff = max(0, min(99, int(self.cutoff_var.get())))
+            ups["upscale_cutoff_pct"] = max(0, min(99, int(self.cutoff_var.get())))
         except (ValueError, tk.TclError):
             errors.append("Skip images over")
-
-        if errors:
-            messagebox.showwarning(
-                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
-            return
-
-        ollama = CFG.setdefault("ollama", {})
-        ups    = CFG.setdefault("upscale", {})
-        ollama["url"]   = self.ollama_url_var.get().strip() or "http://127.0.0.1:11434"
-        ollama["model"] = self.ollama_model_var.get().strip()
-
         for label, pmx, prs in RESOLUTION_PRESETS:
             if label == self.restarget_var.get():
                 ups["max_resolution"], ups["resolution"] = pmx, prs
                 break
-        ups["upscale_cutoff_pct"]   = cutoff
-        ups["discord_webhook_url"]  = self.webhook_var.get().strip()
+        ups["discord_webhook_url"] = self.webhook_var.get().strip()
         ups.update(seedvr_out)
 
-        defs = CFG.setdefault("defaults", {})
-        defs["upscale_source"] = self.default_src_var.get().strip()
-        defs["upscale_output"] = self.default_out_var.get().strip()
-        defs["tag_folder"]     = self.default_tag_var.get().strip()
-        defs["conciliate_original"]  = self.default_corig_var.get().strip()
-        defs["conciliate_processed"] = self.default_cproc_var.get().strip()
-
-        tag = CFG.setdefault("tagging", {})
-        tag["auto_straighten"] = bool(self.straighten_var.get())
         try:
             conf = round(float(self.straighten_conf_var.get()), 2)
         except (ValueError, tk.TclError):
             conf = 0.9
-        tag["straighten_min_confidence"] = min(1.0, max(0.5, conf))
 
-        CFG.setdefault("updates", {})["auto_check"] = bool(self.auto_update_var.get())
+        sections = {
+            "ollama": {
+                "url":   self.ollama_url_var.get().strip() or "http://127.0.0.1:11434",
+                "model": self.ollama_model_var.get().strip(),
+            },
+            "upscale": ups,
+            "defaults": {
+                "upscale_source": self.default_src_var.get().strip(),
+                "upscale_output": self.default_out_var.get().strip(),
+                "tag_folder":     self.default_tag_var.get().strip(),
+                "conciliate_original":  self.default_corig_var.get().strip(),
+                "conciliate_processed": self.default_cproc_var.get().strip(),
+            },
+            "tagging": {
+                "auto_straighten": bool(self.straighten_var.get()),
+                "straighten_min_confidence": min(1.0, max(0.5, conf)),
+            },
+            "updates": {"auto_check": bool(self.auto_update_var.get())},
+            "mqtt": self._mqtt_fields(),
+        }
+        return sections, errors
 
-        mqtt = CFG.setdefault("mqtt", {})
-        mqtt.pop("enabled", None)        # MQTT is now gated by host being set
-        mqtt.update(self._mqtt_fields())
+    def _snapshot(self):
+        """A stable, comparable key for the form's current contents — the basis
+        for unsaved-changes detection. Invalid input counts as 'changed'."""
+        sections, errors = self._collect()
+        return json.dumps(sections, sort_keys=True), bool(errors)
+
+    def is_dirty(self):
+        """True if the form differs from the last-saved (baseline) state."""
+        try:
+            return self._snapshot() != self._baseline
+        except Exception:
+            return False
+
+    def _save(self):
+        """Persist the form to config.json. Returns True on success; on a
+        validation error it warns and returns False (nothing is written)."""
+        sections, errors = self._collect()
+        if errors:
+            messagebox.showwarning(
+                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
+            return False
+
+        for name, values in sections.items():
+            target = CFG.setdefault(name, {})
+            if name == "mqtt":
+                target.pop("enabled", None)   # MQTT is now gated by host being set
+            target.update(values)
 
         if save_config():
+            self._baseline = self._snapshot()    # the form is now the saved state
             # Apply MQTT changes immediately (connect/disconnect/reconfigure).
             self.app.restart_mqtt()
-            self.save_status.configure(
-                text="Saved.", foreground="#1a7f37")
-        else:
-            self.save_status.configure(
-                text="Could not write config.json (check file permissions).",
-                foreground="#b3261e")
+            self.save_status.configure(text="Saved.", foreground="#1a7f37")
+            return True
+        self.save_status.configure(
+            text="Could not write config.json (check file permissions).",
+            foreground="#b3261e")
+        return False
+
+    def revert(self):
+        """Discard unsaved edits: reset every field to the values in CFG."""
+        ollama = CFG.get("ollama", {})
+        ups    = CFG.get("upscale", {})
+        defs   = CFG.get("defaults", {})
+        tag    = CFG.get("tagging", {})
+        mqtt   = CFG.get("mqtt", {})
+        self.default_src_var.set(defs.get("upscale_source", ""))
+        self.default_out_var.set(defs.get("upscale_output", ""))
+        self.default_tag_var.set(defs.get("tag_folder", ""))
+        self.default_corig_var.set(defs.get("conciliate_original", ""))
+        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
+        self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
+        self.straighten_var.set(bool(tag.get("auto_straighten", True)))
+        self.straighten_conf_var.set(float(tag.get("straighten_min_confidence", 0.9)))
+        self.restarget_var.set(self._current_preset_label(ups))
+        self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
+        self.webhook_var.set(ups.get("discord_webhook_url", ""))
+        self.auto_update_var.set(update_auto_check_enabled())
+        self.mqtt_host_var.set(mqtt.get("host", ""))
+        self.mqtt_port_var.set(str(mqtt.get("port", 1883)))
+        self.mqtt_user_var.set(mqtt.get("username", ""))
+        self.mqtt_pass_var.set(mqtt.get("password", ""))
+        self.mqtt_cid_var.set(mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
+        for key, (var, typ) in self._seedvr_vars.items():
+            if key in ups:
+                var.set(ups[key] if typ is bool else str(ups[key]))
+        self._baseline = self._snapshot()
 
 
 # ─────────────────────────────────────────────
@@ -2369,6 +2584,7 @@ class ConciliateTab(ToolTab):
         super().__init__(notebook, app)
         self.tool_name      = "Conciliation"
         self.mqtt_task_name = "conciliating"
+        self.telemetry_interval_ms = 30000      # sample every 30 s while running
         self.orig_var  = tk.StringVar()
         self.proc_var  = tk.StringVar()
         self.mode_var  = tk.StringVar(value=CONCILIATE_MODES[0][0])
@@ -2465,6 +2681,11 @@ class ConciliateTab(ToolTab):
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.grid(row=0, column=1, sticky="ns")
+
+        # Compact system-telemetry row, below the preview table (Feature #3a).
+        self.telemetry_row = TelemetryRow(self)
+        self.telemetry_row.grid(row=6, column=0, columnspan=4,
+                                sticky="ew", pady=(4, 0))
 
     # ── overrides that drop ToolTab's thumbnail/strip assumptions ─────────────
 
@@ -2886,6 +3107,26 @@ class App(tk.Tk):
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
 
+        # System telemetry (Feature #3a): one CPU sampler for the whole app, and
+        # the per-tab readout rows it feeds. Samples run off the UI thread; the
+        # lock keeps a slow nvidia-smi call from overlapping with the next tick.
+        self._cpu_sampler   = system_telemetry.CpuSampler()
+        self._telemetry_lock = threading.Lock()
+        self.telemetry_rows = [t.telemetry_row for t in
+                               (self.upscale_tab, self.tag_tab, self.conciliate_tab)
+                               if t.telemetry_row is not None]
+        # Idle sampler: keep the readout live between runs (e.g. so the user can
+        # watch another app's VRAM free up before starting an upscale). Fires on
+        # a slow 60 s cadence and only when no task is running — task-driven
+        # sampling owns the readout during a run.
+        self._idle_telemetry_job = None
+        self.after(2000, self._idle_telemetry_tick)
+
+        # Guard against leaving the Settings tab with unsaved edits.
+        self._suppress_tab_event = False
+        self._prev_tab_widget    = self.nb.nametowidget(self.nb.select())
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
         self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2948,6 +3189,45 @@ class App(tk.Tk):
         self.settings["main_geometry"] = geo
         self.settings["main_zoomed"]   = zoomed
         save_settings(self.settings)
+
+    # ── Unsaved-settings guard ───────────────────────────────────────────────
+
+    def _on_tab_changed(self, event=None):
+        """When leaving the Settings tab with unsaved edits, prompt to save."""
+        if self._suppress_tab_event:
+            return
+        try:
+            new_widget = self.nb.nametowidget(self.nb.select())
+        except Exception:
+            return
+        leaving_settings = (self._prev_tab_widget is self.settings_tab
+                            and new_widget is not self.settings_tab)
+        if leaving_settings and self.settings_tab.is_dirty():
+            if self._confirm_unsaved("leaving") == "cancel":
+                # Bounce back to Settings without re-triggering this handler.
+                self._suppress_tab_event = True
+                try:
+                    self.nb.select(self.settings_tab)
+                finally:
+                    self._suppress_tab_event = False
+                return   # _prev_tab_widget stays on Settings
+        self._prev_tab_widget = new_widget
+
+    def _confirm_unsaved(self, context):
+        """Modal Save / Don't save / Cancel prompt for unsaved Settings edits.
+        Returns 'ok' (handled — safe to proceed) or 'cancel' (stay put).
+        `context` is 'leaving' or 'closing' for the wording."""
+        verb = "closing" if context == "closing" else "leaving the Settings tab"
+        ans = messagebox.askyesnocancel(
+            APP_TITLE,
+            f"You have unsaved changes in Settings.\n\nSave them before {verb}?")
+        if ans is None:
+            return "cancel"
+        if ans:
+            return "ok" if self.settings_tab._save() else "cancel"
+        # "Don't save" — discard the edits so the form matches config.json again.
+        self.settings_tab.revert()
+        return "ok"
 
     def other_tab(self, tab):
         return self.tag_tab if tab is self.upscale_tab else self.upscale_tab
@@ -3052,6 +3332,74 @@ class App(tk.Tk):
         if client is not None:
             client.publish_many(values)
 
+    # ── System telemetry (Feature #3a) ───────────────────────────────────────
+
+    IDLE_TELEMETRY_MS = 60000   # idle sampling cadence (no task running)
+
+    def _any_task_running(self):
+        return any(t.running for t in
+                   (self.upscale_tab, self.tag_tab, self.conciliate_tab))
+
+    def _idle_telemetry_tick(self):
+        """Sample while idle so the readout stays live between runs. Skips when a
+        task is running — that path samples on its own (faster) cadence."""
+        if not self._any_task_running():
+            self.sample_telemetry()
+        self._idle_telemetry_job = self.after(self.IDLE_TELEMETRY_MS,
+                                              self._idle_telemetry_tick)
+
+    def sample_telemetry(self):
+        """Take one telemetry sample off the UI thread, then push the result to
+        the in-app rows and MQTT. Skips if a previous sample is still in flight
+        (nvidia-smi can take a moment) so overlapping ticks never pile up."""
+        if not self._telemetry_lock.acquire(blocking=False):
+            return
+        threading.Thread(target=self._telemetry_worker, daemon=True).start()
+
+    def _telemetry_worker(self):
+        try:
+            cpu = self._cpu_sampler.sample()
+            ram = system_telemetry.sample_ram()
+            gpu = system_telemetry.sample_gpu()
+        finally:
+            self._telemetry_lock.release()
+        sample = {"cpu": cpu}
+        if ram is not None:
+            sample.update(ram_used_mb=ram[0], ram_total_mb=ram[1])
+        else:
+            sample.update(ram_used_mb=None, ram_total_mb=None)
+        if gpu is not None:
+            used, total, temp = gpu
+            sample.update(gpu_used_mb=used, gpu_total_mb=total, gpu_temp_c=temp)
+        else:
+            sample.update(gpu_used_mb=None, gpu_total_mb=None, gpu_temp_c=None)
+        try:
+            self.after(0, lambda: self._apply_telemetry(sample))
+        except Exception:
+            pass
+
+    def _apply_telemetry(self, sample):
+        """On the UI thread: render the sample in every readout row and mirror
+        it to the MQTT system topics."""
+        for row in self.telemetry_rows:
+            try:
+                row.show(sample)
+            except Exception:
+                pass
+        values = {}
+        if sample.get("cpu") is not None:
+            values[mqtt_publisher.SYS_CPU_TOPIC] = f"{sample['cpu']:.0f}"
+        if sample.get("ram_used_mb") is not None:
+            values[mqtt_publisher.SYS_RAM_TOPIC]       = str(sample["ram_used_mb"])
+            values[mqtt_publisher.SYS_RAM_TOTAL_TOPIC] = str(sample["ram_total_mb"])
+        if sample.get("gpu_used_mb") is not None:
+            values[mqtt_publisher.SYS_GPU_VRAM_TOPIC]       = str(sample["gpu_used_mb"])
+            values[mqtt_publisher.SYS_GPU_VRAM_TOTAL_TOPIC] = str(sample["gpu_total_mb"])
+        if sample.get("gpu_temp_c") is not None:
+            values[mqtt_publisher.SYS_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
+        if values:
+            self.mqtt_publish(values)
+
     def show_update_dialog(self, info):
         """Open (or focus) the single update dialog for the given UpdateInfo."""
         if self._update_dialog is not None and self._update_dialog.winfo_exists():
@@ -3061,6 +3409,9 @@ class App(tk.Tk):
         self._update_dialog = UpdateDialog(self, info)
 
     def _on_close(self):
+        # Don't let unsaved Settings edits vanish on exit.
+        if self.settings_tab.is_dirty() and self._confirm_unsaved("closing") == "cancel":
+            return
         busy = [t for t in (self.upscale_tab, self.tag_tab, self.conciliate_tab) if t.running]
         if busy:
             if not messagebox.askyesno(

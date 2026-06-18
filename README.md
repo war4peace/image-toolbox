@@ -168,6 +168,10 @@ Everything that used to require hand-editing `config.json` is here:
 - **Default folders** for each tool, also settable from each tab's
   *Save as Default* button.
 
+> **Maintainers:** before committing or sharing `config.json`, clear personal
+> data from **Default folders**, the **Discord webhook**, and the **MQTT**
+> section — keeping only the `client_id` default (`image-toolbox-beededbe`).
+
 ### Notifications
 
 Set a **Discord webhook** (in Settings) to get a message when a queue finishes —

@@ -26,6 +26,14 @@ AVAILABILITY_TOPIC   = f"{BASE_TOPIC}/availability"
 LAST_RUN_TOPIC       = f"{BASE_TOPIC}/last_run"
 LAST_USED_TOPIC      = f"{BASE_TOPIC}/last_used"
 
+# System telemetry (published on a timer while a task runs — Feature #3a)
+SYS_CPU_TOPIC        = f"{BASE_TOPIC}/system/cpu"               # CPU usage %
+SYS_RAM_TOPIC        = f"{BASE_TOPIC}/system/ram"             # RAM used, MB
+SYS_RAM_TOTAL_TOPIC  = f"{BASE_TOPIC}/system/ram_total"       # RAM total, MB
+SYS_GPU_VRAM_TOPIC   = f"{BASE_TOPIC}/system/gpu_vram"         # VRAM used, MB
+SYS_GPU_VRAM_TOTAL_TOPIC = f"{BASE_TOPIC}/system/gpu_vram_total"  # VRAM total, MB
+SYS_GPU_TEMP_TOPIC   = f"{BASE_TOPIC}/system/gpu_temp"         # GPU temp, °C
+
 # Live task state (published by the persistent client during a run)
 TASK_NAME_TOPIC     = f"{BASE_TOPIC}/task/name"        # idle / upscaling / tagging / conciliating
 TASK_DETAILS_TOPIC  = f"{BASE_TOPIC}/task/details"     # human-readable phase line
