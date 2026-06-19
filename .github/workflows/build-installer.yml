@@ -40,7 +40,13 @@ jobs:
           # facing notes (shown verbatim in the in-app update dialog). Strip
           # commit/tag trailers and any PGP signature so users see only the
           # human notes — no compare URLs, no code-level detail.
-          $msg = git tag -l --format='%(contents)' "${{ github.ref_name }}"
+          #
+          # actions/checkout can leave the tag *lightweight* in the runner, in
+          # which case %(contents) dereferences to the COMMIT message. Force-
+          # fetch the tag so we read the real annotation object.
+          $tag = "${{ github.ref_name }}"
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" 2>$null
+          $msg = git for-each-ref "refs/tags/$tag" --format='%(contents)'
           $keep = $msg -split "`n" | Where-Object {
             $_ -notmatch '^(Co-Authored-By|Signed-off-by):' -and $_ -notmatch '^-----'
           }
