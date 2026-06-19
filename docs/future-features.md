@@ -4,38 +4,14 @@ Candidate features for the toolbox, **sorted by implementation difficulty
 (easiest first)**, with a feasibility assessment for each. See the bottom for
 the cross-feature dependencies that should drive sequencing.
 
-The remaining candidates split into two tiers: one contained, lower-risk
-addition (#1) and three larger milestones that introduce new process models,
-networking, or packaging (#2–#4). Two earlier tier-1 items shipped in 0.2.8 —
-the `scripts/` move and the "Report an issue" link — and have been removed from
-the list.
+What remains are three larger milestones that each introduce new process models,
+networking, or packaging. The earlier, lower-risk additions have all shipped (the
+`scripts/` reorganisation, the "Report an issue" link, and the original-vs-
+upscaled comparison view) and have been removed from the list.
 
 ---
 
-## 1. Comparison tab (original vs. upscaled) — Medium
-A new tab that shows a source image beside its upscaled result so the user can
-judge the quality gain — ideally with synchronized zoom/pan and a before/after
-wipe slider.
-
-- **Why it's feasible:** the source→upscaled pairing already exists. The
-  `lineage` table (`db.py`, content-hash links) maps an original to its upscaled
-  output independently of path, with the mirrored-tree `relpath` mapping as a
-  fallback — so "find the counterpart" is a lookup, not new bookkeeping.
-- **Reuse:** the tab / `FilmStrip` patterns in `toolbox_gui.py`; the lineage
-  lookup; `Pillow` (already in the venv) for loading and resizing.
-- **Work needed:** a `ComparisonTab` with a pair picker (choose an original;
-  auto-resolve its upscaled counterpart via lineage), an image viewer with synced
-  zoom/pan, and a split before/after slider. Handle the resolution mismatch by
-  rendering both at the same on-screen size (upscaled at native detail, original
-  scaled up by the viewer) so the difference is visible.
-- **Risks:** displaying 4K images in tkinter needs care — downscale to the
-  viewport and re-render on zoom to stay responsive and bounded in memory. It
-  also brings `Pillow`/`ImageTk` into the GUI layer (which has stayed stdlib-only
-  so far, though Pillow is already installed for the engine) — a small, deliberate
-  dependency call. Synced pan/zoom on a tkinter `Canvas` is fiddly but
-  well-trodden.
-
-## 2. Remote upscaling (RunPod) — Hard
+## 1. Remote upscaling (RunPod) — Hard
 Spin up a runpod.io pod, point the application to the pod, install requirements
 on the remote pod, use it to upscale images, and shut it down when finished.
 See `docs/runpod-notes.md` for distilled notes from the old scripts.
@@ -54,7 +30,7 @@ See `docs/runpod-notes.md` for distilled notes from the old scripts.
   uploads, billed pods left running if auto-stop fails, SSH on Windows, remote
   bootstrap drift. Should be its own milestone.
 
-## 3. HTTP interface — Hard
+## 2. HTTP interface — Hard
 Spin up a small HTTP server with a UI that mirrors the application UI.
 
 - **What "mirror" implies:** rebuilding the thumbnail wall, two-row live status,
@@ -71,7 +47,7 @@ Spin up a small HTTP server with a UI that mirrors the application UI.
 - **Scope note:** a minimal "status + start/stop" web panel is far cheaper than
   a true mirror and worth considering first.
 
-## 4. Unraid Community Apps integration — Hardest
+## 3. Unraid Community Apps integration — Hardest
 The user installs and runs the application on their Unraid server.
 
 > **Status: deferred.** The app stays Windows-only for now — there is no Linux
@@ -81,7 +57,7 @@ The user installs and runs the application on their Unraid server.
   Linux port — not a discrete code feature. The app is Windows-bound (tkinter
   GUI, PowerShell `bootstrap.ps1`, `%USERPROFILE%`/`.venv\Scripts` paths,
   `CREATE_NO_WINDOW`). Unraid runs headless Docker on Linux.
-- **Requires:** the HTTP interface (#3) for any UI; a Linux build of the
+- **Requires:** the HTTP interface (#2) for any UI; a Linux build of the
   pipeline; the NVIDIA Container Toolkit for GPU passthrough; a Dockerfile
   replacing `bootstrap.ps1`; and a Community Apps template XML.
 - **What helps:** the heavy lifting (PyTorch/CUDA, SeedVR2, Ollama-over-URL) is
@@ -91,18 +67,15 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **Already shipped (0.2.0–0.2.8):** image-tree conciliation, in-app auto-update,
+- **Already shipped (0.2.0–0.2.9):** image-tree conciliation, in-app auto-update,
   Home Assistant (MQTT), the system-telemetry sampler, crash logging,
-  auto-straighten-before-upscaling, the `scripts/` reorganisation, and the
-  "Report an issue" feedback link. Those former roadmap items have been removed
-  from the list above.
-- **#1 (comparison tab) is independent** and the only remaining tier-1 item. With
-  the `scripts/` move already landed, new files (e.g. a `ComparisonTab`) arrive in
-  the final structure and aren't moved twice.
-- **#4 depends on #3** (headless Unraid needs a web UI). With Home Assistant
-  already done over MQTT, the old telemetry coupling no longer drives sequencing;
-  #2, #3 and #4 remain the large, mostly independent milestones.
-- **Architectural watch-item:** the app is dependency-light and Windows-only. #1
-  leans on `Pillow` in the GUI layer; #2, #3 and #4 each push toward extra
-  packages, a long-running server, and cross-platform support — adopt those
-  deliberately.
+  auto-straighten-before-upscaling, the `scripts/` reorganisation, the "Report an
+  issue" link, and the original-vs-upscaled comparison view (a floating
+  before/after wipe window with shared zoom/pan, plus green/red outcome frames in
+  the film-strip). Those former roadmap items have been removed from the list.
+- **#1, #2 and #3 are large, mostly independent milestones.** With Home Assistant
+  already done over MQTT, the old telemetry coupling no longer drives sequencing.
+- **#3 depends on #2** (headless Unraid needs a web UI).
+- **Architectural watch-item:** the app is dependency-light and Windows-only. #1,
+  #2 and #3 each push toward extra packages, a long-running server, and
+  cross-platform support — adopt those deliberately.
