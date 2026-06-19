@@ -134,8 +134,11 @@ GUI_MARKER = "@@TBX@@"
 def _gui_event(kind, payload):
     """
     Emit one event line for the GUI (no-op outside GUI mode).
-      IMG|<path>      – image now being processed
-      QUEUE|<json>    – ordered list of queued image paths for this pass
+      IMG|<path>          – image now being processed
+      QUEUE|<json>        – ordered list of queued image paths for this pass
+      RESULT|<json>       – [path, "ok"|"fail"] outcome for one image; the strip
+                            frames it green (an upscaled counterpart now exists,
+                            so it is comparable) or red (processing failed)
     """
     if GUI_MODE:
         print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
@@ -1060,6 +1063,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             # was created by an older run). Record it so future runs exclude it.
             if cache is not None:
                 cache.mark_done(local_path)
+            # An upscaled counterpart already exists → green (comparable).
+            _gui_event("RESULT", json.dumps([local_path, "ok"]))
             continue
 
         # ── Too large? ───────────────────────────────────────────────────────
@@ -1155,6 +1160,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             consecutive_failures = 0
             processed_paths.add(local_path)
+            _gui_event("RESULT", json.dumps([local_path, "ok"]))   # strip: green
             if cache is not None:
                 cache.mark_done(local_path)
                 cache.record_lineage(local_path, out_path)
@@ -1174,6 +1180,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             sys.stdout.write(timing + "\n")
             sys.stdout.flush()
             logger.log_only(f"  {prefix} {dim_str}  {local_path}{timing}", timestamp=True)
+            _gui_event("RESULT", json.dumps([local_path, "fail"]))   # strip: red
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 

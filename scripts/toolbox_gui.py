@@ -80,7 +80,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.8"
+APP_VERSION = "0.2.9-experimental"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -1065,6 +1065,12 @@ class ToolTab(ttk.Frame):
             self.strip.rename(old, new)
             if self.preview_name.get() == os.path.basename(old):
                 self.preview_name.set(os.path.basename(new))
+        elif kind == "RESULT" and payload:
+            try:
+                path, status = json.loads(payload)
+            except (ValueError, TypeError):
+                return
+            self.strip.set_status(path, status)
         elif kind == "REFRESH" and payload:
             self.strip.refresh(payload)
         elif kind == "ETA" and payload:
@@ -1254,9 +1260,15 @@ class FilmStrip(ttk.Frame):
     The full ordered queue arrives via a QUEUE event. Thumbnails flow left to
     right and wrap into as many columns as the width allows, re-flowing on
     resize; each image keeps its aspect ratio inside a square cell. The image
-    currently being processed is highlighted and scrolled into view, and any
-    thumbnail can be double-clicked to open it. The +/- buttons (zoom_in /
-    zoom_out) change the cell size.
+    currently being processed is highlighted (blue frame) and any thumbnail can
+    be double-clicked to open it. The +/- buttons (zoom_in / zoom_out) change the
+    cell size.
+
+    Per-image outcomes arrive via RESULT events (set_status): a thin green frame
+    marks a success / an image with an upscaled counterpart that exists (so it
+    can be compared), a thin red frame marks a failure, and no frame means
+    not-yet-processed. Outcomes are run-level (kept across batch swaps) and
+    follow a file through a rename; the blue current-frame always draws on top.
 
     Thumbnails are decoded in a background thread, one batch of BATCH_SIZE
     around the current image at a time (when the current image crosses into
@@ -1266,6 +1278,11 @@ class FilmStrip(ttk.Frame):
     BG          = "#202329"
     HILITE      = "#4f9cff"
     OUTLINE     = "#3a3f48"
+    # Per-image outcome frames (scaffolding for the comparison feature): green =
+    # processed successfully / an upscaled counterpart exists (comparable); red =
+    # processing failed. No frame = not yet processed.
+    OK_FRAME    = "#3fb950"
+    FAIL_FRAME  = "#f85149"
 
     def __init__(self, master, cell=CELL_DEFAULT, on_zoom=None):
         super().__init__(master)
@@ -1294,6 +1311,8 @@ class FilmStrip(ttk.Frame):
         self._cell    = max(CELL_MIN, min(CELL_HARD_MAX, int(cell)))
         self._cols    = 1
         self._hl_id   = None      # highlight rectangle item id
+        self._status  = {}        # path -> "ok"/"fail" (run-level, all batches)
+        self._frame_id = {}       # path -> status-frame rect id (current batch)
         self._gen     = 0         # invalidates stale loader threads
         self._q       = queue.Queue()
         self._resize_after = None
@@ -1333,11 +1352,13 @@ class FilmStrip(ttk.Frame):
         self._paths = [p.strip() for p in paths if p.strip()]
         self._index = {p: i for i, p in enumerate(self._paths)}
         self._renamed = {}
+        self._status = {}               # outcomes belong to one run only
         self._batch = None              # force a rebuild on the next IMG event
 
     def clear(self):
         self._gen += 1
         self._paths, self._index, self._renamed = [], {}, {}
+        self._status = {}
         self._batch, self._current = None, None
         self._build_cells([])
 
@@ -1358,7 +1379,7 @@ class FilmStrip(ttk.Frame):
         if old in self._pos:
             self._pos[new] = self._pos.pop(old)
             self._order[self._pos[new]] = new
-        for d in (self._master, self._photo, self._img_id):
+        for d in (self._master, self._photo, self._img_id, self._status, self._frame_id):
             if old in d:
                 d[new] = d.pop(old)
 
@@ -1393,6 +1414,18 @@ class FilmStrip(ttk.Frame):
         self._current = path
         self._draw_highlight()
 
+    def set_status(self, path, status):
+        """Record a per-image outcome ('ok'/'fail') and, if that image is in the
+        batch on screen, frame it (green/red). Run-level: kept across batches, so
+        scrolling back to an earlier batch still shows its outcomes."""
+        path = (path or "").strip()
+        if not path or status not in ("ok", "fail"):
+            return
+        self._status[path] = status
+        if path in self._pos:
+            self._draw_frame(path)
+            self._draw_highlight()      # keep the blue current-frame on top
+
     # ── Layout ───────────────────────────────────────────────────────────────
 
     def _build_cells(self, order, first=None):
@@ -1401,6 +1434,7 @@ class FilmStrip(ttk.Frame):
         self._master  = {}
         self._photo   = {}
         self._img_id  = {}
+        self._frame_id = {}
         self._hl_id   = None
         self._relayout(force=True)
         self._start_loader(order, first=first)
@@ -1423,6 +1457,7 @@ class FilmStrip(ttk.Frame):
         self._cols = cols
         self.canvas.delete("all")
         self._img_id = {}
+        self._frame_id = {}
         self._hl_id  = None
         cell = self._cell
         for i, p in enumerate(self._order):
@@ -1434,6 +1469,7 @@ class FilmStrip(ttk.Frame):
                 self._img_id[p] = self.canvas.create_image(
                     x0 + cell / 2, y0 + cell / 2, image=photo)
         self._update_scrollregion()
+        self._draw_frames()
         self._draw_highlight()
 
     def _update_scrollregion(self):
@@ -1459,6 +1495,29 @@ class FilmStrip(ttk.Frame):
             self.canvas.coords(self._img_id[p], cx, cy)
         else:
             self._img_id[p] = self.canvas.create_image(cx, cy, image=photo)
+
+    def _draw_frames(self):
+        """(Re)draw every status frame for the batch on screen."""
+        for p in list(self._frame_id):
+            self.canvas.delete(self._frame_id.pop(p))
+        for p in self._order:
+            if p in self._status:
+                self._draw_frame(p)
+
+    def _draw_frame(self, path):
+        """Draw (or redraw) one image's green/red outcome frame."""
+        old = self._frame_id.pop(path, None)
+        if old is not None:
+            self.canvas.delete(old)
+        i = self._pos.get(path)
+        status = self._status.get(path)
+        if i is None or status is None:
+            return
+        x0, y0 = self._cell_origin(i)
+        cell  = self._cell
+        color = self.OK_FRAME if status == "ok" else self.FAIL_FRAME
+        self._frame_id[path] = self.canvas.create_rectangle(
+            x0, y0, x0 + cell, y0 + cell, outline=color, width=2)
 
     def _draw_highlight(self):
         if self._hl_id is not None:
@@ -1592,6 +1651,9 @@ class FilmStrip(ttk.Frame):
             self._place(p)
             changed = True
         if changed:
+            # A freshly placed thumbnail is created above any existing frame, so
+            # redraw the frames (and the highlight) to keep them on top.
+            self._draw_frames()
             self._draw_highlight()
 
 

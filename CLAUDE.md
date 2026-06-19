@@ -27,8 +27,11 @@ bootstrap, tkinter GUI, Windows paths, `CREATE_NO_WINDOW`).
 Resolution Target (4K/2K/1080p). Skips images already near the target
 (skip-cutoff). Resilient long runs: a file cache in `scans/` resumes a stopped
 batch; corrupt/missing files are detected, logged and skipped; a second pass
-re-scans for files that appeared mid-run. Live thumbnail wall, two-row status,
-progress bar, ETA. Pause/resume/stop (stop finishes the current image first).
+re-scans for files that appeared mid-run. Live thumbnail wall (the current image
+has a blue frame; each finished thumbnail is framed **green** when an upscaled
+counterpart exists — i.e. it can be compared — or **red** on failure, via `RESULT`
+events, 0.2.9), two-row status, progress bar, ETA. Pause/resume/stop (stop
+finishes the current image first).
 Works with mapped network drives. **Auto-straighten before upscaling** (0.2.7, on
 by default) rotates sideways photos upright *first*, so the result respects the
 4K-fit target (3840 wide OR 2160 tall) in its final orientation — without it, a

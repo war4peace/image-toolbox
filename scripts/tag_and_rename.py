@@ -95,6 +95,9 @@ def _gui_event(kind, payload):
       LOG|<path>      – session log file location
       RENAME|<json>   – [old_path, new_path]: a queued file changed name
       REFRESH|<path>  – the file's pixels changed (rotation); re-decode its thumb
+      RESULT|<json>   – [path, "ok"|"fail"]: per-image outcome; the strip frames
+                        it green (tagged) or red (failed). Key by the FINAL path
+                        (after any rename), which the strip already tracks.
     Written to the raw stdout so markers never end up in the session log.
     """
     if GUI_MODE:
@@ -1629,6 +1632,8 @@ def main():
             consecutive_fails = 0
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
+            # Strip: green. Key by the final (post-rename) path the strip tracks.
+            _gui_event("RESULT", json.dumps([new_path, "ok"]))
             # GUI ETA: elapsed, images processed this session, position, total.
             # Averaged over processed count, not the counter (which also
             # advances on skipped/already-tagged files).
@@ -1649,6 +1654,8 @@ def main():
             update_cache_entry(cache, root, path, path, "failed")
             save_cache(cache, root)
 
+            # Strip: red. No rename happens on failure, so the path is unchanged.
+            _gui_event("RESULT", json.dumps([path, "fail"]))
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
