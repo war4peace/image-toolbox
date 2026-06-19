@@ -155,8 +155,14 @@ Engine, packaging & CI:
   it + the app. The final "starting" window auto-closes on a 10-second countdown
   (press any key to close early).
 - `installer/ImageToolbox.iss` — Inno Setup script; ships only the scripts +
-  bootstrap (heavy components download on first launch). Built by
-  `.github/workflows/build-installer.yml` on `v*` tags → GitHub Releases.
+  bootstrap (heavy components download on first launch). It packages every
+  top-level module via a `..\*.py` glob (not a hand-maintained list — a missing
+  entry broke 0.2.5). Built by `.github/workflows/build-installer.yml` on `v*`
+  tags → GitHub Releases. **Release notes are the annotated tag message:** write
+  clean, user-facing notes in `git tag -a vX -m "…"`; CI strips trailers/PGP and
+  publishes them as the release body (no auto-generated compare link). The in-app
+  update dialog shows that body, further cleaned by `updater.clean_notes()`. So
+  when cutting a release, the tag `-m` message IS what users read.
 - `tools/git-clean-webhook.py` — repo maintenance helper.
 - `docs/` — `future-features.md` (roadmap + feasibility), `runpod-notes.md`
   (notes for future remote-pod upscaling).

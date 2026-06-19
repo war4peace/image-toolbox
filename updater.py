@@ -45,6 +45,49 @@ class UpdateInfo:
         self.asset_size = asset_size   # bytes, or 0 if unknown
 
 
+def clean_notes(body):
+    """
+    Turn a raw GitHub release body into clean, user-facing text for the update
+    dialog. Releases carry curated notes (from the annotated tag message), but
+    this also defensively strips the noise that auto-generated or older bodies
+    contain so the dialog never shows a bare compare URL or commit trailers:
+
+      * the auto "**Full Changelog**: .../compare/..." line and bare compare URLs
+      * commit/tag trailers (Co-Authored-By:, Signed-off-by:)
+      * PGP signature blocks
+      * light markdown markers (** bold **, leading # headers)
+
+    Collapses runs of blank lines and trims. Returns "" when nothing is left.
+    """
+    out = []
+    in_sig = False
+    for line in (body or "").splitlines():
+        s = line.rstrip()
+        if s.startswith("-----BEGIN PGP"):
+            in_sig = True
+            continue
+        if s.startswith("-----END PGP"):
+            in_sig = False
+            continue
+        if in_sig:
+            continue
+        if re.match(r"^(Co-Authored-By|Signed-off-by):", s, re.IGNORECASE):
+            continue
+        # Auto-generated changelog link, with or without markdown emphasis.
+        if re.match(r"^\**Full Changelog\**\s*:", s, re.IGNORECASE):
+            continue
+        if re.match(r"^https?://\S*/compare/\S+$", s):
+            continue
+        s = s.replace("**", "")                       # bold markers
+        s = re.sub(r"^\s*#{1,6}\s+", "", s)           # markdown headers
+        out.append(s)
+
+    # Collapse 3+ blank lines down to one and trim the ends.
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def parse_version(s):
     """
     'v0.2.10' / '0.2.10' / '0.2.10-experimental' -> (0, 2, 10).
@@ -97,7 +140,7 @@ def check_for_update(current_version, timeout=10):
             asset_size = int(asset.get("size") or 0)
             break
 
-    notes = (data.get("body") or "").strip()
+    notes = clean_notes(data.get("body") or "")
     return "update", UpdateInfo(latest, tag, notes, asset_url, asset_size)
 
 

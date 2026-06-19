@@ -12,6 +12,8 @@ jobs:
       contents: write   # needed to attach the installer to the release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # need the annotated tag object for release notes
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
@@ -30,9 +32,25 @@ jobs:
           name: ImageToolboxSetup
           path: installer/Output/ImageToolboxSetup.exe
 
+      - name: Build release notes from the tag message
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # The annotated tag message is the single source of curated, user-
+          # facing notes (shown verbatim in the in-app update dialog). Strip
+          # commit/tag trailers and any PGP signature so users see only the
+          # human notes — no compare URLs, no code-level detail.
+          $msg = git tag -l --format='%(contents)' "${{ github.ref_name }}"
+          $keep = $msg -split "`n" | Where-Object {
+            $_ -notmatch '^(Co-Authored-By|Signed-off-by):' -and $_ -notmatch '^-----'
+          }
+          ($keep -join "`n").Trim() | Out-File -FilePath RELEASE_NOTES.md -Encoding utf8
+          "----- release notes -----"
+          Get-Content RELEASE_NOTES.md
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: installer/Output/ImageToolboxSetup.exe
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
