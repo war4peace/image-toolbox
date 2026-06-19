@@ -58,11 +58,12 @@ import db
 
 def _load_config():
     """
-    Load settings from config.json in the same directory as this script.
+    Load settings from config.json at the app root (the parent of scripts/).
     Raises a clear error if the file is missing or malformed.
     """
     import json as _json
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(app_root, "config.json")
     if not os.path.exists(config_path):
         print(f"\nERROR: config.json not found at: {config_path}")
         print("Run setup.ps1 first to generate it, or create it manually.")
@@ -76,15 +77,18 @@ _S   = _CFG.get("seedvr2", {})
 _U   = _CFG.get("upscale", {})
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# App root = parent of scripts/. config.json, seedvr2/, models/, logs/ and the
+# .venv all live at the app root, not beside this module.
+APP_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 def _resolve_path(value, default_rel):
     """
-    Resolve a config path; relative paths are anchored at this script's dir.
+    Resolve a config path; relative paths are anchored at the app root.
     Environment variables (%USERPROFILE%, %USERNAME%, …) are expanded, so
     config.json stays portable between machines and users.
     """
     p = os.path.expandvars(value or default_rel)
-    return p if os.path.isabs(p) else os.path.normpath(os.path.join(_SCRIPT_DIR, p))
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(APP_ROOT, p))
 
 SEEDVR2_REPO_DIR    = _resolve_path(_S.get("repo_dir", ""),  "seedvr2")
 SEEDVR2_MODEL_DIR   = _resolve_path(_S.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
@@ -259,7 +263,7 @@ class Logger:
     """
     def __init__(self, source_root):
         digest   = hashlib.sha256(source_root.encode("utf-8")).hexdigest()[:12]
-        log_dir  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        log_dir  = os.path.join(APP_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
         self.path = os.path.join(log_dir, f"log_{digest}.log")
         # Append mode — preserves previous sessions
@@ -1346,7 +1350,7 @@ def main():
     except Exception as e:
         print(f"ERROR: Could not initialize the SeedVR2 engine.\n  -> {e}")
         print("Make sure this script runs inside the toolbox venv, e.g.:")
-        print(f"  {os.path.join(_SCRIPT_DIR, '.venv', 'Scripts', 'python.exe')} batch_upscale.py <source_dir>")
+        print(f"  {os.path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')} scripts\\batch_upscale.py <source_dir>")
         send_discord_notification(
             title       = "Upscale Script -- Engine Failed to Start",
             description = f"Could not initialize the SeedVR2 engine.\n{e}",

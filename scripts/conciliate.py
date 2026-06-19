@@ -56,6 +56,8 @@ except Exception:
 import db
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+# App root = parent of scripts/. Data folders (logs/, db/, …) live there.
+APP_ROOT    = os.path.dirname(SCRIPT_DIR)
 GUI_MARKER  = "@@TBX@@"
 IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 ARCHIVE_DIRNAME = "__Archive__"
@@ -91,7 +93,7 @@ class Logger:
 
     def __init__(self, original_root):
         digest  = hashlib.sha256(original_root.encode("utf-8")).hexdigest()[:12]
-        log_dir = os.path.join(SCRIPT_DIR, "logs")
+        log_dir = os.path.join(APP_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
         self.path = os.path.join(log_dir, f"conc_{digest}.log")
         self._fh  = open(self.path, "a", encoding="utf-8", buffering=1)

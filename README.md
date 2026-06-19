@@ -62,7 +62,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm
 
 # 3. Launch the GUI (model weights ~16 GB download automatically on first use).
-.venv\Scripts\pythonw.exe toolbox_gui.py
+.venv\Scripts\pythonw.exe scripts\toolbox_gui.py
 ```
 
 Or just double-click **`Image Toolbox.cmd`** after cloning — it bootstraps the
@@ -71,10 +71,10 @@ environment and launches the app for you.
 You can also run the tools headless from PowerShell:
 
 ```powershell
-.venv\Scripts\python.exe batch_upscale.py "X:\Your\Photos"               # upscale
-.venv\Scripts\python.exe batch_upscale.py "X:\Your\Photos" "Z:\Output"   # custom output
-.venv\Scripts\python.exe tag_and_rename.py "X:\Your\Photos"              # tag & rename
-.venv\Scripts\python.exe conciliate.py "X:\Your\Photos" "Z:\Output"     # conciliate (archive)
+.venv\Scripts\python.exe scripts\batch_upscale.py "X:\Your\Photos"               # upscale
+.venv\Scripts\python.exe scripts\batch_upscale.py "X:\Your\Photos" "Z:\Output"   # custom output
+.venv\Scripts\python.exe scripts\tag_and_rename.py "X:\Your\Photos"              # tag & rename
+.venv\Scripts\python.exe scripts\conciliate.py "X:\Your\Photos" "Z:\Output"     # conciliate (archive)
 ```
 
 The GUI and the scripts share the same logs and cache database (`db/cache.db`),
@@ -84,8 +84,8 @@ so you can mix and match freely.
 
 ## The app
 
-`toolbox_gui.py` is a Windows GUI (pure Python standard-library tkinter — no extra
-packages) with four tabs.
+`scripts\toolbox_gui.py` is a Windows GUI (pure Python standard-library tkinter —
+no extra packages) with four tabs.
 
 ### Batch Upscaler
 

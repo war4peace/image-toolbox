@@ -38,7 +38,10 @@ import hashlib
 import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_DIR     = os.path.join(SCRIPT_DIR, "db")
+# App root = parent of scripts/. The cache DB and the legacy scans/ & trcache/
+# import folders live at the app root, not beside this module.
+APP_ROOT   = os.path.dirname(SCRIPT_DIR)
+DB_DIR     = os.path.join(APP_ROOT, "db")
 DB_PATH    = os.path.join(DB_DIR, "cache.db")
 
 SCHEMA = """
@@ -309,7 +312,7 @@ def import_legacy_json(conn):
     tg_roots = tg_files = tg_skipped = 0
 
     # ── Eligibility caches (scans/cache_*.json) ────────────────────────────────
-    scans_dir = os.path.join(SCRIPT_DIR, "scans")
+    scans_dir = os.path.join(APP_ROOT, "scans")
     if os.path.isdir(scans_dir):
         for name in sorted(os.listdir(scans_dir)):
             if not (name.startswith("cache_") and name.endswith(".json")):
@@ -338,7 +341,7 @@ def import_legacy_json(conn):
             up_files += len(rows)
 
     # ── Tag & rename caches (trcache/*.cache) ──────────────────────────────────
-    tr_dir = os.path.join(SCRIPT_DIR, "trcache")
+    tr_dir = os.path.join(APP_ROOT, "trcache")
     if os.path.isdir(tr_dir):
         for name in sorted(os.listdir(tr_dir)):
             if not name.endswith(".cache"):

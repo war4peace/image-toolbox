@@ -232,7 +232,7 @@ try {
     Step "Setup complete - launching Image Toolbox"
     Write-Host "  Note: the first upscale you run will download the AI model"
     Write-Host "  weights (~16 GB). The app shows progress while this happens."
-    Start-Process (Join-Path $root ".venv\Scripts\pythonw.exe") -ArgumentList "`"$(Join-Path $root 'toolbox_gui.py')`""
+    Start-Process (Join-Path $root ".venv\Scripts\pythonw.exe") -ArgumentList "`"$(Join-Path $root 'scripts\toolbox_gui.py')`""
     Write-Host ""
     Write-Host "  A full copy of this output was saved to bootstrap.log"
     try { Stop-Transcript | Out-Null } catch {}

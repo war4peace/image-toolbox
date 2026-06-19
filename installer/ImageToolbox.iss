@@ -32,11 +32,12 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-; Ship every top-level Python module. A glob (not a hand-maintained list) so a
-; new module can never again be silently left out of the installer — the failure
-; that broke 0.2.5 (system_telemetry.py / crash_logger.py missing). Non-recursive,
-; so the vendored seedvr2\ tree and tools\ are not swept in.
-Source: "..\*.py";                DestDir: "{app}"; Flags: ignoreversion
+; Ship every app Python module. The modules now live in scripts\ (0.2.8); a glob
+; (not a hand-maintained list) so a new module can never again be silently left
+; out of the installer — the failure that broke 0.2.5 (system_telemetry.py /
+; crash_logger.py missing). Non-recursive, so the vendored seedvr2\ tree and
+; tools\ are not swept in.
+Source: "..\scripts\*.py";        DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
@@ -50,6 +51,11 @@ Source: "..\config.json";         DestDir: "{app}"; Flags: onlyifdoesntexist uni
 ; for auto-straighten). Bootstrap is idempotent — already-present components
 ; (Python, the venv, torch, the SeedVR2 engine) are detected and skipped.
 Type: files; Name: "{app}\.setup_complete"
+; 0.2.8 moved the modules into scripts\. Delete the stale root-level .py and
+; their compiled cache from pre-0.2.8 installs, or old and new copies coexist
+; (and an import could resolve the wrong one).
+Type: files;          Name: "{app}\*.py"
+Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Icons]
 Name: "{autoprograms}\Image Toolbox"; Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"
@@ -68,6 +74,9 @@ Type: filesandordirs; Name: "{app}\scans"
 Type: filesandordirs; Name: "{app}\trcache"
 Type: filesandordirs; Name: "{app}\db"
 Type: filesandordirs; Name: "{app}\__pycache__"
+; The modules live in scripts\ (0.2.8); remove the folder and its runtime
+; __pycache__ (the shipped .py are removed by their [Files] entry anyway).
+Type: filesandordirs; Name: "{app}\scripts"
 Type: files; Name: "{app}\.setup_complete"
 Type: files; Name: "{app}\gui_settings.json"
 Type: files; Name: "{app}\bootstrap.log"

@@ -157,3 +157,22 @@ def sample_gpu(timeout=5):
         return int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
     except ValueError:
         return None
+
+
+def gpu_name(timeout=5):
+    """
+    The first NVIDIA GPU's model name via ``nvidia-smi`` (e.g. "NVIDIA GeForce
+    RTX 4070"), or ``None`` if unavailable. Used to pre-fill bug reports; like
+    the rest of this module it fails safe and never raises.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout.strip().splitlines()[0].strip() or None

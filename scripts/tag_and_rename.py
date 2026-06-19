@@ -67,6 +67,10 @@ except Exception:
 
 import db
 
+# App root = parent of scripts/. config.json, logs/ and the trcache/ import
+# folder live at the app root, not beside this module.
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 # ─────────────────────────────────────────────────────────────
 #  GUI INTEGRATION  (event lines + session log)
@@ -133,7 +137,7 @@ def _setup_session_log(root):
     """
     norm    = os.path.normcase(os.path.abspath(root))
     digest  = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:12]
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    log_dir = os.path.join(APP_ROOT, "logs")
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, f"tag_{digest}.log")
     fh = open(path, "a", encoding="utf-8", buffering=1)
@@ -204,11 +208,11 @@ class RemoteControl:
 
 def _load_config():
     """
-    Load settings from config.json in the same directory as this script.
+    Load settings from config.json at the app root (the parent of scripts/).
     Raises a clear error if the file is missing or malformed.
     """
     import json as _json
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    config_path = os.path.join(APP_ROOT, "config.json")
     if not os.path.exists(config_path):
         print(f"\nERROR: config.json not found at: {config_path}")
         print("Run setup.ps1 first to generate it, or create it manually.")
@@ -324,10 +328,10 @@ def check_dependencies():
 #  CACHE CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-# Cache files live in a "trcache" subfolder next to this script.
+# Cache files live in a "trcache" subfolder at the app root.
 # Each source folder gets its own cache file named after the MD5 of the
 # normalised absolute path, e.g.  trcache/ab4531c2f8d9.cache
-CACHE_DIR            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trcache")
+CACHE_DIR            = os.path.join(APP_ROOT, "trcache")
 CACHE_SCHEMA_VERSION = 1
 
 # ─────────────────────────────────────────────────────────────
@@ -1307,7 +1311,7 @@ def main():
         print(f"    {CACHE_DIR}\\<folderhash>.cache")
         print("    This lets you reverse renames, EXIF changes, or both at any time.")
         print()
-        print("  Configuration (edit config.json in the same directory as this script):")
+        print("  Configuration (edit config.json at the app root, the parent of scripts/):")
         print(f"    OLLAMA_URL                {OLLAMA_URL}")
         print(f"    OLLAMA_MODEL              {OLLAMA_MODEL}")
         print(f"    MIN_WIDTH / MIN_HEIGHT    {MIN_WIDTH} / {MIN_HEIGHT} px")

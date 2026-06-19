@@ -61,8 +61,11 @@ def set_version(version):
 
 
 def _logs_dir():
-    # The log lives next to the app's other logs, beside this module.
-    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    # The log lives in the app's logs/ folder at the app root. This module now
+    # lives in scripts/, so the logs folder is one level up (its parent), not
+    # beside this file.
+    app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(app_root, "logs")
     os.makedirs(d, exist_ok=True)
     return d
 

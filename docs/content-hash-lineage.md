@@ -39,7 +39,7 @@ A lineage is three physical files:
   then re-encodes (JPEG q95, etc.). Re-upscaling the *same* source yields a
   *different* `H1`. So `H1 ≠ f(H0)`.
 - **Tag & rename rewrites EXIF in place.** It writes a description into EXIF and
-  re-snapshots ([tag_and_rename.py:1021](../tag_and_rename.py#L1021)), changing
+  re-snapshots ([tag_and_rename.py:1021](../scripts/tag_and_rename.py#L1021)), changing
   the bytes, so `H2 ≠ H1`.
 
 **Consequence:** hashing alone cannot *link* the files — you cannot hash an
@@ -74,10 +74,10 @@ dependence on folder names. It also recovers renames that today live only in the
 ## Why the current scheme breaks on a move (recap)
 
 - `upscale_roots` / `tag_roots` are keyed by **absolute `source_root`**
-  ([db.py:101](../db.py#L101), [db.py:118](../db.py#L118)). Move the tree and the
+  ([db.py:101](../scripts/db.py#L101), [db.py:118](../scripts/db.py#L118)). Move the tree and the
   root lookup misses entirely → the rename map in `tag_files` is lost.
 - Conciliation then falls back to **mirrored rel-path matching**
-  ([conciliate.py:163](../conciliate.py#L163)). That survives moving a *whole*
+  ([conciliate.py:163](../scripts/conciliate.py#L163)). That survives moving a *whole*
   tree intact, but breaks the moment relative structure, folder names, or file
   names diverge between the two trees — and it can never recover a rename.
 
@@ -92,11 +92,11 @@ Full-file hashing of large photo trees is disk-bound, so:
 - **Algorithm:** `hashlib.blake2b` — in the **standard library** (keeps the
   dependency-light promise), and markedly faster than SHA-256. No new packages.
   (`hashlib` is already imported across the codebase, only for hashing *paths*
-  today — [batch_upscale.py:240](../batch_upscale.py#L240) etc.)
+  today — [batch_upscale.py:240](../scripts/batch_upscale.py#L240) etc.)
 - **Make it incremental.** Cache `(content_hash)` next to the existing
   `(mtime, size)` fingerprint and only re-hash when the fingerprint changes. The
   upscale cache already stores `mtime`+`size` per file
-  ([batch_upscale.py:354](../batch_upscale.py#L354)) — hashing slots in beside it
+  ([batch_upscale.py:354](../scripts/batch_upscale.py#L354)) — hashing slots in beside it
   at near-zero marginal cost on warm runs.
 - **Hashing happens where the file is already being read.** The upscaler already
   loads each source ([upscale_engine.py:206](../upscale_engine.py#L206)) and
@@ -136,13 +136,13 @@ upscale cache) so a fresh DB or a re-scan populates them.
 
 - **Source `H0` + upscaled `H1`:** in `run_pass` right after a successful
   `ENGINE.upscale(...)` and `cache.mark_done(...)`
-  ([batch_upscale.py:964](../batch_upscale.py#L964)-[979](../batch_upscale.py#L979)),
+  ([batch_upscale.py:964](../scripts/batch_upscale.py#L964)-[979](../scripts/batch_upscale.py#L979)),
   where both `local_path` and `out_path` exist. Store `src_hash`, `out_hash`,
   `out_rel_path` on the `upscale_files` row.
 - **Tag input `H1` + final `H2`:** in `update_cache_entry`
-  ([tag_and_rename.py:1005](../tag_and_rename.py#L1005)) after the final rename,
+  ([tag_and_rename.py:1005](../scripts/tag_and_rename.py#L1005)) after the final rename,
   hashing the file before write (= input) and after (= output). Persisted via
-  `save_cache` ([tag_and_rename.py:913](../tag_and_rename.py#L913)) into the new
+  `save_cache` ([tag_and_rename.py:913](../scripts/tag_and_rename.py#L913)) into the new
   columns alongside `entry_json`.
 
 ---
@@ -150,7 +150,7 @@ upscale cache) so a fresh DB or a re-scan populates them.
 ## Optional redundancy: embed `H0` in the output's EXIF
 
 Tag & rename already stows the original filename in `XPComment`
-([tag_and_rename.py:858](../tag_and_rename.py#L858)). The source hash `H0` could
+([tag_and_rename.py:858](../scripts/tag_and_rename.py#L858)). The source hash `H0` could
 likewise be written into a dedicated EXIF field on the **upscaled** (and tagged)
 file. Then lineage survives even a **total DB loss** — conciliation could read
 `H0` straight from the processed file.

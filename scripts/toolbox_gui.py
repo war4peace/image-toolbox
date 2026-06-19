@@ -32,7 +32,9 @@ import shutil
 import datetime
 import threading
 import subprocess
+import platform
 import webbrowser
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -50,7 +52,8 @@ except Exception:
 
     def _emergency_excepthook(exc_type, exc, tb):
         try:
-            _d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            _d = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
             os.makedirs(_d, exist_ok=True)
             _p = os.path.join(
                 _d, "crash_" + _datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
@@ -69,11 +72,15 @@ import system_telemetry
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+# SCRIPT_DIR is where this module (and its sibling child scripts) live: the
+# scripts/ folder. APP_ROOT is its parent — where config.json, gui_settings.json,
+# the .venv, logs/, db/ and the seedvr2/ engine all live.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.7"
+APP_VERSION = "0.2.8-experimental"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -89,7 +96,7 @@ PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 # ─────────────────────────────────────────────
 
 def _load_config():
-    path = os.path.join(SCRIPT_DIR, "config.json")
+    path = os.path.join(APP_ROOT, "config.json")
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
@@ -107,7 +114,7 @@ def save_config(cfg=None):
     """
     if cfg is None:
         cfg = CFG
-    path = os.path.join(SCRIPT_DIR, "config.json")
+    path = os.path.join(APP_ROOT, "config.json")
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
@@ -150,6 +157,65 @@ def update_skipped_version():
 def set_update_skipped_version(version):
     CFG.setdefault("updates", {})["skip_version"] = version or ""
     save_config()
+
+
+# ─────────────────────────────────────────────
+#  REPORT AN ISSUE  (Future Feature #3)
+# ─────────────────────────────────────────────
+
+def _newest_crash_log():
+    """Path of the most recent logs/crash_*.log, or None. Best-effort."""
+    try:
+        log_dir = os.path.join(APP_ROOT, "logs")
+        crashes = [f for f in os.listdir(log_dir)
+                   if f.startswith("crash_") and f.endswith(".log")]
+        if not crashes:
+            return None
+        crashes.sort()
+        return os.path.join(log_dir, crashes[-1])
+    except Exception:
+        return None
+
+
+def _issue_url():
+    """
+    Build a GitHub "new issue" URL pre-filled with the app version and basic
+    environment, so reports arrive actionable. The GPU name is best-effort (it
+    shells out to nvidia-smi) and the newest crash log, if any, is pointed at so
+    the user knows what to attach. All fields fail safe to "unknown".
+    """
+    try:
+        gpu = system_telemetry.gpu_name() or "unknown"
+    except Exception:
+        gpu = "unknown"
+    crash = _newest_crash_log()
+    crash_line = (f"- Newest crash log (please attach): {crash}\n"
+                  if crash else "")
+    body = (
+        "**What happened?**\n\n\n"
+        "**Steps to reproduce:**\n\n\n"
+        "---\n"
+        "*Environment (auto-filled — please keep):*\n"
+        f"- Image Toolbox: {APP_VERSION}\n"
+        f"- OS: {platform.platform()}\n"
+        f"- Python: {sys.version.split()[0]}\n"
+        f"- GPU: {gpu}\n"
+        f"{crash_line}"
+    )
+    params = urllib.parse.urlencode({"title": "", "body": body})
+    return f"https://github.com/{updater.GITHUB_REPO}/issues/new?{params}"
+
+
+def report_issue():
+    """Open a pre-filled GitHub new-issue page in the browser. Fail-safe: on any
+    error, fall back to the plain issues page."""
+    try:
+        webbrowser.open(_issue_url())
+    except Exception:
+        try:
+            webbrowser.open(f"https://github.com/{updater.GITHUB_REPO}/issues/new")
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────
@@ -223,7 +289,7 @@ def _resolve_python():
     """Interpreter used to run the tools — the toolbox venv's python."""
     venv_py = os.path.expandvars(CFG.get("seedvr2", {}).get("venv_python", ""))
     if venv_py:
-        p = venv_py if os.path.isabs(venv_py) else os.path.join(SCRIPT_DIR, venv_py)
+        p = venv_py if os.path.isabs(venv_py) else os.path.join(APP_ROOT, venv_py)
         if os.path.exists(p):
             return p
     return sys.executable
@@ -258,7 +324,7 @@ def _ollama_release_vram():
 #  GUI SETTINGS  (user preferences, e.g. default folders)
 # ─────────────────────────────────────────────
 
-SETTINGS_PATH = os.path.join(SCRIPT_DIR, "gui_settings.json")
+SETTINGS_PATH = os.path.join(APP_ROOT, "gui_settings.json")
 
 
 def load_settings():
@@ -848,13 +914,15 @@ class ToolTab(ttk.Frame):
         return self.proc is not None and self.proc.poll() is None
 
     def launch(self, script, args):
+        # The child scripts are this module's siblings in scripts/; run them with
+        # the working directory at the app root (where config/state/engine live).
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, script)] + args
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
         try:
             self.proc = subprocess.Popen(
-                cmd, cwd=SCRIPT_DIR,
+                cmd, cwd=APP_ROOT,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 creationflags=CREATE_NO_WINDOW, env=env,
@@ -3161,6 +3229,10 @@ class App(tk.Tk):
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
         self.nb.add(self.conciliate_tab, text="  Conciliation  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
+        # Bottom status bar with a right-aligned "Report an issue" link (Future
+        # Feature #3). Packed before the notebook so it reserves the bottom strip;
+        # always visible regardless of the active tab.
+        self._build_statusbar()
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
 
         # System telemetry (Feature #3a): one CPU sampler for the whole app, and
@@ -3199,6 +3271,19 @@ class App(tk.Tk):
         if update_auto_check_enabled() or mqtt_enabled():
             self.after(1500, lambda: threading.Thread(
                 target=self._startup_worker, daemon=True).start())
+
+    def _build_statusbar(self):
+        """A thin bottom strip with a right-aligned 'Report an issue' link
+        (Future Feature #3). The link opens a pre-filled GitHub new-issue page."""
+        bar = ttk.Frame(self)
+        bar.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
+        link = tk.Label(bar, text="Report an issue", fg="#3a86ff",
+                        cursor="hand2", font=("Segoe UI", 9, "underline"))
+        link.pack(side="right")
+        link.bind("<Button-1>", lambda _e: report_issue())
+        # Subtle hover feedback (darker blue) so it reads as a link.
+        link.bind("<Enter>", lambda _e: link.configure(fg="#1a5fd0"))
+        link.bind("<Leave>", lambda _e: link.configure(fg="#3a86ff"))
 
     def _migrate_default_folders(self):
         """Carry default folders saved by older builds in gui_settings.json over

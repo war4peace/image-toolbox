@@ -120,11 +120,15 @@ needs an elevated, registered source and the app runs non-elevated.) See
 
 ## Codebase structure
 
-Top-level Python (the actual app — note line counts give a sense of weight):
+The app's Python modules live in **`scripts/`** (0.2.8 — previously the repo
+root). Data, config, the `.venv` and the vendored `seedvr2/` engine stay at the
+**app root**; each module resolves root-relative resources through an `APP_ROOT`
+= parent-of-`scripts/` (paths anchored off `__file__`, never the cwd). Line
+counts give a sense of weight:
 
-| File | Role |
+| File (`scripts/`) | Role |
 |------|------|
-| `toolbox_gui.py` (~2.5k lines) | The tkinter GUI. `App` (window) hosts four tabs: `UpscaleTab`, `TagTab`, `ConciliateTab`, `SettingsTab`. Launches the tools as **subprocesses** and talks to them over stdin/stdout (`ToolTab.launch`). Also: `LogPane`/`LogViewer`, `FilmStrip` (thumbnail wall), Discord webhook test. `APP_VERSION` lives here. |
+| `toolbox_gui.py` (~2.6k lines) | The tkinter GUI. `App` (window) hosts four tabs: `UpscaleTab`, `TagTab`, `ConciliateTab`, `SettingsTab`. Launches the tools as **subprocesses** (siblings in `scripts/`, run with cwd at the app root) and talks to them over stdin/stdout (`ToolTab.launch`). Also: `LogPane`/`LogViewer`, `FilmStrip` (thumbnail wall), Discord webhook test, the bottom-bar **"Report an issue"** link (`report_issue`/`_issue_url`, 0.2.8). `APP_VERSION` lives here. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
@@ -159,12 +163,13 @@ Engine, packaging & CI:
 - `.venv/` — the Python 3.12 environment (PyTorch CUDA + seedvr2 requirements).
 - `bootstrap.ps1` — first-launch bootstrapper: downloads Python, PyTorch CUDA,
   the SeedVR2 engine, and `paho-mqtt`. Idempotent. `Image Toolbox.cmd` launches
-  it + the app. The final "starting" window auto-closes on a 10-second countdown
-  (press any key to close early).
+  it + the app (it launches `scripts\toolbox_gui.py`). The final "starting"
+  window auto-closes on a 10-second countdown (press any key to close early).
 - `installer/ImageToolbox.iss` — Inno Setup script; ships only the scripts +
-  bootstrap (heavy components download on first launch). It packages every
-  top-level module via a `..\*.py` glob (not a hand-maintained list — a missing
-  entry broke 0.2.5). Built by `.github/workflows/build-installer.yml` on `v*`
+  bootstrap (heavy components download on first launch). It packages every app
+  module via a `..\scripts\*.py` glob into `{app}\scripts` (not a hand-maintained
+  list — a missing entry broke 0.2.5). 0.2.8's `[InstallDelete]` removes the
+  stale root-level `.py` from pre-0.2.8 installs so old/new copies can't coexist. Built by `.github/workflows/build-installer.yml` on `v*`
   tags → GitHub Releases. **Release notes are the annotated tag message:** write
   clean, user-facing notes in `git tag -a vX -m "…"`; CI strips trailers/PGP and
   publishes them as the release body (no auto-generated compare link). The in-app
@@ -186,9 +191,9 @@ Engine, packaging & CI:
   `CREATE_NO_WINDOW` are Windows-specific; cross-platform work (Linux/Unraid)
   requires porting those layers, though the PyTorch/SeedVR2/Ollama core is
   already cross-platform.
-- **Run from source:** `.venv\Scripts\pythonw.exe toolbox_gui.py`, or
-  double-click `Image Toolbox.cmd`. Headless: `python batch_upscale.py <src>
-  [out]` and `python tag_and_rename.py <folder>`.
+- **Run from source:** `.venv\Scripts\pythonw.exe scripts\toolbox_gui.py`, or
+  double-click `Image Toolbox.cmd`. Headless: `python scripts\batch_upscale.py
+  <src> [out]` and `python scripts\tag_and_rename.py <folder>`.
 
 ## Context
 
