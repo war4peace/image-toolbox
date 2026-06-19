@@ -49,6 +49,16 @@ are left alone and logged. Selectable description language, force-tag /
 force-rename, and **one-click Undo** (every change is recorded before anything is
 modified). Already-tagged files are skipped on re-runs.
 
+**Comparison** (0.2.9) — a floating, resizable **original-vs-upscaled** window
+(like the log window: one shared instance, geometry persisted as
+`compare_geometry`). On the Batch Upscaler tab, **double-clicking a green
+(comparable) thumbnail** opens it; the source and its upscaled counterpart sit
+side by side in a draggable split pane, each fit to its half so the quality gain
+is directly visible. Pairing is **current-run**: the upscaler's `RESULT` event
+carries the output path, which the strip remembers (`FilmStrip._compare`).
+Double-clicking a red/unframed thumbnail (or any Tag & Rename thumbnail) just
+opens the file. See `ComparisonWindow` / `_ComparePane`.
+
 **Conciliation** (experimental, 0.2.1) — replaces original photos with their
 processed (upscaled, optionally tagged & renamed) counterparts. Two phases:
 **Scan/Preview** builds a per-folder plan (replaced / no-match / non-image-kept
@@ -136,7 +146,7 @@ counts give a sense of weight:
 
 | File (`scripts/`) | Role |
 |------|------|
-| `toolbox_gui.py` (~2.6k lines) | The tkinter GUI. `App` (window) hosts four tabs: `UpscaleTab`, `TagTab`, `ConciliateTab`, `SettingsTab`. Launches the tools as **subprocesses** (siblings in `scripts/`, run with cwd at the app root) and talks to them over stdin/stdout (`ToolTab.launch`). Also: `LogPane`/`LogViewer`, `FilmStrip` (thumbnail wall), Discord webhook test, the bottom-bar **"Report an issue"** link (`report_issue`/`_issue_url`, 0.2.8). `APP_VERSION` lives here. |
+| `toolbox_gui.py` (~2.6k lines) | The tkinter GUI. `App` (window) hosts four tabs: `UpscaleTab`, `TagTab`, `ConciliateTab`, `SettingsTab`. Launches the tools as **subprocesses** (siblings in `scripts/`, run with cwd at the app root) and talks to them over stdin/stdout (`ToolTab.launch`). Also: `LogPane`/`LogViewer`, `FilmStrip` (thumbnail wall with green/red outcome frames), `ComparisonWindow`/`_ComparePane` (floating original-vs-upscaled view, 0.2.9), Discord webhook test, the bottom-bar **"Report an issue"** link (`report_issue`/`_issue_url`, 0.2.8). `APP_VERSION` lives here. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |

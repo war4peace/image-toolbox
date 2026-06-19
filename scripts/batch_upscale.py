@@ -136,9 +136,11 @@ def _gui_event(kind, payload):
     Emit one event line for the GUI (no-op outside GUI mode).
       IMG|<path>          – image now being processed
       QUEUE|<json>        – ordered list of queued image paths for this pass
-      RESULT|<json>       – [path, "ok"|"fail"] outcome for one image; the strip
-                            frames it green (an upscaled counterpart now exists,
-                            so it is comparable) or red (processing failed)
+      RESULT|<json>       – [path, "ok"|"fail"(, out_path)] outcome for one image;
+                            the strip frames it green (an upscaled counterpart now
+                            exists, so it is comparable) or red (processing
+                            failed). On "ok" the third element is the upscaled
+                            output path, so a double-click can compare the pair.
     """
     if GUI_MODE:
         print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
@@ -1063,8 +1065,9 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             # was created by an older run). Record it so future runs exclude it.
             if cache is not None:
                 cache.mark_done(local_path)
-            # An upscaled counterpart already exists → green (comparable).
-            _gui_event("RESULT", json.dumps([local_path, "ok"]))
+            # An upscaled counterpart already exists → green (comparable). The
+            # third element is the output path, so a double-click can compare.
+            _gui_event("RESULT", json.dumps([local_path, "ok", out_path]))
             continue
 
         # ── Too large? ───────────────────────────────────────────────────────
@@ -1160,7 +1163,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
 
             consecutive_failures = 0
             processed_paths.add(local_path)
-            _gui_event("RESULT", json.dumps([local_path, "ok"]))   # strip: green
+            # Green + output path so a double-click can compare original↔upscaled.
+            _gui_event("RESULT", json.dumps([local_path, "ok", out_path]))
             if cache is not None:
                 cache.mark_done(local_path)
                 cache.record_lineage(local_path, out_path)

@@ -783,6 +783,109 @@ class LogViewer(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
+#  COMPARISON WINDOW  (original vs. upscaled)
+# ─────────────────────────────────────────────
+
+class _ComparePane(ttk.Frame):
+    """One side of the comparison: a header (filename · dimensions) over a canvas
+    that fits the image to the available space, re-fitting on resize. Decoding is
+    lazy (Pillow) and resizes are debounced so dragging stays smooth even at 4K."""
+
+    def __init__(self, master, title):
+        super().__init__(master)
+        self._title  = title
+        self.header  = ttk.Label(self, anchor="center", foreground="#aab2bf")
+        self.header.pack(fill="x", padx=4, pady=(4, 2))
+        self.canvas  = tk.Canvas(self, highlightthickness=0, bg="#15181d")
+        self.canvas.pack(fill="both", expand=True)
+        self._master_img = None       # PIL image at native resolution
+        self._photo      = None       # current PhotoImage (kept referenced)
+        self._resize_after = None
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def set_image(self, path):
+        from PIL import Image, ImageOps
+        try:
+            img = Image.open(path)
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            self._master_img = img
+            self.header.configure(
+                text=f"{self._title}:  {os.path.basename(path)}  ·  {img.width}×{img.height}")
+        except Exception:
+            self._master_img = None
+            self.header.configure(
+                text=f"{self._title}:  {os.path.basename(path)}  ·  (cannot open)")
+        self._render()
+
+    def _on_resize(self, _event):
+        if self._resize_after is not None:
+            self.after_cancel(self._resize_after)
+        self._resize_after = self.after(120, self._render)
+
+    def _render(self):
+        from PIL import Image, ImageTk
+        self._resize_after = None
+        self.canvas.delete("all")
+        m = self._master_img
+        if m is None:
+            return
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        scale = min(cw / m.width, ch / m.height)        # fit, preserve aspect
+        w = max(1, int(round(m.width * scale)))
+        h = max(1, int(round(m.height * scale)))
+        img = m if (w == m.width and h == m.height) else m.resize((w, h), Image.LANCZOS)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.create_image(cw // 2, ch // 2, image=self._photo)
+
+
+class ComparisonWindow(tk.Toplevel):
+    """
+    Floating, resizable original-vs-upscaled comparison (Future Feature #1).
+
+    The source image and its upscaled counterpart sit side by side in a draggable
+    split pane, each fit to its half so the quality gain is directly visible (the
+    lower-resolution original, scaled up to the same on-screen size, reads softer
+    than the upscaled result). Like the log window there is a single shared
+    instance, re-targeted whenever another comparable thumbnail is double-clicked.
+    """
+
+    def __init__(self, master, source, output, app=None):
+        super().__init__(master)
+        self._app = app
+        geo = app.settings.get("compare_geometry") if app is not None else None
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x640")
+        self.minsize(560, 360)
+
+        panes = ttk.Panedwindow(self, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        self._left  = _ComparePane(panes, "Original")
+        self._right = _ComparePane(panes, "Upscaled")
+        panes.add(self._left,  weight=1)
+        panes.add(self._right, weight=1)
+
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.show(source, output)
+
+    def show(self, source, output):
+        """Point the window at a new pair (used for the shared single instance)."""
+        self.title(f"{APP_TITLE} — Compare — {os.path.basename(source)}")
+        self._left.set_image(source)
+        self._right.set_image(output)
+        self.lift()
+        self.focus_set()
+
+    def save_geometry(self):
+        if self._app is not None and self.winfo_exists():
+            self._app.settings["compare_geometry"] = self.geometry()
+            save_settings(self._app.settings)
+
+    def _close(self):
+        self.save_geometry()
+        self.destroy()
+
+
+# ─────────────────────────────────────────────
 #  TOOL TAB BASE  (subprocess plumbing)
 # ─────────────────────────────────────────────
 
@@ -1067,10 +1170,12 @@ class ToolTab(ttk.Frame):
                 self.preview_name.set(os.path.basename(new))
         elif kind == "RESULT" and payload:
             try:
-                path, status = json.loads(payload)
-            except (ValueError, TypeError):
+                data = json.loads(payload)
+                path, status = data[0], data[1]
+                compare_to = data[2] if len(data) > 2 else None
+            except (ValueError, TypeError, IndexError):
                 return
-            self.strip.set_status(path, status)
+            self.strip.set_status(path, status, compare_to)
         elif kind == "REFRESH" and payload:
             self.strip.refresh(payload)
         elif kind == "ETA" and payload:
@@ -1312,7 +1417,12 @@ class FilmStrip(ttk.Frame):
         self._cols    = 1
         self._hl_id   = None      # highlight rectangle item id
         self._status  = {}        # path -> "ok"/"fail" (run-level, all batches)
+        self._compare = {}        # source path -> upscaled output path (this run)
         self._frame_id = {}       # path -> status-frame rect id (current batch)
+        # Optional callback(source_path, output_path): set by the Upscaler tab to
+        # open the comparison window when a green (comparable) thumbnail is
+        # double-clicked. When unset, double-click just opens the file.
+        self.on_compare = None
         self._gen     = 0         # invalidates stale loader threads
         self._q       = queue.Queue()
         self._resize_after = None
@@ -1353,12 +1463,14 @@ class FilmStrip(ttk.Frame):
         self._index = {p: i for i, p in enumerate(self._paths)}
         self._renamed = {}
         self._status = {}               # outcomes belong to one run only
+        self._compare = {}
         self._batch = None              # force a rebuild on the next IMG event
 
     def clear(self):
         self._gen += 1
         self._paths, self._index, self._renamed = [], {}, {}
         self._status = {}
+        self._compare = {}
         self._batch, self._current = None, None
         self._build_cells([])
 
@@ -1379,7 +1491,8 @@ class FilmStrip(ttk.Frame):
         if old in self._pos:
             self._pos[new] = self._pos.pop(old)
             self._order[self._pos[new]] = new
-        for d in (self._master, self._photo, self._img_id, self._status, self._frame_id):
+        for d in (self._master, self._photo, self._img_id, self._status,
+                  self._frame_id, self._compare):
             if old in d:
                 d[new] = d.pop(old)
 
@@ -1414,14 +1527,18 @@ class FilmStrip(ttk.Frame):
         self._current = path
         self._draw_highlight()
 
-    def set_status(self, path, status):
+    def set_status(self, path, status, compare_to=None):
         """Record a per-image outcome ('ok'/'fail') and, if that image is in the
         batch on screen, frame it (green/red). Run-level: kept across batches, so
-        scrolling back to an earlier batch still shows its outcomes."""
+        scrolling back to an earlier batch still shows its outcomes. `compare_to`
+        (the upscaled output path) enables double-click-to-compare for that
+        thumbnail."""
         path = (path or "").strip()
         if not path or status not in ("ok", "fail"):
             return
         self._status[path] = status
+        if compare_to:
+            self._compare[path] = compare_to
         if path in self._pos:
             self._draw_frame(path)
             self._draw_highlight()      # keep the blue current-frame on top
@@ -1561,8 +1678,16 @@ class FilmStrip(ttk.Frame):
         if col < 0 or col >= self._cols:
             return
         idx = row * self._cols + col
-        if 0 <= idx < len(self._order):
-            self._open(self._order[idx])
+        if not (0 <= idx < len(self._order)):
+            return
+        path = self._order[idx]
+        # A comparable (green) thumbnail with a known upscaled output opens the
+        # comparison window; anything else just opens the file.
+        out = self._compare.get(path)
+        if self.on_compare and out and os.path.exists(out) and os.path.exists(path):
+            self.on_compare(path, out)
+        else:
+            self._open(path)
 
     @staticmethod
     def _open(path):
@@ -1670,6 +1795,10 @@ class UpscaleTab(ToolTab):
         self._cancelled   = False    # user cancelled a preparation phase
         self._phase       = ""       # current phase text (from STATUS events)
         self._build()
+        # Double-clicking a comparable (green) thumbnail opens the comparison
+        # window. Only the Upscaler produces an original↔upscaled pair, so only
+        # this tab wires the hook; the Tag tab's double-click just opens the file.
+        self.strip.on_compare = lambda src, out: self.app.show_comparison(src, out)
 
         # Restore the pinned default folders from config.json
         src_default = get_default_folder("upscale_source")
@@ -3279,6 +3408,7 @@ class App(tk.Tk):
         self.settings = load_settings()
         self._last_normal_geo = None
         self.log_window = None          # single shared LogViewer for both tools
+        self.comparison_window = None   # single shared ComparisonWindow
         self._migrate_default_folders()
         self._restore_geometry()
         self._install_picklist_wheel_guard()
@@ -3488,6 +3618,15 @@ class App(tk.Tk):
         if self.log_window is not None and self.log_window.winfo_exists():
             self.log_window.bind_console(console, title)
 
+    # ── Shared comparison window ─────────────────────────────────────────────
+
+    def show_comparison(self, source, output):
+        """Open (or re-target) the single shared comparison window for a pair."""
+        if self.comparison_window is not None and self.comparison_window.winfo_exists():
+            self.comparison_window.show(source, output)
+        else:
+            self.comparison_window = ComparisonWindow(self, source, output, app=self)
+
     # ── Updates ──────────────────────────────────────────────────────────────
 
     def _startup_worker(self):
@@ -3660,6 +3799,8 @@ class App(tk.Tk):
         self._save_geometry()
         if self.log_window is not None and self.log_window.winfo_exists():
             self.log_window.save_geometry()
+        if self.comparison_window is not None and self.comparison_window.winfo_exists():
+            self.comparison_window.save_geometry()
         # Record last-used time and announce going offline before we exit.
         self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))
         self.destroy()
