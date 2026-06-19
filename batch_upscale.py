@@ -96,6 +96,17 @@ MAX_RESOLUTION      = _U.get("max_resolution",   3840)
 DISCORD_WEBHOOK_URL = _U.get("discord_webhook_url", "")
 OUTAGE_THRESHOLD    = _U.get("outage_threshold", 3)
 
+# Auto-straighten BEFORE upscaling (0.2.7). The upscaler targets 3840px wide OR
+# 2160px tall (whichever is reached first) so the result fits a 4K screen with no
+# resizing. A sideways photo upscaled as-is fills the wrong axis; when Tag &
+# Rename later rotates it 90deg the dimensions swap and it no longer fits. So we
+# rotate first: detect orientation with the same CNN/threshold as Tag & Rename
+# (orientation.py), rotate a TEMP COPY upright, upscale that, and delete it — the
+# source is never touched. Set auto_straighten=false to keep the old behaviour.
+AUTO_STRAIGHTEN       = bool(_U.get("auto_straighten", True))
+STRAIGHTEN_CONFIDENCE = float(_U.get("straighten_min_confidence", 0.9))
+_STRAIGHTEN_DISABLED  = False     # set True at warm-up if torch/timm unavailable
+
 # The SeedVR2 engine — created in main() after CLI validation so that
 # `python batch_upscale.py` (usage help) stays instant.
 ENGINE = None
@@ -556,8 +567,10 @@ def get_image_dimensions(path):
             return (0, 0)
 
 
-def should_skip_resolution(path, cutoff_pct=None):
+def _skip_for_dims(w, h, cutoff_pct):
     """
+    The skip rule for a single (already-upright) width/height.
+
     Skip if EITHER dimension already meets or exceeds the output target:
       width  >= MAX_RESOLUTION (3840) — already at or beyond max horizontal
       height >= RESOLUTION     (2160) — already at or beyond max vertical
@@ -569,20 +582,11 @@ def should_skip_resolution(path, cutoff_pct=None):
       height >= 0.66 * 2160 = 1426px
     means the image is skipped (would be upscaled less than 1.52x).
     """
-    if cutoff_pct is None:
-        cutoff_pct = UPSCALE_CUTOFF_PCT
-
-    w, h = get_image_dimensions(path)
-    if w == 0 and h == 0:
-        return False, ""
-
-    # Already at or above target
     if w >= MAX_RESOLUTION:
         return True, f"width {w}px >= {MAX_RESOLUTION}px"
     if h >= RESOLUTION:
         return True, f"height {h}px >= {RESOLUTION}px"
 
-    # Within cutoff percentage of target — upscale gain too small
     if cutoff_pct > 0:
         cutoff_w = MAX_RESOLUTION * cutoff_pct / 100
         cutoff_h = RESOLUTION     * cutoff_pct / 100
@@ -591,6 +595,35 @@ def should_skip_resolution(path, cutoff_pct=None):
             return True, f"within cutoff ({w}x{h}px, would upscale {scale:.2f}x < {100/cutoff_pct:.2f}x minimum)"
 
     return False, ""
+
+
+def should_skip_resolution(path, cutoff_pct=None):
+    """
+    Cheap eligibility check used by the scan and as a pre-filter in the run loop.
+    Reads the stored dimensions (header only — no decode) and applies the skip
+    rule (see _skip_for_dims).
+
+    When auto-straighten is active, a sideways photo's TRUE (upright) dimensions
+    are the transpose of its stored dimensions, which can flip this decision. We
+    deliberately do NOT run the orientation CNN here — eligibility scanning walks
+    every file and must stay cheap — so we are conservative: an image counts as
+    "too large" only when it would be skipped in BOTH orientations. The precise,
+    orientation-aware skip is made at process time once the CNN has run, against
+    the real upright dimensions (see run_pass).
+    """
+    if cutoff_pct is None:
+        cutoff_pct = UPSCALE_CUTOFF_PCT
+
+    w, h = get_image_dimensions(path)
+    if w == 0 and h == 0:
+        return False, ""
+
+    skip, reason = _skip_for_dims(w, h, cutoff_pct)
+    if skip and AUTO_STRAIGHTEN and not _STRAIGHTEN_DISABLED:
+        skip_transposed, _ = _skip_for_dims(h, w, cutoff_pct)
+        if not skip_transposed:
+            return False, ""    # may become eligible once rotated upright
+    return skip, reason
 
 
 def compute_seedvr2_resolution(w, h):
@@ -616,6 +649,88 @@ def compute_seedvr2_resolution(w, h):
     out_w     = round(w * scale)
     out_h     = round(h * scale)
     return min(out_w, out_h)
+
+
+# ─────────────────────────────────────────────
+#  AUTO-STRAIGHTEN (rotate sideways photos upright BEFORE upscaling)
+#  Mirrors Tag & Rename's straighten path (same model, threshold and policy),
+#  but never touches the source: it rotates a temp copy and upscales that.
+# ─────────────────────────────────────────────
+
+def warm_up_straighten():
+    """Load the orientation model up-front (downloads ~82 MB once) so the first
+    image doesn't pay the cost mid-run, and so the eligibility check below knows
+    whether straightening is actually available. Fails safe: any problem just
+    disables straightening and upscaling proceeds without rotation."""
+    global _STRAIGHTEN_DISABLED
+    if not AUTO_STRAIGHTEN:
+        return
+    try:
+        import orientation
+        if not orientation.is_available():
+            print("  Auto-straighten: torch/timm not available — upscaling without rotation.")
+            _STRAIGHTEN_DISABLED = True
+            return
+        print("  Auto-straighten: loading orientation model "
+              "(first run downloads ~82 MB) ...")
+        orientation._get_model()
+        print("  Auto-straighten: ready.")
+    except Exception as exc:
+        print(f"  Auto-straighten: could not initialise ({exc}) — upscaling without rotation.")
+        _STRAIGHTEN_DISABLED = True
+
+
+def detect_rotation(path):
+    """Return (degrees, message). `degrees` is the CNN class to correct: 90 or
+    270 when the photo is confidently sideways (the caller should upscale a
+    rotated copy), otherwise 0 (leave as-is). The message is for the log. Never
+    raises — any failure yields (0, reason) so upscaling proceeds un-rotated."""
+    if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
+        return 0, ""
+    try:
+        import orientation
+        deg, conf = orientation.analyse(path)
+    except Exception as exc:
+        return 0, f"orientation check skipped: {exc}"
+
+    if not orientation.should_rotate(deg, conf, STRAIGHTEN_CONFIDENCE):
+        if deg != 0:
+            why = "180deg" if deg == 180 else f"below {STRAIGHTEN_CONFIDENCE:.2f} confidence"
+            return 0, f"orientation: {deg}deg @ {conf:.2f} — left as-is ({why})"
+        return 0, ""
+
+    return deg, f"straightened before upscale (detected {deg}deg @ {conf:.2f})"
+
+
+def _make_straightened_copy(src_path, degrees):
+    """Copy `src_path` to a temp file and rotate that copy upright for CNN class
+    `degrees`. The source is never modified. Returns the temp path, or None on
+    failure (the caller then upscales the original, un-rotated)."""
+    import tempfile
+    import shutil
+    tmp = None
+    try:
+        ext = os.path.splitext(src_path)[1] or ".png"
+        fd, tmp = tempfile.mkstemp(suffix=ext, prefix="itbx_straighten_")
+        os.close(fd)
+        shutil.copy2(src_path, tmp)
+        import orientation
+        orientation.straighten(tmp, degrees)   # rotates the COPY, clears EXIF orient
+        return tmp
+    except Exception:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return None
+
+
+def _safe_remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -951,12 +1066,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             continue
 
         # ── Process ──────────────────────────────────────────────────────────
-        w, h      = get_image_dimensions(local_path)
-        img_start = time.time()
+        raw_w, raw_h = get_image_dimensions(local_path)
+        img_start    = time.time()
 
         # Unreadable dimensions = corrupted/unsupported file — skip without
         # counting as an engine failure or incrementing the outage counter.
-        if w == 0 or h == 0:
+        if raw_w == 0 or raw_h == 0:
             import datetime as _dt
             _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
             src_folder_link = _osc8_link(dirpath).replace(dirpath, "📁")
@@ -968,10 +1083,45 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             corrupt_files.append(local_path)
             continue
 
+        # ── Auto-straighten: detect orientation, work out the upright size ────
+        # The upright dimensions (stored size transposed for a 90/270 photo)
+        # drive both the skip decision and the SeedVR2 target, so the output
+        # fits a 4K screen once rotated. The source is never modified — a temp
+        # copy is rotated and upscaled, then removed in the finally below.
+        rot_deg, rot_msg = detect_rotation(local_path)
+        rotate           = rot_deg in (90, 270)
+        w, h             = (raw_h, raw_w) if rotate else (raw_w, raw_h)
+
+        # Precise, orientation-aware skip against the true upright dimensions.
+        # The scan pre-check (should_skip_resolution) is deliberately lenient —
+        # it keeps an image eligible if EITHER orientation would be processed —
+        # so the authoritative decision has to be made here, now the real
+        # orientation is known, for both the rotated and upright cases.
+        skip, reason = _skip_for_dims(w, h, UPSCALE_CUTOFF_PCT)
+        if skip:
+            folder_stats[dirpath]["skipped_size"] += 1
+            total_skipped_size += 1
+            note = " (upright, after straighten)" if rotate else ""
+            logger.log_only(f"  {prefix} SKIP ({reason}){note}  {local_path}", timestamp=True)
+            continue
+
+        # Build the upscale source: a rotated temp copy when straightening.
+        src_path = local_path
+        tmp_path = None
+        if rotate:
+            tmp_path = _make_straightened_copy(local_path, rot_deg)
+            if tmp_path is None:
+                rotate  = False                      # rotation failed — upscale as-is
+                w, h    = raw_w, raw_h
+                rot_msg = "straighten FAILED — upscaled without rotation"
+            else:
+                src_path = tmp_path
+
         scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
         out_w   = round(w * scale)
         out_h   = round(h * scale)
-        dim_str = f"{w}x{h}px -> {out_w}x{out_h}px"
+        dim_str = (f"{raw_w}x{raw_h}px ↻ {w}x{h}px -> {out_w}x{out_h}px"
+                   if rotate else f"{w}x{h}px -> {out_w}x{out_h}px")
 
         os.makedirs(output_dir, exist_ok=True)
         _gui_event("IMG", local_path)    # GUI preview strip: current image
@@ -985,7 +1135,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # Log is written only after completion (with timing) — not here
 
         try:
-            ENGINE.upscale(local_path, out_path, compute_seedvr2_resolution(w, h))
+            ENGINE.upscale(src_path, out_path, compute_seedvr2_resolution(w, h))
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
@@ -996,6 +1146,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             sys.stdout.write(f" {out_folder_link} {checkmark}{timing}\n")
             sys.stdout.flush()
             logger.log_only(f"  {prefix} {dim_str}  {local_path} 📁 ✓{timing}", timestamp=True)
+            if rot_msg:
+                logger.log_only(f"           {rot_msg}")
 
             consecutive_failures = 0
             processed_paths.add(local_path)
@@ -1064,6 +1216,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 )
 
             continue
+
+        finally:
+            # Always remove the rotated temp copy, whether the upscale succeeded,
+            # failed, or the loop is about to break for an outage pause.
+            if tmp_path:
+                _safe_remove(tmp_path)
 
     # Persist any cache changes from this pass — including already-done marks
     # recorded while skipping, and especially when the run ends with a Stop
@@ -1272,6 +1430,11 @@ def main():
     else:
         logger.tee(f"No cache found — full eligibility check required.")
 
+    # Load the orientation model now (main thread). Done before the eligibility
+    # check so its conservative skip rule knows whether straightening is actually
+    # available, and so the first image isn't delayed by the one-off model load.
+    warm_up_straighten()
+
     logger.tee(f"Checking eligibility (this may take a while) ...")
     _gui_event("STATUS", "Checking image eligibility …")
 
@@ -1305,7 +1468,20 @@ def main():
         if cached is not None:
             cache_hits += 1
             if cached["already_done"]:
-                pre_done += 1
+                # "Done" is only true if the upscaled output is still on disk.
+                # If the user deleted it (e.g. to force a re-run), the cached
+                # flag is stale — re-evaluate eligibility from the unchanged
+                # source so the image gets processed again.
+                if os.path.exists(out_path):
+                    pre_done += 1
+                    continue
+                skip, reason = should_skip_resolution(local_path)
+                if skip:
+                    cache.set(local_path, eligible=False, already_done=False, skip_reason=reason)
+                    pre_too_large += 1
+                    continue
+                cache.set(local_path, eligible=True, already_done=False)
+                work_items.append(item)
                 continue
             if not cached["eligible"]:
                 pre_too_large += 1
@@ -1382,8 +1558,12 @@ def main():
                 continue
             cached = cache.get(local_path)
             if cached is not None:
-                if cached["already_done"] or not cached["eligible"]:
+                if not cached["eligible"]:
                     continue
+                # The output does not exist (checked just above), so any cached
+                # "done" flag is stale — clear it and reprocess.
+                if cached["already_done"]:
+                    cache.set(local_path, eligible=True, already_done=False)
                 eligible_rescan.append(item)
             else:
                 skip, reason = should_skip_resolution(local_path)

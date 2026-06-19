@@ -66,11 +66,20 @@ def _get_model():
         return _MODEL
     import torch
     import torch.nn as nn
+    import warnings
     from timm import create_model
     m = create_model("resnext50_32x4d", pretrained=False, num_classes=4)
-    sd = torch.hub.load_state_dict_from_url(
-        _WEIGHTS_URL, progress=False, map_location="cpu"
-    )
+    # The pretrained checkpoint (ternaus/check_orientation, 2020) was saved in
+    # PyTorch's pre-1.6 format, so the loader emits a deprecation FutureWarning.
+    # The load works fine; silence just that one message so it doesn't alarm
+    # non-technical users in the log. If the legacy loader is ever removed, the
+    # load raises and callers disable auto-straighten safely.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Falling back to the old format",
+                                category=FutureWarning)
+        sd = torch.hub.load_state_dict_from_url(
+            _WEIGHTS_URL, progress=False, map_location="cpu"
+        )
     sd = sd.get("state_dict", sd)
     sd = {k.replace("model.", "", 1): v for k, v in sd.items()}
     m.load_state_dict(sd)

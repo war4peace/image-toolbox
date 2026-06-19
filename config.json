@@ -22,7 +22,9 @@
         "decode_tile_size": 1024,
         "outage_threshold": 3,
         "discord_webhook_url": "",
-        "upscale_cutoff_pct": 66
+        "upscale_cutoff_pct": 66,
+        "auto_straighten": true,
+        "straighten_min_confidence": 0.9
     },
     "tagging": {
         "min_width": 3840,

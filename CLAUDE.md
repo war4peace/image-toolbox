@@ -29,7 +29,14 @@ Resolution Target (4K/2K/1080p). Skips images already near the target
 batch; corrupt/missing files are detected, logged and skipped; a second pass
 re-scans for files that appeared mid-run. Live thumbnail wall, two-row status,
 progress bar, ETA. Pause/resume/stop (stop finishes the current image first).
-Works with mapped network drives.
+Works with mapped network drives. **Auto-straighten before upscaling** (0.2.7, on
+by default) rotates sideways photos upright *first*, so the result respects the
+4K-fit target (3840 wide OR 2160 tall) in its final orientation — without it, a
+sideways photo is upscaled on the wrong axis and stops fitting once Tag & Rename
+straightens it. The source is never touched: a temp copy is rotated, upscaled,
+then deleted. Uses the same CNN/threshold as Tag & Rename (`orientation.py`); the
+eligibility/skip check is orientation-aware. Toggle + threshold in Settings →
+Upscaling.
 
 **Tag & Rename** — analyses each image with a local Ollama vision model, writes
 a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`.
@@ -118,7 +125,7 @@ Top-level Python (the actual app — note line counts give a sense of weight):
 | File | Role |
 |------|------|
 | `toolbox_gui.py` (~2.5k lines) | The tkinter GUI. `App` (window) hosts four tabs: `UpscaleTab`, `TagTab`, `ConciliateTab`, `SettingsTab`. Launches the tools as **subprocesses** and talks to them over stdin/stdout (`ToolTab.launch`). Also: `LogPane`/`LogViewer`, `FilmStrip` (thumbnail wall), Discord webhook test. `APP_VERSION` lives here. |
-| `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. |
+| `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
 | `conciliate.py` (~430 lines) | Conciliation runner (CLI + GUI-driven). Two phases over stdin (`run`/`q`): scan builds the original→processed plan (matching by content-hash lineage first — path-independent, survives folder moves — then falling back to mirrored-name matching), then run archives/deletes originals and moves processed files into the original tree. No GPU/heavy imports — pure file I/O. |

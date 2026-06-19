@@ -73,7 +73,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.6"
+APP_VERSION = "0.2.7"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -2002,7 +2002,8 @@ RESOLUTION_PRESETS = [
 # Keys in the "upscale" block that get their own dedicated controls and so are
 # NOT rendered in the generic SeedVR Settings box.
 _SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
-                   "upscale_cutoff_pct", "output_subdir", "debug"}
+                   "upscale_cutoff_pct", "output_subdir", "debug",
+                   "auto_straighten", "straighten_min_confidence"}
 
 # Friendly labels for the generic SeedVR fields.
 _SEEDVR_LABELS = {
@@ -2148,6 +2149,24 @@ class SettingsTab(ttk.Frame):
         cut_spin.pack(side="left")
         ttk.Label(strip, text="% of target resolution").pack(side="left", padx=(4, 0))
         Tooltip(cut_spin, "Percentage of the target resolution.   (0 = upscale everything eligible)")
+
+        strip2 = ttk.Frame(sec)
+        strip2.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+        self.up_straighten_var = tk.BooleanVar(value=bool(ups.get("auto_straighten", True)))
+        up_chk = ttk.Checkbutton(strip2, text="Auto-straighten rotated photos before upscaling",
+                                 variable=self.up_straighten_var)
+        up_chk.pack(side="left")
+        Tooltip(up_chk, "Rotates a sideways photo upright BEFORE upscaling so the result still "
+                        "fits a 4K screen. Without this, the upscaler targets the wrong axis and "
+                        "the image no longer fits once Tag & Rename straightens it. The source is "
+                        "never modified (a temp copy is rotated and upscaled).")
+        ttk.Label(strip2, text="Confidence threshold:").pack(side="left", padx=(18, 4))
+        self.up_straighten_conf_var = tk.DoubleVar(
+            value=float(ups.get("straighten_min_confidence", 0.9)))
+        up_spin = ttk.Spinbox(strip2, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+                              textvariable=self.up_straighten_conf_var)
+        up_spin.pack(side="left")
+        Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)")
 
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
         sec = self._section(body, "SeedVR Settings")
@@ -2491,6 +2510,12 @@ class SettingsTab(ttk.Frame):
                 ups["max_resolution"], ups["resolution"] = pmx, prs
                 break
         ups["discord_webhook_url"] = self.webhook_var.get().strip()
+        ups["auto_straighten"] = bool(self.up_straighten_var.get())
+        try:
+            up_conf = round(float(self.up_straighten_conf_var.get()), 2)
+        except (ValueError, tk.TclError):
+            up_conf = 0.9
+        ups["straighten_min_confidence"] = min(1.0, max(0.5, up_conf))
         ups.update(seedvr_out)
 
         try:
@@ -2577,6 +2602,8 @@ class SettingsTab(ttk.Frame):
         self.straighten_conf_var.set(float(tag.get("straighten_min_confidence", 0.9)))
         self.restarget_var.set(self._current_preset_label(ups))
         self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
+        self.up_straighten_var.set(bool(ups.get("auto_straighten", True)))
+        self.up_straighten_conf_var.set(float(ups.get("straighten_min_confidence", 0.9)))
         self.webhook_var.set(ups.get("discord_webhook_url", ""))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))
