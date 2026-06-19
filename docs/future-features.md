@@ -4,110 +4,80 @@ Candidate features for the toolbox, **sorted by implementation difficulty
 (easiest first)**, with a feasibility assessment for each. See the bottom for
 the cross-feature dependencies that should drive sequencing.
 
-All six are feasible. They split into two tiers: contained, low-risk additions
+All six are feasible. They split into two tiers: contained, lower-risk additions
 (1–3) and larger milestones that introduce new process models, networking, or
-packaging (4–6).
+packaging (4–6). Within tier 1 the numbering reflects grouping rather than strict
+difficulty (#3 is the smallest).
 
 ---
 
-## 1. Image tree conciliation ("destructive" functionality) — Easy–Medium
-When the user is satisfied with the upscaling results, the application moves
-upscaled images into the source folder tree and either places the originals in
-an archive folder of choice, or removes them.
+## 1. Move the Python scripts into a `scripts/` subfolder — Easy–Medium
+The repository root currently holds ~11 top-level `.py` files mixed in with
+config, docs and the vendored engine. Move them all into `scripts/` and update
+every reference so the root is just entry points, data and `seedvr2/`.
 
-- **Why it's the easiest:** the output already mirrors the source tree via
-  `os.path.relpath` (`batch_upscale.py`, the `os.walk` / `output_dir` logic), so
-  conciliation is just: walk the output tree, map each file back to its source
-  location, move it in, then archive-or-delete the original.
-- **Reuse:** the relpath mapping in `batch_upscale.py`; the undo-cache pattern
-  from `tag_and_rename.py`; `shutil` from the standard library.
-- **Work needed:** a new module + a small GUI panel (or a button on the Upscale
-  tab); archive-folder picker; collision handling; an undo log.
-- **Risks:** it is *destructive* — the app's whole pitch is "your originals are
-  never touched" — so it needs strong confirmation, a dry-run preview, and undo.
-  Edge case: the upscaler can change the extension (PNG→JPG in
-  `upscale_engine._save_image`), so name-matching must be tolerant.
+- **Why do it:** a cleaner, self-explanatory root (the app's own code vs.
+  config/state/engine), and one obvious home for the modules.
+- **Reuse:** the modules already import each other as flat siblings, so once they
+  all live together in `scripts/` those imports keep working unchanged — the
+  entry script's own directory is on `sys.path`.
+- **Work needed:** the real effort is *path anchoring*. Many modules compute
+  locations from their own `__file__` (e.g. `SCRIPT_DIR` in `batch_upscale.py` /
+  `toolbox_gui.py`), and `config.json`, `gui_settings.json`, `logs/`, `scans/`,
+  `trcache/`, `db/`, `seedvr2/` and the model weights all live at the *app root*,
+  not in `scripts/`. Introduce a single `APP_ROOT` (the parent of `scripts/`) and
+  route every data/config/engine path through it. Then update the launcher
+  (`Image Toolbox.cmd` → `scripts\toolbox_gui.py`), `bootstrap.ps1`, the GUI's
+  subprocess launches (`ToolTab.launch`, which builds the child script paths),
+  and the installer (`installer/ImageToolbox.iss`: `..\*.py` → `..\scripts\*.py`
+  with the matching `DestDir`, plus the shortcut target).
+- **Risks:** path regressions are easy to miss because each module resolves paths
+  independently — the 0.2.5 breakage was exactly a packaging/path mismatch.
+  In-place upgrades also need an `[InstallDelete]` rule to remove the now-stale
+  root-level `.py` files, or old and new copies coexist. Test a clean install
+  *and* an upgrade-over-0.2.x.
 
-## 2. In-app auto-update functionality — Medium
-The application checks for updates, displays patch notes, prompts to update, and
-self-updates.
+## 2. Comparison tab (original vs. upscaled) — Medium
+A new tab that shows a source image beside its upscaled result so the user can
+judge the quality gain — ideally with synchronized zoom/pan and a before/after
+wipe slider.
 
-> **Status: implemented (0.2.3).** See `updater.py` and `UpdateDialog` /
-> the Settings "Updates" section in `toolbox_gui.py`. Checks the GitHub Releases
-> API on startup (opt-out) and on demand; downloads `ImageToolboxSetup.exe`,
-> launches it and quits so Inno Setup replaces the app in place. "Skip this
-> version" is remembered in `config.json` (`updates` section).
+- **Why it's feasible:** the source→upscaled pairing already exists. The
+  `lineage` table (`db.py`, content-hash links) maps an original to its upscaled
+  output independently of path, with the mirrored-tree `relpath` mapping as a
+  fallback — so "find the counterpart" is a lookup, not new bookkeeping.
+- **Reuse:** the tab / `FilmStrip` patterns in `toolbox_gui.py`; the lineage
+  lookup; `Pillow` (already in the venv) for loading and resizing.
+- **Work needed:** a `ComparisonTab` with a pair picker (choose an original;
+  auto-resolve its upscaled counterpart via lineage), an image viewer with synced
+  zoom/pan, and a split before/after slider. Handle the resolution mismatch by
+  rendering both at the same on-screen size (upscaled at native detail, original
+  scaled up by the viewer) so the difference is visible.
+- **Risks:** displaying 4K images in tkinter needs care — downscale to the
+  viewport and re-render on zoom to stay responsive and bounded in memory. It
+  also brings `Pillow`/`ImageTk` into the GUI layer (which has stayed stdlib-only
+  so far, though Pillow is already installed for the engine) — a small, deliberate
+  dependency call. Synced pan/zoom on a tkinter `Canvas` is fiddly but
+  well-trodden.
 
-- **What's in place:** `APP_VERSION` in `toolbox_gui.py`; distribution is the
-  GitHub-Releases installer built by CI on `v*` tags; `urllib` is already used.
-- **Work needed:** query the GitHub Releases API for the latest tag, compare to
-  `APP_VERSION`, show the release body as patch notes (a tkinter dialog),
-  download `ImageToolboxSetup.exe`, launch it and exit.
-- **Why not "easy":** Windows self-update means the installer replaces files of a
-  running app — solved by the standard pattern (launch installer, quit
-  immediately; Inno overwrites the scripts, user relaunches). Must also handle
-  the unsigned-installer SmartScreen flow, network/checksum failures, and
-  "skip this version."
-- **Risks:** low technical risk; mostly UX polish. No GPU/Linux concerns.
+## 3. "Report an issue" feedback link — Easy
+A Feedback button/link in the lower-right of the main window (to the right of the
+telemetry row) that opens
+`https://github.com/war4peace/image-toolbox/issues/new` in the browser.
 
-## 3. Home Assistant integration — Medium
-Statistics, cache file state, application status.
-
-> **Status: implemented (0.2.4).** See `mqtt_publisher.py` and the
-> "Home Assistant (MQTT)" section in `toolbox_gui.py`'s Settings tab. MQTT is a
-> deliberate, opt-in dependency (`paho-mqtt`, installed by `bootstrap.ps1`); it
-> stays disabled until a broker host is configured (no separate enable toggle).
-> A persistent `MqttClient` keeps the connection up for the app's lifetime, sets
-> an availability LWT (`image-toolbox/availability` → online/offline), verifies
-> connectivity on startup, and publishes retained topics: `version`, `update`,
-> `latest_version`, `last_run` (JSON), `last_used`, and live `task/*` state
-> (`name`, `details`, `runtime`, `progress`, `eta`, `average_processing_time`,
-> `last_processing_time`). A "Test" button checks the broker from Settings.
-
-- **What helped:** the data is all readable — app status (is a subprocess
-  running), cache/scan state, processed counts; the existing `@@TBX@@` GUI-event
-  seam surfaces live task phase/progress/ETA, which the publisher mirrors.
-- **Transport chosen:** MQTT (retained topics + LWT) driven by a background
-  publisher in the GUI — no long-running HTTP server needed.
-- **Coupling:** if the HTTP interface (#5) is built first, HA can simply scrape
-  it; MQTT was the cheaper path given no server exists today.
-- **Risks accepted:** a networking dependency and a persistent background loop —
-  kept contained (lazy import, disabled until configured, best-effort publishes).
-
-### 3a. System telemetry sampler (follow-up to #3) — Easy–Medium
-Display CPU usage, GPU VRAM usage and GPU temperature in-app, and publish them to
-MQTT on a timer (~every 30 s).
-
-> **Status: implemented (0.2.5).** See `system_telemetry.py` (CPU via Windows
-> `GetSystemTimes`, RAM via `GlobalMemoryStatusEx` — both `ctypes`; GPU
-> VRAM+temperature via `nvidia-smi` — stayed dependency-light, no psutil/pynvml)
-> and `TelemetryRow` / `App.sample_telemetry` in `toolbox_gui.py`. A compact
-> readout (CPU · RAM · VRAM · GPU temp) sits below the image carousel on each
-> tool tab, with the percentage values colour-banded by load (blue ≤25 % · green
-> ≤65 % · dark yellow ≤85 % · red >85 %). Sampling is task-driven, not a fixed wall-clock timer: during
-> **upscaling** GPU VRAM/temp (and CPU, synced) are read 5 s *after each image
-> starts* — past the load/ramp, so the reading is steady-state work rather than
-> the dip between images; during **Tag & Rename** and **Conciliation** every
-> 30 s; and while **idle** every 60 s (so the user can watch VRAM free up before
-> starting a run — e.g. after closing another GPU app). The idle sampler steps
-> aside whenever a task is running. Samples run off the UI thread (a lock
-> prevents overlapping `nvidia-smi` calls) and publish retained topics
-> `image-toolbox/system/cpu`, `/ram`, `/ram_total`, `/gpu_vram`,
-> `/gpu_vram_total`, `/gpu_temp`.
-
-- **Why now:** natural extension of #3 — once the MQTT publisher exists, adding
-  periodic gauges is mostly a sampling loop plus a few extra retained topics
-  (e.g. `image-toolbox/system/cpu`, `/gpu_vram`, `/gpu_temp`) and a small in-app
-  readout.
-- **Work needed:** a background sampler thread (reuse the publisher's loop);
-  read CPU via stdlib/`psutil`, and NVIDIA GPU VRAM/temperature via `nvidia-smi`
-  (already on a CUDA box) or NVML (`pynvml`); throttle to ~30 s; render a compact
-  status row in the GUI.
-- **Decisions to make:** whether to take on `psutil`/`pynvml` or shell out to
-  `nvidia-smi` to stay dependency-light; sample cadence; whether to publish
-  Home Assistant MQTT discovery configs so the sensors appear automatically.
-- **Risks:** low — read-only telemetry; main watch-item is not spawning
-  `nvidia-smi` too often or blocking the UI thread.
+- **Why it's easy:** `webbrowser.open(...)` is already used (Discord / releases
+  links), so this is one small widget plus a URL.
+- **Make it useful, cheaply:** pre-fill the issue via query params
+  (`?title=…&body=…`) with `APP_VERSION` and basic environment (OS, GPU name from
+  `system_telemetry.sample_gpu`), and prompt the user to attach the newest
+  `logs/crash_*.log` — turning the crash logging added in 0.2.6 into actionable
+  reports. A repo issue template (`?template=`) would standardize this further.
+- **Reuse:** `webbrowser`, `APP_VERSION`, `system_telemetry`, and the crash-log
+  convention from `crash_logger.py`.
+- **Work needed:** place the link in a small bottom-right status area beside the
+  telemetry row; build the pre-filled URL (keep the body short — URLs have length
+  limits, and `body` must be URL-encoded); open it.
+- **Risks:** negligible. Only watch the pre-filled body length and encoding.
 
 ## 4. Remote upscaling (RunPod) — Hard
 Spin up a runpod.io pod, point the application to the pod, install requirements
@@ -165,12 +135,18 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2 and #3 are shipped** (0.2.0–0.2.4). #1 and #2 were independent quick
-  wins; #3 took MQTT rather than waiting on #5, accepting a contained networking
-  dependency. #3a (telemetry sampler) is the natural next increment on top of #3.
-- **#6 depends on #5** (headless needs a web UI). With #3 already done over MQTT,
-  the **#5 → #3** coupling no longer drives sequencing; #5 and #6 remain the
-  large milestones.
-- **Architectural watch-item:** the app is currently dependency-light and
-  Windows-only. #3, #5, and #6 each push it toward extra packages, a
-  long-running server, and cross-platform support — adopt those deliberately.
+- **Already shipped (0.2.0–0.2.7):** image-tree conciliation, in-app auto-update,
+  Home Assistant (MQTT), the system-telemetry sampler, crash logging, and
+  auto-straighten-before-upscaling. Those former roadmap items have been removed
+  from the list above.
+- **Tier 1 (#1–#3) are independent**, but do **#1 (scripts → `scripts/`) first**:
+  it re-anchors paths and touches the installer, so landing it before the
+  comparison tab (#2) means new files arrive in the final structure and aren't
+  moved twice. #3 (feedback link) is the smallest and can slot in any time.
+- **#6 depends on #5** (headless Unraid needs a web UI). With Home Assistant
+  already done over MQTT, the old **#5 → telemetry** coupling no longer drives
+  sequencing; #4, #5 and #6 remain the large, mostly independent milestones.
+- **Architectural watch-item:** the app is dependency-light and Windows-only. #2
+  leans on `Pillow` in the GUI layer; #4, #5 and #6 each push toward extra
+  packages, a long-running server, and cross-platform support — adopt those
+  deliberately.
