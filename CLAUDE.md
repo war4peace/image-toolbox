@@ -95,6 +95,22 @@ exists it shows the patch notes and can download `ImageToolboxSetup.exe`, launch
 it and quit so Inno Setup replaces the app in place. "Skip this version" is
 remembered. Pure stdlib (`urllib`); see `updater.py`.
 
+**Crash logging** (0.2.5) — the GUI runs under `pythonw.exe` (no console), so an
+unhandled exception used to kill the app with only a split-second flash and no
+trail. `crash_logger.install()` is armed at the very top of `toolbox_gui.py`
+(before the feature imports, so even an import-time failure — a module the
+installer forgot to ship — is caught) and hooks `sys.excepthook`,
+`threading.excepthook`, and `tkinter.Tk.report_callback_exception`. On a crash it
+writes `logs/crash_<timestamp>.log` (app/Python/platform header + full traceback)
+and shows a native ctypes message box pointing at the file, so the crash is
+visible even when tkinter itself broke. The three subprocess runners
+(`batch_upscale.py`, `tag_and_rename.py`, `conciliate.py`) also arm it with
+`install(notify=False)` — they write the same crash log but skip the dialog,
+since their traceback already reaches the GUI log pane via stderr. Stdlib only.
+(An Event Viewer entry was considered but dropped — writing the Application log
+needs an elevated, registered source and the app runs non-elevated.) See
+`crash_logger.py`.
+
 ## Codebase structure
 
 Top-level Python (the actual app — note line counts give a sense of weight):
@@ -111,6 +127,7 @@ Top-level Python (the actual app — note line counts give a sense of weight):
 | `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
 | `system_telemetry.py` (~180 lines) | System telemetry sampler (Feature #3a). Stdlib-only, read-only, best-effort: `CpuSampler` reads CPU usage from Windows `GetSystemTimes` (`ctypes`) as a delta between calls; `sample_ram()` reads physical RAM via `GlobalMemoryStatusEx`; `sample_gpu()` shells out to `nvidia-smi` for VRAM used/total and temperature. All fail safe to `None`. The GPU query blocks (spawns a process), so the GUI samples from a background thread. |
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
+| `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |
 
 Configuration & state:
 

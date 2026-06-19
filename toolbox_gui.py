@@ -36,6 +36,32 @@ import webbrowser
 import urllib.request
 import urllib.error
 
+# Arm crash logging before the feature imports below, so even an import-time
+# failure (e.g. a module the installer forgot to ship) leaves a crash log and a
+# visible dialog instead of a silent split-second window. The try/except means
+# a missing crash_logger.py can't itself reintroduce a silent crash.
+try:
+    import crash_logger
+    crash_logger.install()
+except Exception:
+    crash_logger = None
+    import traceback as _traceback
+    import datetime as _datetime
+
+    def _emergency_excepthook(exc_type, exc, tb):
+        try:
+            _d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+            os.makedirs(_d, exist_ok=True)
+            _p = os.path.join(
+                _d, "crash_" + _datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
+            with open(_p, "w", encoding="utf-8") as _f:
+                _traceback.print_exception(exc_type, exc, tb, file=_f)
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _emergency_excepthook
+
 import updater
 import mqtt_publisher
 import system_telemetry
@@ -47,7 +73,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.6"
+
+if crash_logger:
+    crash_logger.set_version(APP_VERSION)
 
 CREATE_NO_WINDOW = 0x08000000
 

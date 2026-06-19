@@ -32,15 +32,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"
 
 [Files]
-Source: "..\toolbox_gui.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\batch_upscale.py";    DestDir: "{app}"; Flags: ignoreversion
-Source: "..\tag_and_rename.py";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\orientation.py";      DestDir: "{app}"; Flags: ignoreversion
-Source: "..\upscale_engine.py";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\conciliate.py";       DestDir: "{app}"; Flags: ignoreversion
-Source: "..\db.py";               DestDir: "{app}"; Flags: ignoreversion
-Source: "..\updater.py";          DestDir: "{app}"; Flags: ignoreversion
-Source: "..\mqtt_publisher.py";   DestDir: "{app}"; Flags: ignoreversion
+; Ship every top-level Python module. A glob (not a hand-maintained list) so a
+; new module can never again be silently left out of the installer — the failure
+; that broke 0.2.5 (system_telemetry.py / crash_logger.py missing). Non-recursive,
+; so the vendored seedvr2\ tree and tools\ are not swept in.
+Source: "..\*.py";                DestDir: "{app}"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion

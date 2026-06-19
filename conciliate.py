@@ -43,6 +43,16 @@ import hashlib
 import datetime
 import threading
 
+# Write a logs/crash_*.log on any unhandled crash. notify=False: this runs
+# headless as a GUI subprocess, whose traceback already reaches the GUI log pane
+# via stderr — no message box. Defensive import so a missing module can't break
+# the run.
+try:
+    import crash_logger
+    crash_logger.install(notify=False)
+except Exception:
+    pass
+
 import db
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
