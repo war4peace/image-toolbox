@@ -3219,6 +3219,7 @@ class App(tk.Tk):
         self.log_window = None          # single shared LogViewer for both tools
         self._migrate_default_folders()
         self._restore_geometry()
+        self._install_picklist_wheel_guard()
 
         self.nb = ttk.Notebook(self)
         self.upscale_tab    = UpscaleTab(self.nb, self)
@@ -3271,6 +3272,32 @@ class App(tk.Tk):
         if update_auto_check_enabled() or mqtt_enabled():
             self.after(1500, lambda: threading.Thread(
                 target=self._startup_worker, daemon=True).start())
+
+    def _install_picklist_wheel_guard(self):
+        """Stop a mouse-wheel scroll over a ttk Combobox/Spinbox from silently
+        changing its value — a Windows footgun that can flip a setting unnoticed
+        (and then trip the unsaved-changes guard). Replaces the default class
+        binding once, so it covers every current and future picklist; the wheel
+        is redirected to the nearest scrollable canvas so the surrounding page
+        still scrolls. The open dropdown list is a separate widget class, so it
+        keeps its own scrolling."""
+        for cls in ("TCombobox", "TSpinbox"):
+            self.bind_class(cls, "<MouseWheel>", self._picklist_wheel)
+
+    def _picklist_wheel(self, event):
+        # Forward the scroll to the first scrollable Canvas ancestor (if any),
+        # then return "break" so the widget's own value-changing binding — and
+        # the page's bind_all handler — don't also fire.
+        w = getattr(event.widget, "master", None)
+        while w is not None:
+            if isinstance(w, tk.Canvas):
+                try:
+                    w.yview_scroll(int(-event.delta / 120), "units")
+                except tk.TclError:
+                    pass
+                break
+            w = getattr(w, "master", None)
+        return "break"
 
     def _build_statusbar(self):
         """A thin bottom strip with a right-aligned 'Report an issue' link

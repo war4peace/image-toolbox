@@ -64,7 +64,12 @@ pipeline options; Discord webhook (with Test); default folders per tool. Setting
 take effect only on **Save**; an **unsaved-changes guard** compares the form
 against `config.json` and shows a Save / Don't save / Cancel prompt when leaving
 the Settings tab or closing the app with pending edits (`SettingsTab.is_dirty` /
-`_collect` / `revert`).
+`_collect` / `revert`). Picklists ignore the mouse wheel (0.2.8): `App`
+rebinds the `TCombobox`/`TSpinbox` `<MouseWheel>` class bindings
+(`_install_picklist_wheel_guard` / `_picklist_wheel`) so scrolling over a
+combobox/spinbox no longer silently cycles its value (which used to flip a
+setting unnoticed and trip the guard); the wheel is forwarded to the nearest
+scrollable canvas so the page still scrolls.
 
 **Notifications** — Discord webhook on queue completion and on errors.
 
