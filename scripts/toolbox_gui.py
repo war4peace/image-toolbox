@@ -786,69 +786,34 @@ class LogViewer(tk.Toplevel):
 #  COMPARISON WINDOW  (original vs. upscaled)
 # ─────────────────────────────────────────────
 
-class _ComparePane(ttk.Frame):
-    """One side of the comparison: a header (filename · dimensions) over a canvas
-    that fits the image to the available space, re-fitting on resize. Decoding is
-    lazy (Pillow) and resizes are debounced so dragging stays smooth even at 4K."""
-
-    def __init__(self, master, title):
-        super().__init__(master)
-        self._title  = title
-        self.header  = ttk.Label(self, anchor="center", foreground="#aab2bf")
-        self.header.pack(fill="x", padx=4, pady=(4, 2))
-        self.canvas  = tk.Canvas(self, highlightthickness=0, bg="#15181d")
-        self.canvas.pack(fill="both", expand=True)
-        self._master_img = None       # PIL image at native resolution
-        self._photo      = None       # current PhotoImage (kept referenced)
-        self._resize_after = None
-        self.canvas.bind("<Configure>", self._on_resize)
-
-    def set_image(self, path):
-        from PIL import Image, ImageOps
-        try:
-            img = Image.open(path)
-            img = ImageOps.exif_transpose(img).convert("RGB")
-            self._master_img = img
-            self.header.configure(
-                text=f"{self._title}:  {os.path.basename(path)}  ·  {img.width}×{img.height}")
-        except Exception:
-            self._master_img = None
-            self.header.configure(
-                text=f"{self._title}:  {os.path.basename(path)}  ·  (cannot open)")
-        self._render()
-
-    def _on_resize(self, _event):
-        if self._resize_after is not None:
-            self.after_cancel(self._resize_after)
-        self._resize_after = self.after(120, self._render)
-
-    def _render(self):
-        from PIL import Image, ImageTk
-        self._resize_after = None
-        self.canvas.delete("all")
-        m = self._master_img
-        if m is None:
-            return
-        cw = max(self.canvas.winfo_width(), 1)
-        ch = max(self.canvas.winfo_height(), 1)
-        scale = min(cw / m.width, ch / m.height)        # fit, preserve aspect
-        w = max(1, int(round(m.width * scale)))
-        h = max(1, int(round(m.height * scale)))
-        img = m if (w == m.width and h == m.height) else m.resize((w, h), Image.LANCZOS)
-        self._photo = ImageTk.PhotoImage(img)
-        self.canvas.create_image(cw // 2, ch // 2, image=self._photo)
-
-
 class ComparisonWindow(tk.Toplevel):
     """
     Floating, resizable original-vs-upscaled comparison (Future Feature #1).
 
-    The source image and its upscaled counterpart sit side by side in a draggable
-    split pane, each fit to its half so the quality gain is directly visible (the
-    lower-resolution original, scaled up to the same on-screen size, reads softer
-    than the upscaled result). Like the log window there is a single shared
-    instance, re-targeted whenever another comparable thumbnail is double-clicked.
+    Both images are drawn aligned on a single canvas, split by a vertical
+    **before/after wipe**: left of the divider shows the original, right shows the
+    upscaled result. Zoom and pan are *shared*, so the two halves always show the
+    same region — the quality gain is directly visible (the lower-resolution
+    original, magnified to the same on-screen scale, reads softer).
+
+    Interaction:
+      * mouse wheel  — zoom in/out, centred on the pointer (fit … 400% of the
+        upscaled image's native pixels)
+      * drag image   — pan, clamped so the view stays filled
+      * drag divider — slide the wipe (grab the handle / the divider line)
+
+    Only the visible region of each side is decoded (Pillow ``resize`` with a
+    float ``box``), so even 4K stays responsive; an interactive gesture renders
+    with a fast filter and a crisp pass follows when it settles. Like the log
+    window there is one shared instance, re-targeted on each double-click.
     """
+
+    ZOOM_STEP = 1.25         # per wheel notch
+    ABS_MAX   = 4.0          # max screen px per upscaled-image px (≈400%)
+    HANDLE_TOL = 9           # px around the divider that grabs the wipe
+    DIVIDER   = "#e8edf3"
+    HANDLE_FILL = "#e8edf3"
+    HANDLE_EDGE = "#202329"
 
     def __init__(self, master, source, output, app=None):
         super().__init__(master)
@@ -857,28 +822,239 @@ class ComparisonWindow(tk.Toplevel):
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x640")
         self.minsize(560, 360)
 
-        panes = ttk.Panedwindow(self, orient="horizontal")
-        panes.pack(fill="both", expand=True)
-        self._left  = _ComparePane(panes, "Original")
-        self._right = _ComparePane(panes, "Upscaled")
-        panes.add(self._left,  weight=1)
-        panes.add(self._right, weight=1)
+        bar = ttk.Frame(self, padding=(8, 4))
+        bar.pack(fill="x")
+        self._old_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._old_lbl.pack(side="left")
+        self._new_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._new_lbl.pack(side="right")
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="#15181d")
+        self.canvas.pack(fill="both", expand=True)
+
+        # View state (shared by both images)
+        self._old = None          # PIL image, native resolution
+        self._new = None          # PIL image, native resolution (the reference)
+        self._zoom = 1.0          # 1.0 == fit-to-window
+        self._ox = self._oy = 0.0 # canvas px of the display rect's top-left
+        self._wipe_frac = 0.5     # divider position as a fraction of width
+        self._inited = False      # offsets centred once images/size are known
+        self._last_size = None    # (cw, ch) for centre-preserving resize
+        self._drag = None         # None | ("pan", x, y) | ("wipe",)
+        self._photos = []         # keep PhotoImage refs alive
+        self._crisp_after = None
+
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
 
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.show(source, output)
 
+    # ── Public API (shared single instance) ──────────────────────────────────
+
     def show(self, source, output):
-        """Point the window at a new pair (used for the shared single instance)."""
+        """Point the window at a new pair and reset the view to fit."""
+        from PIL import Image, ImageOps
+
+        def _load(path):
+            try:
+                im = Image.open(path)
+                return ImageOps.exif_transpose(im).convert("RGB")
+            except Exception:
+                return None
+
+        self._old = _load(source)
+        self._new = _load(output)
+        self._old_lbl.configure(text="Original:  " + self._caption(source, self._old))
+        self._new_lbl.configure(text="Upscaled:  " + self._caption(output, self._new))
         self.title(f"{APP_TITLE} — Compare — {os.path.basename(source)}")
-        self._left.set_image(source)
-        self._right.set_image(output)
+        self._zoom = 1.0
+        self._wipe_frac = 0.5
+        self._inited = False
         self.lift()
         self.focus_set()
+        self._render()
 
     def save_geometry(self):
         if self._app is not None and self.winfo_exists():
             self._app.settings["compare_geometry"] = self.geometry()
             save_settings(self._app.settings)
+
+    # ── Geometry helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _caption(path, img):
+        if img is None:
+            return f"{os.path.basename(path)}  ·  (cannot open)"
+        return f"{os.path.basename(path)}  ·  {img.width}×{img.height}"
+
+    def _size(self):
+        return max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
+
+    def _fit(self, cw, ch):
+        """Absolute scale (screen px per reference px) at zoom == 1.0."""
+        return min(cw / self._new.width, ch / self._new.height)
+
+    def _zoom_max(self, fit):
+        return max(1.0, self.ABS_MAX / fit)
+
+    @staticmethod
+    def _clamp_axis(o, disp, view):
+        """Keep the view filled: centre when the image is smaller than the view,
+        otherwise stop the image edges from leaving a gap."""
+        if disp <= view:
+            return (view - disp) / 2.0
+        return min(0.0, max(view - disp, o))
+
+    # ── Interaction ──────────────────────────────────────────────────────────
+
+    def _on_configure(self, _event):
+        if self._new is None:
+            return
+        cw, ch = self._size()
+        if self._inited and self._last_size and self._last_size != (cw, ch):
+            # Preserve the image point at the view centre across a resize.
+            ocw, och = self._last_size
+            os_ = self._fit(ocw, och) * self._zoom
+            odw, odh = self._new.width * os_, self._new.height * os_
+            cu = (ocw / 2 - self._ox) / odw if odw else 0.5
+            cv = (och / 2 - self._oy) / odh if odh else 0.5
+            ns = self._fit(cw, ch) * self._zoom
+            self._ox = cw / 2 - cu * self._new.width * ns
+            self._oy = ch / 2 - cv * self._new.height * ns
+        self._render()
+
+    def _on_wheel(self, event):
+        if self._new is None:
+            return
+        cw, ch = self._size()
+        fit = self._fit(cw, ch)
+        s = fit * self._zoom
+        dw, dh = self._new.width * s, self._new.height * s
+        # Image-space fraction under the pointer, kept fixed across the zoom.
+        u = (event.x - self._ox) / dw if dw else 0.5
+        v = (event.y - self._oy) / dh if dh else 0.5
+        factor = self.ZOOM_STEP if event.delta > 0 else 1.0 / self.ZOOM_STEP
+        nz = min(max(self._zoom * factor, 1.0), self._zoom_max(fit))
+        if nz == self._zoom:
+            return
+        s2 = fit * nz
+        self._ox = event.x - u * self._new.width * s2
+        self._oy = event.y - v * self._new.height * s2
+        self._zoom = nz
+        self._render(fast=True)
+        self._schedule_crisp()
+
+    def _on_press(self, event):
+        if self._new is None:
+            return
+        cw, _ = self._size()
+        wipe_x = self._wipe_frac * cw
+        if abs(event.x - wipe_x) <= self.HANDLE_TOL:
+            self._drag = ("wipe",)
+        else:
+            self._drag = ("pan", event.x, event.y)
+
+    def _on_drag(self, event):
+        if self._drag is None or self._new is None:
+            return
+        cw, ch = self._size()
+        if self._drag[0] == "wipe":
+            self._wipe_frac = min(1.0, max(0.0, event.x / cw))
+        else:
+            _, lx, ly = self._drag
+            self._ox += event.x - lx
+            self._oy += event.y - ly
+            self._drag = ("pan", event.x, event.y)
+        self._render(fast=True)
+
+    def _on_release(self, _event):
+        if self._drag is not None:
+            self._drag = None
+            self._render(fast=False)
+
+    def _on_motion(self, event):
+        if self._drag is not None or self._new is None:
+            return
+        cw, _ = self._size()
+        near = abs(event.x - self._wipe_frac * cw) <= self.HANDLE_TOL
+        self.canvas.configure(cursor="sb_h_double_arrow" if near else "fleur")
+
+    def _schedule_crisp(self):
+        if self._crisp_after is not None:
+            self.after_cancel(self._crisp_after)
+        self._crisp_after = self.after(140, lambda: self._render(fast=False))
+
+    # ── Rendering ────────────────────────────────────────────────────────────
+
+    def _render(self, fast=False):
+        from PIL import Image
+
+        self._crisp_after = None
+        self.canvas.delete("all")
+        self._photos = []
+        cw, ch = self._size()
+        if self._new is None:
+            self.canvas.create_text(cw / 2, ch / 2, fill="#aab2bf",
+                                    text="Cannot open the upscaled image.")
+            return
+
+        s = self._fit(cw, ch) * self._zoom
+        disp_w = self._new.width * s
+        disp_h = self._new.height * s
+        if not self._inited:
+            self._ox = (cw - disp_w) / 2.0
+            self._oy = (ch - disp_h) / 2.0
+            self._inited = True
+        self._ox = self._clamp_axis(self._ox, disp_w, cw)
+        self._oy = self._clamp_axis(self._oy, disp_h, ch)
+        self._last_size = (cw, ch)
+
+        wipe_x = min(float(cw), max(0.0, self._wipe_frac * cw))
+        resample = Image.BILINEAR if fast else Image.LANCZOS
+        # Left of the divider = original; right = upscaled. Same display rect, so
+        # the two halves are pixel-aligned at every zoom/pan.
+        if self._old is not None:
+            self._blit(self._old, 0.0, wipe_x, disp_w, disp_h, cw, ch, resample)
+        self._blit(self._new, wipe_x, float(cw), disp_w, disp_h, cw, ch, resample)
+        self._draw_divider(wipe_x, ch)
+
+    def _blit(self, img, x0, x1, disp_w, disp_h, cw, ch, resample):
+        """Draw the slice of `img` visible in canvas x-range [x0, x1]."""
+        from PIL import ImageTk
+
+        cx0 = max(x0, self._ox, 0.0)
+        cx1 = min(x1, self._ox + disp_w, float(cw))
+        cy0 = max(0.0, self._oy)
+        cy1 = min(float(ch), self._oy + disp_h)
+        if cx1 - cx0 < 1 or cy1 - cy0 < 1:
+            return
+        iw, ih = img.size
+        sx0 = (cx0 - self._ox) / disp_w * iw
+        sx1 = (cx1 - self._ox) / disp_w * iw
+        sy0 = (cy0 - self._oy) / disp_h * ih
+        sy1 = (cy1 - self._oy) / disp_h * ih
+        tw = max(1, int(round(cx1 - cx0)))
+        th = max(1, int(round(cy1 - cy0)))
+        tile = img.resize((tw, th), resample, box=(sx0, sy0, sx1, sy1))
+        photo = ImageTk.PhotoImage(tile)
+        self._photos.append(photo)
+        self.canvas.create_image(int(round(cx0)), int(round(cy0)),
+                                 anchor="nw", image=photo)
+
+    def _draw_divider(self, wipe_x, ch):
+        self.canvas.create_line(wipe_x, 0, wipe_x, ch, fill=self.DIVIDER, width=2)
+        cy = ch / 2
+        self.canvas.create_rectangle(wipe_x - 7, cy - 24, wipe_x + 7, cy + 24,
+                                     fill=self.HANDLE_FILL, outline=self.HANDLE_EDGE)
+        # Two little arrows hinting the handle slides horizontally.
+        for dx, tip in ((-3, -7), (3, 7)):
+            self.canvas.create_line(wipe_x + dx, cy - 5, wipe_x + tip, cy,
+                                    wipe_x + dx, cy + 5, fill=self.HANDLE_EDGE)
 
     def _close(self):
         self.save_geometry()
