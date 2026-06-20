@@ -68,8 +68,10 @@ class RemoteUpscaleEngine:
             opts += ["-o", f"UserKnownHostsFile={known_hosts}"]
         args = ["ssh", *opts, f"root@{self.host}"]
         try:
-            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+            # stdin=DEVNULL: under the GUI the parent's stdin is a pipe; without
+            # this the tunnel ssh can block on it.
+            return subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError as exc:
             raise RemoteUpscaleError("ssh not found on PATH (OpenSSH required).") from exc
 

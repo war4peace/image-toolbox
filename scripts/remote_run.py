@@ -59,18 +59,22 @@ class RemoteSession:
 
     # ── ssh / scp ──────────────────────────────────────────────────────────────
 
+    # stdin=DEVNULL is essential: under the GUI, batch_upscale's stdin is a pipe
+    # (the GUI sends pause/quit through it). ssh/scp inherit that pipe and BLOCK
+    # reading it — the run hangs on the first ssh/scp. Detaching stdin fixes it.
     def _ssh(self, command, check=True, timeout=None):
         args = ["ssh", *_ssh_base(self.key_path, self.ssh_port, self.known_hosts),
                 f"root@{self.host}", command]
         return subprocess.run(args, check=check, timeout=timeout,
-                              capture_output=True, text=True)
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
     def _scp(self, local, remote):
         args = ["scp", "-i", self.key_path, "-P", str(self.ssh_port),
                 "-o", "StrictHostKeyChecking=no",
                 "-o", f"UserKnownHostsFile={self.known_hosts}",
                 local, f"root@{self.host}:{remote}"]
-        subprocess.run(args, check=True, capture_output=True, text=True)
+        subprocess.run(args, check=True, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True)
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
