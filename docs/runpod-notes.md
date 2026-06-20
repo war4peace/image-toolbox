@@ -28,10 +28,18 @@ the parts that are still worth reusing when remote-pod support is rebuilt.
   smoke number was one-time warmup (CUDA/cuDNN + first-run Blackwell kernel JIT),
   paid once by the resident worker and amortised over the queue. The pod 5090 at
   ~13.4 s/4K beats the local 3090 (17–19 s) and is close to a local 5090 (~10 s).
-  **Optimisation lever for the residual gap: install `sageattention`** (Triton-
-  based; the pod shows `Triton ✅` but `SageAttention ❌ | Flash Attention ❌`,
-  and ComfyUI-on-pod — which uses it — felt faster). Engine load also dropped from
-  239 s (first ever) to **97 s** once the volume held the validation cache.
+  Engine load also dropped from 239 s (first ever) to **97 s** once the volume
+  held the validation cache.
+- **SageAttention experiment — marginal with the pip version.** PyPI
+  `sageattention` is the old **v1.0.6 (INT8)**; with SeedVR2's `attention_mode=
+  sageattn_2` it gave only **12.9 s vs 13.4 s** at 4K (~4%). The real speedups
+  need **SageAttention 2 (FP8)** or **3 (Blackwell FP4)**, neither on PyPI
+  (`sageattn3` does not exist as a package) — they're **source builds** from
+  thu-ml/SageAttention (nvcc compile, ~10 min, some risk). Deferred as an OPTIONAL
+  tuning pass: the pod 5090 already does ~13 s/4K vs the user's 3090 at 17–19 s
+  (~30% faster) without it, so it doesn't block the overnight-run goal. (v1.0.6 is
+  now installed in the volume venv; the worker accepts an `attention_mode`
+  override, e.g. `worker sageattn_2`.)
 
 ## Architecture: what changed, and what still maps
 

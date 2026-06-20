@@ -254,12 +254,16 @@ def cmd_smoke(rpc, args):
 
 def cmd_worker(rpc, args):
     """Start the resident upscale worker on the pod and wait until it is ready
-    (the first model load is slow — weights from the network volume)."""
+    (the first model load is slow — weights from the network volume).
+    Optional arg: an attention_mode override (e.g. sageattn_2) for experiments."""
     _, host, port = _endpoint_or_die(rpc)
     key = _ssh_key_path(rpc)
     wport = int(rpc.get("worker_port", 8200))
     with open(CONFIG, encoding="utf-8") as f:
         upscale_cfg = json.load(f).get("upscale", {})
+    if args:
+        upscale_cfg["attention_mode"] = args[0]
+        print(f"  attention_mode override: {args[0]}")
     settings_path = os.path.join(APP_ROOT, "logs", "_worker_settings.json")
     os.makedirs(os.path.dirname(settings_path), exist_ok=True)
     with open(settings_path, "w", encoding="utf-8") as f:
