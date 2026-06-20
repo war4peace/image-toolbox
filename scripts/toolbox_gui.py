@@ -2955,6 +2955,11 @@ class SettingsTab(ttk.Frame):
                 "'id | name | size | dc'. Refresh to list, or Create one.")
         ttk.Button(vol, text="Refresh", command=self._refresh_volumes).pack(side="left", padx=(6, 0))
         ttk.Button(vol, text="Create…", command=self._create_volume).pack(side="left", padx=(4, 0))
+        del_btn = tk.Button(vol, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
+                            cursor="hand2", command=self._delete_volume)
+        del_btn.pack(side="left", padx=(4, 0))
+        Tooltip(del_btn, "Permanently delete the selected network volume AND all "
+                         "models stored on it. Asks for confirmation first.")
 
         safety = ttk.Frame(sec)
         safety.grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
@@ -3280,6 +3285,52 @@ class SettingsTab(ttk.Frame):
                 vid = (vol or {}).get("id", "")
                 self.runpod_status.configure(
                     text=f"Created volume {vid} in {dc_id}.", foreground="#1a7f37")
+                self._refresh_volumes()
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _delete_volume(self):
+        """Permanently delete the selected network volume (and the models on it),
+        behind an explicit warning confirmation."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        vid = self._selected_volume_id()
+        if not vid:
+            self.runpod_status.configure(
+                text="Select a volume to delete first (Refresh, then pick one).",
+                foreground="#b3261e")
+            return
+        label = self.runpod_vol_var.get().strip() or vid
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Delete this network volume?\n\n  {label}\n\n"
+                "This PERMANENTLY destroys the volume and ALL MODELS stored on it "
+                "(SeedVR2, Ollama). Any disposable pod will have to re-download "
+                "~22 GB the next time you run. This cannot be undone.",
+                icon="warning", default="no"):
+            return
+        self.runpod_status.configure(text="Deleting network volume…", foreground="#666")
+
+        def work():
+            try:
+                runpod_client.delete_network_volume(key, vid)
+                err = None
+            except runpod_client.RunPodError as exc:
+                err = str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_status.configure(text=err, foreground="#b3261e")
+                    return
+                # Clear the selection if it was the deleted volume, then re-list.
+                if self._selected_volume_id() == vid:
+                    self.runpod_vol_var.set("")
+                self.runpod_status.configure(
+                    text=f"Deleted volume {vid}.", foreground="#1a7f37")
                 self._refresh_volumes()
             self.after(0, apply)
 
