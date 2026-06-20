@@ -4,3 +4,7 @@
 # (see tools/git-clean-webhook.py). Without that local config the line is a
 # harmless no-op, so clones/CI are unaffected.
 config.json filter=tbx-webhook
+
+# Shell scripts run on the Linux pod (remote upscaling #1) — they must stay LF
+# or bash chokes on the \r. Force LF regardless of the checkout's autocrlf.
+*.sh text eol=lf
