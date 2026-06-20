@@ -79,8 +79,16 @@ class RemoteSession:
             raise rp.RunPodError("No RunPod API key configured.")
         if not (self.key_path and os.path.exists(self.key_path)):
             raise rp.RunPodError(f"SSH key not found: {self.key_path}")
-        if not self._attach:
-            self._create_pod()
+        if not self.host:
+            # Reuse a still-running app pod (faster, and avoids double-spinning);
+            # mark it as attached so close() won't terminate a pod we didn't make.
+            found = self._find_existing_pod()
+            if found:
+                self.pod_id, self.host, self.ssh_port = found
+                self._attach = found
+                self._emit(f"Reusing running pod {self.pod_id} ({self.host}).")
+            else:
+                self._create_pod()
         self._push_files()
         self._start_worker()
         self._arm_deadman()
@@ -96,6 +104,24 @@ class RemoteSession:
             self.on_event(msg)
         except Exception:
             pass
+
+    def _find_existing_pod(self):
+        """Return (id, host, ssh_port) of a RUNNING app pod that's already up and
+        SSH-reachable, or None. Lets a run reuse a pod the user left running
+        instead of spinning a new one."""
+        try:
+            pods = rp.list_pods(self.api_key)
+        except rp.RunPodError:
+            return None
+        for p in pods:
+            if not isinstance(p, dict) or p.get("desiredStatus") != rp.STATUS_RUNNING:
+                continue
+            if not str(p.get("name", "")).startswith("image-toolbox"):
+                continue
+            host, port = rp.ssh_endpoint(p)
+            if host and port:
+                return p.get("id"), host, port
+        return None
 
     def _create_pod(self):
         vol_id = self.cfg.get("network_volume_id", "").strip()
