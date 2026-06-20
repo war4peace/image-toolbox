@@ -76,5 +76,21 @@
     },
     "updates": {
         "auto_check": true
+    },
+    "runpod": {
+        "api_key": "",
+        "gpu_type_id": "NVIDIA GeForce RTX 5090",
+        "image_name": "",
+        "template_id": "",
+        "network_volume_id": "",
+        "data_center_ids": [],
+        "container_disk_gb": 30,
+        "ssh_key_path": "%USERPROFILE%\\.ssh\\id_ed25519_runpod",
+        "worker_port": 8200,
+        "hourly_rate": 0.90,
+        "stop_pod_when_done": true,
+        "terminate_when_done": false,
+        "max_runtime_minutes": 720,
+        "idle_timeout_minutes": 15
     }
 }

@@ -69,6 +69,7 @@ import updater
 import mqtt_publisher
 import system_telemetry
 import taskbar_progress
+import runpod_client
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -2876,6 +2877,67 @@ class SettingsTab(ttk.Frame):
         self.mqtt_status = ttk.Label(sec, text="", foreground="#666")
         self.mqtt_status.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
+        # ── Remote upscaling (RunPod) ───────────────────────────────────────────
+        rp = CFG.get("runpod", {})
+        sec = self._section(body, "Remote upscaling (RunPod) — experimental")
+        sec.columnconfigure(1, weight=1)
+
+        ttk.Label(sec, wraplength=560, foreground="#666",
+                  text=("Groundwork for upscaling on a rented RunPod GPU (roadmap "
+                        "#1). The API key authenticates the pod control plane; the "
+                        "auto-stop / runtime limits below are the safety net that "
+                        "keeps a billed pod from being left running. Not yet wired "
+                        "to a run.")
+                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+
+        ttk.Label(sec, text="API key:").grid(row=1, column=0, sticky="w", pady=3)
+        self.runpod_key_var = tk.StringVar(value=rp.get("api_key", ""))
+        key_entry = ttk.Entry(sec, textvariable=self.runpod_key_var, show="•")
+        key_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(key_entry, "RunPod API key (rest.runpod.io). Stored locally in "
+                           "config.json; never committed.")
+        self.runpod_test_btn = ttk.Button(sec, text="Test", command=self._test_runpod)
+        self.runpod_test_btn.grid(row=1, column=2, columnspan=2, sticky="e", padx=6, pady=3)
+
+        ttk.Label(sec, text="Hourly rate (USD):").grid(row=2, column=0, sticky="w", pady=3)
+        self.runpod_rate_var = tk.StringVar(value=str(rp.get("hourly_rate", 0.90)))
+        rate_spin = ttk.Spinbox(sec, from_=0.0, to=100.0, increment=0.10, width=8,
+                                format="%.2f", textvariable=self.runpod_rate_var)
+        rate_spin.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
+                           "completion notification.")
+
+        safety = ttk.Frame(sec)
+        safety.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(safety, text="Auto-stop after:").pack(side="left", padx=(0, 4))
+        self.runpod_maxrun_var = tk.StringVar(value=str(rp.get("max_runtime_minutes", 720)))
+        maxrun_spin = ttk.Spinbox(safety, from_=0, to=10080, increment=30, width=7,
+                                  textvariable=self.runpod_maxrun_var)
+        maxrun_spin.pack(side="left")
+        ttk.Label(safety, text="min max runtime,").pack(side="left", padx=(4, 12))
+        Tooltip(maxrun_spin, "Hard ceiling enforced on the pod itself: it stops "
+                             "after this long no matter what (0 = no limit). The "
+                             "dead-man's switch — survives a dropped connection.")
+        self.runpod_idle_var = tk.StringVar(value=str(rp.get("idle_timeout_minutes", 15)))
+        idle_spin = ttk.Spinbox(safety, from_=0, to=1440, increment=5, width=6,
+                                textvariable=self.runpod_idle_var)
+        idle_spin.pack(side="left")
+        ttk.Label(safety, text="min idle timeout").pack(side="left", padx=(4, 0))
+        Tooltip(idle_spin, "Stop the pod after this many minutes with no work "
+                           "(0 = no idle limit).")
+
+        self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", False)))
+        term_chk = ttk.Checkbutton(
+            sec, text="Terminate (delete) the pod when done, not just stop it",
+            variable=self.runpod_terminate_var)
+        term_chk.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        Tooltip(term_chk, "Terminate frees all billing (disposable pod). Stop "
+                          "keeps the pod's storage — and its storage charge — so it "
+                          "can be resumed. Terminate suits the create-on-demand flow.")
+
+        self.runpod_status = ttk.Label(sec, text="", foreground="#666")
+        self.runpod_status.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
@@ -3050,6 +3112,53 @@ class SettingsTab(ttk.Frame):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _runpod_fields(self):
+        """The RunPod settings currently in the form (so Test works pre-Save).
+        Numeric fields fall back to their defaults rather than erroring — the
+        save path re-validates and reports."""
+        def _num(var, default, cast):
+            try:
+                return cast(str(var.get()).strip())
+            except (ValueError, tk.TclError):
+                return default
+        rp = CFG.get("runpod", {})
+        return {
+            "api_key":              self.runpod_key_var.get().strip(),
+            "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
+            "max_runtime_minutes":  _num(self.runpod_maxrun_var, 720, int),
+            "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
+            "terminate_when_done":  bool(self.runpod_terminate_var.get()),
+            # Carried through unchanged (no UI yet) so a save never drops them.
+            "gpu_type_id":      rp.get("gpu_type_id", "NVIDIA GeForce RTX 5090"),
+            "image_name":       rp.get("image_name", ""),
+            "template_id":      rp.get("template_id", ""),
+            "network_volume_id": rp.get("network_volume_id", ""),
+            "data_center_ids":  rp.get("data_center_ids", []),
+            "container_disk_gb": rp.get("container_disk_gb", 30),
+            "ssh_key_path":     rp.get("ssh_key_path", ""),
+            "worker_port":      rp.get("worker_port", 8200),
+            "stop_pod_when_done": rp.get("stop_pod_when_done", True),
+        }
+
+    def _test_runpod(self):
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        self.runpod_test_btn.configure(state="disabled")
+        self.runpod_status.configure(text="Testing connection…", foreground="#666")
+
+        def work():
+            ok, msg = runpod_client.test_connection(key)
+            def apply():
+                self.runpod_test_btn.configure(state="normal")
+                self.runpod_status.configure(
+                    text=msg, foreground="#1a7f37" if ok else "#b3261e")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _pick_folder(self, var):
         folder = filedialog.askdirectory(title="Choose a folder")
         if folder:
@@ -3136,6 +3245,7 @@ class SettingsTab(ttk.Frame):
             },
             "updates": {"auto_check": bool(self.auto_update_var.get())},
             "mqtt": self._mqtt_fields(),
+            "runpod": self._runpod_fields(),
         }
         return sections, errors
 
@@ -3208,6 +3318,12 @@ class SettingsTab(ttk.Frame):
         self.mqtt_user_var.set(mqtt.get("username", ""))
         self.mqtt_pass_var.set(mqtt.get("password", ""))
         self.mqtt_cid_var.set(mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
+        rp = CFG.get("runpod", {})
+        self.runpod_key_var.set(rp.get("api_key", ""))
+        self.runpod_rate_var.set(str(rp.get("hourly_rate", 0.90)))
+        self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
+        self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
+        self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", False)))
         for key, (var, typ) in self._seedvr_vars.items():
             if key in ups:
                 var.set(ups[key] if typ is bool else str(ups[key]))
