@@ -2882,13 +2882,25 @@ class SettingsTab(ttk.Frame):
         sec = self._section(body, "Remote upscaling (RunPod) — experimental")
         sec.columnconfigure(1, weight=1)
 
-        ttk.Label(sec, wraplength=560, foreground="#666",
+        desc = ttk.Frame(sec)
+        desc.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+        ttk.Label(desc, wraplength=560, foreground="#666",
                   text=("Groundwork for upscaling on a rented RunPod GPU (roadmap "
                         "#1). The API key authenticates the pod control plane; the "
                         "auto-stop / runtime limits below are the safety net that "
                         "keeps a billed pod from being left running. Not yet wired "
                         "to a run.")
-                  ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+                  ).pack(anchor="w")
+        key_link = tk.Label(desc, text="Get a RunPod API key →", fg="#3a86ff",
+                            cursor="hand2", font=("Segoe UI", 9, "underline"))
+        key_link.pack(anchor="w", pady=(2, 0))
+        key_link.bind("<Button-1>",
+                      lambda _e: webbrowser.open(runpod_client.CONSOLE_API_KEYS_URL))
+        key_link.bind("<Enter>", lambda _e: key_link.configure(fg="#1a5fd0"))
+        key_link.bind("<Leave>", lambda _e: key_link.configure(fg="#3a86ff"))
+        Tooltip(key_link,
+                "Opens the RunPod console (Settings → API Keys → Create API Key). "
+                f"Docs: {runpod_client.DOCS_API_KEYS_URL}")
 
         ttk.Label(sec, text="API key:").grid(row=1, column=0, sticky="w", pady=3)
         self.runpod_key_var = tk.StringVar(value=rp.get("api_key", ""))

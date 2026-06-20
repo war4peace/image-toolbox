@@ -36,6 +36,11 @@ import urllib.error
 BASE_URL    = "https://rest.runpod.io/v1"
 _USER_AGENT = "ImageToolbox-RunPod"
 
+# Where users create an API key (console) and read how (docs) — surfaced as a
+# link in Settings so a user can get a key without hunting for it.
+CONSOLE_API_KEYS_URL = "https://www.runpod.io/console/user/settings"
+DOCS_API_KEYS_URL    = "https://docs.runpod.io/get-started/api-keys"
+
 # `desiredStatus` values returned by the API.
 STATUS_RUNNING    = "RUNNING"
 STATUS_EXITED     = "EXITED"
