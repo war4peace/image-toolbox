@@ -46,6 +46,34 @@ STATUS_RUNNING    = "RUNNING"
 STATUS_EXITED     = "EXITED"
 STATUS_TERMINATED = "TERMINATED"
 
+# The REST API exposes NO endpoint to list GPU types or data centers (they are
+# fixed enums) — so these are curated picklists for the Settings UI. Edit
+# config.json directly for an id not listed here.
+#
+# Common GPU types (the value goes into create_pod's `gpuTypeIds`):
+GPU_TYPES = [
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA RTX A5000",
+    "NVIDIA RTX A6000",
+    "NVIDIA A40",
+    "NVIDIA L40S",
+    "NVIDIA L40",
+    "NVIDIA H100 80GB HBM3",
+]
+
+# European data centers only (user is in Romania; network volumes are
+# region-locked and throughput is region-dependent). EU-RO-1 is closest.
+# (label, dataCenterId)
+EU_DATACENTERS = [
+    ("Romania (EU-RO-1)",        "EU-RO-1"),
+    ("Netherlands (EU-NL-1)",    "EU-NL-1"),
+    ("Sweden (EU-SE-1)",         "EU-SE-1"),
+    ("Czech Republic (EU-CZ-1)", "EU-CZ-1"),
+    ("Iceland (EUR-IS-1)",       "EUR-IS-1"),
+    ("Iceland (EUR-IS-2)",       "EUR-IS-2"),
+]
+
 
 class RunPodError(Exception):
     """A RunPod REST call failed (network, auth, HTTP, or parse error)."""
@@ -169,6 +197,40 @@ def pod_status(api_key, pod_id, timeout=30):
     if not isinstance(pod, dict):
         return None
     return pod.get("desiredStatus")
+
+
+# ── network volumes (the persistent model store) ─────────────────────────────
+
+def list_network_volumes(api_key, timeout=30):
+    """Return the account's network volumes (each has id, name, size, dataCenterId)."""
+    result = _request("GET", "/networkvolumes", api_key, timeout=timeout)
+    if isinstance(result, dict):
+        return result.get("networkVolumes") or result.get("data") or []
+    return result or []
+
+
+def get_network_volume(api_key, vol_id, timeout=30):
+    """Return one network volume's details."""
+    return _request("GET", f"/networkvolumes/{vol_id}", api_key, timeout=timeout)
+
+
+def create_network_volume(api_key, name, size_gb, data_center_id, timeout=60):
+    """Create a network volume (size in GB, 1–4000) in a specific data center.
+
+    The data center is fixed at creation and locks every pod that mounts the
+    volume to that region — pass an EU id for a Europe-based user."""
+    size = int(size_gb)
+    if not 1 <= size <= 4000:
+        raise RunPodError("Network volume size must be between 1 and 4000 GB.")
+    if not data_center_id:
+        raise RunPodError("A data center id is required to create a network volume.")
+    body = {"name": name, "size": size, "dataCenterId": data_center_id}
+    return _request("POST", "/networkvolumes", api_key, body=body, timeout=timeout)
+
+
+def delete_network_volume(api_key, vol_id, timeout=60):
+    """Delete a network volume (frees its monthly storage charge)."""
+    return _request("DELETE", f"/networkvolumes/{vol_id}", api_key, timeout=timeout)
 
 
 # ── UI-facing helpers (return (ok, message), never raise) ────────────────────

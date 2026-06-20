@@ -122,7 +122,14 @@ Wrinkles to honour when this is built:
   the local after-run auto-stop with a cancel countdown (wired in with the run
   flow, Phase 3). The on-pod half is fully exercisable only once Phase 2
   provisions a real pod, but its decision logic is verified off-pod (`--selftest`).
-- **Phase 2:** `create_pod` → wait RUNNING → SSH probe → bring up the worker.
+- **Phase 2a (done):** region-aware provisioning groundwork. `runpod_client` has
+  network-volume CRUD (`/networkvolumes`, verified live) + curated `GPU_TYPES` and
+  EU-only `EU_DATACENTERS` enums (the REST API has no list endpoint). Settings now
+  has a GPU-type picklist, an **EU data-center picklist (defaults to EU-RO-1)**, and
+  a model-volume row (Refresh lists, Create makes one in the chosen DC with a cost
+  confirmation). No pod spun up.
+- **Phase 2b:** `create_pod` → wait RUNNING → SSH probe → bring up the worker, with
+  the model volume mounted (data center derived from the volume's region).
 - **Phase 3:** `RemoteUpscaleEngine` streaming; `DEGRADED` teardown/re-provision;
   cost embed.
 

@@ -72,7 +72,7 @@ import taskbar_progress
 import runpod_client
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 # SCRIPT_DIR is where this module (and its sibling child scripts) live: the
 # scripts/ folder. APP_ROOT is its parent — where config.json, gui_settings.json,
@@ -2919,8 +2919,45 @@ class SettingsTab(ttk.Frame):
         Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
                            "completion notification.")
 
+        # GPU type + data center (curated enums — the REST API has no list call).
+        hw = ttk.Frame(sec)
+        hw.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(hw, text="GPU type:").pack(side="left", padx=(0, 4))
+        self.runpod_gpu_var = tk.StringVar(
+            value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var,
+                               values=runpod_client.GPU_TYPES, width=26)
+        gpu_cmb.pack(side="left")
+        Tooltip(gpu_cmb, "RunPod GPU type id. Pick one or type an unlisted id.")
+        ttk.Label(hw, text="Data center:").pack(side="left", padx=(18, 4))
+        self._dc_label_by_id = {dcid: lbl for lbl, dcid in runpod_client.EU_DATACENTERS}
+        self._dc_id_by_label = {lbl: dcid for lbl, dcid in runpod_client.EU_DATACENTERS}
+        dc_ids = rp.get("data_center_ids") or []
+        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
+        self.runpod_dc_var = tk.StringVar(
+            value=self._dc_label_by_id.get(cur_dc, runpod_client.EU_DATACENTERS[0][0]))
+        dc_cmb = ttk.Combobox(hw, textvariable=self.runpod_dc_var, state="readonly",
+                              values=[lbl for lbl, _ in runpod_client.EU_DATACENTERS], width=24)
+        dc_cmb.pack(side="left")
+        Tooltip(dc_cmb, "European data centers only (region-locked network volume; "
+                        "throughput is region-dependent). EU-RO-1 is closest to Romania.")
+
+        # Network volume (the persistent model store).
+        vol = ttk.Frame(sec)
+        vol.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(vol, text="Model volume:").pack(side="left", padx=(0, 4))
+        self.runpod_vol_var = tk.StringVar(value=rp.get("network_volume_id", ""))
+        self.runpod_vol_cmb = ttk.Combobox(vol, textvariable=self.runpod_vol_var, width=40)
+        self.runpod_vol_cmb.pack(side="left")
+        Tooltip(self.runpod_vol_cmb,
+                "Persistent RunPod network volume that holds the models (SeedVR2 + "
+                "Ollama) so disposable pods don't re-download them. Format: "
+                "'id | name | size | dc'. Refresh to list, or Create one.")
+        ttk.Button(vol, text="Refresh", command=self._refresh_volumes).pack(side="left", padx=(6, 0))
+        ttk.Button(vol, text="Create…", command=self._create_volume).pack(side="left", padx=(4, 0))
+
         safety = ttk.Frame(sec)
-        safety.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
+        safety.grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
         ttk.Label(safety, text="Auto-stop after:").pack(side="left", padx=(0, 4))
         self.runpod_maxrun_var = tk.StringVar(value=str(rp.get("max_runtime_minutes", 720)))
         maxrun_spin = ttk.Spinbox(safety, from_=0, to=10080, increment=30, width=7,
@@ -2942,13 +2979,13 @@ class SettingsTab(ttk.Frame):
         term_chk = ttk.Checkbutton(
             sec, text="Terminate (delete) the pod when done, not just stop it",
             variable=self.runpod_terminate_var)
-        term_chk.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        term_chk.grid(row=6, column=0, columnspan=4, sticky="w", pady=3)
         Tooltip(term_chk, "Terminate frees all billing (disposable pod). Stop "
                           "keeps the pod's storage — and its storage charge — so it "
                           "can be resumed. Terminate suits the create-on-demand flow.")
 
         self.runpod_status = ttk.Label(sec, text="", foreground="#666")
-        self.runpod_status.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.runpod_status.grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
@@ -3134,23 +3171,119 @@ class SettingsTab(ttk.Frame):
             except (ValueError, tk.TclError):
                 return default
         rp = CFG.get("runpod", {})
+        dc_id = self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
         return {
             "api_key":              self.runpod_key_var.get().strip(),
             "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 720, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
+            "gpu_type_id":      self.runpod_gpu_var.get().strip() or runpod_client.GPU_TYPES[0],
+            "data_center_ids":  [dc_id] if dc_id else [],
+            "network_volume_id": self._selected_volume_id(),
             # Carried through unchanged (no UI yet) so a save never drops them.
-            "gpu_type_id":      rp.get("gpu_type_id", "NVIDIA GeForce RTX 5090"),
             "image_name":       rp.get("image_name", ""),
             "template_id":      rp.get("template_id", ""),
-            "network_volume_id": rp.get("network_volume_id", ""),
-            "data_center_ids":  rp.get("data_center_ids", []),
             "container_disk_gb": rp.get("container_disk_gb", 30),
             "ssh_key_path":     rp.get("ssh_key_path", ""),
             "worker_port":      rp.get("worker_port", 8200),
             "stop_pod_when_done": rp.get("stop_pod_when_done", True),
         }
+
+    def _selected_volume_id(self):
+        """Resolve the network-volume field to a bare id. The combobox shows
+        'id | name | size | dc' after a Refresh, but a raw id (typed/pasted) is
+        also accepted."""
+        return (self.runpod_vol_var.get().split("|", 1)[0]).strip()
+
+    def _refresh_volumes(self):
+        """List the account's network volumes into the combobox (free call)."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        self.runpod_status.configure(text="Listing network volumes…", foreground="#666")
+        keep = self._selected_volume_id()
+
+        def work():
+            try:
+                vols = runpod_client.list_network_volumes(key)
+                err = None
+            except runpod_client.RunPodError as exc:
+                vols, err = [], str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_status.configure(text=err, foreground="#b3261e")
+                    return
+                labels = [f"{v.get('id','')} | {v.get('name','?')} | "
+                          f"{v.get('size','?')} GB | {v.get('dataCenterId','?')}"
+                          for v in vols if isinstance(v, dict)]
+                self.runpod_vol_cmb.configure(values=labels)
+                # Re-select the previously-chosen volume if it is still present.
+                match = next((l for l in labels if l.split("|", 1)[0].strip() == keep), None)
+                if match:
+                    self.runpod_vol_var.set(match)
+                self.runpod_status.configure(
+                    text=(f"{len(labels)} network volume(s) on the account."
+                          if labels else "No network volumes yet — use Create…"),
+                    foreground="#1a7f37" if labels else "#666")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _create_volume(self):
+        """Create a network volume in the selected EU data center (this starts a
+        small monthly storage charge — confirmed first)."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        dc_id = self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
+        if not dc_id:
+            self.runpod_status.configure(text="Pick a data center first.",
+                                         foreground="#b3261e")
+            return
+        name = simpledialog.askstring(
+            "Create network volume",
+            "Name for the model volume:", parent=self, initialvalue="image-toolbox-models")
+        if not name:
+            return
+        size = simpledialog.askinteger(
+            "Create network volume",
+            "Size in GB (SeedVR2 ~16 GB + Ollama model ~6 GB; 40 leaves headroom):",
+            parent=self, initialvalue=40, minvalue=1, maxvalue=4000)
+        if not size:
+            return
+        est = size * 0.07
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Create a {size} GB network volume '{name}' in {dc_id}?\n\n"
+                f"This starts a storage charge of about ${est:.2f}/month "
+                f"(at $0.07/GB/mo) until you delete it."):
+            return
+        self.runpod_status.configure(text="Creating network volume…", foreground="#666")
+
+        def work():
+            try:
+                vol = runpod_client.create_network_volume(key, name, size, dc_id)
+                err = None
+            except runpod_client.RunPodError as exc:
+                vol, err = None, str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_status.configure(text=err, foreground="#b3261e")
+                    return
+                vid = (vol or {}).get("id", "")
+                self.runpod_status.configure(
+                    text=f"Created volume {vid} in {dc_id}.", foreground="#1a7f37")
+                self._refresh_volumes()
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _test_runpod(self):
         key = self.runpod_key_var.get().strip()
@@ -3336,6 +3469,12 @@ class SettingsTab(ttk.Frame):
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", False)))
+        self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        dc_ids = rp.get("data_center_ids") or []
+        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
+        self.runpod_dc_var.set(
+            self._dc_label_by_id.get(cur_dc, runpod_client.EU_DATACENTERS[0][0]))
+        self.runpod_vol_var.set(rp.get("network_volume_id", ""))
         for key, (var, typ) in self._seedvr_vars.items():
             if key in ups:
                 var.set(ups[key] if typ is bool else str(ups[key]))
