@@ -718,9 +718,13 @@ def warm_up_straighten():
             return
         print("  Auto-straighten: loading orientation model "
               "(first run downloads ~82 MB) ...")
-        # Load on a worker thread with a timeout so a stuck local CUDA init can't
-        # hang the run. The leaked thread (if it ever unblocks) is a harmless
-        # daemon; the run proceeds without straighten.
+        # Import the heavy NATIVE libs in the MAIN thread first. Importing
+        # torch/numpy in a background thread can deadlock in numpy's C-extension
+        # init — hit in REMOTE mode, where (unlike local) no engine has already
+        # imported torch on the main thread, so orientation was the first to do
+        # so. Only the model build + CUDA move is then time-boxed on a thread, so
+        # a genuinely stuck GPU still can't hang the whole run.
+        import numpy, torch, timm        # noqa: F401,E401 — main-thread native import
         import threading
         result = {}
 
