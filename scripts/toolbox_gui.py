@@ -68,6 +68,7 @@ except Exception:
 import updater
 import mqtt_publisher
 import system_telemetry
+import taskbar_progress
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -80,7 +81,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.2.9"
+APP_VERSION = "0.3.0"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -1210,6 +1211,9 @@ class ToolTab(ttk.Frame):
             messagebox.showerror(APP_TITLE, f"Could not start {script}:\n{exc}")
             return False
         self._finished = False
+        # Taskbar button: marquee until the first real progress tick arrives
+        # (covers the initial scan), then it switches to a determinate fill.
+        self.app.taskbar_state("indeterminate")
         if hasattr(self, "viewlog_btn"):
             self.viewlog_btn.configure(state="normal")
         # If the shared log window is open, make it follow this run's output.
@@ -1359,8 +1363,18 @@ class ToolTab(ttk.Frame):
         elif kind == "LOG" and payload:
             self._log_path = payload
             self.viewlog_btn.configure(state="normal")
+        elif kind == "DEGRADED" and payload:
+            # Performance watchdog tripped in the runner (sustained slow streak or
+            # a hard OOM): it is auto-stopping. Surface it and flash for attention —
+            # the user is typically away during a long run. The full reason (carried
+            # in the JSON payload) is already in the log stream; keep this short.
+            self.status_var.set("⚠ GPU performance degraded — run auto-stopped "
+                                "(reboot, then resume).")
+            self.app.taskbar_state("error")    # red taskbar bar
+            self.app.flash_attention()
         elif kind == "DONE":
             self._last_done = payload   # JSON summary; published to MQTT on exit
+            self.app.flash_attention()  # catch the eye when a long run finishes
 
     def _reset_stream_state(self):
         """Reset the marker parser, console and preview strip before a new run."""
@@ -1394,6 +1408,7 @@ class ToolTab(ttk.Frame):
             return
         self.progress.set(cur * 100 / tot)
         self.status_var.set(f"Processing image {cur} of {tot} …")
+        self.app.taskbar_progress(cur, tot)
         self.app.mqtt_publish({mqtt_publisher.TASK_PROGRESS_TOPIC: f"{cur}/{tot}"})
 
     def _handle_eta(self, payload):
@@ -1412,6 +1427,7 @@ class ToolTab(ttk.Frame):
             return
         if total > 0:
             self.progress.set(idx * 100 / total)
+            self.app.taskbar_progress(idx, total)
         mqtt_values = {
             mqtt_publisher.TASK_RUNTIME_TOPIC:  str(int(elapsed)),
             mqtt_publisher.TASK_PROGRESS_TOPIC: f"{idx}/{total}",
@@ -1461,6 +1477,12 @@ class ToolTab(ttk.Frame):
     def on_exit(self, code):
         """Subclasses override for their own UI, then call super().on_exit(code)
         so the shared MQTT 'task finished' state is published once."""
+        # Drop the blue 'currently processing' frame so the final image shows its
+        # own green/red outcome instead of staying highlighted after the run ends.
+        strip = getattr(self, "strip", None)
+        if strip is not None:
+            strip.clear_current()
+        self.app.taskbar_clear()        # remove the taskbar progress/error bar
         self._stop_telemetry()
         # One immediate idle sample so the row reflects VRAM freeing up right
         # after the run, rather than waiting for the next idle tick. The proc is
@@ -1577,6 +1599,7 @@ class FilmStrip(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.canvas.bind("<MouseWheel>", self._wheel)
         self.canvas.bind("<Double-Button-1>", self._on_double)
+        self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Configure>", self._on_resize)
 
         self._paths   = []        # full queue
@@ -1719,6 +1742,18 @@ class FilmStrip(ttk.Frame):
             self._draw_frame(path)
             self._draw_highlight()      # keep the blue current-frame on top
 
+    def clear_current(self):
+        """Drop the blue 'currently processing' highlight (called when a run
+        ends). Without this the last image keeps its blue frame even though it is
+        finished — it should show its own green/red outcome frame instead."""
+        if self._current is None:
+            return
+        last = self._current
+        self._current = None
+        self._draw_highlight()          # _current is None now → removes the rect
+        if last in self._pos:           # reveal the finished image's outcome frame
+            self._draw_frame(last)
+
     # ── Layout ───────────────────────────────────────────────────────────────
 
     def _build_cells(self, order, first=None):
@@ -1846,17 +1881,24 @@ class FilmStrip(ttk.Frame):
         else:
             self._update_scrollregion()
 
-    def _on_double(self, event):
+    def _path_at(self, event):
+        """Map a canvas click to the queued image path under it, or None for
+        empty space. Shared by double-click-to-open and the right-click menu."""
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
         col = int((x - GRID_GAP) // (self._cell + GRID_GAP))
         row = int((y - GRID_GAP) // (self._cell + GRID_GAP))
         if col < 0 or col >= self._cols:
-            return
+            return None
         idx = row * self._cols + col
         if not (0 <= idx < len(self._order)):
+            return None
+        return self._order[idx]
+
+    def _on_double(self, event):
+        path = self._path_at(event)
+        if not path:
             return
-        path = self._order[idx]
         # A comparable (green) thumbnail with a known upscaled output opens the
         # comparison window; anything else just opens the file.
         out = self._compare.get(path)
@@ -1865,11 +1907,89 @@ class FilmStrip(ttk.Frame):
         else:
             self._open(path)
 
+    def _on_right_click(self, event):
+        """Context menu over a thumbnail. Entries depend on the image's outcome:
+        a failed image offers only its folder; a processed (green) image offers
+        the original, the upscaled counterpart, their folders and Compare; an
+        unprocessed/processing image offers just open-image / open-folder."""
+        path = self._path_at(event)
+        if not path:
+            return
+        status   = self._status.get(path)
+        upscaled = self._compare.get(path)
+        menu = tk.Menu(self, tearoff=0)
+        if status == "fail":
+            menu.add_command(label="Open failed image folder",
+                             command=lambda p=path: self._open_folder(p))
+        elif status == "ok" and upscaled:
+            menu.add_command(label="Open original image",
+                             command=lambda p=path: self._open(p))
+            menu.add_command(label="Open original image folder",
+                             command=lambda p=path: self._open_folder(p))
+            menu.add_command(label="Open upscaled image",
+                             command=lambda p=upscaled: self._open(p))
+            menu.add_command(label="Open upscaled image folder",
+                             command=lambda p=upscaled: self._open_folder(p))
+            menu.add_separator()
+            can_compare = bool(self.on_compare and os.path.exists(upscaled)
+                               and os.path.exists(path))
+            menu.add_command(
+                label="Compare images",
+                command=lambda p=path, o=upscaled: self.on_compare(p, o),
+                state=("normal" if can_compare else "disabled"))
+        else:
+            # Unprocessed or currently processing — no outcome recorded yet (and
+            # tag-only "ok" with no upscaled counterpart falls here too).
+            menu.add_command(label="Open image",
+                             command=lambda p=path: self._open(p))
+            menu.add_command(label="Open image folder",
+                             command=lambda p=path: self._open_folder(p))
+        # Clipboard helpers, useful in every state (the thumbnail's source path).
+        menu.add_separator()
+        menu.add_command(label="Copy path",
+                         command=lambda p=path: self._to_clipboard(p))
+        menu.add_command(label="Copy filename",
+                         command=lambda p=path: self._to_clipboard(os.path.basename(p)))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _to_clipboard(self, text):
+        """Put `text` on the clipboard (so it survives after the app closes,
+        Tk owns the selection while running). Fail-safe."""
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        except tk.TclError:
+            pass
+
     @staticmethod
     def _open(path):
         if os.path.exists(path):
             try:
                 os.startfile(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _open_folder(path):
+        """Open the folder holding `path` in Explorer with the file selected;
+        fall back to just opening the folder. Fail-safe (best effort)."""
+        if not path:
+            return
+        norm = os.path.normpath(path)
+        if os.path.exists(norm):
+            try:
+                subprocess.Popen(["explorer", f"/select,{norm}"],
+                                 creationflags=CREATE_NO_WINDOW)
+                return
+            except Exception:
+                pass
+        folder = os.path.dirname(norm)
+        if os.path.isdir(folder):
+            try:
+                os.startfile(folder)
             except OSError:
                 pass
 
@@ -2040,6 +2160,7 @@ class UpscaleTab(ToolTab):
                 return
             if tot > 0:
                 self.progress.set(cur * 100 / tot)
+                self.app.taskbar_progress(cur, tot)
                 if not self._cancelled:
                     self.status_var.set(f"{self._phase}  ({cur:,} / {tot:,})")
         else:
@@ -2438,7 +2559,9 @@ RESOLUTION_PRESETS = [
 # NOT rendered in the generic SeedVR Settings box.
 _SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
                    "upscale_cutoff_pct", "output_subdir", "debug",
-                   "auto_straighten", "straighten_min_confidence"}
+                   "auto_straighten", "straighten_min_confidence",
+                   "watchdog_enabled", "watchdog_factor", "watchdog_consecutive",
+                   "watchdog_min_samples"}
 
 # Friendly labels for the generic SeedVR fields.
 _SEEDVR_LABELS = {
@@ -2602,6 +2725,32 @@ class SettingsTab(ttk.Frame):
                               textvariable=self.up_straighten_conf_var)
         up_spin.pack(side="left")
         Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)")
+
+        strip3 = ttk.Frame(sec)
+        strip3.grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
+        self.watchdog_var = tk.BooleanVar(value=bool(ups.get("watchdog_enabled", True)))
+        wd_chk = ttk.Checkbutton(
+            strip3, text="Performance watchdog (auto-stop on GPU degradation)",
+            variable=self.watchdog_var)
+        wd_chk.pack(side="left")
+        Tooltip(wd_chk,
+                "Watches per-image upscale time. If it degrades to a sustained multiple of the "
+                "normal speed (the GPU thrashing VRAM into system RAM) OR hits a hard out-of-memory "
+                "error, the run auto-stops after the current image and you're notified (log, Discord, "
+                "taskbar flash). The resume cache continues the queue after you reboot — the known cure.")
+        ttk.Label(strip3, text="Slowdown factor:").pack(side="left", padx=(18, 4))
+        self.watchdog_factor_var = tk.DoubleVar(value=float(ups.get("watchdog_factor", 3.0)))
+        wf_spin = ttk.Spinbox(strip3, from_=1.5, to=10.0, increment=0.5, width=6, format="%.1f",
+                              textvariable=self.watchdog_factor_var)
+        wf_spin.pack(side="left")
+        Tooltip(wf_spin, "How many times slower than the run's healthy rate (per megapixel) "
+                         "counts as 'slow' (e.g. 3×).")
+        ttk.Label(strip3, text="for").pack(side="left", padx=(12, 4))
+        self.watchdog_consec_var = tk.IntVar(value=int(ups.get("watchdog_consecutive", 2)))
+        wc_spin = ttk.Spinbox(strip3, from_=1, to=10, width=4, textvariable=self.watchdog_consec_var)
+        wc_spin.pack(side="left")
+        ttk.Label(strip3, text="images in a row").pack(side="left", padx=(4, 0))
+        Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a single odd image).")
 
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
         sec = self._section(body, "SeedVR Settings")
@@ -2951,6 +3100,16 @@ class SettingsTab(ttk.Frame):
         except (ValueError, tk.TclError):
             up_conf = 0.9
         ups["straighten_min_confidence"] = min(1.0, max(0.5, up_conf))
+        ups["watchdog_enabled"] = bool(self.watchdog_var.get())
+        try:
+            wd_factor = round(float(self.watchdog_factor_var.get()), 1)
+        except (ValueError, tk.TclError):
+            wd_factor = 3.0
+        ups["watchdog_factor"] = min(10.0, max(1.5, wd_factor))
+        try:
+            ups["watchdog_consecutive"] = max(1, min(10, int(self.watchdog_consec_var.get())))
+        except (ValueError, tk.TclError):
+            ups["watchdog_consecutive"] = 2
         ups.update(seedvr_out)
 
         try:
@@ -3039,6 +3198,9 @@ class SettingsTab(ttk.Frame):
         self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
         self.up_straighten_var.set(bool(ups.get("auto_straighten", True)))
         self.up_straighten_conf_var.set(float(ups.get("straighten_min_confidence", 0.9)))
+        self.watchdog_var.set(bool(ups.get("watchdog_enabled", True)))
+        self.watchdog_factor_var.set(float(ups.get("watchdog_factor", 3.0)))
+        self.watchdog_consec_var.set(int(ups.get("watchdog_consecutive", 2)))
         self.webhook_var.set(ups.get("discord_webhook_url", ""))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))
@@ -3229,6 +3391,7 @@ class ConciliateTab(ToolTab):
             if tot > 0:
                 self.progress.grid()
                 self.progress.set(cur * 100 / tot)
+                self.app.taskbar_progress(cur, tot)
                 self.app.mqtt_publish({mqtt_publisher.TASK_PROGRESS_TOPIC: f"{cur}/{tot}"})
         elif kind == "DONE":
             self._last_done = payload     # for MQTT last_run (published on exit)
@@ -3236,6 +3399,7 @@ class ConciliateTab(ToolTab):
                 self._result = json.loads(payload)
             except ValueError:
                 self._result = None
+            self.app.flash_attention()    # catch the eye when the run finishes
         else:
             super()._handle_event(kind, payload)
 
@@ -3868,6 +4032,69 @@ class App(tk.Tk):
         self.stop_mqtt()
         if mqtt_enabled():
             self.start_mqtt()
+
+    def flash_attention(self):
+        """Flash the taskbar button until the window is brought to the foreground,
+        so a notification catches the eye while the user is working in another app
+        (e.g. an overnight upscale finishing or degrading). Windows-only, ctypes
+        only (matches the dependency-light telemetry/crash-logger pattern) and
+        fail-safe — never let a missing API break the GUI. No-op if already focused
+        (FLASHW_TIMERNOFG) or not on Windows."""
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            # winfo_id() is Tk's client HWND; its parent is the top-level window
+            # that owns the taskbar button.
+            hwnd = user32.GetParent(self.winfo_id()) or self.winfo_id()
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [("cbSize",    ctypes.c_uint),
+                            ("hwnd",      wintypes.HWND),
+                            ("dwFlags",   ctypes.c_uint),
+                            ("uCount",    ctypes.c_uint),
+                            ("dwTimeout", ctypes.c_uint)]
+
+            FLASHW_TRAY      = 0x00000002   # flash the taskbar button
+            FLASHW_TIMERNOFG = 0x0000000C   # keep flashing until the window is focused
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd,
+                              FLASHW_TRAY | FLASHW_TIMERNOFG, 0, 0)
+            user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
+
+    def _taskbar(self):
+        """Lazily build the taskbar progress controller for this window (the
+        button only exists once the window is shown). Fail-safe → None."""
+        tb = getattr(self, "_taskbar_obj", "unset")
+        if tb == "unset":
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                self._taskbar_obj = taskbar_progress.TaskbarProgress(hwnd)
+            except Exception:
+                self._taskbar_obj = None
+        return self._taskbar_obj
+
+    def taskbar_progress(self, done, total):
+        """Paint a green done/total fill on the taskbar button (UI thread)."""
+        tb = self._taskbar()
+        if tb is not None:
+            tb.set_progress(done, total)
+
+    def taskbar_state(self, state):
+        """Set the taskbar bar state ('indeterminate'/'error'/'none'/…)."""
+        tb = self._taskbar()
+        if tb is not None:
+            tb.set_state(state)
+
+    def taskbar_clear(self):
+        """Remove the taskbar progress bar (run finished or idle)."""
+        tb = self._taskbar()
+        if tb is not None:
+            tb.clear()
 
     def mqtt_publish(self, values):
         """Publish a {topic: payload} mapping if the client is running (no-op

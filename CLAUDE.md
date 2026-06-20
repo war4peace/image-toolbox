@@ -64,6 +64,20 @@ fast filter and a crisp LANCZOS pass follows when they settle. Pairing is
 strip remembers (`FilmStrip._compare`). Double-clicking a red/unframed thumbnail
 (or any Tag & Rename thumbnail) just opens the file. See `ComparisonWindow`.
 
+**Film-strip context menu** (0.3.0) — right-clicking a thumbnail
+(`FilmStrip._on_right_click`, hit-tested via the shared `_path_at`) opens an
+outcome-aware menu: a **processed** (green) image offers *Open original image /
+folder*, *Open upscaled image / folder* and *Compare images* (same action as
+double-click); a **failed** (red) image offers *Open failed image folder*; an
+**unprocessed/processing** image (and a tag-only "ok" with no upscaled
+counterpart) offers *Open image / Open image folder*. Folder entries select the
+file in Explorer (`_open_folder` → `explorer /select,`), falling back to opening
+the folder; image entries reuse `_open` (`os.startfile`). Every state also offers
+*Copy path* / *Copy filename* (`_to_clipboard`). The blue "currently processing"
+frame is cleared when a run ends (`FilmStrip.clear_current`, called from
+`ToolTab.on_exit`) so the last image shows its own green/red outcome instead of
+staying highlighted.
+
 **Conciliation** (experimental, 0.2.1) — replaces original photos with their
 processed (upscaled, optionally tagged & renamed) counterparts. Two phases:
 **Scan/Preview** builds a per-folder plan (replaced / no-match / non-image-kept
@@ -89,7 +103,36 @@ combobox/spinbox no longer silently cycles its value (which used to flip a
 setting unnoticed and trip the guard); the wheel is forwarded to the nearest
 scrollable canvas so the page still scrolls.
 
-**Notifications** — Discord webhook on queue completion and on errors.
+**Performance watchdog** (0.3.0, experimental) — guards long upscale runs against
+the **degraded-GPU** failure mode: as a run accumulates GPU/driver state the
+pipeline can silently slow from seconds/image to minutes (the GPU thrashing VRAM
+into system RAM), or fail with a hard OOM; only a reboot cures it and it
+reproduces outside the app (ComfyUI hits it too), so it is **below** the app, not
+a code bug. `run_pass` compares each image's **seconds per output megapixel**
+against the run's **running minimum** (the GPU's healthy throughput): anchoring to
+the minimum — not a rolling average — means a slow *creeping* ramp can't drift the
+baseline up and evade detection, and the per-MP normalisation keeps it valid
+across mixed resolutions. **Either** a sustained slow streak (≥`watchdog_factor`×,
+default 3×, the healthy rate for `watchdog_consecutive` images) **or** a hard OOM
+(`_is_oom_error`) is one *degradation episode*: it emits a `DEGRADED` event, sends
+a Discord alert, and **auto-stops after the current image** (the resume cache
+continues the queue after a reboot; the rescan pass is skipped via the `degraded`
+stat). Edge-triggered (one notification per episode). Inherent limit: a run that
+is *already* degraded at image #1 has no healthy sample to anchor to (reboot
+first). Toggle + factor/consecutive in Settings → Upscaling; `watchdog_min_samples`
+is config-only. Built as a reusable health signal for remote-pod upscaling
+(future #1). See `WATCHDOG_*` and `_trigger_degradation` in `batch_upscale.py`.
+
+**Notifications** — Discord webhook on queue completion and on errors. A
+**taskbar flash** (0.3.0, `App.flash_attention` via ctypes `FlashWindowEx`,
+Windows-only, fail-safe) fires on run completion (every tool) and on a watchdog
+degradation episode, so an unattended run catches the eye while the user is in
+another app. A **taskbar progress bar** (0.3.0, `taskbar_progress.py` →
+`ITaskbarList3` driven straight from ctypes COM, no new dependency) paints run
+progress onto the app's taskbar button — marquee during the initial scan, a green
+done/total fill while processing, **red** on a watchdog degradation, cleared when
+the run ends. Driven from `App.taskbar_progress` / `taskbar_state` / `taskbar_clear`
+off the same progress/DEGRADED/exit hooks as the in-app bar.
 
 **Home Assistant (MQTT)** (0.2.4) — optional, opt-in integration that publishes
 app state to an MQTT broker for Home Assistant / MQTT Explorer. No separate
@@ -162,6 +205,7 @@ counts give a sense of weight:
 | `system_telemetry.py` (~180 lines) | System telemetry sampler (Feature #3a). Stdlib-only, read-only, best-effort: `CpuSampler` reads CPU usage from Windows `GetSystemTimes` (`ctypes`) as a delta between calls; `sample_ram()` reads physical RAM via `GlobalMemoryStatusEx`; `sample_gpu()` shells out to `nvidia-smi` for VRAM used/total and temperature. All fail safe to `None`. The GPU query blocks (spawns a process), so the GUI samples from a background thread. |
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 | `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |
+| `taskbar_progress.py` (~170 lines) | Windows taskbar progress bar (0.3.0). `TaskbarProgress` wraps the shell `ITaskbarList3` COM interface **driven straight from ctypes** (manual GUID + vtable calls — no comtypes/pywin32, no new dependency), painting run progress onto the app's taskbar button: `set_progress(done, total)` (green fill), `set_state("indeterminate"/"error"/"none")`, `clear()`. Windows-only, fail-safe (disables itself on any COM failure); all calls come from the GUI/UI thread. Driven via `App.taskbar_*`. |
 
 Configuration & state:
 

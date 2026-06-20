@@ -24,7 +24,11 @@
         "discord_webhook_url": "",
         "upscale_cutoff_pct": 66,
         "auto_straighten": true,
-        "straighten_min_confidence": 0.9
+        "straighten_min_confidence": 0.9,
+        "watchdog_enabled": true,
+        "watchdog_factor": 3.0,
+        "watchdog_consecutive": 2,
+        "watchdog_min_samples": 3
     },
     "tagging": {
         "min_width": 3840,

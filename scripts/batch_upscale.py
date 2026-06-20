@@ -100,6 +100,23 @@ MAX_RESOLUTION      = _U.get("max_resolution",   3840)
 DISCORD_WEBHOOK_URL = _U.get("discord_webhook_url", "")
 OUTAGE_THRESHOLD    = _U.get("outage_threshold", 3)
 
+# Performance watchdog (0.3.0). On a clean boot the 3090 upscales at a steady
+# rate, but after accumulating GPU/driver state the pipeline can degrade — per
+# image time climbs from seconds to minutes (the GPU thrashing VRAM into system
+# RAM), or it surfaces as a hard OOM. Only a reboot cures it, and it wastes power
+# for no progress meanwhile. The watchdog compares each image's **seconds per
+# output megapixel** against the run's **running minimum** (the GPU's healthy
+# throughput) — anchoring to the minimum, not a rolling average, means a slow
+# CREEPING ramp can't drift the baseline up and evade detection, and the per-MP
+# normalisation keeps it valid across very different image resolutions. EITHER a
+# sustained slow streak OR a hard OOM is one "degradation episode": it notifies
+# (GUI + Discord + taskbar flash) and AUTO-STOPS after the current image. The
+# resume cache picks the queue back up after a reboot, so stopping is safe.
+WATCHDOG_ENABLED     = bool(_U.get("watchdog_enabled", True))
+WATCHDOG_FACTOR      = float(_U.get("watchdog_factor", 3.0))   # x the healthy rate = "slow"
+WATCHDOG_CONSECUTIVE = int(_U.get("watchdog_consecutive", 2))  # slow images in a row to trip
+WATCHDOG_MIN_SAMPLES = int(_U.get("watchdog_min_samples", 3))  # images seen before tripping
+
 # Auto-straighten BEFORE upscaling (0.2.7). The upscaler targets 3840px wide OR
 # 2160px tall (whichever is reached first) so the result fits a 4K screen with no
 # resizing. A sideways photo upscaled as-is fills the wrong axis; when Tag &
@@ -181,6 +198,20 @@ def fmt_hhmmss(seconds):
     h, rem  = divmod(seconds, 3600)
     m, s    = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _is_oom_error(exc):
+    """
+    True when an exception looks like a CUDA/torch out-of-memory error. With
+    "Prefer No Sysmem Fallback" set in the NVIDIA panel, the degraded GPU fails
+    fast with a hard OOM instead of crawling — the watchdog treats that as the
+    same degradation episode as a sustained slow streak.
+    """
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return ("out of memory" in s
+            or "outofmemory" in s
+            or "cuda_error_out_of_memory" in s
+            or ("cuda error" in s and "memory" in s))
 
 
 # ─────────────────────────────────────────────
@@ -1006,6 +1037,40 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     """
     consecutive_failures = 0
 
+    # ── Performance watchdog state (0.3.0) ───────────────────────────────────
+    # min_spmp = the run's best (lowest) seconds-per-output-megapixel = the GPU's
+    # healthy throughput; the baseline is the running minimum so a creeping ramp
+    # can't drift it up. slow_streak counts consecutive degraded images;
+    # degraded_stop breaks out after the current image (temp copy cleaned up by
+    # the finally first).
+    min_spmp     = None
+    samples_seen = 0
+    slow_streak  = 0
+    degraded_stop = False
+
+    def _trigger_degradation(reason, image, idx, total, grand_elapsed):
+        """Announce a degradation episode (GUI + Discord) and stop the run.
+
+        Called once per episode (the loop breaks straight after), so the
+        notification is naturally edge-triggered — no per-slow-image spam."""
+        logger.tee("  WARNING: PERFORMANCE DEGRADATION DETECTED -- stopping after this image.")
+        logger.tee(f"  {reason}")
+        logger.tee("  A Windows reboot is the known cure; the resume cache will pick the queue back up.")
+        _gui_event("DEGRADED", json.dumps({
+            "reason": reason, "image": image, "idx": idx, "total": total,
+        }))
+        send_discord_notification(
+            title       = "Upscale Script -- Performance Degradation Detected",
+            description = reason,
+            color       = 15105570,        # orange
+            fields      = [
+                {"name": "Last image",    "value": image},
+                {"name": "Progress",      "value": f"{idx}/{total}"},
+                {"name": "Total elapsed", "value": fmt_hhmmss(grand_elapsed)},
+                {"name": "Machine",       "value": os.environ.get("COMPUTERNAME", "unknown")},
+            ],
+        )
+
     # GUI preview strip: announce the full ordered queue for this pass
     if GUI_MODE:
         _gui_event("QUEUE", json.dumps([item[1] for item in work_items]))
@@ -1176,6 +1241,37 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             # processed count (NOT the counter, which also advances on skips).
             _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}")
 
+            # ── Performance watchdog: degradation detection ──────────────────
+            # Seconds per output megapixel vs the run's healthy minimum. The
+            # minimum can only be set by genuinely fast images, so a slow ramp
+            # can't poison it (unlike a rolling average), and per-MP normalisation
+            # keeps the comparison fair across mixed resolutions. Trip on a
+            # sustained jump to >= WATCHDOG_FACTOR x that floor.
+            if WATCHDOG_ENABLED:
+                out_mp = max((out_w * out_h) / 1_000_000.0, 1e-6)
+                spmp   = img_elapsed / out_mp
+                samples_seen += 1
+                if min_spmp is None or spmp < min_spmp:
+                    min_spmp = spmp
+                if samples_seen >= WATCHDOG_MIN_SAMPLES and spmp >= min_spmp * WATCHDOG_FACTOR:
+                    slow_streak += 1
+                    ratio = spmp / min_spmp
+                    logger.tee(
+                        f"  WATCHDOG: image #{idx} took {fmt_mmss(img_elapsed)} for "
+                        f"{out_w}x{out_h} (~{ratio:.1f}x the healthy rate) "
+                        f"[{slow_streak}/{WATCHDOG_CONSECUTIVE}]")
+                    if slow_streak >= WATCHDOG_CONSECUTIVE:
+                        _trigger_degradation(
+                            reason=(f"Per-image upscale time degraded to ~{ratio:.1f}x the "
+                                    f"healthy rate ({fmt_mmss(img_elapsed)} for {out_w}x{out_h}) "
+                                    f"for {slow_streak} consecutive images. The GPU is likely "
+                                    f"thrashing VRAM into system memory."),
+                            image=local_path, idx=idx, total=total,
+                            grand_elapsed=grand_elapsed)
+                        degraded_stop = True
+                else:
+                    slow_streak = 0
+
         except Exception as e:
             img_elapsed        = time.time() - img_start
             grand_elapsed      = time.time() - grand_start - pause.paused_seconds
@@ -1188,7 +1284,20 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
-            if consecutive_failures >= OUTAGE_THRESHOLD:
+            # A hard OOM is the degraded-GPU symptom in its fail-fast form (the
+            # "Prefer No Sysmem Fallback" case). Treat it as a degradation episode
+            # immediately — auto-stop rather than waiting for OUTAGE_THRESHOLD.
+            if WATCHDOG_ENABLED and _is_oom_error(e):
+                _trigger_degradation(
+                    reason=(f"GPU ran out of memory on "
+                            f"'{os.path.basename(local_path)}'. The pipeline has "
+                            f"likely degraded (VRAM fragmentation / sysmem-fallback "
+                            f"OOM). Last error: {e}"),
+                    image=local_path, idx=idx, total=total,
+                    grand_elapsed=grand_elapsed)
+                degraded_stop = True
+
+            elif consecutive_failures >= OUTAGE_THRESHOLD:
                 outage_msg = (
                     f"{consecutive_failures} consecutive image(s) failed. "
                     f"The GPU pipeline may be in a bad state (out of VRAM, "
@@ -1230,13 +1339,21 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     ]
                 )
 
-            continue
+            if not degraded_stop:
+                continue
+            # else: fall through so the finally cleans up, then break below.
 
         finally:
             # Always remove the rotated temp copy, whether the upscale succeeded,
-            # failed, or the loop is about to break for an outage pause.
+            # failed, or the loop is about to break for an outage pause / stop.
             if tmp_path:
                 _safe_remove(tmp_path)
+
+        # Performance watchdog tripped (sustained slow streak or a hard OOM):
+        # stop the run cleanly after this image. The resume cache picks the queue
+        # back up after the user reboots — the known cure for the degraded GPU.
+        if degraded_stop:
+            break
 
     # Persist any cache changes from this pass — including already-done marks
     # recorded while skipping, and especially when the run ends with a Stop
@@ -1262,6 +1379,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "total_failed":          total_failed,
         "corrupt_files":         corrupt_files,
         "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
+        "degraded":              degraded_stop,
     }
 
 
@@ -1554,6 +1672,10 @@ def main():
     if stats1.get("user_quit"):
         logger.tee("")
         logger.tee("  Quit requested by user — skipping rescan.")
+    elif stats1.get("degraded"):
+        logger.tee("")
+        logger.tee("  GPU performance degraded — auto-stopped, skipping rescan. "
+                   "Reboot and re-run; the resume cache continues the queue.")
     else:
         logger.tee("")
         logger.tee("  Rescanning source directory for any new or renamed files ...")
@@ -1705,6 +1827,7 @@ def main():
 
     # ── Discord: queue finished / stopped ───────────────────────────────────
     user_quit = bool(stats1.get("user_quit")) or (stats2 is not None and bool(stats2.get("user_quit")))
+    degraded  = bool(stats1.get("degraded"))  or (stats2 is not None and bool(stats2.get("degraded")))
 
     # GUI: machine-readable run summary (drives the MQTT last_run topic).
     _gui_event("DONE", json.dumps({
@@ -1715,8 +1838,13 @@ def main():
         "failed":          total_failed,
         "elapsed_seconds": round(grand_elapsed, 1),
         "stopped_by_user": user_quit,
+        "degraded":        degraded,
     }))
-    if total_failed > 0:
+    # Degraded takes precedence: a watchdog OOM also bumps total_failed, so check
+    # it first or the run would be mislabelled "Finished with Failures".
+    if degraded:
+        notif_title, notif_color = "Upscale Queue -- Auto-Stopped (GPU Degraded)", 15105570  # orange
+    elif total_failed > 0:
         notif_title, notif_color = "Upscale Queue -- Finished with Failures", 16776960   # yellow
     elif user_quit:
         notif_title, notif_color = "Upscale Queue -- Stopped by User", 16776960          # yellow
