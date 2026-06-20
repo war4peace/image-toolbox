@@ -1194,13 +1194,15 @@ class ToolTab(ttk.Frame):
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def launch(self, script, args):
+    def launch(self, script, args, extra_env=None):
         # The child scripts are this module's siblings in scripts/; run them with
         # the working directory at the app root (where config/state/engine live).
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, script)] + args
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        if extra_env:
+            env.update(extra_env)
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=APP_ROOT,
@@ -2087,6 +2089,7 @@ class UpscaleTab(ToolTab):
         self.mqtt_task_name = "upscaling"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
+        self.remote_var   = tk.BooleanVar(value=False)
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
@@ -2134,6 +2137,15 @@ class UpscaleTab(ToolTab):
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
+
+        self.remote_chk = ttk.Checkbutton(
+            btns, text="Run on remote pod (RunPod)", variable=self.remote_var)
+        self.remote_chk.pack(side="left", padx=(18, 6))
+        Tooltip(self.remote_chk,
+                "Run the upscaling on a rented RunPod GPU instead of this PC "
+                "(roadmap #1, experimental). Creates a billed pod, streams each "
+                "image to it, and terminates the pod when done. Needs a RunPod "
+                "API key + model volume in Settings → Remote upscaling.")
 
         self._build_output_area(row=3)
 
@@ -2253,14 +2265,38 @@ class UpscaleTab(ToolTab):
             return
         out = self.out_var.get().strip() or os.path.join(src, "__upscaled__")
         self.out_var.set(out)
-        if not self.confirm_gpu_overlap():
+
+        remote = bool(self.remote_var.get())
+        extra_env = None
+        if remote:
+            rp = CFG.get("runpod", {})
+            if not rp.get("api_key") or not rp.get("network_volume_id"):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Remote upscaling needs a RunPod API key and a model volume.\n"
+                    "Set them in Settings → Remote upscaling (RunPod).")
+                return
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    "Run this batch on a rented RunPod GPU?\n\n"
+                    "This creates a BILLED pod, streams each image to it, writes the "
+                    "results here, and terminates the pod when the run ends. The pod "
+                    "also self-terminates on an idle / max-runtime deadline as a "
+                    "safety net.\n\nProceed?"):
+                return
+            extra_env = {"IMGTBX_UPSCALE_REMOTE": "1"}
+        elif not self.confirm_gpu_overlap():
+            # Local run only: warn about local GPU contention. (No local GPU is
+            # used in remote mode, so that check is skipped above.)
             return
 
         self.progress.set(0)
         self._reset_stream_state()
-        self.status_var.set("Starting — loading the AI engine (the first run can take a few minutes) …")
+        self.status_var.set(
+            "Starting the remote pod (first run takes a few minutes) …" if remote
+            else "Starting — loading the AI engine (the first run can take a few minutes) …")
         # The skip-cutoff now lives in Settings; batch_upscale reads it from config.json.
-        if self.launch("batch_upscale.py", [src, out]):
+        if self.launch("batch_upscale.py", [src, out], extra_env=extra_env):
             self._paused     = False
             self._processing = False
             self._cancelled  = False
