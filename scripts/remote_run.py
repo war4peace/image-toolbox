@@ -183,16 +183,23 @@ class RemoteSession:
 
     def _start_worker(self):
         self._emit("Starting the resident worker (first model load is slow) …")
-        launch = (
-            "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
-            "cd /root && nohup /workspace/venv/bin/python /root/worker.py "
+        wp = self.worker_port
+        # If a healthy worker is already up (reused pod), skip the relaunch — that
+        # avoids a needless ~97 s model reload. Otherwise launch it. The launch
+        # must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the redirect on
+        # the backgrounded command — a `cd && nohup … &` wrapper leaves the ssh
+        # channel open and the call hangs (the worker loads but ssh never returns).
+        inner = (
+            "echo $$ > /root/worker.pid; "
+            "exec /workspace/venv/bin/python /root/worker.py "
             "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
-            f"--settings /root/worker_settings.json --port {self.worker_port} "
-            f"--heartbeat {HEARTBEAT} < /dev/null > /root/worker.log 2>&1 & "
-            "echo $! > /root/worker.pid; "
-            f"for i in $(seq 1 120); do "
-            f"  curl -sf localhost:{self.worker_port}/health >/dev/null 2>&1 && break; sleep 5; done; "
-            f"curl -sf localhost:{self.worker_port}/health >/dev/null 2>&1 || "
+            f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT}")
+        launch = (
+            f"if curl -sf localhost:{wp}/health >/dev/null 2>&1; then echo ALREADY_HEALTHY; exit 0; fi; "
+            "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
+            f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
+            f"for i in $(seq 1 120); do curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; sleep 5; done; "
+            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
             "{ echo WORKER_FAILED; tail -n 20 /root/worker.log; exit 1; }")
         res = self._ssh(launch, check=False, timeout=900)
         if "WORKER_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
