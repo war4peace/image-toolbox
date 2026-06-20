@@ -116,8 +116,12 @@ Wrinkles to honour when this is built:
   Settings → *Remote upscaling (RunPod)* holds the API key (with a **Test**
   button), hourly rate, and the dead-man's-switch limits. Nothing is provisioned
   yet — Test only lists pods (free).
-- **Phase 1 (next):** the on-pod dead-man's switch + local auto-stop with cancel
-  countdown.
+- **Phase 1 (in progress):** the on-pod dead-man's switch — `pod/deadman.py` is
+  done (self-stops on max-runtime/idle via `runpodctl stop pod $RUNPOD_POD_ID`,
+  pure tested `evaluate()`; the user's API key never lives on the pod). Remaining:
+  the local after-run auto-stop with a cancel countdown (wired in with the run
+  flow, Phase 3). The on-pod half is fully exercisable only once Phase 2
+  provisions a real pod, but its decision logic is verified off-pod (`--selftest`).
 - **Phase 2:** `create_pod` → wait RUNNING → SSH probe → bring up the worker.
 - **Phase 3:** `RemoteUpscaleEngine` streaming; `DEGRADED` teardown/re-provision;
   cost embed.
