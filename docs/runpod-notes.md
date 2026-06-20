@@ -6,6 +6,30 @@ Reference notes distilled from the old `remote-image-upscale.ps1` /
 ComfyUI architecture** and do not run against the current app; this file keeps
 the parts that are still worth reusing when remote-pod support is rebuilt.
 
+## Open items / TODO
+
+- **SSH onboarding for non-technical users.** The remote flow needs an SSH
+  keypair on the user's machine and its public key on the RunPod account. Today
+  that is manual. Plan: (a) **bundle / ensure OpenSSH** (Windows 10/11 ship it,
+  but it can be absent/disabled — detect and guide, or carry a portable copy);
+  (b) an in-app **"Set up RunPod SSH"** button that generates the keypair
+  (`ssh-keygen -t ed25519`) if missing, shows the public key with a copy button,
+  and links straight to the RunPod SSH-keys page — or, if the REST API exposes an
+  SSH-key endpoint, **adds it to the account automatically** (investigate).
+- **Pod cold-start is slow — mostly network-volume read throughput.** The ~239 s
+  engine load is dominated by reading the 16 GB DiT from the **network volume**
+  (NFS-like, far slower than local NVMe) plus a hash-validation pass that reads it
+  *again*. Mitigations to try: copy models volume→local container disk once on pod
+  start then load locally; **skip the safetensors hash-validation** on a trusted
+  volume; keep the worker resident so the load is paid once per pod, not per image.
+- **Confirm warm upscale throughput.** The first image took 78 s for 1620×1080 —
+  but that is a single *cold* image (CUDA/cuDNN warmup, likely first-run Blackwell
+  kernel JIT under torch 2.9.1/cu128, no Sage/Flash attention). Reference: locally
+  a 3090 does ~4K in 17–19 s (first ~22–24 s); a 5090 should be ~10 s. We have NO
+  steady-state sample yet — the resident worker (Phase 3) must measure image #2…N
+  to tell one-time warmup from a real per-image regression. Treat 78 s as
+  unexplained until measured warm.
+
 ## Architecture: what changed, and what still maps
 
 The old model: run the tool **locally**, SSH-tunnel into a service on the pod,
