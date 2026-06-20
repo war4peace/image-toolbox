@@ -15,7 +15,7 @@ set -euo pipefail
 
 VOL=/workspace
 SEEDVR2_DIR="$VOL/seedvr2"
-PYDEPS="$VOL/pydeps"
+VENV="$VOL/venv"
 MODELS="$VOL/models"
 SEEDVR2_MODELS="$MODELS/seedvr2"
 OLLAMA_MODELS_DIR="$MODELS/ollama"
@@ -26,7 +26,8 @@ SEEDVR2_ZIP="https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/refs/
 echo "================ provisioning to $VOL ================"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
 python --version
-mkdir -p "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR" "$PYDEPS"
+mkdir -p "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR"
+rm -rf "$VOL/pydeps"   # remove the abandoned --target dir from earlier attempts
 
 # 1. SeedVR2 engine code -------------------------------------------------------
 if [ ! -f "$SEEDVR2_DIR/inference_cli.py" ]; then
@@ -43,14 +44,28 @@ else
   echo "---- SeedVR2 engine already present ----"
 fi
 
-# 2. Light python deps to the volume (torch/torchvision come from the image) ---
-echo "---- installing python deps to $PYDEPS ----"
+# 2. venv on the volume, INHERITING the image's torch via --system-site-packages
+#    (so pip sees torch is already satisfied and does NOT pull a second,
+#    conflicting torch/CUDA — the failure mode of an earlier --target attempt).
+#    The light deps install into the venv and persist on the volume.
+echo "---- creating venv at $VENV (reusing the image's torch 2.9.1+cu128) ----"
+rm -rf "$VENV"
+python -m venv --system-site-packages "$VENV"
 grep -ivE '^torch($|[<>=~ ])|^torchvision' "$SEEDVR2_DIR/requirements.txt" > /tmp/reqs.txt
-pip install --no-cache-dir --target="$PYDEPS" -r /tmp/reqs.txt pillow piexif timm huggingface_hub
+# The image ships torch 2.9.1+cu128 and torchaudio 2.9.1 but NO torchvision.
+# Pin torch so nothing (timm/torchvision) drags in a newer torch that would
+# mismatch the system torchaudio; install the matching torchvision from the
+# cu128 index so its ABI matches the image torch.
+echo "torch==2.9.1" > /tmp/constraints.txt
+"$VENV/bin/pip" install --no-cache-dir -c /tmp/constraints.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    -r /tmp/reqs.txt pillow piexif timm huggingface_hub torchvision==0.24.1
+echo "---- versions in venv (torch must stay 2.9.1+cu128) ----"
+"$VENV/bin/python" -c "import torch,torchvision,torchaudio;print('torch',torch.__version__,'tv',torchvision.__version__,'ta',torchaudio.__version__,'cuda',torch.cuda.is_available())"
 
 # 3. SeedVR2 weights to the volume (download_weight skips files already valid) --
 echo "---- downloading SeedVR2 weights to $SEEDVR2_MODELS ----"
-PYTHONPATH="$PYDEPS:$SEEDVR2_DIR" python - "$SEEDVR2_DIR" "$SEEDVR2_MODELS" "$DIT_MODEL" <<'PY'
+PYTHONPATH="$SEEDVR2_DIR" "$VENV/bin/python" - "$SEEDVR2_DIR" "$SEEDVR2_MODELS" "$DIT_MODEL" <<'PY'
 import sys
 seedvr2_dir, model_dir, dit_model = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, seedvr2_dir)
@@ -76,4 +91,4 @@ ollama pull "$OLLAMA_MODEL"
 
 echo "================ provisioning complete ================"
 echo "Volume contents:"
-du -sh "$SEEDVR2_DIR" "$PYDEPS" "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR" 2>/dev/null || true
+du -sh "$SEEDVR2_DIR" "$VENV" "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR" 2>/dev/null || true

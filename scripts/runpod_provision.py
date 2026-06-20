@@ -34,7 +34,7 @@ STATE      = os.path.join(APP_ROOT, "logs", "runpod_dev_state.json")
 KNOWN_HOSTS = os.path.join(APP_ROOT, "logs", "runpod_known_hosts")
 PROVISION_SH = os.path.join(APP_ROOT, "pod", "provision.sh")
 
-DEFAULT_IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu"
+DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
 
 
 def _load_config():
@@ -87,7 +87,7 @@ def _ssh_opts(key, port):
 
 def _ssh(host, port, key, command, check=True):
     args = ["ssh", *_ssh_opts(key, port), f"root@{host}", command]
-    print(f"  $ ssh root@{host} -p {port}  «{command[:80]}{'…' if len(command) > 80 else ''}»")
+    print(f"  $ ssh root@{host} -p {port}  [{command[:80]}{'...' if len(command) > 80 else ''}]")
     return subprocess.run(args, check=check)
 
 
@@ -139,7 +139,7 @@ def cmd_create(rpc, args):
         "ports":             ["22/tcp"],
     }
     print(f"Creating pod: {gpu} in {region}, volume {vol_id}, image {image}")
-    print("  *** this STARTS BILLING — remember to 'terminate' when done ***")
+    print("  *** this STARTS BILLING - remember to 'terminate' when done ***")
     pod = rp.create_pod(key, spec)
     pod_id = (pod or {}).get("id")
     if not pod_id:
@@ -172,7 +172,7 @@ def cmd_status(rpc, args):
     if created:
         hrs = (time.time() - created) / 3600.0
         rate = float(rpc.get("hourly_rate", 0.0))
-        print(f"elapsed  : {hrs:.2f} h   est. cost ≈ ${hrs * rate:.2f} (@ ${rate}/h)")
+        print(f"elapsed  : {hrs:.2f} h   est. cost ~ ${hrs * rate:.2f} (@ ${rate}/h)")
 
 
 def cmd_probe(rpc, args):
@@ -197,6 +197,49 @@ def cmd_provision(rpc, args):
     _ssh(host, port, key, f"{env} bash /root/provision.sh")
 
 
+def cmd_smoke(rpc, args):
+    """End-to-end proof: push the engine + a sample image, upscale on the pod
+    (models from the volume), pull the result back. Usage:
+        smoke [local_image] [resolution]"""
+    _, host, port = _endpoint_or_die(rpc)
+    key = _ssh_key_path(rpc)
+    local_img = args[0] if args else os.path.join(APP_ROOT, "samples", "original", "pisic7.jpg")
+    resolution = args[1] if len(args) > 1 else "1080"
+    if not os.path.exists(local_img):
+        sys.exit(f"Sample image not found: {local_img}")
+
+    # Engine settings come from config.json's upscale section.
+    with open(CONFIG, encoding="utf-8") as f:
+        upscale_cfg = json.load(f).get("upscale", {})
+    settings_path = os.path.join(APP_ROOT, "logs", "_smoke_settings.json")
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(upscale_cfg, f)
+
+    engine_py = os.path.join(APP_ROOT, "scripts", "upscale_engine.py")
+    one_py    = os.path.join(APP_ROOT, "pod", "upscale_one.py")
+    _scp(host, port, key, engine_py, "/root/upscale_engine.py")
+    _scp(host, port, key, one_py, "/root/upscale_one.py")
+    _scp(host, port, key, settings_path, "/root/smoke_settings.json")
+    _scp(host, port, key, local_img, "/root/smoke_in.jpg")
+
+    print("Upscaling one image on the pod (engine loads from the volume)…")
+    cmd = ("/workspace/venv/bin/python /root/upscale_one.py "
+           "/workspace/seedvr2 /workspace/models/seedvr2 /root/smoke_settings.json "
+           f"/root/smoke_in.jpg /root/smoke_out.jpg {resolution}")
+    _ssh(host, port, key, cmd)
+
+    out_local = os.path.join(APP_ROOT, "test_output", "runpod_smoke.jpg")
+    os.makedirs(os.path.dirname(out_local), exist_ok=True)
+    args_scp = ["scp", "-i", key, "-P", str(port),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+                f"root@{host}:/root/smoke_out.jpg", out_local]
+    print(f"  $ scp root@{host}:/root/smoke_out.jpg -> {out_local}")
+    subprocess.run(args_scp, check=True)
+    print(f"Done. Result saved to {out_local}")
+
+
 def cmd_ssh(rpc, args):
     if not args:
         sys.exit('Usage: runpod_provision.py ssh "<command>"')
@@ -219,7 +262,7 @@ def cmd_terminate(rpc, args):
 
 COMMANDS = {
     "create": cmd_create, "status": cmd_status, "probe": cmd_probe,
-    "provision": cmd_provision, "ssh": cmd_ssh,
+    "provision": cmd_provision, "smoke": cmd_smoke, "ssh": cmd_ssh,
     "terminate": cmd_terminate, "stop": cmd_terminate,
 }
 

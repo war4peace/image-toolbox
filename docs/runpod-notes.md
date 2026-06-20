@@ -128,12 +128,32 @@ Wrinkles to honour when this is built:
   has a GPU-type picklist, an **EU data-center picklist (defaults to EU-RO-1)**, and
   a model-volume row (Refresh lists, Create makes one in the chosen DC with a cost
   confirmation). No pod spun up.
-- **Phase 2b (in progress):** provision + worker bring-up. Helpers added to
-  `runpod_client`: `wait_until_running` (polls until RUNNING + SSH reachable),
-  `ssh_endpoint` (reads `publicIp` + `portMappings["22"]`), `volume_region`
-  (the DC a pod must match). SSH keypair confirmed on the dev box; its public key
-  goes into the RunPod account. Remaining: `create_pod` spec assembly, the
-  one-time on-volume provisioning, and `pod/worker.py`.
+- **Phase 2b (done — validated live on an RTX 5090 in EU-RO-1):** provision +
+  one-image upscale proven end-to-end. `runpod_client` helpers `wait_until_running`
+  / `ssh_endpoint` / `volume_region`; `scripts/runpod_provision.py` dev driver
+  (create/status/probe/provision/smoke/ssh/terminate); `pod/provision.sh` filled
+  the volume (16 GB weights + 5.6 GB Ollama + 2.6 GB venv + 50 MB engine ≈ 24 GB);
+  `pod/upscale_one.py` upscaled 900×600 → 1620×1080 via the **unchanged**
+  `UpscaleEngine`, models loaded from the volume, result fetched back. Pod then
+  terminated; the volume persists for the next pod.
+
+  **Hard-won provisioning lessons (baked into provision.sh / the driver):**
+  - **Base image:** `runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204` (the
+    plausible `2.8.0-...-cuda12.8.1-...` tag does NOT exist on the registry —
+    `create` failed cleanly with RunPod's own message, no pod leaked). Ships
+    Python 3.12, torch 2.9.1+cu128, torchaudio 2.9.1 — but **no torchvision**.
+  - **Torch pinning is essential.** Installing the seedvr2 deps naively makes
+    `timm`/`torchvision` drag in a newer torch (2.12 + CUDA 13) that mismatches
+    the image's torchaudio 2.9.1 → `libtorchaudio.so: undefined symbol` at import
+    (diffusers→transformers→torchaudio). Fix: a venv with `--system-site-packages`
+    + a constraints file pinning `torch==2.9.1` + install matching
+    `torchvision==0.24.1` from the cu128 index. Final: torch/tv/ta all 2.9.1+cu128.
+  - **Volume mounts at `/workspace`.** Models auto-download there via the engine's
+    `download_weight` (skips if present, so later pods reuse them).
+  - **Cold start ≈ 5 min per fresh pod:** ~239 s engine load (incl. one-time 16 GB
+    safetensors hash-validation) + ~78 s first-image warmup (no Sage/Flash attn;
+    sdpa). **Phase 3's resident worker pays this once and amortizes it over the
+    whole queue** — and we may skip the hash-validation on a trusted volume.
 
 ### Provisioning architecture (Phase 2b)
 
