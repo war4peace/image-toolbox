@@ -75,32 +75,38 @@ def _log(msg):
 
 
 def stop_pod(pod_id, terminate=False, retries=3):
-    """Stop (or terminate) this pod. Tries runpodctl first, then a REST fallback
-    if an API key happens to be in the environment. Returns True on success."""
+    """Stop (or terminate) this pod. On REST-API-created pods `runpodctl` is NOT
+    pre-authed and $RUNPOD_POD_ID is unset, so when an API key is in the
+    environment we use the REST API directly (the reliable path here); runpodctl
+    is kept as a fallback for web-UI-launched pods that DO pre-auth it.
+    Returns True on success."""
     if not pod_id:
-        _log("ERROR: no pod id (RUNPOD_POD_ID unset) — cannot self-stop.")
+        _log("ERROR: no pod id — cannot self-stop (pass --pod-id).")
         return False
 
-    verb = "remove" if terminate else "stop"
-    cmd = ["runpodctl", verb, "pod", pod_id]
-    for attempt in range(1, retries + 1):
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if res.returncode == 0:
-                _log(f"runpodctl {verb} pod succeeded.")
+    # Preferred path for REST-created pods: REST API with the on-pod key.
+    if os.environ.get("RUNPOD_API_KEY", "").strip():
+        for attempt in range(1, retries + 1):
+            if _rest_stop(pod_id, terminate):
                 return True
-            _log(f"runpodctl attempt {attempt}/{retries} failed "
-                 f"(rc={res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
-        except FileNotFoundError:
-            _log("runpodctl not found on PATH.")
-            break
-        except Exception as exc:                          # noqa: BLE001 (fail-safe)
-            _log(f"runpodctl attempt {attempt}/{retries} errored: {exc}")
-        time.sleep(2 * attempt)
+            _log(f"REST stop attempt {attempt}/{retries} failed; retrying…")
+            time.sleep(2 * attempt)
 
-    # Last resort: REST, only if a key is already present on the pod.
-    if _rest_stop(pod_id, terminate):
-        return True
+    # Fallback: runpodctl (works only where it is pre-authed).
+    verb = "remove" if terminate else "stop"
+    try:
+        res = subprocess.run(["runpodctl", verb, "pod", pod_id],
+                             capture_output=True, text=True, timeout=60)
+        if res.returncode == 0:
+            _log(f"runpodctl {verb} pod succeeded.")
+            return True
+        _log(f"runpodctl failed (rc={res.returncode}): "
+             f"{res.stderr.strip() or res.stdout.strip()}")
+    except FileNotFoundError:
+        _log("runpodctl not found on PATH.")
+    except Exception as exc:                              # noqa: BLE001 (fail-safe)
+        _log(f"runpodctl errored: {exc}")
+
     _log("ERROR: could not stop the pod by any method — manual stop required.")
     return False
 

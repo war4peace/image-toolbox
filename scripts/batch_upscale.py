@@ -1470,19 +1470,48 @@ def main():
     print("  Loading SeedVR2 engine (first run may download model weights) ...")
     _gui_event("STATUS", "Loading the AI engine …")
     global ENGINE
+    # Remote mode (roadmap #1): the GUI sets IMGTBX_UPSCALE_REMOTE=1 to run the
+    # GPU work on a RunPod pod. The queue, resume cache, skip logic and the
+    # performance watchdog all stay LOCAL — only the per-image upscale is remote.
+    REMOTE = os.environ.get("IMGTBX_UPSCALE_REMOTE") == "1"
     try:
-        from upscale_engine import UpscaleEngine
-        # debug=true in config.json's "upscale" section restores the verbose
-        # SeedVR2 pipeline output in the terminal.
-        ENGINE = UpscaleEngine(SEEDVR2_REPO_DIR, SEEDVR2_MODEL_DIR, _U,
-                               debug=bool(_U.get("debug", False)))
+        if REMOTE:
+            import atexit
+            from remote_run import RemoteSession
+
+            def _remote_status(msg):
+                print(f"  [remote] {msg}", flush=True)
+                _gui_event("STATUS", msg)
+
+            _gui_event("STATUS", "Starting remote pod …")
+            # Dev-only: IMGTBX_REMOTE_ATTACH="pod_id,host,ssh_port" reuses a
+            # running pod instead of creating one (no teardown on close).
+            _attach = None
+            _att = os.environ.get("IMGTBX_REMOTE_ATTACH")
+            if _att:
+                _p = _att.split(",")
+                _attach = (_p[0], _p[1], int(_p[2]))
+            session = RemoteSession(_CFG.get("runpod", {}), _U, APP_ROOT,
+                                    on_event=_remote_status, attach=_attach)
+            ENGINE = session.start()
+            # Guarantee teardown on any normal/sys.exit path; the on-pod
+            # dead-man's switch is the backup if the process is hard-killed.
+            atexit.register(session.close)
+        else:
+            from upscale_engine import UpscaleEngine
+            # debug=true in config.json's "upscale" section restores the verbose
+            # SeedVR2 pipeline output in the terminal.
+            ENGINE = UpscaleEngine(SEEDVR2_REPO_DIR, SEEDVR2_MODEL_DIR, _U,
+                                   debug=bool(_U.get("debug", False)))
     except Exception as e:
-        print(f"ERROR: Could not initialize the SeedVR2 engine.\n  -> {e}")
-        print("Make sure this script runs inside the toolbox venv, e.g.:")
-        print(f"  {os.path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')} scripts\\batch_upscale.py <source_dir>")
+        where = "remote pod" if REMOTE else "SeedVR2 engine"
+        print(f"ERROR: Could not initialize the {where}.\n  -> {e}")
+        if not REMOTE:
+            print("Make sure this script runs inside the toolbox venv, e.g.:")
+            print(f"  {os.path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')} scripts\\batch_upscale.py <source_dir>")
         send_discord_notification(
             title       = "Upscale Script -- Engine Failed to Start",
-            description = f"Could not initialize the SeedVR2 engine.\n{e}",
+            description = f"Could not initialize the {where}.\n{e}",
             color       = 15548997,   # red
             fields      = [{"name": "Machine", "value": os.environ.get("COMPUTERNAME", "unknown")}],
         )

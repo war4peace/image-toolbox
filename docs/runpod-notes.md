@@ -220,9 +220,24 @@ Wrinkles to honour when this is built:
   `bench` (cold-vs-warm timing). Also `runpod_client.create_pod_resilient` — a
   **deploy watchdog**: each pod gets a deploy budget (240 s); on timeout or early
   EXIT it terminates the bad pod and tries a fresh one (RunPod sometimes hands out
-  pods that never finish deploying), up to N attempts. Remaining for Phase 3:
-  wire `RemoteUpscaleEngine` into `batch_upscale` (pick engine by config), the
-  worker/pod lifecycle + `DEGRADED` teardown/re-provision, GUI, cost embed.
+  pods that never finish deploying), up to N attempts.
+- **Phase 3 integration (done — real batch validated):** `scripts/remote_run.py`
+  (`RemoteSession`: create pod via watchdog → push engine/worker/deadman → start
+  worker → **arm the on-pod dead-man's switch** → hand back a connected
+  `RemoteUpscaleEngine` → terminate on close; has an `attach` mode for dev).
+  `batch_upscale.py` selects the remote engine when `IMGTBX_UPSCALE_REMOTE=1`
+  (queue/resume/skip/watchdog stay local) and tears the pod down via `atexit`.
+  Validated: a real 7-image batch ran on the pod at ~12 s/image (4K), results
+  written locally, 0 failed.
+  **SSH gotchas solved:** (1) a pod self-terminates via the REST API with the key
+  ON the pod — REST-created pods have NO pre-authed runpodctl and no
+  $RUNPOD_POD_ID, so key-on-pod is unavoidable (written to a 0600 file; use a
+  SCOPED key in prod). (2) a backgrounded daemon must be launched as
+  `setsid sh -c '…' </dev/null >log 2>&1 &` with the redirect directly on the
+  backgrounded command — a `cd && …` wrapper (or missing redirect) keeps the ssh
+  channel open and the call hangs.
+  Remaining for Phase 3: the GUI "Run on remote pod" toggle, `DEGRADED`
+  teardown/re-provision, cost embed.
 
 ## RunPod REST API
 
