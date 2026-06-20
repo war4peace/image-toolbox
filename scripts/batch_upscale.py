@@ -710,6 +710,17 @@ def warm_up_straighten():
     global _STRAIGHTEN_DISABLED
     if not AUTO_STRAIGHTEN:
         return
+    # In REMOTE mode the GPU work runs on the pod. Doing straighten locally here
+    # would import torch/numpy on the user's machine, which both defeats the
+    # offload and can DEADLOCK loading numpy's OpenBLAS DLL once the process
+    # already has background threads/subprocesses (the ssh tunnel) — a Windows
+    # loader-lock deadlock, confirmed via py-spy's native stack. Skip it: the
+    # right home for remote-mode straighten is the pod worker itself (TODO).
+    if os.environ.get("IMGTBX_UPSCALE_REMOTE") == "1":
+        print("  Auto-straighten: skipped in remote mode for now "
+              "(straighten will move onto the pod) — remote upscales aren't rotated yet.")
+        _STRAIGHTEN_DISABLED = True
+        return
     try:
         import orientation
         if not orientation.is_available():
