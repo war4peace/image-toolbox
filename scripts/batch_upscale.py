@@ -126,6 +126,11 @@ WATCHDOG_MIN_SAMPLES = int(_U.get("watchdog_min_samples", 3))  # images seen bef
 # source is never touched. Set auto_straighten=false to keep the old behaviour.
 AUTO_STRAIGHTEN       = bool(_U.get("auto_straighten", True))
 STRAIGHTEN_CONFIDENCE = float(_U.get("straighten_min_confidence", 0.9))
+# Cap the orientation-model load. Normally ~3 s (or a one-time ~82 MB download);
+# but a stuck local CUDA init (a degraded/contended GPU) could hang forever and
+# block the whole run — especially in remote mode where the GPU work is on the
+# pod. If the load exceeds this, fail safe to "no straighten" and continue.
+STRAIGHTEN_INIT_TIMEOUT = float(_U.get("straighten_init_timeout", 90))
 _STRAIGHTEN_DISABLED  = False     # set True at warm-up if torch/timm unavailable
 
 # The SeedVR2 engine — created in main() after CLI validation so that
@@ -713,7 +718,29 @@ def warm_up_straighten():
             return
         print("  Auto-straighten: loading orientation model "
               "(first run downloads ~82 MB) ...")
-        orientation._get_model()
+        # Load on a worker thread with a timeout so a stuck local CUDA init can't
+        # hang the run. The leaked thread (if it ever unblocks) is a harmless
+        # daemon; the run proceeds without straighten.
+        import threading
+        result = {}
+
+        def _load():
+            try:
+                orientation._get_model()
+                result["ok"] = True
+            except Exception as exc:        # noqa: BLE001 — reported below
+                result["err"] = exc
+
+        th = threading.Thread(target=_load, daemon=True)
+        th.start()
+        th.join(STRAIGHTEN_INIT_TIMEOUT)
+        if th.is_alive():
+            print(f"  Auto-straighten: model load did not finish within "
+                  f"{STRAIGHTEN_INIT_TIMEOUT:.0f}s (local GPU stuck?) — upscaling without rotation.")
+            _STRAIGHTEN_DISABLED = True
+            return
+        if result.get("err"):
+            raise result["err"]
         print("  Auto-straighten: ready.")
     except Exception as exc:
         print(f"  Auto-straighten: could not initialise ({exc}) — upscaling without rotation.")
