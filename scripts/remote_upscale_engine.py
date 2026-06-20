@@ -1,0 +1,138 @@
+"""
+remote_upscale_engine.py
+------------------------
+Client-side counterpart of pod/worker.py for remote upscaling (#1, Phase 3).
+
+`RemoteUpscaleEngine` mirrors `UpscaleEngine`'s interface (`upscale(src, dest,
+resolution)`, `close()`, `device_name`), but instead of running SeedVR2 locally it
+streams **one image at a time** to a resident worker on a RunPod pod:
+
+    local image bytes --(ssh -L tunnel)--> POST /upscale --> upscaled bytes --> dest
+
+so batch_upscale.py can pick local vs remote by config with no other change. The
+queue, resume-cache, skip logic and the performance watchdog all stay local; only
+the per-image GPU work moves to the pod. "Never touch source" is trivially kept —
+only a copy is uploaded.
+
+Connectivity is an `ssh -L` tunnel to the pod's worker port (the worker binds
+localhost, never exposed publicly). Pure standard library (subprocess + urllib).
+"""
+import os
+import time
+import socket
+import subprocess
+import urllib.request
+import urllib.error
+
+
+class RemoteUpscaleError(Exception):
+    pass
+
+
+def _free_local_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+class RemoteUpscaleEngine:
+    """Stream images to a pod worker over an ssh -L tunnel. Same surface as
+    UpscaleEngine so it is a drop-in for batch_upscale."""
+
+    def __init__(self, host, ssh_port, ssh_key, worker_port=8200, local_port=None,
+                 known_hosts=None, ready_timeout=420, request_timeout=600):
+        self.host = host
+        self.ssh_port = int(ssh_port)
+        self.ssh_key = ssh_key
+        self.worker_port = int(worker_port)
+        self.local_port = int(local_port or _free_local_port())
+        self.request_timeout = request_timeout
+        self._tunnel = self._open_tunnel(known_hosts)
+        info = self._wait_health(ready_timeout)
+        self.device_name = info.get("device", "remote")
+
+    # ── tunnel ────────────────────────────────────────────────────────────────
+
+    def _open_tunnel(self, known_hosts):
+        opts = [
+            "-i", self.ssh_key, "-p", str(self.ssh_port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-N", "-L", f"{self.local_port}:127.0.0.1:{self.worker_port}",
+        ]
+        if known_hosts:
+            opts += ["-o", f"UserKnownHostsFile={known_hosts}"]
+        args = ["ssh", *opts, f"root@{self.host}"]
+        try:
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except FileNotFoundError as exc:
+            raise RemoteUpscaleError("ssh not found on PATH (OpenSSH required).") from exc
+
+    def _health_url(self):
+        return f"http://127.0.0.1:{self.local_port}/health"
+
+    def _wait_health(self, timeout):
+        """Poll the worker's /health through the tunnel until ready. The worker's
+        first model load is slow (weights from the network volume), so the
+        default timeout is generous."""
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            if self._tunnel.poll() is not None:
+                raise RemoteUpscaleError("SSH tunnel exited before the worker was reachable.")
+            try:
+                with urllib.request.urlopen(self._health_url(), timeout=10) as resp:
+                    import json
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+            except Exception as exc:                  # noqa: BLE001 (expected while loading)
+                last = str(exc)
+                time.sleep(3)
+        raise RemoteUpscaleError(f"Worker not ready within {timeout}s ({last}).")
+
+    # ── same interface as UpscaleEngine ────────────────────────────────────────
+
+    def upscale(self, src_path, dest_path, resolution):
+        """Upscale one image on the pod and write it to dest_path atomically."""
+        with open(src_path, "rb") as f:
+            data = f.read()
+        ext = os.path.splitext(dest_path)[1] or ".jpg"
+        url = (f"http://127.0.0.1:{self.local_port}/upscale"
+               f"?resolution={int(resolution)}&ext={ext}")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
+                out = resp.read()
+                proc = resp.headers.get("X-Process-Time")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise RemoteUpscaleError(f"Worker error HTTP {exc.code}: {detail}") from exc
+        except Exception as exc:                       # noqa: BLE001
+            raise RemoteUpscaleError(f"Remote upscale failed: {exc}") from exc
+
+        tmp = dest_path + ".tmp" + ext
+        try:
+            with open(tmp, "wb") as f:
+                f.write(out)
+            os.replace(tmp, dest_path)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
+        self.last_process_time = float(proc) if proc else None
+
+    def close(self):
+        if self._tunnel and self._tunnel.poll() is None:
+            self._tunnel.terminate()
+            try:
+                self._tunnel.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._tunnel.kill()

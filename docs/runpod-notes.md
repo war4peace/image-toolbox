@@ -22,13 +22,16 @@ the parts that are still worth reusing when remote-pod support is rebuilt.
   *again*. Mitigations to try: copy models volume→local container disk once on pod
   start then load locally; **skip the safetensors hash-validation** on a trusted
   volume; keep the worker resident so the load is paid once per pod, not per image.
-- **Confirm warm upscale throughput.** The first image took 78 s for 1620×1080 —
-  but that is a single *cold* image (CUDA/cuDNN warmup, likely first-run Blackwell
-  kernel JIT under torch 2.9.1/cu128, no Sage/Flash attention). Reference: locally
-  a 3090 does ~4K in 17–19 s (first ~22–24 s); a 5090 should be ~10 s. We have NO
-  steady-state sample yet — the resident worker (Phase 3) must measure image #2…N
-  to tell one-time warmup from a real per-image regression. Treat 78 s as
-  unexplained until measured warm.
+- **Warm upscale throughput — RESOLVED (the 78 s was cold-start).** Measured via
+  the resident worker (`bench`): cold image #1 ≈ 41 s, then **warm ≈ 7.6 s/image at
+  1080** (1620×1080) and **≈ 13.4 s/image at 4K-class** (3240×2160). So the 78 s
+  smoke number was one-time warmup (CUDA/cuDNN + first-run Blackwell kernel JIT),
+  paid once by the resident worker and amortised over the queue. The pod 5090 at
+  ~13.4 s/4K beats the local 3090 (17–19 s) and is close to a local 5090 (~10 s).
+  **Optimisation lever for the residual gap: install `sageattention`** (Triton-
+  based; the pod shows `Triton ✅` but `SageAttention ❌ | Flash Attention ❌`,
+  and ComfyUI-on-pod — which uses it — felt faster). Engine load also dropped from
+  239 s (first ever) to **97 s** once the volume held the validation cache.
 
 ## Architecture: what changed, and what still maps
 
@@ -200,8 +203,18 @@ Wrinkles to honour when this is built:
   the dev box's `id_ed25519_runpod` key (public half added to the RunPod account).
 - **Region.** The pod's `dataCenterIds` is derived from the volume's region
   (`volume_region`), keeping pod and volume co-located (EU for this user).
-- **Phase 3:** `RemoteUpscaleEngine` streaming; `DEGRADED` teardown/re-provision;
-  cost embed.
+- **Phase 3 (core built + validated live):** `pod/worker.py` — resident worker,
+  loads `UpscaleEngine` once, serves one image per HTTP request over localhost
+  (reached via `ssh -L`), touches the deadman heartbeat. `scripts/remote_upscale_engine.py`
+  — `RemoteUpscaleEngine` (same interface as `UpscaleEngine`) opens the tunnel and
+  streams each image. Dev driver gained `worker` (start it; kills a prior one by
+  **pidfile** — not `pkill -f worker.py`, which matches the launching shell) and
+  `bench` (cold-vs-warm timing). Also `runpod_client.create_pod_resilient` — a
+  **deploy watchdog**: each pod gets a deploy budget (240 s); on timeout or early
+  EXIT it terminates the bad pod and tries a fresh one (RunPod sometimes hands out
+  pods that never finish deploying), up to N attempts. Remaining for Phase 3:
+  wire `RemoteUpscaleEngine` into `batch_upscale` (pick engine by config), the
+  worker/pod lifecycle + `DEGRADED` teardown/re-provision, GUI, cost embed.
 
 ## RunPod REST API
 

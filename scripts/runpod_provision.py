@@ -140,20 +140,32 @@ def cmd_create(rpc, args):
     }
     print(f"Creating pod: {gpu} in {region}, volume {vol_id}, image {image}")
     print("  *** this STARTS BILLING - remember to 'terminate' when done ***")
-    pod = rp.create_pod(key, spec)
-    pod_id = (pod or {}).get("id")
-    if not pod_id:
-        sys.exit(f"Create did not return a pod id. Response: {pod}")
-    _save_state({"pod_id": pod_id, "created_at": time.time(),
-                 "region": region, "gpu": gpu})
-    print(f"  created pod {pod_id}; waiting for RUNNING + SSH …")
 
-    def on_status(status, host, port):
-        print(f"    status={status} ssh={host}:{port}")
-    pod = rp.wait_until_running(key, pod_id, timeout=900, poll=8, on_status=on_status)
+    def on_event(kind, attempt, pod_id, info):
+        if kind == "created":
+            # Record the in-flight pod immediately so a hang is always cleanable.
+            _save_state({"pod_id": pod_id, "created_at": time.time(),
+                         "region": region, "gpu": gpu})
+            print(f"  [attempt {attempt}] created pod {pod_id}; waiting for RUNNING + SSH …")
+        elif kind == "status":
+            s, h, p = info
+            print(f"    status={s} ssh={h}:{p}")
+        elif kind == "bad":
+            print(f"  [attempt {attempt}] pod {pod_id} did not deploy ({info}) "
+                  f"-> retiring it and trying a fresh pod")
+        elif kind == "giveup":
+            print(f"  gave up after {attempt} attempt(s): {info}")
+
+    try:
+        pod = rp.create_pod_resilient(key, spec, attempts=3, deploy_timeout=240,
+                                      poll=8, on_event=on_event)
+    except rp.RunPodError as exc:
+        _clear_state()
+        sys.exit(f"Could not get a healthy pod: {exc}")
+    pod_id = pod.get("id")
     host, port = rp.ssh_endpoint(pod)
-    print(f"\nReady. SSH: ssh -i <key> -p {port} root@{host}")
-    print("Next: python scripts/runpod_provision.py probe   (then 'provision')")
+    print(f"\nReady (pod {pod_id}). SSH: ssh -i <key> -p {port} root@{host}")
+    print("Next: python scripts/runpod_provision.py worker   (then 'bench')")
 
 
 def cmd_status(rpc, args):
@@ -240,6 +252,84 @@ def cmd_smoke(rpc, args):
     print(f"Done. Result saved to {out_local}")
 
 
+def cmd_worker(rpc, args):
+    """Start the resident upscale worker on the pod and wait until it is ready
+    (the first model load is slow — weights from the network volume)."""
+    _, host, port = _endpoint_or_die(rpc)
+    key = _ssh_key_path(rpc)
+    wport = int(rpc.get("worker_port", 8200))
+    with open(CONFIG, encoding="utf-8") as f:
+        upscale_cfg = json.load(f).get("upscale", {})
+    settings_path = os.path.join(APP_ROOT, "logs", "_worker_settings.json")
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(upscale_cfg, f)
+
+    _scp(host, port, key, os.path.join(APP_ROOT, "scripts", "upscale_engine.py"),
+         "/root/upscale_engine.py")
+    _scp(host, port, key, os.path.join(APP_ROOT, "pod", "worker.py"), "/root/worker.py")
+    _scp(host, port, key, settings_path, "/root/worker_settings.json")
+
+    # NB: kill any previous worker via a PID file — NOT `pkill -f worker.py`,
+    # which would also match this very ssh shell (its command line contains
+    # "worker.py") and kill it before nohup runs.
+    launch = (
+        "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
+        "cd /root && nohup /workspace/venv/bin/python /root/worker.py "
+        "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
+        f"--settings /root/worker_settings.json --port {wport} "
+        "> /root/worker.log 2>&1 & "
+        "echo $! > /root/worker.pid; echo \"started pid $(cat /root/worker.pid)\"; "
+        "for i in $(seq 1 100); do "
+        f"  if curl -sf localhost:{wport}/health >/dev/null 2>&1; then "
+        f"    echo READY; curl -s localhost:{wport}/health; echo; break; fi; "
+        "  sleep 5; done; "
+        "echo '--- worker.log (tail) ---'; tail -n 8 /root/worker.log")
+    print("Starting worker on the pod (waits for the slow first model load)…")
+    _ssh(host, port, key, launch, check=False)
+
+
+def cmd_bench(rpc, args):
+    """Stream the same image through the worker N times to separate cold-start
+    warmup (image #1) from steady-state throughput (#2..N). Usage:
+        bench [image] [count] [resolution]"""
+    _, host, port = _endpoint_or_die(rpc)
+    key = _ssh_key_path(rpc)
+    wport = int(rpc.get("worker_port", 8200))
+    img = args[0] if args else os.path.join(APP_ROOT, "samples", "original", "pisic7.jpg")
+    count = int(args[1]) if len(args) > 1 else 4
+    resolution = int(args[2]) if len(args) > 2 else 1080
+    if not os.path.exists(img):
+        sys.exit(f"Image not found: {img}")
+
+    from remote_upscale_engine import RemoteUpscaleEngine, RemoteUpscaleError
+    print(f"Connecting to worker on {host} (worker port {wport})…")
+    try:
+        engine = RemoteUpscaleEngine(host, port, key, worker_port=wport,
+                                     known_hosts=KNOWN_HOSTS)
+    except RemoteUpscaleError as exc:
+        sys.exit(f"Could not reach the worker: {exc}  (run 'worker' first?)")
+    print(f"Connected — device: {engine.device_name}")
+    out_dir = os.path.join(APP_ROOT, "test_output")
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        times = []
+        for i in range(1, count + 1):
+            dst = os.path.join(out_dir, f"runpod_bench_{i}.jpg")
+            t0 = time.time()
+            engine.upscale(img, dst, resolution)
+            wall = time.time() - t0
+            times.append(wall)
+            tag = "cold" if i == 1 else "warm"
+            wt = engine.last_process_time
+            print(f"  image {i}/{count} [{tag}]: {wall:.1f}s wall"
+                  + (f" (worker {wt:.1f}s)" if wt else ""))
+        warm = times[1:] or times
+        print(f"\nwarm avg: {sum(warm)/len(warm):.1f}s/image over {len(warm)} image(s)")
+    finally:
+        engine.close()
+
+
 def cmd_ssh(rpc, args):
     if not args:
         sys.exit('Usage: runpod_provision.py ssh "<command>"')
@@ -262,7 +352,8 @@ def cmd_terminate(rpc, args):
 
 COMMANDS = {
     "create": cmd_create, "status": cmd_status, "probe": cmd_probe,
-    "provision": cmd_provision, "smoke": cmd_smoke, "ssh": cmd_ssh,
+    "provision": cmd_provision, "smoke": cmd_smoke,
+    "worker": cmd_worker, "bench": cmd_bench, "ssh": cmd_ssh,
     "terminate": cmd_terminate, "stop": cmd_terminate,
 }
 

@@ -240,6 +240,48 @@ def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
         time.sleep(poll)
 
 
+def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
+                         on_event=None):
+    """Create a pod and wait until it is reachable, retrying with a FRESH pod if
+    it doesn't deploy in time or EXITs early.
+
+    RunPod occasionally hands out a pod that never finishes deploying (a
+    misconfigured/unhealthy host) — it sits without an SSH endpoint, or flips to
+    EXITED. Rather than wait forever, give each pod a `deploy_timeout`; on failure
+    terminate it and try another, up to `attempts` times. Returns the running pod
+    dict, or raises RunPodError if every attempt fails.
+
+    `on_event(kind, attempt, pod_id, info)` is called for UI/logging with kind in
+    {"created","status","bad","giveup"}.
+    """
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        pod = create_pod(api_key, spec)
+        pod_id = (pod or {}).get("id")
+        if not pod_id:
+            last_err = f"create returned no pod id: {pod}"
+            if on_event:
+                on_event("bad", attempt, None, last_err)
+            continue
+        if on_event:
+            on_event("created", attempt, pod_id, None)
+        try:
+            return wait_until_running(
+                api_key, pod_id, timeout=deploy_timeout, poll=poll,
+                on_status=(lambda s, h, p, a=attempt, pid=pod_id:
+                           on_event("status", a, pid, (s, h, p)) if on_event else None))
+        except RunPodError as exc:
+            last_err = str(exc)
+            if on_event:
+                on_event("bad", attempt, pod_id, last_err)
+            # Tear the bad pod down before trying a fresh one (don't leave it billing).
+            ensure_stopped(api_key, pod_id, terminate=True)
+    if on_event:
+        on_event("giveup", attempts, None, last_err)
+    raise RunPodError(
+        f"Pod failed to deploy after {attempts} attempt(s). Last error: {last_err}")
+
+
 def volume_region(api_key, vol_id, timeout=30):
     """Return a network volume's dataCenterId (its region), or None. Pods that
     mount the volume MUST be created in this same data center."""
@@ -313,7 +355,11 @@ def ensure_stopped(api_key, pod_id, terminate=False, timeout=60):
     if not pod_id:
         return True, "No pod to stop."
     status = pod_status(api_key, pod_id, timeout=timeout)
-    if status in (STATUS_EXITED, STATUS_TERMINATED, None):
+    if status is None or status == STATUS_TERMINATED:
+        return True, f"Pod {pod_id} is already gone."
+    # An EXITED pod is "stopped" already — but if we mean to TERMINATE, it still
+    # exists (and may bill storage), so fall through and delete it.
+    if status == STATUS_EXITED and not terminate:
         return True, f"Pod {pod_id} is already stopped."
     try:
         if terminate:
