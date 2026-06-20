@@ -128,8 +128,34 @@ Wrinkles to honour when this is built:
   has a GPU-type picklist, an **EU data-center picklist (defaults to EU-RO-1)**, and
   a model-volume row (Refresh lists, Create makes one in the chosen DC with a cost
   confirmation). No pod spun up.
-- **Phase 2b:** `create_pod` → wait RUNNING → SSH probe → bring up the worker, with
-  the model volume mounted (data center derived from the volume's region).
+- **Phase 2b (in progress):** provision + worker bring-up. Helpers added to
+  `runpod_client`: `wait_until_running` (polls until RUNNING + SSH reachable),
+  `ssh_endpoint` (reads `publicIp` + `portMappings["22"]`), `volume_region`
+  (the DC a pod must match). SSH keypair confirmed on the dev box; its public key
+  goes into the RunPod account. Remaining: `create_pod` spec assembly, the
+  one-time on-volume provisioning, and `pod/worker.py`.
+
+### Provisioning architecture (Phase 2b)
+
+- **Everything heavy lives on the network volume** (mounted at `/workspace`): the
+  Python venv (torch CUDA + seedvr2 requirements), the SeedVR2 weights, and the
+  Ollama models. A one-time provisioning builds them once; every disposable pod
+  just mounts the volume and starts fast — no ~20 GB reinstall/redownload per pod.
+- **Models auto-populate.** `UpscaleEngine.__init__` calls
+  `src.utils.downloads.download_weight(..., model_dir=...)`, which downloads the
+  weights to `model_dir` if missing. Point `model_dir` at a path on the volume and
+  the **first run fills the volume**; later pods find them present. Same idea for
+  Ollama via `OLLAMA_MODELS` on the volume. So there is **no separate model
+  uploader** — provisioning just sets the paths and triggers one download.
+- **The worker reuses `UpscaleEngine` unchanged.** `pod/worker.py` is a thin
+  resident wrapper: load the engine once (models from the volume), then serve one
+  image per request, touching the heartbeat `deadman.py` watches.
+- **Connectivity.** Pod is created with `ports: ["22/tcp"]`; only port 22 is
+  public (`publicIp:portMappings["22"]`). The worker binds localhost on the pod
+  and is reached through an `ssh -L` tunnel — never exposed publicly. SSH auth is
+  the dev box's `id_ed25519_runpod` key (public half added to the RunPod account).
+- **Region.** The pod's `dataCenterIds` is derived from the volume's region
+  (`volume_region`), keeping pod and volume co-located (EU for this user).
 - **Phase 3:** `RemoteUpscaleEngine` streaming; `DEGRADED` teardown/re-provision;
   cost embed.
 

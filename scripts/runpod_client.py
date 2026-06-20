@@ -29,6 +29,7 @@ API surface (verified against rest.runpod.io/v1 OpenAPI, 2026-06):
 """
 
 import json
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -197,6 +198,56 @@ def pod_status(api_key, pod_id, timeout=30):
     if not isinstance(pod, dict):
         return None
     return pod.get("desiredStatus")
+
+
+# ── provisioning helpers (poll for ready, read SSH endpoint) ─────────────────
+
+def ssh_endpoint(pod):
+    """Return (host, port) for direct-TCP SSH into a pod, or (None, None) if the
+    pod hasn't published its port-22 mapping yet. Requires the pod to have been
+    created with "22/tcp" in its ports."""
+    if not isinstance(pod, dict):
+        return None, None
+    ip = pod.get("publicIp")
+    mappings = pod.get("portMappings") or {}
+    port = mappings.get("22") or mappings.get(22)
+    return (ip, port) if (ip and port) else (None, None)
+
+
+def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
+    """Poll a pod until it is RUNNING with a reachable SSH endpoint, and return
+    the pod dict. Raises RunPodError on timeout or if the pod ends up
+    EXITED/TERMINATED first. `on_status(status, host, port)` is called on each
+    poll for UI feedback."""
+    deadline = time.time() + timeout
+    while True:
+        pod = get_pod(api_key, pod_id)
+        status = pod.get("desiredStatus") if isinstance(pod, dict) else None
+        host, port = ssh_endpoint(pod)
+        if on_status:
+            try:
+                on_status(status, host, port)
+            except Exception:                            # noqa: BLE001 (UI cb is best-effort)
+                pass
+        if status in (STATUS_EXITED, STATUS_TERMINATED):
+            raise RunPodError(f"Pod entered {status} before it became reachable.")
+        if status == STATUS_RUNNING and host and port:
+            return pod
+        if time.time() >= deadline:
+            raise RunPodError(
+                f"Timed out after {timeout}s waiting for the pod to become reachable "
+                f"(last status: {status}).")
+        time.sleep(poll)
+
+
+def volume_region(api_key, vol_id, timeout=30):
+    """Return a network volume's dataCenterId (its region), or None. Pods that
+    mount the volume MUST be created in this same data center."""
+    try:
+        vol = get_network_volume(api_key, vol_id, timeout=timeout)
+    except RunPodError:
+        return None
+    return vol.get("dataCenterId") if isinstance(vol, dict) else None
 
 
 # ── network volumes (the persistent model store) ─────────────────────────────
