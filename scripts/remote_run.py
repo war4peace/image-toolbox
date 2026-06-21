@@ -232,16 +232,27 @@ class RemoteSession:
             f"setsid sh -c '{inner}' < /dev/null > /root/deadman.log 2>&1 & echo armed")
         self._ssh(launch, check=False, timeout=60)
 
-    def close(self):
+    def close(self, stop_pod=None):
         """Disconnect and tear the pod down. The on-pod deadman is the backup if
-        this fails (e.g. the client crashed before reaching here)."""
+        this fails (e.g. the client crashed before reaching here).
+
+        `stop_pod` overrides the default teardown decision (the GUI's Stop modal
+        uses it): None = default (stop only a pod we created, never a reused one);
+        True = stop the pod now regardless (even a reused one); False = leave the
+        pod running (the dead-man's switch stops it on the idle timeout)."""
         if self.engine:
             try:
                 self.engine.close()
             except Exception:
                 pass
             self.engine = None
-        if self.pod_id and not self._attach:
+        if not self.pod_id:
+            return
+        do_stop = (not self._attach) if stop_pod is None else stop_pod
+        if do_stop:
             ok, msg = rp.ensure_stopped(self.api_key, self.pod_id,
                                         terminate=self.terminate_when_done)
             self._emit(msg)
+        else:
+            self._emit("Leaving the remote pod running — the dead-man's switch "
+                       "will stop it after the idle timeout.")

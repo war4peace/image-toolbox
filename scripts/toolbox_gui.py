@@ -823,6 +823,12 @@ class ComparisonWindow(tk.Toplevel):
         geo = app.settings.get("compare_geometry") if app is not None else None
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x640")
         self.minsize(560, 360)
+        self._last_normal_geo = None
+        if app is not None and app.settings.get("compare_zoomed"):
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
 
         bar = ttk.Frame(self, padding=(8, 4))
         bar.pack(fill="x")
@@ -852,6 +858,9 @@ class ComparisonWindow(tk.Toplevel):
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_motion)
+        # Track the last non-maximised geometry on the Toplevel itself, so a
+        # close-while-maximised still records a sensible size + the zoomed flag.
+        self.bind("<Configure>", self._track_geometry, add="+")
 
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.show(source, output)
@@ -881,9 +890,18 @@ class ComparisonWindow(tk.Toplevel):
         self.focus_set()
         self._render()
 
+    def _track_geometry(self, event):
+        if event.widget is self and self.state() == "normal":
+            self._last_normal_geo = self.geometry()
+
     def save_geometry(self):
         if self._app is not None and self.winfo_exists():
-            self._app.settings["compare_geometry"] = self.geometry()
+            try:
+                zoomed = (self.state() == "zoomed")
+            except tk.TclError:
+                zoomed = False
+            self._app.settings["compare_geometry"] = self._last_normal_geo or self.geometry()
+            self._app.settings["compare_zoomed"] = zoomed
             save_settings(self._app.settings)
 
     # ── Geometry helpers ─────────────────────────────────────────────────────
@@ -2297,6 +2315,7 @@ class UpscaleTab(ToolTab):
             else "Starting — loading the AI engine (the first run can take a few minutes) …")
         # The skip-cutoff now lives in Settings; batch_upscale reads it from config.json.
         if self.launch("batch_upscale.py", [src, out], extra_env=extra_env):
+            self._remote_run = remote
             self._paused     = False
             self._processing = False
             self._cancelled  = False
@@ -2325,7 +2344,22 @@ class UpscaleTab(ToolTab):
             self.status_var.set("Pausing — finishes the current image first …")
 
     def _stop(self):
-        self.send("q")
+        if getattr(self, "_remote_run", False):
+            idle = int(CFG.get("runpod", {}).get("idle_timeout_minutes", 15))
+            # Yes → stop the pod now · No → leave it running · Cancel → keep going.
+            ans = messagebox.askyesnocancel(
+                APP_TITLE,
+                "The upscale run will stop after the current image.\n\n"
+                "Also STOP the remote pod now?\n\n"
+                "• Yes — stop the pod immediately (billing stops now).\n"
+                f"• No — leave it running; the dead-man's switch stops it "
+                f"automatically after {idle} min of inactivity.\n\n"
+                "Cancel — keep the run going.")
+            if ans is None:
+                return                              # cancelled — keep running
+            self.send("qstop" if ans else "qkeep")
+        else:
+            self.send("q")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Stopping — finishes the current image first …")
 

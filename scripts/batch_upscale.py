@@ -167,6 +167,19 @@ def _gui_event(kind, payload):
     if GUI_MODE:
         print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
 
+
+# Remote-pod teardown override (roadmap #1): when the GUI's "Stop" modal lets the
+# user choose, it sends "qstop"/"qkeep" on stdin which sets this. The remote
+# teardown reads it: "stop" → stop the pod now (even a reused one), "keep" → leave
+# it running for the dead-man's switch, None → default (stop only a pod we made).
+_REMOTE_TEARDOWN = None
+
+
+def _set_remote_teardown(value):
+    global _REMOTE_TEARDOWN
+    _REMOTE_TEARDOWN = value
+
+
 # Images whose shortest dimension is already >= this fraction of the target
 # will be skipped. Default 66% means a 2538x1428 image (66% of 3840x2160)
 # would be skipped — only images that need at least a 1.5x upscale are processed.
@@ -917,6 +930,12 @@ class PauseController:
                     self._handle_key("p")
                 elif cmd in ("q", "quit"):
                     self._handle_key("q")
+                elif cmd == "qstop":          # quit + stop the remote pod now
+                    _set_remote_teardown("stop")
+                    self._handle_key("q")
+                elif cmd == "qkeep":          # quit but leave the remote pod running
+                    _set_remote_teardown("keep")
+                    self._handle_key("q")
         except Exception:
             pass
         if not self._quit:
@@ -1538,7 +1557,11 @@ def main():
             ENGINE = session.start()
             # Guarantee teardown on any normal/sys.exit path; the on-pod
             # dead-man's switch is the backup if the process is hard-killed.
-            atexit.register(session.close)
+            # The GUI's "Stop" modal can override the teardown (stop the pod now
+            # even if reused, or leave it running) via _REMOTE_TEARDOWN.
+            def _remote_teardown():
+                session.close(stop_pod={"stop": True, "keep": False}.get(_REMOTE_TEARDOWN))
+            atexit.register(_remote_teardown)
         else:
             from upscale_engine import UpscaleEngine
             # debug=true in config.json's "upscale" section restores the verbose
