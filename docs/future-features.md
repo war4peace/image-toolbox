@@ -114,6 +114,17 @@ Stop-pod modal, and the dead-man's switch). Captured follow-ups:
     safety-net alongside the time/idle dead-man's switch.
   - Caveat: GraphQL is the legacy, semi-supported API — keep it in one isolated,
     fail-safe helper (no balance → skip the funds checks, never block on it).
+- **Multiple remote providers (investigate).** RunPod is the only backend today.
+  Investigate alternatives (e.g. **vast.ai**, and others) so the user could pick a
+  remote-pod supplier — for price, GPU availability, or region (a user outside the
+  EU may have no nearby RunPod DC). This means abstracting the provider behind a
+  thin interface: create/start/stop/terminate, an SSH endpoint, a model-volume
+  equivalent, and per-hour cost / balance. The pod-side worker, the streaming
+  engine, the dead-man's switch and the queue/watchdog are all provider-agnostic
+  already, so the work is a provider adapter + a Settings picker — not a rewrite.
+  vast.ai's model differs (a marketplace of individual hosts, per-host pricing,
+  its own CLI/API and no managed network volumes), so feasibility hinges on
+  whether a persistent model store and reliable SSH can be had per provider.
 
 ## 2. HTTP interface — Hard
 Spin up a small HTTP server with a UI that mirrors the application UI.
