@@ -1226,6 +1226,14 @@ class ToolTab(ttk.Frame):
         self.status_top.configure(text=top)
         self.status_bot.configure(text=bot)
 
+    def restore_defaults_if_empty(self):
+        """Re-apply the pinned default folder(s) to any field still empty.
+
+        Called when this tab is entered (see App._on_tab_changed), not only at
+        construction — so a default set in Settings *after* startup shows up when
+        the user switches to the tab. Idempotent: only fills empty fields, never
+        overwrites a folder the user is working with. Overridden per tool."""
+
     # ── Process control ─────────────────────────────────────────────────────
 
     @property
@@ -2143,17 +2151,25 @@ class UpscaleTab(ToolTab):
         self.strip.on_compare = lambda src, out: self.app.show_comparison(src, out)
 
         # Restore the pinned default folders from config.json
-        src_default = get_default_folder("upscale_source")
-        if src_default and os.path.isdir(src_default):
-            self.src_var.set(src_default)
-            if not self.out_var.get().strip():
-                self.out_var.set(os.path.join(src_default, "__upscaled__"))
-        out_default = get_default_folder("upscale_output")
-        if out_default:
-            self.out_var.set(out_default)
+        self.restore_defaults_if_empty()
         self.src_var.trace_add("write", lambda *_: self._refresh_save_buttons())
         self.out_var.trace_add("write", lambda *_: self._refresh_save_buttons())
         self._refresh_save_buttons()
+
+    def restore_defaults_if_empty(self):
+        if not self.src_var.get().strip():
+            src_default = get_default_folder("upscale_source")
+            if src_default and os.path.isdir(src_default):
+                self.src_var.set(src_default)
+        if not self.out_var.get().strip():
+            # An explicit output default wins; otherwise mirror it next to source.
+            out_default = get_default_folder("upscale_output")
+            if out_default:
+                self.out_var.set(out_default)
+            else:
+                src_now = self.src_var.get().strip()
+                if src_now and os.path.isdir(src_now):
+                    self.out_var.set(os.path.join(src_now, "__upscaled__"))
 
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
@@ -2468,11 +2484,15 @@ class TagTab(ToolTab):
         self._build()
 
         # Restore the pinned default folder from config.json
-        tag_default = get_default_folder("tag_folder")
-        if tag_default and os.path.isdir(tag_default):
-            self.dir_var.set(tag_default)
+        self.restore_defaults_if_empty()
         self.dir_var.trace_add("write", lambda *_: self._refresh_dir_buttons())
         self._refresh_dir_buttons()
+
+    def restore_defaults_if_empty(self):
+        if not self.dir_var.get().strip():
+            tag_default = get_default_folder("tag_folder")
+            if tag_default and os.path.isdir(tag_default):
+                self.dir_var.set(tag_default)
 
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
@@ -3829,15 +3849,20 @@ class ConciliateTab(ToolTab):
         self._build()
 
         # Restore pinned default folders from config.json
-        orig_default = get_default_folder("conciliate_original")
-        if orig_default:
-            self.orig_var.set(orig_default)
-        proc_default = get_default_folder("conciliate_processed")
-        if proc_default:
-            self.proc_var.set(proc_default)
+        self.restore_defaults_if_empty()
         self.orig_var.trace_add("write", lambda *_: self._refresh_buttons())
         self.proc_var.trace_add("write", lambda *_: self._refresh_buttons())
         self._refresh_buttons()
+
+    def restore_defaults_if_empty(self):
+        if not self.orig_var.get().strip():
+            orig_default = get_default_folder("conciliate_original")
+            if orig_default:
+                self.orig_var.set(orig_default)
+        if not self.proc_var.get().strip():
+            proc_default = get_default_folder("conciliate_processed")
+            if proc_default:
+                self.proc_var.set(proc_default)
 
     # ── construction ──────────────────────────────────────────────────────────
 
@@ -4494,6 +4519,10 @@ class App(tk.Tk):
                     self._suppress_tab_event = False
                 return   # _prev_tab_widget stays on Settings
         self._prev_tab_widget = new_widget
+        # Entering a tool tab: fill any empty folder field from the pinned
+        # default, so a default set in Settings after startup takes effect.
+        if isinstance(new_widget, ToolTab):
+            new_widget.restore_defaults_if_empty()
 
     def _confirm_unsaved(self, context):
         """Modal Save / Don't save / Cancel prompt for unsaved Settings edits.
