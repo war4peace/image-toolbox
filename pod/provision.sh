@@ -94,6 +94,15 @@ PY
 # 4. Ollama + vision model to the volume ---------------------------------------
 echo "---- installing ollama ----"
 command -v ollama >/dev/null 2>&1 || curl -fsSL https://ollama.com/install.sh | sh
+# Cache the ollama BINARY on the volume too (not just the models): a disposable
+# run-pod for remote Tag & Rename then reuses it without re-downloading. The
+# remote_run tag session prefers /workspace/ollama/bin/ollama, falling back to a
+# fresh install only if this is missing (an older volume).
+OLLAMA_SRC="$(command -v ollama || true)"
+if [ -n "$OLLAMA_SRC" ]; then
+  mkdir -p "$VOL/ollama/bin"
+  cp -f "$OLLAMA_SRC" "$VOL/ollama/bin/ollama" 2>/dev/null || true
+fi
 export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
 pkill -f "ollama serve" 2>/dev/null || true
 nohup ollama serve >/tmp/ollama.log 2>&1 &

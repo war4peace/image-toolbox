@@ -80,7 +80,10 @@ zero-config SSH (the app owns an ed25519 key and injects its public half via
 marker `bootstrap.ps1` reads to skip the ~3 GB local GPU stack for Remote-only;
 and **one-click model-volume provisioning** from Settings ("Provision models…" →
 `runpod_provision.py setup-volume`, a create→provision→auto-terminate pod with a
-streamed progress window). Remaining follow-ups:
+streamed progress window). It also added **remote Tag & Rename** (worker "tag
+mode" + `ollama serve` on the pod + a second tunnel; `tag_and_rename` runs locally
+against the tunnelled Ollama, straighten on the pod) so a Remote-only install can
+tag too. Remaining follow-ups:
 
 - **Region from bootstrap.** Ask the user's region during first-run bootstrap and
   use it as the default for both (a) creating the model network volume and (b) the

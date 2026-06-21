@@ -2511,6 +2511,9 @@ class TagTab(ToolTab):
         self.lang_var   = tk.StringVar(value="English")
         self.ftag_var   = tk.BooleanVar(value=False)
         self.fren_var   = tk.BooleanVar(value=False)
+        # Remote toggle defaults ON for a Remote-only install (the only way to tag
+        # there — no local Ollama/torch); OFF for Local/Both.
+        self.remote_var = tk.BooleanVar(value=(get_install_mode() == "remote"))
         self.scope_var  = tk.StringVar(value=UNDO_SCOPES[0][0])
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
@@ -2552,6 +2555,16 @@ class TagTab(ToolTab):
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
         for b in (self.start_btn, self.resume_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
+
+        self.remote_chk = ttk.Checkbutton(
+            btns, text="Run on remote pod (RunPod)", variable=self.remote_var)
+        self.remote_chk.pack(side="left", padx=(18, 6))
+        Tooltip(self.remote_chk,
+                "Run the vision model (and the auto-straighten CNN) on a rented "
+                "RunPod GPU instead of this PC (roadmap #1, experimental). Tagging "
+                "itself runs locally; only the model calls go over an SSH tunnel. "
+                "Creates a billed pod and terminates it when done. Needs a RunPod "
+                "API key + model volume in Settings → Remote upscaling.")
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
         undo.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
@@ -2614,8 +2627,43 @@ class TagTab(ToolTab):
         folder = self._valid_dir()
         if not folder:
             return
-        if not self.confirm_gpu_overlap():
-            return
+        remote = bool(self.remote_var.get())
+        extra_env = None
+        if remote:
+            rp = CFG.get("runpod", {})
+            if not rp.get("api_key") or not rp.get("network_volume_id"):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Remote tagging needs a RunPod API key and a model volume.\n"
+                    "Set them in Settings → Remote upscaling (RunPod).")
+                return
+            ok_ssh, ssh_info = ssh_setup.setup(
+                os.path.expandvars(rp.get("ssh_key_path", "")) or None)
+            if not ok_ssh:
+                messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
+                return
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    "Run Tag & Rename on a rented RunPod GPU?\n\n"
+                    "This creates a BILLED pod running the vision model, tags each "
+                    "image against it (the files are still read/written here), and "
+                    "terminates the pod when the run ends. The pod also "
+                    "self-terminates on an idle / max-runtime deadline.\n\nProceed?"):
+                return
+            extra_env = {"IMGTBX_TAG_REMOTE": "1"}
+        else:
+            # A Remote-only install has no local Ollama or torch — refuse a local
+            # tag run with a clear message instead of crashing on a missing model.
+            if get_install_mode() == "remote":
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "This is a Remote-only install — the local vision model "
+                    "(Ollama) and PyTorch aren't installed.\n\n"
+                    "Tick 'Run on remote pod (RunPod)' to tag on a rented GPU, or "
+                    "reinstall and choose Local or Both to tag on this PC.")
+                return
+            if not self.confirm_gpu_overlap():
+                return
         args = [folder, "--no-prompt"]
         if self.ftag_var.get():
             args.append("-ftag")
@@ -2629,8 +2677,11 @@ class TagTab(ToolTab):
         self.progress.set(0)
         self._reset_stream_state()
         self.eta_var.set("calculating…")
-        self.status_var.set("Starting — checking Ollama and scanning the folder …")
-        if self.launch("tag_and_rename.py", args):
+        self.status_var.set(
+            "Starting the remote pod (first run takes a few minutes) …" if remote
+            else "Starting — checking Ollama and scanning the folder …")
+        if self.launch("tag_and_rename.py", args, extra_env=extra_env):
+            self._remote_run = remote
             self._set_running(True)
 
     def _undo(self):
@@ -2655,6 +2706,7 @@ class TagTab(ToolTab):
             args.append("--exif-only")
 
         self._mode = "undo"
+        self._remote_run = False    # undo is always local file I/O
         self.progress.set(0)
         self._reset_stream_state()
         self.status_var.set("Undoing previous changes …")
@@ -2666,7 +2718,22 @@ class TagTab(ToolTab):
         self.status_var.set("Resuming …")
 
     def _stop(self):
-        self.send("q")
+        if getattr(self, "_remote_run", False):
+            idle = int(CFG.get("runpod", {}).get("idle_timeout_minutes", 15))
+            # Yes → stop the pod now · No → leave it running · Cancel → keep going.
+            ans = messagebox.askyesnocancel(
+                APP_TITLE,
+                "The tagging run will stop after the current image.\n\n"
+                "Also STOP the remote pod now?\n\n"
+                "• Yes — stop the pod immediately (billing stops now).\n"
+                f"• No — leave it running; the dead-man's switch stops it "
+                f"automatically after {idle} min of inactivity.\n\n"
+                "Cancel — keep the run going.")
+            if ans is None:
+                return                              # cancelled — keep running
+            self.send("qstop" if ans else "qkeep")
+        else:
+            self.send("q")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Stopping — finishes the current image first …")
 

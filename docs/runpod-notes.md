@@ -141,9 +141,17 @@ Wrinkles to honour when this is built:
 - **`upscale_engine` import must stay lazy/conditional.** `batch_upscale.py` must
   not import the SeedVR2 engine (torch) when running in remote mode, or a
   torch-less install can't launch. Select Remote vs Local engine before importing.
-- **Tagging in remote mode** reuses the existing pattern: tunnel to **Ollama on
-  the pod** (`ssh -L 11434:localhost:11434`, set Ollama URL to localhost) — no
-  code change, and bootstrap still never installs Ollama itself.
+- **Tagging in remote mode — DONE (0.3.2), now automated.** The GUI sets
+  `IMGTBX_TAG_REMOTE=1`; `tag_and_rename._setup_remote_tagging()` starts a
+  `RemoteSession(mode="tag")` which: starts the worker in **tag mode** (skips the
+  SeedVR2 load, serves `/orient` only — leaves the VRAM for Ollama), starts
+  `ollama serve` on the pod (models from the volume; the ollama **binary** is
+  cached on the volume by provision.sh, with an install-if-missing fallback),
+  opens a **second ssh -L tunnel** to 11434, and exposes `session.ollama_url`.
+  tag_and_rename then repoints `OLLAMA_URL` at the tunnel and routes
+  auto-straighten detection to the pod's `/orient` (rotation stays local PIL).
+  bootstrap still never installs Ollama locally. **Known v1 gap:** no remote
+  telemetry row for tagging yet (the upscale path has one).
 - **Pillow and the comparison view stay in every mode** — the GUI needs Pillow,
   and the before/after wipe compares the local original against the locally
   downloaded result, so it works unchanged for remote runs.

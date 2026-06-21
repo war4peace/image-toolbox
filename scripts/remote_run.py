@@ -41,12 +41,21 @@ def _ssh_base(key, port, known_hosts):
 
 class RemoteSession:
     def __init__(self, runpod_cfg, upscale_cfg, app_root, on_event=None,
-                 attach=None):
+                 attach=None, mode="upscale"):
         """`attach` = (pod_id, host, ssh_port) to reuse a running pod instead of
-        creating one (dev/validation). `on_event(msg)` is for progress lines."""
+        creating one (dev/validation). `on_event(msg)` is for progress lines.
+
+        `mode`: "upscale" (full worker: SeedVR2 + /upscale + /orient) or "tag"
+        (remote Tag & Rename — the worker loads only /orient so the VRAM is free
+        for Ollama, which is also started on the pod and reached via a second
+        tunnel exposed as `self.ollama_url`)."""
         self.cfg = runpod_cfg
         self.upscale_cfg = upscale_cfg
         self.app_root = app_root
+        self.mode = mode
+        self.worker_mode = "tag" if mode == "tag" else "full"
+        self.ollama_url = None        # set in tag mode (local end of the tunnel)
+        self._ollama_tunnel = None
         self.api_key = runpod_cfg.get("api_key", "")
         # Empty/unset ssh_key_path → the app's managed default key, so a user who
         # never touched config.json still has a usable key (zero-config, #1).
@@ -121,12 +130,18 @@ class RemoteSession:
                 self._create_pod()
         self._push_files()
         self._start_worker()
+        if self.mode == "tag":
+            self._start_ollama()
         self._arm_deadman()
         self._emit("Connecting to the worker …")
         self.engine = RemoteUpscaleEngine(
             self.host, self.ssh_port, self.key_path,
             worker_port=self.worker_port, known_hosts=self.known_hosts)
-        self._emit(f"Remote engine ready on {self.engine.device_name}.")
+        if self.mode == "tag":
+            self._open_ollama_tunnel()
+            self._emit(f"Remote tagging ready (Ollama at {self.ollama_url}).")
+        else:
+            self._emit(f"Remote engine ready on {self.engine.device_name}.")
         return self.engine
 
     def _emit(self, msg):
@@ -228,14 +243,20 @@ class RemoteSession:
                            check=False, timeout=30)
         if health.returncode == 0 and health.stdout.strip():
             try:
-                running = json.loads(health.stdout).get("version")
+                info = json.loads(health.stdout)
+                running = info.get("version")
+                running_mode = info.get("mode", "full")
             except ValueError:
-                running = None
-            if running and running == self.worker_version:
+                running, running_mode = None, None
+            if running and running == self.worker_version and running_mode == self.worker_mode:
                 self._emit("Reusing the healthy worker already on the pod "
-                           "(matching version).")
+                           "(matching version + mode).")
                 return
-            self._emit("Worker on the pod is a different version — reloading it.")
+            if running_mode != self.worker_mode:
+                self._emit(f"Worker on the pod is in '{running_mode}' mode — "
+                           f"reloading it in '{self.worker_mode}' mode.")
+            else:
+                self._emit("Worker on the pod is a different version — reloading it.")
         self._emit("Starting the resident worker (first model load is slow) …")
         # The launch must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the
         # redirect on the backgrounded command — a `cd && nohup … &` wrapper
@@ -248,7 +269,7 @@ class RemoteSession:
             "/workspace/venv/bin/python /root/worker.py "
             "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
             f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT} "
-            f"--worker-version {self.worker_version}")
+            f"--worker-version {self.worker_version} --mode {self.worker_mode}")
         launch = (
             "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
             f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
@@ -259,6 +280,59 @@ class RemoteSession:
         if "WORKER_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
             raise rp.RunPodError(
                 "Worker failed to become ready:\n" + (res.stdout + res.stderr)[-800:])
+
+    def _start_ollama(self):
+        """Start `ollama serve` on the pod (remote Tag & Rename), serving the
+        vision model from the network volume. The models live on the volume
+        (provision.sh) but the ollama BINARY normally does not, so resolve it from
+        PATH → a volume cache → an on-the-fly install. Skips if already up (reused
+        pod). setsid + redirect-on-the-backgrounded-command so the ssh call
+        returns (same rule as the worker launch)."""
+        self._emit("Starting Ollama on the pod (vision model from the volume) …")
+        launch = (
+            "if curl -sf localhost:11434/api/version >/dev/null 2>&1; then echo OLLAMA_UP; exit 0; fi; "
+            "OLLAMA_BIN=$(command -v ollama || true); "
+            "{ [ -z \"$OLLAMA_BIN\" ] && [ -x /workspace/ollama/bin/ollama ]; } && OLLAMA_BIN=/workspace/ollama/bin/ollama; "
+            "if [ -z \"$OLLAMA_BIN\" ]; then curl -fsSL https://ollama.com/install.sh | sh >/root/ollama_install.log 2>&1; "
+            "OLLAMA_BIN=$(command -v ollama || echo /usr/local/bin/ollama); fi; "
+            "export OLLAMA_MODELS=/workspace/models/ollama OLLAMA_HOST=127.0.0.1:11434; "
+            "setsid \"$OLLAMA_BIN\" serve </dev/null >/root/ollama.log 2>&1 & "
+            "for i in $(seq 1 90); do curl -sf localhost:11434/api/version >/dev/null 2>&1 && break; sleep 2; done; "
+            "curl -sf localhost:11434/api/version >/dev/null 2>&1 || { echo OLLAMA_FAILED; tail -n 20 /root/ollama.log; exit 1; }")
+        res = self._ssh(launch, check=False, timeout=600)
+        if "OLLAMA_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
+            raise rp.RunPodError(
+                "Ollama failed to start on the pod:\n" + (res.stdout + res.stderr)[-800:])
+
+    def _open_ollama_tunnel(self):
+        """Open an ssh -L tunnel to the pod's Ollama (11434) and set
+        self.ollama_url to the local end, so tag_and_rename can point its Ollama
+        URL at localhost."""
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        local = s.getsockname()[1]
+        s.close()
+        opts = ["-i", self.key_path, "-p", str(self.ssh_port),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", f"UserKnownHostsFile={self.known_hosts}",
+                "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
+                "-N", "-L", f"{local}:127.0.0.1:11434"]
+        args = ["ssh", *opts, f"root@{self.host}"]
+        self._ollama_tunnel = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if self._ollama_tunnel.poll() is not None:
+                raise rp.RunPodError("Ollama SSH tunnel exited before it was reachable.")
+            try:
+                with socket.create_connection(("127.0.0.1", local), timeout=3):
+                    self.ollama_url = f"http://127.0.0.1:{local}"
+                    return
+            except OSError:
+                time.sleep(2)
+        raise rp.RunPodError("Ollama tunnel was not reachable within 60s.")
 
     def _arm_deadman(self):
         max_min = int(self.cfg.get("max_runtime_minutes", 720))
@@ -296,6 +370,13 @@ class RemoteSession:
             except Exception:
                 pass
             self.engine = None
+        if self._ollama_tunnel and self._ollama_tunnel.poll() is None:
+            try:
+                self._ollama_tunnel.terminate()
+                self._ollama_tunnel.wait(timeout=5)
+            except Exception:
+                pass
+            self._ollama_tunnel = None
         if not self.pod_id:
             return
         do_stop = (not self._attach) if stop_pod is None else stop_pod

@@ -182,7 +182,14 @@ class RemoteControl:
     def _watch(self):
         try:
             for line in sys.stdin:
-                if line.strip().lower() in ("q", "quit"):
+                cmd = line.strip().lower()
+                if cmd in ("q", "quit"):
+                    self._stop.set()
+                elif cmd == "qstop":          # quit + stop the remote pod now
+                    _set_remote_teardown("stop")
+                    self._stop.set()
+                elif cmd == "qkeep":          # quit but leave the remote pod running
+                    _set_remote_teardown("keep")
                     self._stop.set()
                 else:
                     self._resume.set()
@@ -230,6 +237,20 @@ _T   = _CFG.get("tagging", {})
 
 OLLAMA_URL   = _O.get("url",   "http://127.0.0.1:11434")
 OLLAMA_MODEL = _O.get("model", "qwen2.5vl:7b")
+
+# Remote Tag & Rename (#1): the GUI sets IMGTBX_TAG_REMOTE=1 to run Ollama (and
+# the auto-straighten CNN) on a rented RunPod pod. tag_and_rename still runs
+# LOCALLY (it reads/writes the local files and does EXIF/rename) — only the model
+# calls go over an ssh tunnel: OLLAMA_URL is repointed at the tunnel and the
+# orientation CNN is called on the pod via REMOTE_ORIENT. Set up in main().
+REMOTE        = os.environ.get("IMGTBX_TAG_REMOTE") == "1"
+REMOTE_ORIENT = None      # pod analyse(path) -> (degrees, confidence) when remote
+_REMOTE_TEARDOWN = None    # "stop"/"keep"/None — the GUI Stop modal's choice
+
+
+def _set_remote_teardown(value):
+    global _REMOTE_TEARDOWN
+    _REMOTE_TEARDOWN = value
 
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
@@ -786,6 +807,12 @@ def warm_up_straighten():
     global _STRAIGHTEN_DISABLED
     if not AUTO_STRAIGHTEN:
         return
+    if REMOTE:
+        # The CNN runs on the pod (REMOTE_ORIENT, set up in main) — nothing to
+        # load locally, so a torch-less Remote-only install still straightens.
+        print("  Auto-straighten: orientation CNN runs on the pod "
+              "(local stays torch-free).\n")
+        return
     try:
         import orientation
         if not orientation.is_available():
@@ -812,9 +839,13 @@ def straighten_if_needed(path):
     """
     if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
         return 0, ""
+    import orientation   # torch-free for should_rotate/straighten; analyse may be remote
     try:
-        import orientation
-        deg, conf = orientation.analyse(path)
+        if REMOTE_ORIENT is not None:
+            # Detect on the pod (sends only a thumbnail); rotate locally with PIL.
+            deg, conf = REMOTE_ORIENT(path)
+        else:
+            deg, conf = orientation.analyse(path)
     except Exception as exc:
         return 0, f"orientation check skipped: {exc}"
 
@@ -1270,6 +1301,51 @@ def collect_work_items(root, force_tag=False):
     return items
 
 
+def _setup_remote_tagging():
+    """Remote Tag & Rename (#1): create/reuse a pod running Ollama + the
+    orientation CNN, repoint OLLAMA_URL at the ssh tunnel and route straighten to
+    the pod (REMOTE_ORIENT). Returns the RemoteSession (so the caller keeps a
+    reference; teardown is registered via atexit) or None when not in remote
+    mode. Exits on failure. The on-pod dead-man's switch is the teardown backup.
+
+    Kept out of main() so the `global OLLAMA_URL` reassignment doesn't clash with
+    main() reading OLLAMA_URL earlier in its body."""
+    global OLLAMA_URL, REMOTE_ORIENT
+    if not REMOTE:
+        return None
+    import atexit
+    from remote_run import RemoteSession
+
+    def _remote_status(msg):
+        print(f"  [remote] {msg}", flush=True)
+        _gui_event("STATUS", msg)
+
+    _gui_event("STATUS", "Starting the remote pod for tagging …")
+    # Dev-only: IMGTBX_REMOTE_ATTACH="pod_id,host,ssh_port" reuses a running pod.
+    _attach = None
+    _att = os.environ.get("IMGTBX_REMOTE_ATTACH")
+    if _att:
+        _p = _att.split(",")
+        _attach = (_p[0], _p[1], int(_p[2]))
+    try:
+        session = RemoteSession(_CFG.get("runpod", {}), _CFG.get("upscale", {}),
+                                APP_ROOT, on_event=_remote_status,
+                                attach=_attach, mode="tag")
+        engine = session.start()
+    except Exception as exc:                          # noqa: BLE001
+        print(f"ERROR: Could not start the remote pod for tagging.\n  -> {exc}")
+        _gui_event("STATUS", f"Remote tagging failed to start: {exc}")
+        sys.exit(1)
+    OLLAMA_URL = session.ollama_url                   # tag_and_rename now calls the pod's Ollama
+    REMOTE_ORIENT = engine.analyse                    # straighten detection runs on the pod
+
+    def _remote_teardown():
+        session.close(stop_pod={"stop": True, "keep": False}.get(_REMOTE_TEARDOWN))
+    atexit.register(_remote_teardown)
+    print(f"  Remote tagging ready — Ollama via {OLLAMA_URL}")
+    return session
+
+
 # ─────────────────────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────────────────────
@@ -1436,6 +1512,11 @@ def main():
     #    (a heavy C extension) while a background thread is already blocked in
     #    stdin.readline() deadlocks on the Windows loader lock — so the import
     #    must happen here, before any other thread exists. ──
+    # Remote Tag & Rename (#1): start the pod (Ollama + orientation CNN) and
+    # repoint OLLAMA_URL / REMOTE_ORIENT BEFORE warm-up and the Ollama check, so
+    # both see the remote setup. No-op locally.
+    _remote_session = _setup_remote_tagging()
+
     warm_up_straighten()
 
     # ── Remote control (active only when stdin is piped, e.g. GUI mode) ──

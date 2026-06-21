@@ -43,6 +43,8 @@ _HEARTBEAT = None
 _COUNT = 0
 _VERSION = ""           # worker-code version (hash of the pushed .py files); a
                         # reused pod reloads the worker when this stops matching
+_MODE = "full"          # "full" (SeedVR2 + /upscale) or "tag" (/orient only); a
+                        # reused pod also reloads when the requested mode differs
 # GPU work (upscale + the orient CNN) is serialised through this lock so a
 # /telemetry or /health request can still be answered WHILE an upscale runs
 # (the server is multi-threaded; those two endpoints never take the lock).
@@ -190,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"status": "ok",
                                "device": getattr(_ENGINE, "device_name", "?"),
                                "version": _VERSION,
+                               "mode": _MODE,
                                "count": _COUNT}).encode()
             self._send(200, body, "application/json")
         elif path == "/telemetry":
@@ -246,6 +249,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_upscale(self, parsed):
         global _COUNT
+        if _ENGINE is None:
+            # Tag mode: the SeedVR2 engine wasn't loaded (this pod serves only
+            # /orient for remote Tag & Rename, leaving VRAM for Ollama).
+            self._send(503, b"upscale engine not loaded (worker is in tag mode)",
+                       "text/plain")
+            return
         q = parse_qs(parsed.query)
         try:
             resolution = int(q.get("resolution", ["1080"])[0])
@@ -302,7 +311,7 @@ def _ctype_for(ext):
 
 
 def main(argv=None):
-    global _ENGINE, _HEARTBEAT, _VERSION
+    global _ENGINE, _HEARTBEAT, _VERSION, _MODE
     p = argparse.ArgumentParser(description="Resident upscale worker for a RunPod pod.")
     p.add_argument("--repo-dir", required=True)
     p.add_argument("--model-dir", required=True)
@@ -313,22 +322,32 @@ def main(argv=None):
     p.add_argument("--worker-version", default="",
                    help="code version reported by /health so a reused pod can "
                         "detect a stale worker and reload it")
+    p.add_argument("--mode", choices=("full", "tag"), default="full",
+                   help="full = load SeedVR2 and serve /upscale + /orient; "
+                        "tag = skip the SeedVR2 load and serve /orient only "
+                        "(remote Tag & Rename — leaves the VRAM for Ollama)")
     args = p.parse_args(argv)
 
     _HEARTBEAT = args.heartbeat
     _VERSION = args.worker_version
+    _MODE = args.mode
     sys.path.insert(0, args.repo_dir)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from upscale_engine import UpscaleEngine
 
-    with open(args.settings, encoding="utf-8") as f:
-        settings = json.load(f)
-
-    _log(f"loading engine (repo={args.repo_dir} models={args.model_dir}) …")
-    t0 = time.time()
-    _ENGINE = UpscaleEngine(args.repo_dir, args.model_dir, settings)
-    _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name}")
-    _touch(_HEARTBEAT)                            # ready = first heartbeat
+    if args.mode == "tag":
+        # Tag mode: no SeedVR2 (orientation is lazy-loaded on the first /orient).
+        # /health answers immediately so the client knows the pod is reachable.
+        _log("tag mode — SeedVR2 engine NOT loaded; serving /orient + /telemetry.")
+        _touch(_HEARTBEAT)
+    else:
+        from upscale_engine import UpscaleEngine
+        with open(args.settings, encoding="utf-8") as f:
+            settings = json.load(f)
+        _log(f"loading engine (repo={args.repo_dir} models={args.model_dir}) …")
+        t0 = time.time()
+        _ENGINE = UpscaleEngine(args.repo_dir, args.model_dir, settings)
+        _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name}")
+        _touch(_HEARTBEAT)                        # ready = first heartbeat
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     _log(f"serving on {args.host}:{args.port}")
@@ -337,7 +356,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        _ENGINE.close()
+        if _ENGINE is not None:
+            _ENGINE.close()
 
 
 if __name__ == "__main__":
