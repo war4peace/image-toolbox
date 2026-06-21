@@ -170,7 +170,11 @@ def _gui_event(kind, payload):
                             output path, so a double-click can compare the pair.
     """
     if GUI_MODE:
-        print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
+        # One atomic write (not print's two) so a background-thread event — the
+        # remote telemetry sampler — can't be byte-split by the main thread's
+        # concurrent per-image writes. The GUI parser strips it even mid-line.
+        sys.stdout.write(f"{GUI_MARKER}{kind}|{payload}\n")
+        sys.stdout.flush()
 
 
 # Remote-pod teardown override (roadmap #1): when the GUI's "Stop" modal lets the

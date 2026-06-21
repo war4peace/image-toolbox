@@ -1178,7 +1178,9 @@ class ToolTab(ttk.Frame):
                 "Double-click an image to open it • use +/– to resize")
 
         # Compact system-telemetry row, just below the carousel (Feature #3a).
-        self.telemetry_row = TelemetryRow(self)
+        # The "Local Unit" prefix is the same width as the remote row's
+        # "Remote pod" so the two rows' columns line up when both are shown.
+        self.telemetry_row = TelemetryRow(self, prefix="Local Unit")
         self.telemetry_row.grid(row=row + 3, column=0, columnspan=4,
                                 sticky="ew", pady=(4, 0))
         # Second row for the remote pod (remote #1, Feature #4) — created hidden,
@@ -1306,17 +1308,20 @@ class ToolTab(ttk.Frame):
     def _filter_markers(self, text):
         """
         Strip "@@TBX@@KIND|payload\\n" event lines from the output stream and
-        dispatch them to _handle_event. Markers always start at the beginning
-        of a line but may be split across read chunks, so the parser keeps
-        state between calls (including holding back an ambiguous prefix like
-        "@@TB" that arrives at the very end of a chunk).
+        dispatch them to _handle_event. Events are normally on their own line,
+        but a background thread (the remote-pod telemetry sampler) can interleave
+        one MID-LINE, so the marker is detected ANYWHERE in the stream — not only
+        at a line start. Consuming the event together with its trailing newline
+        reconstructs the human line it split. State is kept between calls: a
+        marker split across read chunks, and an ambiguous trailing prefix like
+        "@@TB" held back until the next chunk completes it.
         """
         out  = []
         data = self._hold + text
         self._hold = ""
         pos, n = 0, len(data)
         while pos < n:
-            if self._marker_buf is not None:        # inside a marker line
+            if self._marker_buf is not None:        # inside a marker line → to \n
                 nl = data.find("\n", pos)
                 if nl < 0:
                     self._marker_buf += data[pos:]
@@ -1324,32 +1329,26 @@ class ToolTab(ttk.Frame):
                 else:
                     self._marker_buf += data[pos:nl]
                     self._on_marker(self._marker_buf)
-                    self._marker_buf    = None
-                    self._at_line_start = True
-                    pos = nl + 1
+                    self._marker_buf = None
+                    pos = nl + 1                    # consume the event's newline
                 continue
-            if self._at_line_start:
-                head = data[pos:pos + len(GUI_MARKER)]
-                if head == GUI_MARKER:
-                    self._marker_buf = ""
-                    pos += len(GUI_MARKER)
-                    continue
-                if pos + len(head) == n and GUI_MARKER.startswith(head):
-                    self._hold = head               # might be a marker — wait for more
-                    break
-                self._at_line_start = False
-            # Both \n and \r end a "line" for marker detection: the scripts'
-            # in-place progress updates end with \r, and a marker printed
-            # right after one starts at a \r boundary, not a \n boundary.
-            cands = [i for i in (data.find("\n", pos), data.find("\r", pos)) if i >= 0]
-            if not cands:
-                out.append(data[pos:])
+            idx = data.find(GUI_MARKER, pos)
+            if idx < 0:
+                # No complete marker ahead. Hold back a trailing partial marker
+                # prefix ("@@TB") so it isn't shown as content and can complete
+                # on the next chunk.
+                hold = ""
+                for k in range(len(GUI_MARKER) - 1, 0, -1):
+                    if n - pos >= k and data.endswith(GUI_MARKER[:k]):
+                        hold = GUI_MARKER[:k]
+                        break
+                out.append(data[pos:n - len(hold)] if hold else data[pos:])
+                self._hold = hold
                 pos = n
             else:
-                nxt = min(cands)
-                out.append(data[pos:nxt + 1])
-                self._at_line_start = True
-                pos = nxt + 1
+                out.append(data[pos:idx])           # human text before the marker
+                self._marker_buf = ""
+                pos = idx + len(GUI_MARKER)
         return "".join(out)
 
     def _on_marker(self, content):
