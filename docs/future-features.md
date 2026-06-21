@@ -67,6 +67,54 @@ home, the local auto-stop is the proving ground.
   uploads, billed pods left running if auto-stop fails, SSH on Windows, remote
   bootstrap drift. Should be its own milestone.
 
+### Remote-pod backlog (enhancements on the working core)
+
+The core remote path is implemented and validated on `0.3.1-experimental`
+(create/stream, straighten-on-pod via the worker's `/orient`, pod telemetry, the
+Stop-pod modal, and the dead-man's switch). Captured follow-ups:
+
+- **Region from bootstrap.** Ask the user's region during first-run bootstrap and
+  use it as the default for both (a) creating the model network volume and (b) the
+  target data center when spinning up pods. Today the volume's region is read back
+  and pods are pinned to it (region-locked), but the *initial* choice is implicit —
+  pre-seeding it from bootstrap (defaulting to the nearest EU DC, e.g. EU-RO-1 for
+  this user) removes a manual step and prevents a wrong-region volume that no pod
+  can then attach. The curated EU list already exists (`EU_DATACENTERS`).
+- **GPU fallback chain when the primary type is unavailable.** RTX 5090 capacity in
+  a single EU DC is intermittent (seen: "not enough free GPUs" on restart, and a
+  dry region failing `create`). When the configured GPU can't be allocated, fall
+  through a prioritized list instead of failing the run. Proposed order: **L40S**
+  (48 GB, Ada, datacenter-reliable, good EU availability) → **RTX PRO 4500
+  Blackwell** (32 GB, newest gen, fast) → **A40** (48 GB, Ampere — older/slower but
+  cheap and widely available). All four run on the current cu128 / torch 2.9.1
+  image (Blackwell sm_120, Ada sm_89, Ampere sm_86). The SeedVR2 workload peaked
+  ~21.7 GB VRAM, so 32 GB is enough — VRAM isn't the differentiator, throughput and
+  availability are, which is why the order is speed-then-cheap-fallback. *Agreed
+  with the proposed priority;* L40S is strong enough (48 GB + datacenter
+  reliability) it could even be a co-default with the 5090, but the 5090 benched
+  faster so it stays primary. Implementation: `create_pod` already takes a
+  `gpuTypeIds` **list** — verify whether RunPod treats it as "any of these in
+  order" (then the fallback is just passing the list); otherwise loop the types in
+  `create_pod_resilient` on a capacity failure.
+- **Cost & funds tracking + auto-stop** (API verified live, 2026-06-21):
+  - Per-pod hourly rate is on the pod object: `costPerHr` (REST `GET /pods/{id}`,
+    e.g. 0.99) — read it from the pod instead of the manually-set
+    `runpod.hourly_rate`.
+  - Account balance + total spend rate come from the **legacy GraphQL** API:
+    `query { myself { clientBalance currentSpendPerHr } }` at
+    `https://api.runpod.io/graphql` (returned clientBalance≈34.57,
+    currentSpendPerHr≈0.998). The REST key (`rpa_…`) authenticates it (Bearer *or*
+    `?api_key=`), but the endpoint Cloudflare-blocks the default `Python-urllib`
+    User-Agent — **must send a browser-like `User-Agent`**. The REST API has **no**
+    balance/billing endpoint (all probes 400).
+  - Derived: session cost = `elapsed_h × costPerHr`; **time until funds depleted**
+    = `clientBalance / currentSpendPerHr` (≈34 h here). Surface in the status row /
+    Discord embed, and **auto-stop** the pod (or refuse to start) when session cost
+    exceeds a configurable cap *or* remaining balance drops below a floor — a money
+    safety-net alongside the time/idle dead-man's switch.
+  - Caveat: GraphQL is the legacy, semi-supported API — keep it in one isolated,
+    fail-safe helper (no balance → skip the funds checks, never block on it).
+
 ## 2. HTTP interface — Hard
 Spin up a small HTTP server with a UI that mirrors the application UI.
 
