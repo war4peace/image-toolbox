@@ -534,27 +534,35 @@ class TelemetryRow(ttk.Frame):
         return f"{used_mb/1024:.1f}/{total_mb/1024:.1f} GB ({pct}%)", pct
 
     def show(self, sample):
-        """Render a telemetry sample dict (any field may be None)."""
+        """Render a telemetry sample dict (any field may be None). Prefixed rows
+        (the Upscale tab's local + remote pair) pad each field to a fixed width —
+        in the monospace font this lines their columns up; unprefixed single
+        rows stay compact."""
+        pad = bool(self._prefix)
+
+        def fld(text, width):
+            return text.ljust(width) if pad else text
+
         segs = []
         if self._prefix:
-            segs.append((self._prefix, self.GREY))
+            segs.append((self._prefix.ljust(10), self.GREY))
         cpu = sample.get("cpu")
         if cpu is not None:
             c = round(cpu)
-            segs.append((f"CPU {c}%", self._band(c)))
+            segs.append((fld(f"CPU {c}%", 8), self._band(c)))
         else:
-            segs.append(("CPU —", self.GREY))
+            segs.append((fld("CPU —", 8), self.GREY))
 
         ru, rt = sample.get("ram_used_mb"), sample.get("ram_total_mb")
         if ru is not None and rt:
             text, pct = self._gb(ru, rt)
-            segs.append((f"RAM {text}", self._band(pct)))
+            segs.append((fld(f"RAM {text}", 25), self._band(pct)))
 
         vu, vt = sample.get("gpu_used_mb"), sample.get("gpu_total_mb")
         temp   = sample.get("gpu_temp_c")
         if vu is not None and vt:
             text, pct = self._gb(vu, vt)
-            segs.append((f"VRAM {text}", self._band(pct)))
+            segs.append((fld(f"VRAM {text}", 26), self._band(pct)))
         if temp is not None:
             segs.append((f"GPU {temp}°C", self.GREY))
         if vu is None and temp is None:

@@ -20,6 +20,7 @@ Pure standard library (subprocess + the stdlib runpod_client / remote engine).
 import os
 import json
 import time
+import hashlib
 import tempfile
 import subprocess
 
@@ -56,6 +57,23 @@ class RemoteSession:
         self.host = attach[1] if attach else None
         self.ssh_port = attach[2] if attach else None
         self.engine = None
+        self.worker_version = self._worker_version()
+
+    def _worker_version(self):
+        """Short hash of the worker-side code (worker.py + the modules it loads).
+        The worker reports it via /health; a reused pod whose worker reports a
+        different version is restarted, so it never keeps serving stale code
+        after an app update."""
+        h = hashlib.blake2b(digest_size=8)
+        for rel in (("pod", "worker.py"),
+                    ("scripts", "upscale_engine.py"),
+                    ("scripts", "orientation.py")):
+            try:
+                with open(os.path.join(self.app_root, *rel), "rb") as f:
+                    h.update(f.read())
+            except OSError:
+                pass
+        return h.hexdigest()
 
     # ── ssh / scp ──────────────────────────────────────────────────────────────
 
@@ -188,23 +206,37 @@ class RemoteSession:
             os.remove(keyfile.name)
 
     def _start_worker(self):
-        self._emit("Starting the resident worker (first model load is slow) …")
         wp = self.worker_port
-        # If a healthy worker is already up (reused pod), skip the relaunch — that
-        # avoids a needless ~97 s model reload. Otherwise launch it. The launch
-        # must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the redirect on
-        # the backgrounded command — a `cd && nohup … &` wrapper leaves the ssh
-        # channel open and the call hangs (the worker loads but ssh never returns).
-        # TORCH_HOME points at the volume so the auto-straighten CNN weights
-        # (cached by provision.sh) are found without re-downloading on every pod.
+        # Reuse a worker only if it is healthy AND running the CURRENT code
+        # version — otherwise a reused pod would keep serving a stale worker
+        # after an app update (e.g. the telemetry / straighten code changed).
+        # A matching version skips the needless ~97 s model reload.
+        health = self._ssh(f"curl -sf localhost:{wp}/health || true",
+                           check=False, timeout=30)
+        if health.returncode == 0 and health.stdout.strip():
+            try:
+                running = json.loads(health.stdout).get("version")
+            except ValueError:
+                running = None
+            if running and running == self.worker_version:
+                self._emit("Reusing the healthy worker already on the pod "
+                           "(matching version).")
+                return
+            self._emit("Worker on the pod is a different version — reloading it.")
+        self._emit("Starting the resident worker (first model load is slow) …")
+        # The launch must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the
+        # redirect on the backgrounded command — a `cd && nohup … &` wrapper
+        # leaves the ssh channel open and the call hangs (worker loads, ssh never
+        # returns). TORCH_HOME points at the volume so the auto-straighten CNN
+        # weights (cached by provision.sh) are found without re-downloading.
         inner = (
             "echo $$ > /root/worker.pid; "
             "exec env TORCH_HOME=/workspace/models/torch "
             "/workspace/venv/bin/python /root/worker.py "
             "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
-            f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT}")
+            f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT} "
+            f"--worker-version {self.worker_version}")
         launch = (
-            f"if curl -sf localhost:{wp}/health >/dev/null 2>&1; then echo ALREADY_HEALTHY; exit 0; fi; "
             "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
             f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
             f"for i in $(seq 1 120); do curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; sleep 5; done; "

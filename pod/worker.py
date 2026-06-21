@@ -41,6 +41,8 @@ from urllib.parse import urlparse, parse_qs
 _ENGINE = None
 _HEARTBEAT = None
 _COUNT = 0
+_VERSION = ""           # worker-code version (hash of the pushed .py files); a
+                        # reused pod reloads the worker when this stops matching
 # GPU work (upscale + the orient CNN) is serialised through this lock so a
 # /telemetry or /health request can still be answered WHILE an upscale runs
 # (the server is multi-threaded; those two endpoints never take the lock).
@@ -187,6 +189,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             body = json.dumps({"status": "ok",
                                "device": getattr(_ENGINE, "device_name", "?"),
+                               "version": _VERSION,
                                "count": _COUNT}).encode()
             self._send(200, body, "application/json")
         elif path == "/telemetry":
@@ -299,7 +302,7 @@ def _ctype_for(ext):
 
 
 def main(argv=None):
-    global _ENGINE, _HEARTBEAT
+    global _ENGINE, _HEARTBEAT, _VERSION
     p = argparse.ArgumentParser(description="Resident upscale worker for a RunPod pod.")
     p.add_argument("--repo-dir", required=True)
     p.add_argument("--model-dir", required=True)
@@ -307,9 +310,13 @@ def main(argv=None):
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8200)
     p.add_argument("--heartbeat", default="/tmp/upscale_heartbeat")
+    p.add_argument("--worker-version", default="",
+                   help="code version reported by /health so a reused pod can "
+                        "detect a stale worker and reload it")
     args = p.parse_args(argv)
 
     _HEARTBEAT = args.heartbeat
+    _VERSION = args.worker_version
     sys.path.insert(0, args.repo_dir)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from upscale_engine import UpscaleEngine
