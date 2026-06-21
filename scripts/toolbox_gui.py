@@ -139,6 +139,24 @@ def set_default_folder(key, value):
     save_config()
 
 
+def get_install_mode():
+    """Installation mode chosen at install time: 'local' | 'remote' | 'both'.
+
+    Read from install_mode.txt (written by the installer; see bootstrap.ps1). A
+    Remote-only install has NO local upscaling engine (torch + SeedVR2 are
+    skipped), so the GUI defaults the 'Run on remote pod' toggle on and refuses a
+    local run. Missing/unknown marker → 'both' (a from-source run or a pre-0.3.2
+    install supports everything)."""
+    try:
+        with open(os.path.join(APP_ROOT, "install_mode.txt"), encoding="utf-8") as f:
+            mode = f.read().strip().lower()
+        if mode in ("local", "remote", "both"):
+            return mode
+    except OSError:
+        pass
+    return "both"
+
+
 # ─────────────────────────────────────────────
 #  UPDATE PREFERENCES  (config.json "updates" section)
 # ─────────────────────────────────────────────
@@ -2139,7 +2157,9 @@ class UpscaleTab(ToolTab):
         self.mqtt_task_name = "upscaling"
         self.src_var      = tk.StringVar()
         self.out_var      = tk.StringVar()
-        self.remote_var   = tk.BooleanVar(value=False)
+        # Default the remote toggle ON for a Remote-only install (it's the only
+        # way to upscale there); OFF for Local/Both.
+        self.remote_var   = tk.BooleanVar(value=(get_install_mode() == "remote"))
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
@@ -2351,10 +2371,22 @@ class UpscaleTab(ToolTab):
                     "safety net.\n\nProceed?"):
                 return
             extra_env = {"IMGTBX_UPSCALE_REMOTE": "1"}
-        elif not self.confirm_gpu_overlap():
-            # Local run only: warn about local GPU contention. (No local GPU is
-            # used in remote mode, so that check is skipped above.)
-            return
+        else:
+            # Local run requested. A Remote-only install has no local engine
+            # (torch + SeedVR2 weren't installed), so a local run would crash on
+            # import — refuse it with a clear message instead.
+            if get_install_mode() == "remote":
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "This is a Remote-only install — the local upscaling engine "
+                    "(PyTorch + SeedVR2) isn't installed.\n\n"
+                    "Tick 'Run on remote pod (RunPod)' to upscale on a rented GPU, "
+                    "or reinstall and choose Local or Both to upscale on this PC.")
+                return
+            if not self.confirm_gpu_overlap():
+                # Warn about local GPU contention. (No local GPU is used in remote
+                # mode, so that check is skipped above.)
+                return
 
         self.progress.set(0)
         self._reset_stream_state()
