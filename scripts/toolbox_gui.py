@@ -493,7 +493,7 @@ class TelemetryRow(ttk.Frame):
 
     IDLE  = "System: sampling…"
     GREY  = "#7f8a99"
-    SEP   = "   ·   "
+    SEP   = " · "
     FONT  = ("Consolas", 9)
 
     # Percentage → colour band: blue 0–25, green 26–65, dark yellow 66–85,
@@ -556,13 +556,13 @@ class TelemetryRow(ttk.Frame):
         ru, rt = sample.get("ram_used_mb"), sample.get("ram_total_mb")
         if ru is not None and rt:
             text, pct = self._gb(ru, rt)
-            segs.append((fld(f"RAM {text}", 25), self._band(pct)))
+            segs.append((fld(f"RAM {text}", 24), self._band(pct)))
 
         vu, vt = sample.get("gpu_used_mb"), sample.get("gpu_total_mb")
         temp   = sample.get("gpu_temp_c")
         if vu is not None and vt:
             text, pct = self._gb(vu, vt)
-            segs.append((fld(f"VRAM {text}", 26), self._band(pct)))
+            segs.append((fld(f"VRAM {text}", 24), self._band(pct)))
         if temp is not None:
             segs.append((f"GPU {temp}°C", self.GREY))
         if vu is None and temp is None:
