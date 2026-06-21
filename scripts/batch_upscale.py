@@ -132,6 +132,11 @@ STRAIGHTEN_CONFIDENCE = float(_U.get("straighten_min_confidence", 0.9))
 # pod. If the load exceeds this, fail safe to "no straighten" and continue.
 STRAIGHTEN_INIT_TIMEOUT = float(_U.get("straighten_init_timeout", 90))
 _STRAIGHTEN_DISABLED  = False     # set True at warm-up if torch/timm unavailable
+# Remote mode (#1 option B): the orientation CNN runs ON THE POD. The local side
+# stays torch-free — it sends a thumbnail to the worker's /orient endpoint, then
+# rotates a temp copy (pure PIL) and uploads that, exactly like the local path.
+# Set in warm_up_straighten(); detect_rotation routes the CNN to ENGINE.analyse.
+REMOTE_STRAIGHTEN     = False
 
 # The SeedVR2 engine — created in main() after CLI validation so that
 # `python batch_upscale.py` (usage help) stays instant.
@@ -720,19 +725,20 @@ def warm_up_straighten():
     image doesn't pay the cost mid-run, and so the eligibility check below knows
     whether straightening is actually available. Fails safe: any problem just
     disables straightening and upscaling proceeds without rotation."""
-    global _STRAIGHTEN_DISABLED
+    global _STRAIGHTEN_DISABLED, REMOTE_STRAIGHTEN
     if not AUTO_STRAIGHTEN:
         return
-    # In REMOTE mode the GPU work runs on the pod. Doing straighten locally here
-    # would import torch/numpy on the user's machine, which both defeats the
-    # offload and can DEADLOCK loading numpy's OpenBLAS DLL once the process
-    # already has background threads/subprocesses (the ssh tunnel) — a Windows
-    # loader-lock deadlock, confirmed via py-spy's native stack. Skip it: the
-    # right home for remote-mode straighten is the pod worker itself (TODO).
+    # In REMOTE mode the orientation CNN runs ON THE POD (option B): the worker's
+    # /orient endpoint owns the only torch-dependent step. The local side never
+    # imports torch — which both keeps the offload honest and sidesteps the
+    # OpenBLAS/numpy loader-lock DEADLOCK that froze the GUI when it tried to load
+    # the model locally (confirmed via py-spy's native stack). detect_rotation
+    # sends a thumbnail to the pod and rotates a temp copy with pure PIL; the
+    # skip / resolution math is unchanged. Straighten stays ENABLED.
     if os.environ.get("IMGTBX_UPSCALE_REMOTE") == "1":
-        print("  Auto-straighten: skipped in remote mode for now "
-              "(straighten will move onto the pod) — remote upscales aren't rotated yet.")
-        _STRAIGHTEN_DISABLED = True
+        REMOTE_STRAIGHTEN = True
+        print("  Auto-straighten: orientation CNN runs on the pod "
+              "(local stays torch-free); rotating + uploading copies locally.")
         return
     try:
         import orientation
@@ -782,9 +788,13 @@ def detect_rotation(path):
     raises — any failure yields (0, reason) so upscaling proceeds un-rotated."""
     if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
         return 0, ""
+    import orientation                              # torch-free here (policy + PIL)
     try:
-        import orientation
-        deg, conf = orientation.analyse(path)
+        if REMOTE_STRAIGHTEN and ENGINE is not None:
+            # The CNN runs on the pod; we send only a thumbnail (no local torch).
+            deg, conf = ENGINE.analyse(path)
+        else:
+            deg, conf = orientation.analyse(path)
     except Exception as exc:
         return 0, f"orientation check skipped: {exc}"
 

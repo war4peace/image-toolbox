@@ -21,6 +21,11 @@ Endpoints:
     GET  /health                      -> {"status":"ok","device":"...","count":N}
     POST /upscale?resolution=R&ext=.jpg   body = source bytes
                                       -> upscaled bytes (X-Process-Time header, s)
+    POST /orient                      body = a small thumbnail of the source
+                                      -> {"degrees":D,"confidence":C}  (auto-straighten,
+                                         remote-pod #1 option B — the CNN runs here so
+                                         the local side needs no torch; it sends only a
+                                         ~512px thumbnail, then rotates + uploads locally)
 """
 import os
 import sys
@@ -74,11 +79,51 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        global _COUNT
         parsed = urlparse(self.path)
+        if parsed.path == "/orient":
+            self._handle_orient()
+            return
         if parsed.path != "/upscale":
             self._send(404, b"not found", "text/plain")
             return
+        self._handle_upscale(parsed)
+
+    def _handle_orient(self):
+        """Detect orientation (the auto-straighten CNN) on a thumbnail the local
+        side sent. Fail safe: any error reports 'upright' (degrees 0) so the
+        client leaves the image un-rotated."""
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            self._send(400, b"empty body", "text/plain")
+            return
+        data = self.rfile.read(length)
+        _touch(_HEARTBEAT)
+        tmpdir = tempfile.mkdtemp(prefix="ori_")
+        src = os.path.join(tmpdir, "in.jpg")
+        try:
+            with open(src, "wb") as f:
+                f.write(data)
+            import orientation
+            deg, conf = orientation.analyse(src)
+            body = json.dumps({"degrees": int(deg), "confidence": float(conf)}).encode()
+            self._send(200, body, "application/json")
+        except Exception as exc:                 # noqa: BLE001 — report, fail safe
+            _log(f"orient error: {exc}")
+            body = json.dumps({"degrees": 0, "confidence": 0.0,
+                               "error": str(exc)}).encode()
+            self._send(200, body, "application/json")
+        finally:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+
+    def _handle_upscale(self, parsed):
+        global _COUNT
         q = parse_qs(parsed.query)
         try:
             resolution = int(q.get("resolution", ["1080"])[0])

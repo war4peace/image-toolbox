@@ -131,6 +131,37 @@ class RemoteUpscaleEngine:
             raise
         self.last_process_time = float(proc) if proc else None
 
+    def analyse(self, src_path):
+        """Detect orientation on the pod (auto-straighten #1, option B). The CNN
+        runs on the pod, so the local side needs no torch; we send only a small
+        thumbnail (the model sees 224px anyway) to keep per-image bandwidth tiny.
+        Returns (degrees, confidence) like orientation.analyse. Fail-safe: any
+        problem yields (0, 0.0) so the caller leaves the image un-rotated.
+
+        The thumbnail is built WITHOUT applying EXIF orientation, matching the
+        local orientation.analyse (which reads the stored pixels) so the detected
+        class means the same thing on both paths."""
+        from io import BytesIO
+        from PIL import Image
+        try:
+            im = Image.open(src_path).convert("RGB")
+            im.thumbnail((512, 512))                 # longest side <= 512px
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            data = buf.getvalue()
+        except Exception:
+            return 0, 0.0
+        url = f"http://127.0.0.1:{self.local_port}/orient"
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
+                import json
+                info = json.loads(resp.read().decode("utf-8", "replace"))
+            return int(info.get("degrees", 0)), float(info.get("confidence", 0.0))
+        except Exception:
+            return 0, 0.0
+
     def close(self):
         if self._tunnel and self._tunnel.poll() is None:
             self._tunnel.terminate()

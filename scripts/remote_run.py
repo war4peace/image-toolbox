@@ -161,7 +161,9 @@ class RemoteSession:
 
     def _push_files(self):
         self._emit("Uploading worker + dead-man's switch to the pod …")
-        for name in ("upscale_engine.py",):
+        # orientation.py rides along so the worker can run the auto-straighten CNN
+        # on the pod (remote #1 option B) — the local side stays torch-free.
+        for name in ("upscale_engine.py", "orientation.py"):
             self._scp(os.path.join(self.app_root, "scripts", name), f"/root/{name}")
         for name in ("worker.py", "deadman.py"):
             self._scp(os.path.join(self.app_root, "pod", name), f"/root/{name}")
@@ -193,9 +195,12 @@ class RemoteSession:
         # must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the redirect on
         # the backgrounded command — a `cd && nohup … &` wrapper leaves the ssh
         # channel open and the call hangs (the worker loads but ssh never returns).
+        # TORCH_HOME points at the volume so the auto-straighten CNN weights
+        # (cached by provision.sh) are found without re-downloading on every pod.
         inner = (
             "echo $$ > /root/worker.pid; "
-            "exec /workspace/venv/bin/python /root/worker.py "
+            "exec env TORCH_HOME=/workspace/models/torch "
+            "/workspace/venv/bin/python /root/worker.py "
             "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
             f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT}")
         launch = (

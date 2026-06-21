@@ -63,6 +63,21 @@ echo "torch==2.9.1" > /tmp/constraints.txt
 echo "---- versions in venv (torch must stay 2.9.1+cu128) ----"
 "$VENV/bin/python" -c "import torch,torchvision,torchaudio;print('torch',torch.__version__,'tv',torchvision.__version__,'ta',torchaudio.__version__,'cuda',torch.cuda.is_available())"
 
+# 2b. Auto-straighten orientation CNN weights (ternaus/check_orientation, ~82 MB)
+#     cached onto the volume's torch hub dir so disposable pods don't re-download
+#     and the worker's first /orient is instant. The worker runs with the same
+#     TORCH_HOME so it finds them. (timm is already installed above.)
+echo "---- caching the orientation CNN weights to $MODELS/torch ----"
+export TORCH_HOME="$MODELS/torch"
+mkdir -p "$TORCH_HOME"
+"$VENV/bin/python" - <<'PY'
+import torch
+url = ("https://github.com/ternaus/check_orientation/releases/download/"
+       "v0.0.3/2020-11-16_resnext50_32x4d.zip")
+torch.hub.load_state_dict_from_url(url, progress=False, map_location="cpu")
+print("orientation weights cached")
+PY
+
 # 3. SeedVR2 weights to the volume (download_weight skips files already valid) --
 echo "---- downloading SeedVR2 weights to $SEEDVR2_MODELS ----"
 PYTHONPATH="$SEEDVR2_DIR" "$VENV/bin/python" - "$SEEDVR2_DIR" "$SEEDVR2_MODELS" "$DIT_MODEL" <<'PY'
