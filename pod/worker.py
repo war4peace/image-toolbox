@@ -33,12 +33,19 @@ import json
 import time
 import argparse
 import tempfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 _ENGINE = None
 _HEARTBEAT = None
 _COUNT = 0
+# GPU work (upscale + the orient CNN) is serialised through this lock so a
+# /telemetry or /health request can still be answered WHILE an upscale runs
+# (the server is multi-threaded; those two endpoints never take the lock).
+_GPU_LOCK = threading.Lock()
+_PREV_CPU = None        # (idle, total) jiffies from the last /telemetry sample
 
 
 def _touch(path):
@@ -53,6 +60,72 @@ def _touch(path):
 
 def _log(msg):
     print(f"[worker] {msg}", flush=True)
+
+
+# ── pod telemetry (remote #1, Feature #4) ───────────────────────────────────
+# Linux equivalents of the app's system_telemetry.py (which is Windows-only):
+# CPU from /proc/stat (busy fraction between calls), RAM from /proc/meminfo,
+# GPU from nvidia-smi. All best-effort, fail safe to None — same sample shape
+# the GUI's TelemetryRow already renders.
+
+def _sample_cpu():
+    """Busy % since the previous call (delta of /proc/stat jiffies)."""
+    global _PREV_CPU
+    try:
+        with open("/proc/stat") as f:
+            nums = [int(x) for x in f.readline().split()[1:]]
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)   # idle + iowait
+        total = sum(nums)
+        prev, _PREV_CPU = _PREV_CPU, (idle, total)
+        if prev is None:
+            return None
+        di, dt = idle - prev[0], total - prev[1]
+        if dt <= 0:
+            return None
+        return max(0.0, min(100.0, 100.0 * (1.0 - di / dt)))
+    except Exception:
+        return None
+
+
+def _sample_ram():
+    """(used_mb, total_mb) from /proc/meminfo."""
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                info[k] = int(rest.strip().split()[0])       # kB
+        total = info.get("MemTotal", 0) // 1024
+        avail = info.get("MemAvailable", info.get("MemFree", 0)) // 1024
+        if total <= 0:
+            return None
+        return total - avail, total
+    except Exception:
+        return None
+
+
+def _sample_gpu():
+    """(vram_used_mb, vram_total_mb, temp_c) from nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,temperature.gpu",
+             "--format=csv,noheader,nounits"], text=True, timeout=8)
+        used, total, temp = [p.strip() for p in out.strip().splitlines()[0].split(",")]
+        return int(float(used)), int(float(total)), int(float(temp))
+    except Exception:
+        return None
+
+
+def _sample_telemetry():
+    ram, gpu = _sample_ram(), _sample_gpu()
+    return {
+        "cpu":          _sample_cpu(),
+        "ram_used_mb":  ram[0] if ram else None,
+        "ram_total_mb": ram[1] if ram else None,
+        "gpu_used_mb":  gpu[0] if gpu else None,
+        "gpu_total_mb": gpu[1] if gpu else None,
+        "gpu_temp_c":   gpu[2] if gpu else None,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -70,10 +143,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):
-        if urlparse(self.path).path == "/health":
+        path = urlparse(self.path).path
+        if path == "/health":
             body = json.dumps({"status": "ok",
                                "device": getattr(_ENGINE, "device_name", "?"),
                                "count": _COUNT}).encode()
+            self._send(200, body, "application/json")
+        elif path == "/telemetry":
+            # Lock-free so it answers even while an upscale holds _GPU_LOCK.
+            body = json.dumps(_sample_telemetry()).encode()
             self._send(200, body, "application/json")
         else:
             self._send(404, b"not found", "text/plain")
@@ -104,7 +182,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(src, "wb") as f:
                 f.write(data)
             import orientation
-            deg, conf = orientation.analyse(src)
+            with _GPU_LOCK:
+                deg, conf = orientation.analyse(src)
             body = json.dumps({"degrees": int(deg), "confidence": float(conf)}).encode()
             self._send(200, body, "application/json")
         except Exception as exc:                 # noqa: BLE001 — report, fail safe
@@ -147,9 +226,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with open(src, "wb") as f:
                 f.write(data)
-            t0 = time.time()
-            _ENGINE.upscale(src, dst, resolution)
-            dt = time.time() - t0
+            with _GPU_LOCK:
+                t0 = time.time()
+                _ENGINE.upscale(src, dst, resolution)
+                dt = time.time() - t0
             with open(dst, "rb") as f:
                 out = f.read()
             _COUNT += 1
@@ -203,7 +283,7 @@ def main(argv=None):
     _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name}")
     _touch(_HEARTBEAT)                            # ready = first heartbeat
 
-    httpd = HTTPServer((args.host, args.port), Handler)
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     _log(f"serving on {args.host}:{args.port}")
     try:
         httpd.serve_forever()

@@ -508,8 +508,9 @@ class TelemetryRow(ttk.Frame):
             return "#b58900"   # dark yellow
         return "#d11a2a"       # red
 
-    def __init__(self, master):
+    def __init__(self, master, prefix=""):
         super().__init__(master)
+        self._prefix = prefix      # optional leading label, e.g. "Remote pod"
         self._labels = []
         self._set([(self.IDLE, self.GREY)])
 
@@ -535,6 +536,8 @@ class TelemetryRow(ttk.Frame):
     def show(self, sample):
         """Render a telemetry sample dict (any field may be None)."""
         segs = []
+        if self._prefix:
+            segs.append((self._prefix, self.GREY))
         cpu = sample.get("cpu")
         if cpu is not None:
             c = round(cpu)
@@ -1178,6 +1181,12 @@ class ToolTab(ttk.Frame):
         self.telemetry_row = TelemetryRow(self)
         self.telemetry_row.grid(row=row + 3, column=0, columnspan=4,
                                 sticky="ew", pady=(4, 0))
+        # Second row for the remote pod (remote #1, Feature #4) — created hidden,
+        # shown only while a remote-pod run is streaming RTELEM telemetry.
+        self.remote_telemetry_row = TelemetryRow(self, prefix="Remote pod")
+        self.remote_telemetry_row.grid(row=row + 4, column=0, columnspan=4,
+                                       sticky="ew", pady=(1, 0))
+        self.remote_telemetry_row.grid_remove()
 
     def _save_cell(self, cell):
         self.app.settings["thumb_cell"] = cell
@@ -1393,6 +1402,13 @@ class ToolTab(ttk.Frame):
                                 "(reboot, then resume).")
             self.app.taskbar_state("error")    # red taskbar bar
             self.app.flash_attention()
+        elif kind == "RTELEM" and payload:
+            # Remote-pod telemetry (#4): reveal/update the tab's remote row.
+            try:
+                sample = json.loads(payload)
+            except ValueError:
+                return
+            self.app.apply_remote_telemetry(self, sample)
         elif kind == "DONE":
             self._last_done = payload   # JSON summary; published to MQTT on exit
             self.app.flash_attention()  # catch the eye when a long run finishes
@@ -2378,6 +2394,9 @@ class UpscaleTab(ToolTab):
         self._paused = False
         self.pause_btn.configure(text="Pause")
         self.eta_var.set("—")
+        # The remote-pod telemetry row only makes sense during a remote run.
+        if self.remote_telemetry_row.winfo_manager():
+            self.remote_telemetry_row.grid_remove()
         # Surface the run's tally line (e.g. "65 processed, 850 already done,
         # 5 corrupted, …") on the top status row, above the closing message.
         self._final_top = self.console.find_last(r"\(\d+ processed")
@@ -4557,6 +4576,32 @@ class App(tk.Tk):
             values[mqtt_publisher.SYS_GPU_VRAM_TOTAL_TOPIC] = str(sample["gpu_total_mb"])
         if sample.get("gpu_temp_c") is not None:
             values[mqtt_publisher.SYS_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
+        if values:
+            self.mqtt_publish(values)
+
+    def apply_remote_telemetry(self, tab, sample):
+        """Render a remote-pod telemetry sample (remote #1, Feature #4) in the
+        tab's dedicated remote row — revealing it on the first sample — and
+        mirror it to the MQTT system/remote/* topics."""
+        row = getattr(tab, "remote_telemetry_row", None)
+        if row is not None:
+            try:
+                if not row.winfo_manager():     # hidden via grid_remove → reveal
+                    row.grid()
+                row.show(sample)
+            except Exception:
+                pass
+        values = {}
+        if sample.get("cpu") is not None:
+            values[mqtt_publisher.SYS_REMOTE_CPU_TOPIC] = f"{sample['cpu']:.0f}"
+        if sample.get("ram_used_mb") is not None:
+            values[mqtt_publisher.SYS_REMOTE_RAM_TOPIC]       = str(sample["ram_used_mb"])
+            values[mqtt_publisher.SYS_REMOTE_RAM_TOTAL_TOPIC] = str(sample["ram_total_mb"])
+        if sample.get("gpu_used_mb") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOPIC]       = str(sample["gpu_used_mb"])
+            values[mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOTAL_TOPIC] = str(sample["gpu_total_mb"])
+        if sample.get("gpu_temp_c") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
         if values:
             self.mqtt_publish(values)
 

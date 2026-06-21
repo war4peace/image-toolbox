@@ -185,6 +185,23 @@ def _set_remote_teardown(value):
     _REMOTE_TEARDOWN = value
 
 
+def _start_remote_telemetry(engine, interval=10.0):
+    """Remote #1, Feature #4: poll the pod's telemetry and stream it to the GUI
+    as RTELEM events, so it can show a dedicated 'remote pod' readout row. The
+    worker answers /telemetry lock-free, so this works during an upscale. Daemon
+    thread; best-effort (a failed sample is just skipped)."""
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                sample = engine.telemetry()
+            except Exception:
+                sample = None
+            if sample:
+                _gui_event("RTELEM", json.dumps(sample))
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 # Images whose shortest dimension is already >= this fraction of the target
 # will be skipped. Default 66% means a 2538x1428 image (66% of 3840x2160)
 # would be skipped — only images that need at least a 1.5x upscale are processed.
@@ -1572,6 +1589,8 @@ def main():
             def _remote_teardown():
                 session.close(stop_pod={"stop": True, "keep": False}.get(_REMOTE_TEARDOWN))
             atexit.register(_remote_teardown)
+            # Stream the pod's CPU/RAM/GPU to the GUI's remote telemetry row.
+            _start_remote_telemetry(ENGINE)
         else:
             from upscale_engine import UpscaleEngine
             # debug=true in config.json's "upscale" section restores the verbose
