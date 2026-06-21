@@ -11,6 +11,10 @@
   #define MyAppVersion "0.0.0"
 #endif
 
+; Referral link shown to users who pick a Remote/Both install (they need a
+; RunPod account with credit to rent a GPU). Update here if the link changes.
+#define RunPodReferral "https://runpod.io?ref=760zp6wq"
+
 [Setup]
 AppId={{B4D4B6F2-1B0E-4A41-9C4B-1D0A6E4B7C21}
 AppName=Image Toolbox
@@ -68,6 +72,10 @@ Name: "{autoprograms}\Image Toolbox"; Filename: "{app}\Image Toolbox.cmd"; Worki
 Name: "{autodesktop}\Image Toolbox";  Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"; Tasks: desktopicon
 
 [Run]
+; Remote/Both need a RunPod account with credit to rent a GPU. Offer to open the
+; referral sign-up page (opt-in checkbox on the finished page; only shown for a
+; Remote/Both install). shellexec opens the URL in the default browser.
+Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your browser) - needed to rent a remote GPU"; Flags: postinstall shellexec nowait skipifsilent; Check: NeedsRunPodAccount
 Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (first launch downloads ~3 GB of components)"; Flags: postinstall nowait skipifsilent unchecked
 
 [UninstallDelete]
@@ -101,7 +109,9 @@ procedure InitializeWizard;
 begin
   InstallModePage := CreateInputOptionPage(wpSelectTasks,
     'Installation mode', 'Where should Image Toolbox do the upscaling?',
-    'You can change this later by re-running the installer.',
+    'Remote and Both rent a paid GPU on RunPod, so they need a RunPod account '
+    + 'with credit - if you pick one, the last page can open a sign-up link for '
+    + 'you. You can change this later by re-running the installer.',
     True,   { Exclusive: radio buttons }
     False);
   InstallModePage.Add('Local - upscale on this PC''s NVIDIA GPU (downloads ~3 GB now, AI weights ~16 GB on first run)');
@@ -118,6 +128,13 @@ begin
   else
     Result := 'local';
   end;
+end;
+
+{ Gate the referral [Run] checkbox: only a Remote/Both install needs a RunPod
+  account. Local users never see the sign-up offer. }
+function NeedsRunPodAccount: Boolean;
+begin
+  Result := (InstallModeValue = 'remote') or (InstallModeValue = 'both');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
