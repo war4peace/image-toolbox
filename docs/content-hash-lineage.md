@@ -33,9 +33,9 @@ A lineage is three physical files:
 
 `H0`, `H1`, `H2` are **mutually underivable**:
 
-- **Upscale rewrites and is non-deterministic.** [upscale_engine.py:206](../upscale_engine.py#L206)
+- **Upscale rewrites and is non-deterministic.** [upscale_engine.py:206](../scripts/upscale_engine.py#L206)
   loads via PIL, applies EXIF orientation, runs SeedVR2 with a fresh
-  `random.randint` seed every call ([upscale_engine.py:216](../upscale_engine.py#L216)),
+  `random.randint` seed every call ([upscale_engine.py:223](../scripts/upscale_engine.py#L223)),
   then re-encodes (JPEG q95, etc.). Re-upscaling the *same* source yields a
   *different* `H1`. So `H1 ≠ f(H0)`.
 - **Tag & rename rewrites EXIF in place.** It writes a description into EXIF and

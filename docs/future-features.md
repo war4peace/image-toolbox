@@ -58,20 +58,29 @@ home, the local auto-stop is the proving ground.
   the models** so disposable pods don't re-download ~22 GB each start
   (region-locked — see notes); stream progress (and `DEGRADED`) back over SSH;
   the dead-man's-switch stop path and **cost tracking** above.
-- **Packaging follow-on:** a first-run **install-mode wizard** (Local / Remote /
-  Both) so a GPU-less user gets a lightweight install that skips the local torch
-  (~3 GB) + SeedVR2 weights (~16 GB). Lands *after* the core remote path works,
-  since remote-only requires the pod worker to also handle auto-straighten (no
-  local torch). See `docs/runpod-notes.md`.
+- **Packaging follow-on — DONE (0.3.2).** An **install-mode wizard** (Local /
+  Remote / Both) in the Inno installer writes `install_mode.txt`; `bootstrap.ps1`
+  reads it and a Remote-only install skips the local torch (~3 GB) + SeedVR2
+  engine/weights + timm + Ollama, checking for OpenSSH instead. The GUI already
+  imports `upscale_engine`/torch lazily, so a torch-less install launches; remote
+  auto-straighten runs on the pod worker (`/orient`), and tagging tunnels to
+  Ollama on the pod. See `docs/runpod-notes.md`.
 - **Risks:** the most failure-prone — network drops mid-transfer, partial
   uploads, billed pods left running if auto-stop fails, SSH on Windows, remote
   bootstrap drift. Should be its own milestone.
 
 ### Remote-pod backlog (enhancements on the working core)
 
-The core remote path is implemented and validated on `0.3.1-experimental`
-(create/stream, straighten-on-pod via the worker's `/orient`, pod telemetry, the
-Stop-pod modal, and the dead-man's switch). Captured follow-ups:
+The core remote path shipped in 0.3.1 (create/stream, straighten-on-pod via the
+worker's `/orient`, pod telemetry, the Stop-pod modal, and the dead-man's switch).
+**0.3.2 added the onboarding layer that makes it usable by a non-technical user:**
+zero-config SSH (the app owns an ed25519 key and injects its public half via
+`PUBLIC_KEY`, so no key is registered on the RunPod website — `ssh_setup.py`); a
+**Local / Remote / Both install-mode wizard** in the Inno installer that writes a
+marker `bootstrap.ps1` reads to skip the ~3 GB local GPU stack for Remote-only;
+and **one-click model-volume provisioning** from Settings ("Provision models…" →
+`runpod_provision.py setup-volume`, a create→provision→auto-terminate pod with a
+streamed progress window). Remaining follow-ups:
 
 - **Region from bootstrap.** Ask the user's region during first-run bootstrap and
   use it as the default for both (a) creating the model network volume and (b) the

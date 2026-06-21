@@ -23,6 +23,19 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+# Installation mode picked in the installer (Local / Remote / Both), written to
+# install_mode.txt. Remote-only skips the heavy local GPU stack - PyTorch CUDA,
+# the SeedVR2 engine + weights, timm and Ollama - because upscaling and tagging
+# run on a rented RunPod pod instead. A missing marker means "both", so an
+# in-place upgrade of an existing (full) install keeps doing the full setup.
+$installMode = "both"
+$modeFile = Join-Path $root "install_mode.txt"
+if (Test-Path $modeFile) {
+    try { $installMode = ((Get-Content $modeFile -Raw).Trim().ToLower()) } catch {}
+}
+if (@("local","remote","both") -notcontains $installMode) { $installMode = "both" }
+$remoteOnly = ($installMode -eq "remote")
+
 # Everything shown below is also saved to bootstrap.log for later review.
 try { Start-Transcript -Path (Join-Path $root "bootstrap.log") -Append | Out-Null } catch {}
 
@@ -90,7 +103,11 @@ try {
     Write-Host "=========================================" -ForegroundColor Green
     Write-Host "  Image Toolbox - first-launch setup"      -ForegroundColor Green
     Write-Host "=========================================" -ForegroundColor Green
-    Write-Host "  This one-time setup downloads about 3 GB of components."
+    if ($remoteOnly) {
+        Write-Host "  Remote mode: a small one-time setup (no local GPU stack)."
+    } else {
+        Write-Host "  This one-time setup downloads about 3 GB of components."
+    }
     Write-Host "  Please keep this window open until it finishes."
 
     # -- 1. GPU check (warning only) --------------------------------------
@@ -98,6 +115,8 @@ try {
     $gpu = cmd /c "nvidia-smi -L 2>nul"
     if ($LASTEXITCODE -eq 0 -and $gpu) {
         Write-Host "  Found: $("$gpu".Trim() -split "`n" | Select-Object -First 1)"
+    } elseif ($remoteOnly) {
+        Write-Host "  No local NVIDIA GPU - fine for Remote mode (the GPU work runs on the pod)."
     } else {
         Write-Host "  WARNING: No NVIDIA GPU detected. The Batch Upscaler" -ForegroundColor Yellow
         Write-Host "  requires an NVIDIA GPU with current drivers."        -ForegroundColor Yellow
@@ -132,7 +151,9 @@ try {
 
     # -- 4. SeedVR2 engine ----------------------------------------------------
     Step "Downloading the SeedVR2 upscaling engine"
-    if (Test-Path "seedvr2\inference_cli.py") {
+    if ($remoteOnly) {
+        Write-Host "  Skipped (Remote mode - the engine runs on the pod)."
+    } elseif (Test-Path "seedvr2\inference_cli.py") {
         Write-Host "  Already present - keeping it."
     } else {
         $zip = Join-Path $env:TEMP "seedvr2.zip"
@@ -145,14 +166,40 @@ try {
     }
 
     # -- 5. Python packages ---------------------------------------------------
-    Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
-    Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
-    Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
+    if ($remoteOnly) {
+        # No local GPU stack: the GUI needs only Pillow (display/comparison),
+        # piexif and paho-mqtt. torch / SeedVR2 / timm all live on the pod.
+        Step "Installing the lightweight components (Remote mode - no local GPU stack)"
+        Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
+        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt")
+    } else {
+        Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
+        Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
+        Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
-    Step "Installing the remaining components"
-    Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt")
+        Step "Installing the remaining components"
+        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt")
+    }
+
+    # -- 5b. OpenSSH (Remote mode reaches the pod over SSH) -------------------
+    if ($remoteOnly) {
+        Step "Checking for the OpenSSH client (used to reach the remote pod)"
+        $sshCmd = Get-Command ssh -ErrorAction SilentlyContinue
+        if ($sshCmd) {
+            Write-Host "  Found: $($sshCmd.Source)"
+        } else {
+            Write-Host "  WARNING: OpenSSH client not found." -ForegroundColor Yellow
+            Write-Host "  Enable it via Settings > Apps > Optional features > 'OpenSSH Client'." -ForegroundColor Yellow
+            Write-Host "  (The app can also generate its SSH key for you once OpenSSH is present.)" -ForegroundColor Yellow
+        }
+    }
 
     # -- 6. Ollama (optional - powers the Tag & Rename feature) ---------------
+    # Remote mode tags via Ollama running ON the pod (reached over an SSH tunnel),
+    # so no local Ollama is installed here.
+    if ($remoteOnly) {
+        Step "Skipping Ollama (Remote mode - Tag & Rename uses Ollama on the pod)"
+    } else {
     Step "Checking for Ollama (used by the Tag & Rename feature)"
     $ollamaExe = Find-Ollama
     if ($ollamaExe) {
@@ -225,6 +272,7 @@ try {
                 Write-Host "  Skipped. You can download it later with:  ollama pull $model"
             }
         }
+    }
     }
 
     # -- Done -------------------------------------------------------------------

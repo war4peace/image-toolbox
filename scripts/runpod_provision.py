@@ -27,6 +27,7 @@ import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runpod_client as rp
+import ssh_setup
 
 APP_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG     = os.path.join(APP_ROOT, "config.json")
@@ -88,7 +89,9 @@ def _ssh_opts(key, port):
 def _ssh(host, port, key, command, check=True):
     args = ["ssh", *_ssh_opts(key, port), f"root@{host}", command]
     print(f"  $ ssh root@{host} -p {port}  [{command[:80]}{'...' if len(command) > 80 else ''}]")
-    return subprocess.run(args, check=check)
+    # stdin=DEVNULL: when this runs as a GUI subprocess its stdin is a pipe;
+    # ssh would inherit and block on it. The remote commands never read it.
+    return subprocess.run(args, check=check, stdin=subprocess.DEVNULL)
 
 
 def _scp(host, port, key, local, remote):
@@ -98,7 +101,7 @@ def _scp(host, port, key, local, remote):
             "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
             local, f"root@{host}:{remote}"]
     print(f"  $ scp {os.path.basename(local)} -> root@{host}:{remote}")
-    return subprocess.run(args, check=True)
+    return subprocess.run(args, check=True, stdin=subprocess.DEVNULL)
 
 
 def _endpoint_or_die(rpc):
@@ -138,6 +141,11 @@ def cmd_create(rpc, args):
         "containerDiskInGb": int(rpc.get("container_disk_gb", 30)),
         "ports":             ["22/tcp"],
     }
+    # Hand the app's public key to the pod (RunPod appends $PUBLIC_KEY to
+    # authorized_keys at boot) so SSH works without registering it on the account.
+    pub = ssh_setup.read_public_key(_ssh_key_path(rpc))
+    if pub:
+        spec["env"] = {"PUBLIC_KEY": pub}
     print(f"Creating pod: {gpu} in {region}, volume {vol_id}, image {image}")
     print("  *** this STARTS BILLING - remember to 'terminate' when done ***")
 
@@ -354,9 +362,93 @@ def cmd_terminate(rpc, args):
         _clear_state()
 
 
+def cmd_setup_volume(rpc, args):
+    """One-shot model-volume provisioning for the GUI 'Provision models' button:
+    create a fresh pod, run pod/provision.sh to fill the network volume (~22 GB:
+    SeedVR2 + Ollama + venv), then ALWAYS terminate the pod — even on error or
+    Ctrl-C — so a provisioning pod is never left billing. Streams progress to
+    stdout (the GUI shows it live). The on-pod dead-man's switch is not used here
+    because this process owns the teardown in a finally."""
+    key = rpc["api_key"]
+    vol_id = rpc.get("network_volume_id", "").strip()
+    if not vol_id:
+        sys.exit("No model volume selected (Settings → Remote upscaling → Create…).")
+    region = rp.volume_region(key, vol_id)
+    if not region:
+        sys.exit(f"Could not read the data center of volume {vol_id}.")
+    if not os.path.exists(PROVISION_SH):
+        sys.exit(f"Missing {PROVISION_SH}")
+
+    # Ensure the app's SSH key exists and grab its public half for PUBLIC_KEY.
+    try:
+        kp, pub, _created = ssh_setup.ensure_keypair(
+            os.path.expandvars(rpc.get("ssh_key_path", "")) or None)
+    except ssh_setup.SshSetupError as exc:
+        sys.exit(f"SSH setup failed: {exc}")
+
+    image = rpc.get("image_name") or DEFAULT_IMAGE
+    gpu   = rpc.get("gpu_type_id", "NVIDIA GeForce RTX 5090")
+    spec = {
+        "name":              "image-toolbox-provision",
+        "imageName":         image,
+        "gpuTypeIds":        [gpu],
+        "gpuCount":          1,
+        "cloudType":         "SECURE",
+        "dataCenterIds":     [region],
+        "networkVolumeId":   vol_id,
+        "containerDiskInGb": int(rpc.get("container_disk_gb", 30)),
+        "ports":             ["22/tcp"],
+    }
+    if pub:
+        spec["env"] = {"PUBLIC_KEY": pub}
+
+    print(f"Provisioning the model volume {vol_id} in {region}.", flush=True)
+    print(f"  GPU {gpu}, image {image}. This downloads ~22 GB to the volume and", flush=True)
+    print("  can take 10-20 minutes. The pod is terminated automatically when done.", flush=True)
+    print("  *** a pod is now BILLING until provisioning finishes ***", flush=True)
+
+    def on_event(kind, attempt, pod_id, info):
+        if kind == "created":
+            _save_state({"pod_id": pod_id, "created_at": time.time(),
+                         "region": region, "gpu": gpu})
+            print(f"  [attempt {attempt}] created pod {pod_id}; waiting for RUNNING + SSH …", flush=True)
+        elif kind == "status":
+            s, h, p = info
+            print(f"    status={s} ssh={h}:{p}", flush=True)
+        elif kind == "bad":
+            print(f"  [attempt {attempt}] pod {pod_id} did not deploy ({info}) — retrying", flush=True)
+        elif kind == "giveup":
+            print(f"  gave up after {attempt} attempt(s): {info}", flush=True)
+
+    pod_id = None
+    try:
+        pod = rp.create_pod_resilient(key, spec, attempts=3, deploy_timeout=240,
+                                      poll=8, on_event=on_event)
+        pod_id = pod.get("id")
+        host, port = rp.ssh_endpoint(pod)
+        if not host:
+            sys.exit("Pod became ready but published no SSH endpoint.")
+        _scp(host, port, kp, PROVISION_SH, "/root/provision.sh")
+        dit = rpc.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
+        env = (f"DIT_MODEL='{os.environ.get('DIT_MODEL', dit)}' "
+               f"OLLAMA_MODEL='{os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:7b')}'")
+        print("Running provision.sh on the pod …", flush=True)
+        res = _ssh(host, port, kp, f"{env} bash /root/provision.sh", check=False)
+        if res.returncode != 0:
+            sys.exit(f"provision.sh failed (exit {res.returncode}). The pod will still be terminated.")
+        print("Provisioning complete — the model volume is ready.", flush=True)
+    finally:
+        if pod_id:
+            print("Terminating the provisioning pod …", flush=True)
+            ok, msg = rp.ensure_stopped(key, pod_id, terminate=True)
+            print("  " + msg, flush=True)
+            if ok:
+                _clear_state()
+
+
 COMMANDS = {
     "create": cmd_create, "status": cmd_status, "probe": cmd_probe,
-    "provision": cmd_provision, "smoke": cmd_smoke,
+    "provision": cmd_provision, "smoke": cmd_smoke, "setup-volume": cmd_setup_volume,
     "worker": cmd_worker, "bench": cmd_bench, "ssh": cmd_ssh,
     "terminate": cmd_terminate, "stop": cmd_terminate,
 }

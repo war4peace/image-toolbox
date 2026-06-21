@@ -87,3 +87,44 @@ Type: filesandordirs; Name: "{app}\pod"
 Type: files; Name: "{app}\.setup_complete"
 Type: files; Name: "{app}\gui_settings.json"
 Type: files; Name: "{app}\bootstrap.log"
+Type: files; Name: "{app}\install_mode.txt"
+
+[Code]
+{ Install-mode wizard page (#1 remote onboarding): lets the user pick whether the
+  app upscales locally, on a rented RunPod pod, or both. The choice is written to
+  install_mode.txt, which bootstrap.ps1 reads to decide what to download — Remote
+  skips the ~3 GB local GPU stack (PyTorch CUDA + SeedVR2 + Ollama). }
+var
+  InstallModePage: TInputOptionWizardPage;
+
+procedure InitializeWizard;
+begin
+  InstallModePage := CreateInputOptionPage(wpSelectTasks,
+    'Installation mode', 'Where should Image Toolbox do the upscaling?',
+    'You can change this later by re-running the installer.',
+    True,   { Exclusive: radio buttons }
+    False);
+  InstallModePage.Add('Local - upscale on this PC''s NVIDIA GPU (downloads ~3 GB now, AI weights ~16 GB on first run)');
+  InstallModePage.Add('Remote - upscale on a rented RunPod GPU (lightweight; no local GPU or large downloads needed)');
+  InstallModePage.Add('Both - local and remote (full install)');
+  InstallModePage.SelectedValueIndex := 0;
+end;
+
+function InstallModeValue: String;
+begin
+  case InstallModePage.SelectedValueIndex of
+    1: Result := 'remote';
+    2: Result := 'both';
+  else
+    Result := 'local';
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  { Write the marker after files are copied so bootstrap (run on first launch)
+    can read it. Rewritten on every (re)install, so changing the mode is just a
+    reinstall. }
+  if CurStep = ssPostInstall then
+    SaveStringToFile(ExpandConstant('{app}\install_mode.txt'), InstallModeValue, False);
+end;

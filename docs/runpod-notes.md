@@ -8,14 +8,18 @@ the parts that are still worth reusing when remote-pod support is rebuilt.
 
 ## Open items / TODO
 
-- **SSH onboarding for non-technical users.** The remote flow needs an SSH
-  keypair on the user's machine and its public key on the RunPod account. Today
-  that is manual. Plan: (a) **bundle / ensure OpenSSH** (Windows 10/11 ship it,
-  but it can be absent/disabled — detect and guide, or carry a portable copy);
-  (b) an in-app **"Set up RunPod SSH"** button that generates the keypair
-  (`ssh-keygen -t ed25519`) if missing, shows the public key with a copy button,
-  and links straight to the RunPod SSH-keys page — or, if the REST API exposes an
-  SSH-key endpoint, **adds it to the account automatically** (investigate).
+- **SSH onboarding for non-technical users — DONE (0.3.2, zero-config).** The app
+  now owns a dedicated ed25519 key (`scripts/ssh_setup.py`): it locates OpenSSH
+  (Windows 10/11 optional feature; detected + guided if absent), generates the key
+  on demand (Settings → "Set up SSH key", and auto-ensured in the remote-run
+  preflight), and hands its **public half to every pod via the `PUBLIC_KEY` env
+  var** — RunPod's base images append it to `authorized_keys` at boot, so **no key
+  is ever registered on the RunPod website** and `ssh_key_path` needn't be edited
+  (empty → the managed default). Verified live: SSH connected first try on the
+  production image with only `PUBLIC_KEY`, no account key. The old plan's manual
+  "show the key + link to the RunPod SSH page" step was dropped — `PUBLIC_KEY`
+  makes it unnecessary. (RunPod also honours an `SSH_PUBLIC_KEY` override for
+  custom-command images; we use `PUBLIC_KEY`, which the pytorch base image reads.)
 - **Pod cold-start is slow — mostly network-volume read throughput.** The ~239 s
   engine load is dominated by reading the 16 GB DiT from the **network volume**
   (NFS-like, far slower than local NVMe) plus a hash-validation pass that reads it

@@ -70,6 +70,7 @@ import mqtt_publisher
 import system_telemetry
 import taskbar_progress
 import runpod_client
+import ssh_setup
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -82,7 +83,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -2317,6 +2318,14 @@ class UpscaleTab(ToolTab):
                     "Remote upscaling needs a RunPod API key and a model volume.\n"
                     "Set them in Settings → Remote upscaling (RunPod).")
                 return
+            # Zero-config SSH: make sure the app's key exists before we create a
+            # pod (the pod trusts its public half via PUBLIC_KEY). Auto-generates
+            # on first remote run so the user needn't have opened Settings.
+            ok_ssh, ssh_info = ssh_setup.setup(
+                os.path.expandvars(rp.get("ssh_key_path", "")) or None)
+            if not ok_ssh:
+                messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
+                return
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run this batch on a rented RunPod GPU?\n\n"
@@ -2981,11 +2990,11 @@ class SettingsTab(ttk.Frame):
         desc = ttk.Frame(sec)
         desc.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
         ttk.Label(desc, wraplength=560, foreground="#666",
-                  text=("Groundwork for upscaling on a rented RunPod GPU (roadmap "
-                        "#1). The API key authenticates the pod control plane; the "
-                        "auto-stop / runtime limits below are the safety net that "
-                        "keeps a billed pod from being left running. Not yet wired "
-                        "to a run.")
+                  text=("Upscale on a rented RunPod GPU (roadmap #1) — tick "
+                        "'Run on remote pod' on the Batch Upscaler tab. The API "
+                        "key authenticates the pod control plane; the auto-stop / "
+                        "runtime limits below are the safety net that keeps a "
+                        "billed pod from being left running.")
                   ).pack(anchor="w")
         key_link = tk.Label(desc, text="Get a RunPod API key →", fg="#3a86ff",
                             cursor="hand2", font=("Segoe UI", 9, "underline"))
@@ -2997,6 +3006,23 @@ class SettingsTab(ttk.Frame):
         Tooltip(key_link,
                 "Opens the RunPod console (Settings → API Keys → Create API Key). "
                 f"Docs: {runpod_client.DOCS_API_KEYS_URL}")
+
+        # Zero-config SSH: the app owns a dedicated key and hands its public half
+        # to every pod via PUBLIC_KEY, so the user never runs ssh-keygen or pastes
+        # a key into the RunPod website. The button generates/locates it on demand;
+        # a run also auto-ensures it, so this is a convenience, not a prerequisite.
+        ssh_row = ttk.Frame(desc)
+        ssh_row.pack(anchor="w", pady=(6, 0))
+        self.runpod_ssh_btn = ttk.Button(ssh_row, text="Set up SSH key",
+                                         command=self._setup_ssh)
+        self.runpod_ssh_btn.pack(side="left")
+        self.runpod_ssh_status = ttk.Label(ssh_row, text="", foreground="#666")
+        self.runpod_ssh_status.pack(side="left", padx=(8, 0))
+        Tooltip(self.runpod_ssh_btn,
+                "Generates the dedicated SSH key the app uses to reach rented "
+                "pods (one-time). Its public half is sent to each pod "
+                "automatically — you never paste a key into the RunPod website.")
+        self._refresh_ssh_status()
 
         ttk.Label(sec, text="API key:").grid(row=1, column=0, sticky="w", pady=3)
         self.runpod_key_var = tk.StringVar(value=rp.get("api_key", ""))
@@ -3056,6 +3082,11 @@ class SettingsTab(ttk.Frame):
         del_btn.pack(side="left", padx=(4, 0))
         Tooltip(del_btn, "Permanently delete the selected network volume AND all "
                          "models stored on it. Asks for confirmation first.")
+        prov_btn = ttk.Button(vol, text="Provision models…", command=self._provision_models)
+        prov_btn.pack(side="left", padx=(12, 0))
+        Tooltip(prov_btn, "One-time: fill the selected volume with the models "
+                          "(SeedVR2 + Ollama) by briefly renting a pod. ~10-20 min; "
+                          "the pod is terminated automatically when finished.")
 
         safety = ttk.Frame(sec)
         safety.grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
@@ -3450,6 +3481,143 @@ class SettingsTab(ttk.Frame):
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _effective_ssh_key(self):
+        """The key path a run will use: the configured one, else the app default."""
+        return (os.path.expandvars(CFG.get("runpod", {}).get("ssh_key_path", ""))
+                or ssh_setup.default_key_path())
+
+    def _refresh_ssh_status(self):
+        """Reflect the current SSH-key state without generating anything."""
+        if ssh_setup.read_public_key(self._effective_ssh_key()):
+            self.runpod_ssh_status.configure(text="SSH key ready ✓", foreground="#1a7f37")
+            return
+        ok, _ssh, _kg, _msg = ssh_setup.ssh_available()
+        if ok:
+            self.runpod_ssh_status.configure(text="No key yet — click to set up.",
+                                             foreground="#666")
+        else:
+            self.runpod_ssh_status.configure(
+                text="OpenSSH not found — enable it in Windows Optional features.",
+                foreground="#b3261e")
+
+    def _setup_ssh(self):
+        """Generate (or locate) the app's dedicated SSH key off the UI thread."""
+        self.runpod_ssh_btn.configure(state="disabled")
+        self.runpod_ssh_status.configure(text="Setting up SSH…", foreground="#666")
+        # Use the configured path if any; ensure_keypair falls back to the default.
+        key_path = os.path.expandvars(CFG.get("runpod", {}).get("ssh_key_path", "")) or None
+
+        def work():
+            ok, info = ssh_setup.setup(key_path)
+            def apply():
+                self.runpod_ssh_btn.configure(state="normal")
+                self.runpod_ssh_status.configure(
+                    text=info.get("message", ""),
+                    foreground="#1a7f37" if ok else "#b3261e")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _provision_models(self):
+        """One-time model-volume provisioning: launch runpod_provision.py
+        setup-volume (create pod → fill the volume → auto-terminate) and stream
+        its progress in a window. Reads config.json, so settings must be saved."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        if not self._selected_volume_id():
+            self.runpod_status.configure(text="Select or create a model volume first.",
+                                         foreground="#b3261e")
+            return
+        # setup-volume reads config.json, not the live form — persist edits first.
+        if self.is_dirty():
+            if not messagebox.askokcancel(
+                    APP_TITLE, "Provisioning reads your saved settings. Save the "
+                               "current changes now and continue?"):
+                return
+            if not self._save():
+                return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "Provision the model volume now?\n\n"
+                "This briefly rents a BILLED pod, downloads ~22 GB of models "
+                "(SeedVR2 + Ollama) onto the selected volume, and terminates the "
+                "pod automatically when done — usually 10-20 minutes. You only "
+                "need to do this once per volume.\n\nProceed?"):
+            return
+        self._stream_provision()
+
+    def _stream_provision(self):
+        """Run the setup-volume subprocess and stream its output into a window."""
+        win = tk.Toplevel(self)
+        win.title("Provisioning the model volume")
+        win.geometry("780x460")
+        body = ttk.Frame(win, padding=8)
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, wrap="word", font=("Consolas", 9), state="disabled")
+        sb = ttk.Scrollbar(body, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        def append(s):
+            txt.configure(state="normal")
+            txt.insert("end", s)
+            txt.see("end")
+            txt.configure(state="disabled")
+
+        cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "runpod_provision.py"),
+               "setup-volume"]
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=APP_ROOT, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=CREATE_NO_WINDOW, env=env)
+        except Exception as exc:
+            append(f"Could not start provisioning: {exc}\n")
+            return
+
+        q = queue.Queue()
+
+        def reader():
+            dec = codecs.getincrementaldecoder("utf-8")("replace")
+            for chunk in iter(lambda: proc.stdout.read1(4096), b""):
+                q.put(dec.decode(chunk))
+            q.put(None)
+
+        def pump():
+            done = False
+            while True:
+                try:
+                    item = q.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    done = True
+                    break
+                append(item)
+            if done:
+                code = proc.wait()
+                append(f"\n--- finished (exit {code}) ---\n")
+                if code == 0:
+                    self.runpod_status.configure(
+                        text="Model volume provisioned — remote upscaling is ready.",
+                        foreground="#1a7f37")
+                else:
+                    self.runpod_status.configure(
+                        text="Provisioning failed — see the window for details.",
+                        foreground="#b3261e")
+            else:
+                win.after(80, pump)
+
+        threading.Thread(target=reader, daemon=True).start()
+        win.after(80, pump)
 
     def _pick_folder(self, var):
         folder = filedialog.askdirectory(title="Choose a folder")

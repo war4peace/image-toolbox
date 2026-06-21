@@ -184,6 +184,25 @@ since their traceback already reaches the GUI log pane via stderr. Stdlib only.
 needs an elevated, registered source and the app runs non-elevated.) See
 `crash_logger.py`.
 
+**Remote upscaling (RunPod)** (0.3.1, experimental; onboarding 0.3.2) — runs the
+batch on a **rented RunPod GPU** for users without a strong local GPU (or whose
+GPU hit the degradation bug). Tick "Run on remote pod" on the Batch Upscaler tab:
+the app creates a disposable pod, streams **one image at a time** to a resident
+on-pod worker that loads SeedVR2 once, fetches each result back, and tears the pod
+down — the queue, resume-cache, film-strip and watchdog all stay local; the source
+is never touched (only a copy is uploaded). A **dead-man's switch** on the pod
+(max-runtime + idle-timeout) guarantees a billed pod can't be left running even if
+the connection drops. Models live on a **region-locked network volume** (written
+once, mounted on every pod). Auto-straighten runs **on the pod** (worker `/orient`)
+so the local side needs no torch; a second **telemetry row** shows the pod's
+CPU/RAM/VRAM/temp during a run. **0.3.2 made it usable by a non-technical user:**
+**zero-config SSH** (the app owns an ed25519 key and injects its public half via
+`PUBLIC_KEY` — no key on the RunPod website, no `config.json` editing; Settings →
+"Set up SSH key"), a **Local / Remote / Both install-mode wizard** (Remote-only
+installs skip the ~3 GB local GPU stack), and **one-click model-volume
+provisioning** (Settings → "Provision models…"). See the remote-pod module cluster
+below and `docs/runpod-notes.md` / `docs/future-features.md` #1.
+
 ## Codebase structure
 
 The app's Python modules live in **`scripts/`** (0.2.8 — previously the repo
@@ -206,14 +225,19 @@ counts give a sense of weight:
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 | `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |
 | `taskbar_progress.py` (~170 lines) | Windows taskbar progress bar (0.3.0). `TaskbarProgress` wraps the shell `ITaskbarList3` COM interface **driven straight from ctypes** (manual GUID + vtable calls — no comtypes/pywin32, no new dependency), painting run progress onto the app's taskbar button: `set_progress(done, total)` (green fill), `set_state("indeterminate"/"error"/"none")`, `clear()`. Windows-only, fail-safe (disables itself on any COM failure); all calls come from the GUI/UI thread. Driven via `App.taskbar_*`. |
+| **Remote-pod (#1) cluster** (`runpod_client.py`, `remote_run.py`, `remote_upscale_engine.py`, `runpod_provision.py`, `ssh_setup.py`; plus `pod/worker.py`, `pod/deadman.py`, `pod/provision.sh`) | Remote upscaling on a rented RunPod GPU (shipped 0.3.1; onboarding in 0.3.2). `runpod_client` = stdlib REST control plane (create/start/stop/terminate/inspect pods + network volumes). `remote_run.RemoteSession` orchestrates a run (create→push→start worker→arm dead-man's switch→stream→teardown); `remote_upscale_engine.RemoteUpscaleEngine` is a drop-in for `UpscaleEngine` that streams one image per HTTP request over `ssh -L`. `pod/worker.py` is the resident on-pod worker (loads SeedVR2 once; serves `/upscale`, `/orient`, `/telemetry`, `/health`). **`ssh_setup.py` (0.3.2)** = zero-config SSH: locates OpenSSH, generates the app's ed25519 key, reads its public half — handed to each pod via the `PUBLIC_KEY` env so SSH needs no key registered on the RunPod website. `runpod_provision.py` is the dev driver + the GUI's `setup-volume` one-shot (create→provision the model volume→auto-terminate). All stdlib + the Windows OpenSSH client; the GUI launches these as subprocesses / background threads. |
 
 Configuration & state:
 
 - `config.json` — persistent settings: `seedvr2`, `ollama`, `upscale`,
-  `tagging`, `defaults`, `mqtt`, `updates` sections. Edited via the Settings tab;
-  preserved across installer upgrades. **Don't hand-edit in normal flow**, and
-  the tracked copy is a credential-free template — never commit real `mqtt`
-  broker credentials.
+  `tagging`, `defaults`, `mqtt`, `updates`, `runpod` sections. Edited via the
+  Settings tab; preserved across installer upgrades. **Don't hand-edit in normal
+  flow**, and the tracked copy is a credential-free template — never commit real
+  `mqtt` broker credentials or the `runpod` API key. `runpod.ssh_key_path` may be
+  left blank — the app falls back to its managed key (`ssh_setup.default_key_path`).
+- `install_mode.txt` — written by the installer (Local / Remote / Both). Read once
+  by `bootstrap.ps1` to decide what to download; a Remote-only install skips the
+  local GPU stack (torch CUDA + SeedVR2 + Ollama). Missing = "both" (upgrade-safe).
 - `gui_settings.json` — GUI-only state (window geometry, thumbnail size).
 - `db/cache.db` — the single SQLite cache (eligibility + tag/rename), see
   `db.py`. **This replaces the old per-folder JSON caches.** The legacy `scans/`

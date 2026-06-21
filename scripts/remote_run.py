@@ -25,6 +25,7 @@ import tempfile
 import subprocess
 
 import runpod_client as rp
+import ssh_setup
 from remote_upscale_engine import RemoteUpscaleEngine
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
@@ -47,7 +48,14 @@ class RemoteSession:
         self.upscale_cfg = upscale_cfg
         self.app_root = app_root
         self.api_key = runpod_cfg.get("api_key", "")
-        self.key_path = os.path.expandvars(runpod_cfg.get("ssh_key_path", ""))
+        # Empty/unset ssh_key_path → the app's managed default key, so a user who
+        # never touched config.json still has a usable key (zero-config, #1).
+        self.key_path = (os.path.expandvars(runpod_cfg.get("ssh_key_path", ""))
+                         or ssh_setup.default_key_path())
+        # Public half of the app's key — handed to the pod via PUBLIC_KEY so SSH
+        # works without the user registering it on the RunPod website (zero-config
+        # onboarding, #1). None falls back to account-level keys (back-compat).
+        self.public_key = ssh_setup.read_public_key(self.key_path) if self.key_path else None
         self.worker_port = int(runpod_cfg.get("worker_port", 8200))
         self.terminate_when_done = bool(runpod_cfg.get("terminate_when_done", True))
         self.on_event = on_event or (lambda *a: None)
@@ -161,6 +169,11 @@ class RemoteSession:
             "containerDiskInGb": int(self.cfg.get("container_disk_gb", 30)),
             "ports": ["22/tcp"],
         }
+        # Inject the app's public key so the pod trusts it at boot (RunPod base
+        # images append $PUBLIC_KEY to authorized_keys) — no account-level
+        # registration needed. Additive: account keys still work too.
+        if self.public_key:
+            spec["env"] = {"PUBLIC_KEY": self.public_key}
         self._emit(f"Creating pod ({spec['gpuTypeIds'][0]} in {region}) …")
 
         def ev(kind, attempt, pod_id, info):

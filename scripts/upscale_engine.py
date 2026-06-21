@@ -213,7 +213,14 @@ class UpscaleEngine:
         and appended to log_sink instead, unless debug=True.
         """
         self.args.resolution = int(resolution)
-        self.args.seed       = random.randint(0, 2**32 - 1)
+        # Cap the seed at 2**31-1, not 2**32-1: the SeedVR2 engine internally
+        # derives the VAE seed as `seed + 1000000` (generation_phases.py) and
+        # feeds it to numpy's np.random.seed(), which rejects anything above
+        # 2**32-1. A draw in the top 1,000,000 of the full 32-bit range used to
+        # overflow that and fail the image ("Seed must be between 0 and
+        # 2**32 - 1"). 2**31-1 still gives 2.1 billion distinct seeds with
+        # billions of headroom for any internal offset.
+        self.args.seed       = random.randint(0, 2**31 - 1)
 
         if self.debug:
             frames = self._load_image(src_path)
