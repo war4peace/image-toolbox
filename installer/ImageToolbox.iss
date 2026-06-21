@@ -38,6 +38,12 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; crash_logger.py missing). Non-recursive, so the vendored seedvr2\ tree and
 ; tools\ are not swept in.
 Source: "..\scripts\*.py";        DestDir: "{app}\scripts"; Flags: ignoreversion
+; Remote-upscaling (#1) pod-side code: worker.py / deadman.py are SCP'd to the
+; RunPod pod at runtime, provision.sh fills the model volume. provision.sh must
+; stay LF (the .gitattributes rule keeps it LF; Inno ships byte-for-byte).
+; Non-recursive, so pod\__pycache__ is not swept in.
+Source: "..\pod\*.py";            DestDir: "{app}\pod"; Flags: ignoreversion
+Source: "..\pod\*.sh";            DestDir: "{app}\pod"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
@@ -77,6 +83,7 @@ Type: filesandordirs; Name: "{app}\__pycache__"
 ; The modules live in scripts\ (0.2.8); remove the folder and its runtime
 ; __pycache__ (the shipped .py are removed by their [Files] entry anyway).
 Type: filesandordirs; Name: "{app}\scripts"
+Type: filesandordirs; Name: "{app}\pod"
 Type: files; Name: "{app}\.setup_complete"
 Type: files; Name: "{app}\gui_settings.json"
 Type: files; Name: "{app}\bootstrap.log"
