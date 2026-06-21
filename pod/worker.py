@@ -88,7 +88,47 @@ def _sample_cpu():
 
 
 def _sample_ram():
-    """(used_mb, total_mb) from /proc/meminfo."""
+    """(used_mb, total_mb) for THIS pod. Prefer the cgroup memory limit/usage —
+    the container's own slice — so the % means a real fraction of the pod's RAM
+    and matches the RunPod dashboard; fall back to host-wide /proc/meminfo only
+    when no cgroup limit is set.
+
+    Why: /proc/meminfo is NOT container-namespaced — inside a pod it reports the
+    physical HOST's RAM and host-wide usage, over-reporting both total and used.
+    cgroup v2 is memory.current/memory.max; v1 is
+    memory.usage_in_bytes/memory.limit_in_bytes (a huge sentinel == unlimited).
+    'used' is the working set (usage minus reclaimable page cache, from
+    memory.stat) — the basis container dashboards report."""
+    MB = 1024 * 1024
+    for usage_p, limit_p, stat_p in (
+            ("/sys/fs/cgroup/memory.current",
+             "/sys/fs/cgroup/memory.max",
+             "/sys/fs/cgroup/memory.stat"),
+            ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+             "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+             "/sys/fs/cgroup/memory/memory.stat")):
+        try:
+            raw = open(limit_p).read().strip()
+            if raw == "max":                         # v2: no limit set
+                continue
+            limit = int(raw)
+            if limit <= 0 or limit >= (1 << 62):     # v1 unlimited sentinel
+                continue
+            usage = int(open(usage_p).read().strip())
+        except (OSError, ValueError):
+            continue
+        stat = {}
+        try:
+            for line in open(stat_p):
+                p = line.split()
+                if len(p) >= 2:
+                    stat[p[0]] = p[1]
+        except OSError:
+            pass
+        inactive = int(stat.get("total_inactive_file", stat.get("inactive_file", 0)))
+        used = max(0, usage - inactive)
+        return used // MB, limit // MB
+    # No cgroup limit — fall back to host-wide /proc/meminfo.
     try:
         info = {}
         with open("/proc/meminfo") as f:
