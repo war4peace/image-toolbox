@@ -1361,13 +1361,23 @@ class ToolTab(ttk.Frame):
         self.console.feed(f"[remote] GPU availability check failed: {exc}\n")
 
     def _fallback_ceiling(self):
-        """Max $/h an AUTOMATIC fallback GPU may cost. 0 / unset = no cap. The
-        default ($0.50) stops a sold-out cheap card from silently escalating the
-        chain to a $1.49+ A100. The user's own explicit pick is never capped."""
+        """Max $/h an AUTOMATIC fallback GPU may cost. 0 / unset = no cap. Stops a
+        sold-out cheap card from silently escalating the chain to an expensive one.
+        The user's own explicit pick is never capped.
+
+        The ceiling is PER TASK (benchmarks, 2026-06): tagging runs fine on $0.24
+        cards so its cap stays low ($0.50), but the cheapest viable *upscale* card
+        is ~$0.74 — a single $0.50 cap left upscaling with no fallback at all — so
+        the upscale cap defaults to $1.10 (covers the RTX 5090 sweet spot, still
+        blocks a runaway A100/B200). Each tab sets `_gpu_price_key`/`_gpu_price_default`.
+        The pre-0.3.4 single `max_price_per_hour` key is deprecated and ignored."""
+        key     = getattr(self, "_gpu_price_key", "max_price_per_hour_tag")
+        default = getattr(self, "_gpu_price_default", 0.50)
         try:
-            return float(CFG.get("runpod", {}).get("max_price_per_hour", 0.50) or 0)
+            raw = CFG.get("runpod", {}).get(key)
+            return float((raw if raw is not None else default) or 0)
         except (TypeError, ValueError):
-            return 0.50
+            return default
 
     def _selected_gpu_chain(self):
         """The picked GPU id followed by the other in-stock ids (cheapest-first,
@@ -2366,6 +2376,11 @@ class UpscaleTab(ToolTab):
         # the persisted preference is runpod.gpu_type_id.
         self._gpu_min_vram = 32
         self._gpu_pref_key = "gpu_type_id"
+        # Upscale fallback ceiling: the cheapest viable 32 GB card is ~$0.74, so a
+        # $0.50 cap would leave upscaling with no automatic fallback (see
+        # _fallback_ceiling). $1.10 covers the RTX 5090 value pick, blocks A100/B200.
+        self._gpu_price_key     = "max_price_per_hour_upscale"
+        self._gpu_price_default = 1.10
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
@@ -2730,6 +2745,10 @@ class TagTab(ToolTab):
         # is plenty; the persisted preference is runpod.tag_gpu_type_id.
         self._gpu_min_vram = 16
         self._gpu_pref_key = "tag_gpu_type_id"
+        # Tag fallback ceiling: tagging runs fine on $0.24–0.39 cards, so a low cap
+        # keeps a sold-out cheap card from escalating to a pricey one.
+        self._gpu_price_key     = "max_price_per_hour_tag"
+        self._gpu_price_default = 0.50
         self.scope_var  = tk.StringVar(value=UNDO_SCOPES[0][0])
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
@@ -3407,18 +3426,32 @@ class SettingsTab(ttk.Frame):
         Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
                            "completion notification.")
 
-        ttk.Label(sec, text="Max fallback (USD/h):").grid(
-            row=2, column=2, sticky="e", padx=6, pady=3)
-        self.runpod_maxprice_var = tk.StringVar(
-            value=str(rp.get("max_price_per_hour", 0.50)))
-        maxprice_spin = ttk.Spinbox(sec, from_=0.0, to=100.0, increment=0.10, width=8,
-                                    format="%.2f", textvariable=self.runpod_maxprice_var)
-        maxprice_spin.grid(row=2, column=3, sticky="w", padx=6, pady=3)
-        Tooltip(maxprice_spin,
-                "Cost guardrail. When your picked GPU is sold out, only cheaper "
-                "in-stock GPUs at or below this hourly price are tried "
-                "automatically — so a run can't silently escalate to an expensive "
-                "card. Your own explicit pick is never capped. 0 = no limit.")
+        # Cost guardrail — the automatic-fallback price ceiling, split PER TASK:
+        # tagging runs on $0.24 cards (cap stays low), but the cheapest viable
+        # upscale card is ~$0.74, so a shared $0.50 cap left upscaling with no
+        # fallback — see _fallback_ceiling. Both on one inline row.
+        price = ttk.Frame(sec)
+        price.grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=3)
+        ttk.Label(price, text="Max fallback — upscale:").grid(row=0, column=0, sticky="e")
+        self.runpod_maxprice_up_var = tk.StringVar(
+            value=str(rp.get("max_price_per_hour_upscale", 1.10)))
+        up_spin = ttk.Spinbox(price, from_=0.0, to=100.0, increment=0.10, width=7,
+                              format="%.2f", textvariable=self.runpod_maxprice_up_var)
+        up_spin.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        ttk.Label(price, text="tag:").grid(row=0, column=2, sticky="e", padx=(10, 0))
+        self.runpod_maxprice_tag_var = tk.StringVar(
+            value=str(rp.get("max_price_per_hour_tag", 0.50)))
+        tag_spin = ttk.Spinbox(price, from_=0.0, to=100.0, increment=0.10, width=7,
+                               format="%.2f", textvariable=self.runpod_maxprice_tag_var)
+        tag_spin.grid(row=0, column=3, sticky="w", padx=(4, 0))
+        for _sp, _kind, _cap in ((up_spin, "Upscaling", "$0.74+"),
+                                 (tag_spin, "Tag & Rename", "$0.24+")):
+            Tooltip(_sp,
+                    f"Cost guardrail for {_kind} (USD/h). When your picked GPU is "
+                    "sold out, only cheaper in-stock GPUs at or below this hourly "
+                    "price are tried automatically — so a run can't silently "
+                    f"escalate to an expensive card ({_kind} cards start at {_cap}). "
+                    "Your own explicit pick is never capped. 0 = no limit.")
 
         # GPU defaults + data center. These are the PERSISTED PREFERENCE (curated
         # lists); each tool tab has a live picker that shows what's actually
@@ -3428,11 +3461,12 @@ class SettingsTab(ttk.Frame):
         ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.runpod_gpu_var = tk.StringVar(
             value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
-        gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var,
+        gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
                                values=runpod_client.GPU_TYPES, width=26)
         gpu_cmb.grid(row=0, column=1, sticky="w")
-        Tooltip(gpu_cmb, "RunPod GPU for upscaling (the heavy SeedVR2 work). "
-                         "Pick one or type an unlisted id.")
+        Tooltip(gpu_cmb, "RunPod GPU for upscaling (the heavy SeedVR2 work). This is "
+                         "the persisted preference; each tab's live picker shows "
+                         "what's actually deployable now and overrides it per run.")
         ttk.Label(hw, text="Data center:").grid(row=0, column=2, sticky="w", padx=(18, 4))
         self._dc_label_by_id = {dcid: lbl for lbl, dcid in runpod_client.EU_DATACENTERS}
         self._dc_id_by_label = {lbl: dcid for lbl, dcid in runpod_client.EU_DATACENTERS}
@@ -3707,7 +3741,8 @@ class SettingsTab(ttk.Frame):
         return {
             "api_key":              self.runpod_key_var.get().strip(),
             "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
-            "max_price_per_hour":   _num(self.runpod_maxprice_var, 0.50, float),
+            "max_price_per_hour_upscale": _num(self.runpod_maxprice_up_var, 1.10, float),
+            "max_price_per_hour_tag":     _num(self.runpod_maxprice_tag_var, 0.50, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 720, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
@@ -4143,6 +4178,8 @@ class SettingsTab(ttk.Frame):
             target = CFG.setdefault(name, {})
             if name == "mqtt":
                 target.pop("enabled", None)   # MQTT is now gated by host being set
+            if name == "runpod":
+                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
             target.update(values)
 
         if save_config():
@@ -4190,7 +4227,8 @@ class SettingsTab(ttk.Frame):
         rp = CFG.get("runpod", {})
         self.runpod_key_var.set(rp.get("api_key", ""))
         self.runpod_rate_var.set(str(rp.get("hourly_rate", 0.90)))
-        self.runpod_maxprice_var.set(str(rp.get("max_price_per_hour", 0.50)))
+        self.runpod_maxprice_up_var.set(str(rp.get("max_price_per_hour_upscale", 1.10)))
+        self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))

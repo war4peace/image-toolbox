@@ -369,14 +369,26 @@ provision.sh), so a different image needs the **volume re-provisioned** with a
 matching/own torch. Deferred — the filter already makes the current image
 reliable.
 
-**Cost guardrail — price ceiling.** The picker's selection seeds a price-ordered
-fallback chain, but the *automatic* part is capped at `runpod.max_price_per_hour`
-(default $0.50/h; 0 = no cap). Live testing hit the failure this prevents: a
-picked RTX 4000 Ada was sold out at create, the chain fell through the phantom
-Blackwells (400), and landed on an **A100-SXM4-80GB at $1.49/h** — wildly overkill
-for tagging. With the ceiling, only cheaper in-stock cards are tried
-automatically; the user's own explicit pick is honoured regardless (its price is
-shown in the confirm, flagged when above the ceiling).
+**Cost guardrail — per-task price ceiling.** The picker's selection seeds a
+price-ordered fallback chain, but the *automatic* part is capped at a configurable
+hourly ceiling (0 = no cap). Live testing hit the failure this prevents: a picked
+RTX 4000 Ada was sold out at create, the chain fell through the phantom Blackwells
+(400), and landed on an **A100-SXM4-80GB at $1.49/h** — wildly overkill for
+tagging. With the ceiling, only cheaper in-stock cards are tried automatically; the
+user's own explicit pick is honoured regardless (its price is shown in the confirm,
+flagged when above the ceiling).
+
+The ceiling is **split by task** (0.3.4) — `runpod.max_price_per_hour_upscale`
+(default **$1.10/h**) and `runpod.max_price_per_hour_tag` (default **$0.50/h**).
+Benchmarks forced this: tagging runs fine on $0.24–0.39 cards, but the cheapest
+viable *upscale* card is the RTX PRO 4500 at **$0.74** — already above a $0.50 cap —
+so a single shared cap left an upscale run with **no automatic fallback at all**
+(it would be refused if the hand-picked card sold out). The upscale default of
+$1.10 covers the RTX 5090 value pick (cheapest *per run* for upscaling, ~$0.36/100
+images) while still blocking a runaway A100/B200. Each tab carries its own ceiling
+(`_gpu_price_key`/`_gpu_price_default` → `_fallback_ceiling` in `toolbox_gui.py`);
+the pre-0.3.4 single `runpod.max_price_per_hour` key is deprecated (ignored, and
+dropped from config on the next Settings save).
 
 Wrapped as `runpod_client.available_gpus(api_key, data_center_id, min_memory_gb)`
 → in-stock GPUs ≥ the VRAM floor, **sorted by price ascending**. The GUI's tab

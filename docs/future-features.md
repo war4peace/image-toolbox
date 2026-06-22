@@ -114,10 +114,32 @@ tag too. Remaining follow-ups:
   `gpuTypeIds` **list** — verify whether RunPod treats it as "any of these in
   order" (then the fallback is just passing the list); otherwise loop the types in
   `create_pod_resilient` on a capacity failure.
+- **Retire the static `hourly_rate` setting → use the live price** (0.3.4 raised
+  this; the data is already in hand). Settings still carries a hand-typed
+  **"Hourly rate (USD)"** used only to estimate a run's cost for the completion
+  notification — but as of the 0.3.3 live picker we now know the *real* price two
+  ways: the GraphQL availability query already returns `lowestPrice` per GPU
+  (`runpod_client.available_gpus` → each card's `price`), so we have the rate
+  **before the pod even exists**, and `costPerHr` is on the pod object once it's
+  running. Replace the static field with the actual selected-GPU price (fall back
+  to the typed value only if the lookup fails). Removes a setting the user has to
+  guess at and keeps the cost estimate honest when availability shifts the card.
+- **Real-time run statistics** (builds directly on the live price above). Once the
+  per-run rate is known live, surface running cost as the batch progresses:
+  **elapsed cost** (`elapsed_h × price`), **cost per image so far**
+  (`elapsed_cost / done`), and a **projected total** (`cost_per_image × total`) —
+  shown in the tool tab's status row and the Discord completion embed, and
+  published to the MQTT `last_run`/`task/*` topics. The per-image figure is the
+  number the benchmarking has been chasing by hand (e.g. RTX 5090 ≈ $0.0036/image
+  upscaling) — computing it live turns the price ceiling and GPU picker from
+  guard-rails into an informed, real-time cost view. The watchdog's per-image
+  timing already exists to hang the math off; the streaming engine reports each
+  image's completion, so the hook points are there.
 - **Cost & funds tracking + auto-stop** (API verified live, 2026-06-21):
   - Per-pod hourly rate is on the pod object: `costPerHr` (REST `GET /pods/{id}`,
     e.g. 0.99) — read it from the pod instead of the manually-set
-    `runpod.hourly_rate`.
+    `runpod.hourly_rate` (see the two bullets above — this is the same live price,
+    just read from the running pod rather than the pre-deploy catalog).
   - Account balance + total spend rate come from the **legacy GraphQL** API:
     `query { myself { clientBalance currentSpendPerHr } }` at
     `https://api.runpod.io/graphql` (returned clientBalance≈34.57,
