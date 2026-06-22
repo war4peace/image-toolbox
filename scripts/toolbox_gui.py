@@ -71,6 +71,11 @@ import system_telemetry
 import taskbar_progress
 import runpod_client
 import ssh_setup
+# Single-instance guard is optional — a packaging miss must not brick startup.
+try:
+    import single_instance
+except Exception:
+    single_instance = None
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -5235,6 +5240,12 @@ class App(tk.Tk):
 
 
 def main():
+    # Refuse to start a second copy — two instances share the SQLite cache and the
+    # resume/log folders (double file access, DB contention). Done first, before
+    # anything touches config/DB. The existing window is brought to the front.
+    if single_instance and not single_instance.acquire(
+            window_title=f"{APP_TITLE} {APP_VERSION}", app_title=APP_TITLE):
+        sys.exit(0)
     # Crisp text on high-DPI displays
     try:
         import ctypes
