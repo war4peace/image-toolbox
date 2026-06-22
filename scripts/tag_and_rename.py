@@ -285,6 +285,14 @@ CAMERA_FILENAME_PATTERNS = _T.get("camera_filename_patterns", [
 CONDENSED_MAX_WORDS = _T.get("condensed_max_words", 5)
 OLLAMA_TIMEOUT      = _T.get("ollama_timeout",      120)
 OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
+# Cap the longest edge of the image SENT TO THE VISION MODEL. A full-res photo
+# (e.g. 2272x1704) makes qwen2.5vl emit a huge number of vision tokens, which
+# OOMs a small-VRAM GPU and makes Ollama answer HTTP 400 — every ≤24 GB remote
+# card crashed on the first large image until this was added. Downscaling to
+# ~1280 px (the size that always worked) fixes it and speeds up tagging on every
+# GPU, with no loss for describe-and-title use (we don't OCR). 0 = send full res.
+# The SOURCE FILE IS NEVER TOUCHED — only the in-memory copy sent to the model.
+TAG_MAX_IMAGE_PX    = int(_T.get("max_image_px",    1280))
 
 # Auto-straighten: detect sideways photos with a small CNN and rotate them
 # upright before tagging. Only confident 90/270 calls are acted on (see
@@ -625,6 +633,35 @@ def unload_model():
         return False
 
 
+def _encode_image_for_model(path):
+    """Return the base64 image to send to the vision model.
+
+    Downscales the longest edge to TAG_MAX_IMAGE_PX (in memory) so a large photo
+    can't OOM a small-VRAM GPU into an HTTP 400, and applies EXIF orientation so
+    the model sees the picture upright. Fail-safe: any problem (Pillow missing,
+    odd format, already small, or downscaling disabled) falls back to the raw file
+    bytes — tagging must never break because of the resize. The source file on
+    disk is never modified."""
+    if TAG_MAX_IMAGE_PX and TAG_MAX_IMAGE_PX > 0:
+        try:
+            import io
+            from PIL import Image, ImageOps
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)       # honour orientation
+                if max(im.size) > TAG_MAX_IMAGE_PX:
+                    im.thumbnail((TAG_MAX_IMAGE_PX, TAG_MAX_IMAGE_PX),
+                                 Image.LANCZOS)
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=90)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:                              # noqa: BLE001 (fail-safe)
+            pass                                       # fall back to raw bytes
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
+
+
 def analyse_image(path, language="English"):
     """
     Send the image to Ollama and return (long_description, condensed_title).
@@ -632,8 +669,7 @@ def analyse_image(path, language="English"):
     LINE 2 (the filename title) is always in English so filenames stay ASCII-safe.
     Raises RuntimeError on failure.
     """
-    with open(path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("ascii")
+    img_b64 = _encode_image_for_model(path)
 
     # For non-English, append a language directive to the LINE 1 instruction.
     # LINE 2 is kept in English regardless — filenames must survive ASCII sanitisation.

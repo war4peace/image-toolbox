@@ -47,7 +47,14 @@ a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`
 upright before tagging; only confident calls act, ambiguous/upside-down images
 are left alone and logged. Selectable description language, force-tag /
 force-rename, and **one-click Undo** (every change is recorded before anything is
-modified). Already-tagged files are skipped on re-runs.
+modified). Already-tagged files are skipped on re-runs. The image sent to the
+model is **downscaled to a max longest edge** (0.3.3, `tagging.max_image_px`,
+default 1280 px, Settings → Tag & Rename; source files are never touched) — a
+full-res photo emits so many vision tokens that it OOMs a small-VRAM GPU into an
+HTTP 400 (every ≤24 GB remote card crashed on the first 2272×1704 image until
+this), and downscaling also speeds up tagging everywhere with no loss for
+describe-and-title use. EXIF orientation is applied to the in-memory copy so the
+model sees the photo upright. See `_encode_image_for_model` in `tag_and_rename.py`.
 
 **Comparison** (0.2.9) — a floating, resizable **original-vs-upscaled** window
 (like the log window: one shared instance, geometry persisted as

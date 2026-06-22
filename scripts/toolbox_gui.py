@@ -3140,6 +3140,20 @@ class SettingsTab(ttk.Frame):
         spin.pack(side="left")
         Tooltip(spin, "0.50–1.00   (higher = fewer, safer rotations)")
 
+        imgsz = ttk.Frame(sec)
+        imgsz.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
+        ttk.Label(imgsz, text="Max image size sent to model:").pack(side="left", padx=(0, 4))
+        self.tag_maxpx_var = tk.IntVar(value=int(tag.get("max_image_px", 1280)))
+        maxpx_spin = ttk.Spinbox(imgsz, from_=0, to=4096, increment=128, width=6,
+                                 textvariable=self.tag_maxpx_var)
+        maxpx_spin.pack(side="left")
+        ttk.Label(imgsz, text="px (longest edge; 0 = full resolution)").pack(side="left", padx=(4, 0))
+        Tooltip(maxpx_spin,
+                "The image is downscaled to this longest edge before going to the "
+                "vision model (your source files are never changed). Large photos "
+                "otherwise OOM small-VRAM GPUs into an HTTP 400 — 1280 px is plenty "
+                "for describing and titling. Higher = more detail + more VRAM.")
+
         # ── Upscaling targets ──────────────────────────────────────────────────
         sec = self._section(body, "Upscaling")
         sec.columnconfigure(1, weight=1)
@@ -4066,6 +4080,10 @@ class SettingsTab(ttk.Frame):
             conf = round(float(self.straighten_conf_var.get()), 2)
         except (ValueError, tk.TclError):
             conf = 0.9
+        try:
+            max_px = max(0, int(self.tag_maxpx_var.get()))
+        except (ValueError, tk.TclError):
+            max_px = 1280
 
         sections = {
             "ollama": {
@@ -4083,6 +4101,7 @@ class SettingsTab(ttk.Frame):
             "tagging": {
                 "auto_straighten": bool(self.straighten_var.get()),
                 "straighten_min_confidence": min(1.0, max(0.5, conf)),
+                "max_image_px": max_px,
             },
             "updates": {"auto_check": bool(self.auto_update_var.get())},
             "mqtt": self._mqtt_fields(),
@@ -4144,6 +4163,7 @@ class SettingsTab(ttk.Frame):
         self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
         self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
         self.straighten_var.set(bool(tag.get("auto_straighten", True)))
+        self.tag_maxpx_var.set(int(tag.get("max_image_px", 1280)))
         self.straighten_conf_var.set(float(tag.get("straighten_min_confidence", 0.9)))
         self.restarget_var.set(self._current_preset_label(ups))
         self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
