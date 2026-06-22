@@ -1354,6 +1354,23 @@ def collect_work_items(root, force_tag=False):
     return items
 
 
+def _start_remote_telemetry(engine, interval=10.0):
+    """Poll the pod's telemetry and stream it to the GUI as RTELEM events so the
+    Tag & Rename tab shows the same 'Remote pod' CPU/RAM/VRAM/temp row as the
+    upscaler (#4). The worker serves /telemetry in tag mode too. Daemon thread,
+    best-effort — a failed sample is just skipped."""
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                sample = engine.telemetry()
+            except Exception:                             # noqa: BLE001 (fail-safe)
+                sample = None
+            if sample:
+                _gui_event("RTELEM", json.dumps(sample))
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def _setup_remote_tagging():
     """Remote Tag & Rename (#1): create/reuse a pod running Ollama + the
     orientation CNN, repoint OLLAMA_URL at the ssh tunnel and route straighten to
@@ -1392,6 +1409,7 @@ def _setup_remote_tagging():
     OLLAMA_URL = session.ollama_url                   # tag_and_rename now calls the pod's Ollama
     REMOTE_ORIENT = engine.analyse                    # straighten detection runs on the pod
     REMOTE_SESSION = session                          # so the loop can detect a pod stop
+    _start_remote_telemetry(engine)                   # feed the GUI's 'Remote pod' row
 
     def _remote_teardown():
         session.close(stop_pod={"stop": True, "keep": False}.get(_REMOTE_TEARDOWN))

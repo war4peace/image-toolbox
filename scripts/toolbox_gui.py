@@ -3499,14 +3499,17 @@ class SettingsTab(ttk.Frame):
         Tooltip(idle_spin, "Stop the pod after this many minutes with no work "
                            "(0 = no idle limit).")
 
-        self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", False)))
+        self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", True)))
         term_chk = ttk.Checkbutton(
             sec, text="Terminate (delete) the pod when done, not just stop it",
             variable=self.runpod_terminate_var)
         term_chk.grid(row=6, column=0, columnspan=4, sticky="w", pady=3)
-        Tooltip(term_chk, "Terminate frees all billing (disposable pod). Stop "
-                          "keeps the pod's storage — and its storage charge — so it "
-                          "can be resumed. Terminate suits the create-on-demand flow.")
+        Tooltip(term_chk, "ON (recommended): the disposable pod is deleted when a "
+                          "run ends, freeing ALL billing. This NEVER deletes your "
+                          "model network volume — that's a separate resource. OFF "
+                          "only stops the pod (it lingers as EXITED and keeps "
+                          "billing for its disk); the app never reuses a stopped "
+                          "pod, so OFF just leaves billing cruft.")
 
         self.runpod_status = ttk.Label(sec, text="", foreground="#666")
         self.runpod_status.grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
@@ -4185,7 +4188,7 @@ class SettingsTab(ttk.Frame):
         self.runpod_maxprice_var.set(str(rp.get("max_price_per_hour", 0.50)))
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
-        self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", False)))
+        self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
         self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
         self.runpod_tag_gpu_var.set(self._tag_gpu_label_by_id.get(
             rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1]),
