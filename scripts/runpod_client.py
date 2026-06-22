@@ -84,16 +84,13 @@ TAG_GPU_TYPES = [
     ("RTX 4000 Ada — 20 GB (~$0.26/h)",  "NVIDIA RTX 4000 Ada Generation"),
 ]
 
-# GPU type ids the REST /pods endpoint will actually CREATE. This is the enum
-# from the create_pod request schema — and it is NOT the same set GraphQL's
-# gpuTypes catalog returns. GraphQL advertises newer cards (e.g. "NVIDIA RTX PRO
-# 4500 Blackwell", "NVIDIA RTX PRO 4000 Blackwell") with live stock + price that
-# the REST create endpoint rejects with HTTP 400 ("value must be one of …").
-# available_gpus() intersects live availability with THIS set so the picker can
-# never offer a GPU that only fails at create time.
-#
-# To regenerate: POST /pods with gpuTypeIds=["__invalid__"] and read the enum out
-# of the 400 body's "value must be one of …" message (no pod is created).
+# Reference only (no longer used to filter the picker). The REST /pods create
+# endpoint accepts ONLY this curated enum and 400s on newer cards — e.g.
+# "NVIDIA RTX PRO 4500/4000 Blackwell" — that GraphQL's catalog lists with live
+# stock. We deploy via the GraphQL path (deploy_pod) instead, which takes the
+# FULL catalog, so this intersection is no longer needed; kept to document the
+# REST limitation and why deploy_pod exists. (To regenerate: POST /pods with
+# gpuTypeIds=["__invalid__"] and read the 400 body's "value must be one of …".)
 CREATABLE_GPU_IDS = frozenset({
     "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000",
     "NVIDIA GeForce RTX 5090", "NVIDIA H100 80GB HBM3", "NVIDIA GeForce RTX 3090",
@@ -220,8 +217,66 @@ def get_pod(api_key, pod_id, timeout=30):
 def create_pod(api_key, spec, timeout=60):
     """Create a pod from `spec` (gpuTypeIds, imageName/templateId, ports, …) and
     return the created pod (including its new `id`). Creating a pod starts the
-    billing clock — callers must own a guaranteed stop path."""
+    billing clock — callers must own a guaranteed stop path.
+
+    NOTE: the REST create endpoint only accepts a CURATED GPU enum
+    (CREATABLE_GPU_IDS) — it 400s on newer cards (Blackwell PRO 4000/4500) that
+    the GraphQL deploy path (deploy_pod) handles. New code should prefer
+    deploy_pod; this is kept for reference / the REST-only path."""
     return _request("POST", "/pods", api_key, body=spec, timeout=timeout)
+
+
+_DEPLOY_MUTATION = """
+mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
+  podFindAndDeployOnDemand(input: $input) { id machineId costPerHr }
+}
+"""
+
+
+def deploy_pod(api_key, spec, timeout=90):
+    """Create a pod via the GraphQL deploy path (`podFindAndDeployOnDemand`) and
+    return {"id": …} for the new pod. This is the SAME path the RunPod console
+    uses, so it accepts the FULL GPU catalog — including cards the REST
+    create_pod enum rejects with HTTP 400 (e.g. Blackwell PRO 4000/4500).
+
+    `spec` is the REST-style dict create_pod takes (so callers don't change); it
+    is translated to the GraphQL input here. Two things the REST API does for free
+    that GraphQL needs spelled out: a mounted network volume needs an explicit
+    `volumeMountPath` (without it the container fails with "field Target must not
+    be empty" and never starts — hence no public IP), and `supportPublicIp` must
+    be set so the pod gets the direct-TCP SSH endpoint the app relies on.
+
+    Like create_pod, this STARTS BILLING — callers must own a guaranteed stop
+    path. The pod's SSH endpoint appears a bit later (poll via wait_until_running).
+    Raises RunPodError on capacity / validation / transport failure.
+    """
+    gpu_ids = spec.get("gpuTypeIds") or []
+    dcs = spec.get("dataCenterIds") or []
+    vol = spec.get("networkVolumeId") or ""
+    env = spec.get("env") or {}
+    inp = {
+        "cloudType":        spec.get("cloudType", "SECURE"),
+        "gpuCount":         int(spec.get("gpuCount", 1)),
+        "gpuTypeId":        gpu_ids[0] if gpu_ids else None,
+        "name":             spec.get("name", "image-toolbox"),
+        "imageName":        spec.get("imageName", ""),
+        "containerDiskInGb": int(spec.get("containerDiskInGb", 30)),
+        "volumeInGb":       int(spec.get("volumeInGb", 0)),
+        "ports":            ",".join(spec.get("ports") or ["22/tcp"]),
+        "supportPublicIp":  True,
+        "env":              [{"key": k, "value": v} for k, v in env.items()],
+    }
+    if dcs:
+        inp["dataCenterId"] = dcs[0]
+    if vol:
+        inp["networkVolumeId"] = vol
+        # REST defaults this; GraphQL requires it or the bind-mount fails.
+        inp["volumeMountPath"] = spec.get("volumeMountPath", "/workspace")
+    data = _graphql(api_key, _DEPLOY_MUTATION, {"input": inp}, timeout=timeout)
+    pod = data.get("podFindAndDeployOnDemand")
+    if not isinstance(pod, dict) or not pod.get("id"):
+        raise RunPodError(f"Deploy returned no pod id: {data}")
+    return pod
 
 
 def start_pod(api_key, pod_id, timeout=60):
@@ -319,7 +374,9 @@ def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
         gspec = spec if gpu is None else {**spec, "gpuTypeIds": [gpu]}
         for attempt in range(1, attempts + 1):
             try:
-                pod = create_pod(api_key, gspec)
+                # GraphQL deploy (not REST create): accepts the full GPU catalog,
+                # so a card from the live picker never 400s at create time.
+                pod = deploy_pod(api_key, gspec)
             except RunPodError as exc:
                 # Capacity / unavailable at create time → try the next GPU now
                 # rather than burning this type's remaining attempts.
@@ -475,9 +532,9 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
             continue
         if mem < min_memory_gb:
             continue
-        if g.get("id") not in CREATABLE_GPU_IDS:
-            # GraphQL lists it but REST create_pod would 400 — don't offer it.
-            continue
+        # No REST-enum filter here: pods are created via the GraphQL deploy path
+        # (deploy_pod), which accepts the full catalog — so every in-stock card is
+        # genuinely deployable, matching what the RunPod console offers.
         out.append({
             "id":        g.get("id"),
             "name":      g.get("displayName") or g.get("id"),

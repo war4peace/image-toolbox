@@ -313,15 +313,35 @@ The **GraphQL** endpoint has the data the REST one lacks:
 - `lowestPrice.uninterruptablePrice` = on-demand $/h in that DC;
   `stockStatus` ∈ High/Medium/Low when deployable, **null = out of stock there**.
 
-**Gotcha — GraphQL catalog ≠ REST create enum.** The GraphQL `gpuTypes` list is a
-*superset* of the GPU ids the REST `POST /pods` endpoint will accept. Newer cards
-(seen 2026-06-22: `NVIDIA RTX PRO 4500 Blackwell`, `NVIDIA RTX PRO 4000 Blackwell`)
-appear in GraphQL with live stock + price but `create_pod` **rejects them with
-HTTP 400** ("value must be one of …"). So `available_gpus` intersects availability
-with `runpod_client.CREATABLE_GPU_IDS` — the enum from the create schema (dump it
-by POSTing `/pods` with `gpuTypeIds=["__invalid__"]` and reading the 400 body; no
-pod is created). Without the intersection the picker offers a card that only fails
-at create, and the fallback chain wastes attempts 400-ing through phantom GPUs.
+**Gotcha — GraphQL catalog ≠ REST create enum → deploy via GraphQL.** The GraphQL
+`gpuTypes` list is a *superset* of the GPU ids the REST `POST /pods` endpoint
+accepts. Newer cards (seen 2026-06-22: `NVIDIA RTX PRO 4500 Blackwell`,
+`NVIDIA RTX PRO 4000 Blackwell`) appear in GraphQL with live stock + price but
+REST `create_pod` **rejects them with HTTP 400** ("value must be one of …").
+
+First attempt was to intersect availability with the REST enum (`CREATABLE_GPU_IDS`,
+dumped via `POST /pods` `gpuTypeIds=["__invalid__"]`). But that *hides* cheap,
+available cards the website happily deploys — so instead **pod creation moved to
+the GraphQL deploy path** (`runpod_client.deploy_pod` → `podFindAndDeployOnDemand`,
+the same mutation the RunPod console uses). It accepts the full catalog, so the
+picker shows everything in stock (incl. RTX 2000 Ada ~$0.24) and `available_gpus`
+no longer filters. `CREATABLE_GPU_IDS` stays only as documentation.
+
+**Two GraphQL-deploy gotchas that cost a debugging round (both verified live):**
+
+1. **`volumeMountPath` is mandatory with a network volume.** REST defaults it to
+   `/workspace`; GraphQL does not, and omitting it makes the container fail at
+   create with `invalid mount config for type "bind": field Target must not be
+   empty`. The pod shows `desiredStatus: RUNNING` but the container never starts —
+   so it **never gets a public IP / port-22 mapping** and SSH never comes up. Pass
+   `volumeMountPath: "/workspace"`, `volumeInGb: 0`, `networkVolumeId`.
+2. **`supportPublicIp: true` + `ports: "22/tcp"`** (a *string*, comma-separated —
+   not the REST array) are needed for the direct-TCP SSH endpoint the app relies
+   on (`publicIp` + `portMappings["22"]`, which appear ~90 s after RUNNING).
+
+A failed-mount deploy can also leave an **auto-replacement pod** whose id the
+mutation never returned — diag/teardown must sweep by **name**, not just the
+returned id, or a replacement lingers and bills.
 
 **Cost guardrail — price ceiling.** The picker's selection seeds a price-ordered
 fallback chain, but the *automatic* part is capped at `runpod.max_price_per_hour`
