@@ -208,8 +208,22 @@ lightweight worker "tag mode" (no SeedVR2, so the VRAM is free for Ollama);
 but its Ollama URL is repointed at an ssh tunnel and auto-straighten detection
 runs on the pod. Tagging uses a **cheap GPU tier** (`runpod.tag_gpu_type_id` →
 an ordered fallback chain of 16–20 GB cards in `TAG_GPU_TYPES`; the vision model
-needs only ~6.6 GB), not the upscale GPU. See the remote-pod module cluster below
-and `docs/runpod-notes.md` / `docs/future-features.md` #1.
+needs only ~6.6 GB), not the upscale GPU. **0.3.3 added a live GPU picker** next
+to each tab's "Run on remote pod" toggle: it queries RunPod's **GraphQL** endpoint
+(`runpod_client.available_gpus`) for the cards **actually deployable right now** in
+the volume's region — with live price and stock — filtered to a VRAM floor (≥32 GB
+upscale, ≥16 GB tag) and **sorted cheapest-first**, so a user can no longer pick a
+GPU that only fails at create time (the curated `GPU_TYPES`/`TAG_GPU_TYPES`
+picklists could, and EU-RO-1 routinely has all four tag cards out of stock). The
+selection overrides the configured default for that run and seeds a price-ordered
+fallback chain (passed to `RemoteSession` via `IMGTBX_GPU_OVERRIDE`); the Settings
+comboboxes remain the persisted *preference* (pre-selected when in stock). If
+nothing meets the VRAM floor the run is refused up-front with a clear message
+instead of spinning a doomed pod, and a failed run now surfaces the real cause on
+the status line (pointing at "View log") rather than the old "see the messages
+above" (there were none — the clean output is in the log window, not the tab). See
+the remote-pod module cluster below and `docs/runpod-notes.md` /
+`docs/future-features.md` #1.
 
 ## Codebase structure
 
@@ -233,7 +247,7 @@ counts give a sense of weight:
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 | `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |
 | `taskbar_progress.py` (~170 lines) | Windows taskbar progress bar (0.3.0). `TaskbarProgress` wraps the shell `ITaskbarList3` COM interface **driven straight from ctypes** (manual GUID + vtable calls — no comtypes/pywin32, no new dependency), painting run progress onto the app's taskbar button: `set_progress(done, total)` (green fill), `set_state("indeterminate"/"error"/"none")`, `clear()`. Windows-only, fail-safe (disables itself on any COM failure); all calls come from the GUI/UI thread. Driven via `App.taskbar_*`. |
-| **Remote-pod (#1) cluster** (`runpod_client.py`, `remote_run.py`, `remote_upscale_engine.py`, `runpod_provision.py`, `ssh_setup.py`; plus `pod/worker.py`, `pod/deadman.py`, `pod/provision.sh`) | Remote upscaling on a rented RunPod GPU (shipped 0.3.1; onboarding in 0.3.2). `runpod_client` = stdlib REST control plane (create/start/stop/terminate/inspect pods + network volumes). `remote_run.RemoteSession` orchestrates a run (create→push→start worker→arm dead-man's switch→stream→teardown); `remote_upscale_engine.RemoteUpscaleEngine` is a drop-in for `UpscaleEngine` that streams one image per HTTP request over `ssh -L`. `pod/worker.py` is the resident on-pod worker (serves `/upscale`, `/orient`, `/telemetry`, `/health`); its `--mode` is `full` (loads SeedVR2) or `tag` (skips SeedVR2 and serves `/orient` only — remote Tag & Rename, with `remote_run` also starting `ollama serve` and tunnelling 11434). **`ssh_setup.py` (0.3.2)** = zero-config SSH: locates OpenSSH, generates the app's ed25519 key, reads its public half — handed to each pod via the `PUBLIC_KEY` env so SSH needs no key registered on the RunPod website. `runpod_provision.py` is the dev driver + the GUI's `setup-volume` one-shot (create→provision the model volume→auto-terminate). All stdlib + the Windows OpenSSH client; the GUI launches these as subprocesses / background threads. |
+| **Remote-pod (#1) cluster** (`runpod_client.py`, `remote_run.py`, `remote_upscale_engine.py`, `runpod_provision.py`, `ssh_setup.py`; plus `pod/worker.py`, `pod/deadman.py`, `pod/provision.sh`) | Remote upscaling on a rented RunPod GPU (shipped 0.3.1; onboarding in 0.3.2). `runpod_client` = stdlib REST control plane (create/start/stop/terminate/inspect pods + network volumes) **plus a GraphQL helper** (`available_gpus`/`_graphql`) — the REST API can't list GPU types/prices/stock, but `api.runpod.io/graphql` can (browser User-Agent to pass Cloudflare), so the GUI's live GPU picker (0.3.3) shows only what's deployable now in the volume's region, cheapest-first. `remote_run.RemoteSession` orchestrates a run (create→push→start worker→arm dead-man's switch→stream→teardown); `remote_upscale_engine.RemoteUpscaleEngine` is a drop-in for `UpscaleEngine` that streams one image per HTTP request over `ssh -L`. `pod/worker.py` is the resident on-pod worker (serves `/upscale`, `/orient`, `/telemetry`, `/health`); its `--mode` is `full` (loads SeedVR2) or `tag` (skips SeedVR2 and serves `/orient` only — remote Tag & Rename, with `remote_run` also starting `ollama serve` and tunnelling 11434). **`ssh_setup.py` (0.3.2)** = zero-config SSH: locates OpenSSH, generates the app's ed25519 key, reads its public half — handed to each pod via the `PUBLIC_KEY` env so SSH needs no key registered on the RunPod website. `runpod_provision.py` is the dev driver + the GUI's `setup-volume` one-shot (create→provision the model volume→auto-terminate). All stdlib + the Windows OpenSSH client; the GUI launches these as subprocesses / background threads. |
 
 Configuration & state:
 

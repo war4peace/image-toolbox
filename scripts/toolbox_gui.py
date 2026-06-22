@@ -83,7 +83,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -1252,6 +1252,144 @@ class ToolTab(ttk.Frame):
         the user switches to the tab. Idempotent: only fills empty fields, never
         overwrites a folder the user is working with. Overridden per tool."""
 
+    # ── Remote-pod row: "Run on remote pod" + live GPU picker ────────────────
+    #
+    # The picker queries RunPod for what is ACTUALLY deployable right now (GPU,
+    # live price, stock) in the volume's region, filtered to a usable VRAM floor
+    # and sorted cheapest-first — so the user can't pick a card that only fails at
+    # create time (the static Settings picklists could). The selection overrides
+    # the configured default for this run and seeds a price-ordered fallback
+    # chain. Tabs set self._gpu_min_vram and self._gpu_pref_key before building.
+
+    def _build_remote_row(self, row):
+        """A dedicated full-width row so the long checkbox label and the GPU
+        picker both fit (fixes the 'Run on rer' clipping when they shared the
+        button row)."""
+        rr = ttk.Frame(self)
+        rr.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.remote_chk = ttk.Checkbutton(
+            rr, text="Run on remote pod (RunPod)", variable=self.remote_var,
+            command=self._on_remote_toggle)
+        self.remote_chk.pack(side="left")
+        Tooltip(self.remote_chk,
+                "Run on a rented RunPod GPU instead of this PC (roadmap #1, "
+                "experimental). Creates a billed pod and terminates it when done. "
+                "Needs a RunPod API key + model volume in Settings.")
+        ttk.Label(rr, text="GPU:").pack(side="left", padx=(16, 4))
+        self.gpu_pick_var = tk.StringVar(value="")
+        self.gpu_combo = ttk.Combobox(
+            rr, textvariable=self.gpu_pick_var, state="disabled", width=44)
+        self.gpu_combo.pack(side="left")
+        Tooltip(self.gpu_combo,
+                "GPUs that can be rented in your volume's region right now, "
+                "cheapest first. Live availability and price from RunPod.")
+        self.gpu_refresh_btn = ttk.Button(
+            rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
+        self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
+        Tooltip(self.gpu_refresh_btn, "Re-check availability and pricing.")
+        self._gpu_choices = []      # parallel to the combobox values (dicts)
+        self._gpu_loaded  = False   # True after a successful fetch
+        # A Remote-only install defaults the toggle on — load the list up front.
+        if self.remote_var.get():
+            self.after(300, self._on_remote_toggle)
+
+    def _on_remote_toggle(self):
+        on = bool(self.remote_var.get())
+        self.gpu_combo.configure(state="readonly" if on else "disabled")
+        self.gpu_refresh_btn.configure(state="normal" if on else "disabled")
+        if on and not self._gpu_loaded:
+            self._refresh_gpus()
+
+    def _refresh_gpus(self):
+        rp_cfg = CFG.get("runpod", {})
+        if not rp_cfg.get("api_key"):
+            self.gpu_pick_var.set("(set a RunPod API key in Settings)")
+            return
+        self.gpu_refresh_btn.configure(state="disabled")
+        self.gpu_pick_var.set("loading available GPUs …")
+        self.gpu_combo.configure(values=[])
+        min_vram = getattr(self, "_gpu_min_vram", 0)
+
+        def work():
+            try:
+                import runpod_client as rp
+                key   = rp_cfg.get("api_key", "")
+                vol   = rp_cfg.get("network_volume_id", "").strip()
+                # The pod is created in the VOLUME's region, so price/stock must be
+                # read there — fall back to the configured DC, then global.
+                dc = (rp.volume_region(key, vol) if vol else None) \
+                    or rp_cfg.get("data_center_id") or None
+                gpus = rp.available_gpus(key, dc, min_memory_gb=min_vram)
+                self.after(0, lambda: self._populate_gpus(gpus, dc))
+            except Exception as exc:                     # noqa: BLE001 (UI thread)
+                self.after(0, lambda e=exc: self._gpu_error(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gpu_label(self, g):
+        price = f"${g['price']:.2f}/h" if g.get("price") is not None else "price n/a"
+        return f"{g['name']} — {g['memory_gb']} GB — {price} ({g['stock']})"
+
+    def _populate_gpus(self, gpus, dc):
+        self.gpu_refresh_btn.configure(state="normal")
+        self._gpu_choices = gpus
+        self._gpu_loaded  = True
+        if not gpus:
+            region = dc or "this region"
+            self.gpu_combo.configure(values=[])
+            self.gpu_pick_var.set(f"no GPU available in {region} right now")
+            return
+        labels = [self._gpu_label(g) for g in gpus]
+        self.gpu_combo.configure(values=labels)
+        # Pre-select the persisted preference if it is in stock; else cheapest.
+        pref = CFG.get("runpod", {}).get(getattr(self, "_gpu_pref_key", ""), "")
+        idx = next((i for i, g in enumerate(gpus) if g["id"] == pref), 0)
+        self.gpu_combo.current(idx)
+
+    def _gpu_error(self, exc):
+        self.gpu_refresh_btn.configure(state="normal")
+        self._gpu_choices = []
+        self._gpu_loaded  = False
+        self.gpu_pick_var.set("couldn't load list — will use the Settings default")
+        self.console.feed(f"[remote] GPU availability check failed: {exc}\n")
+
+    def _selected_gpu_chain(self):
+        """The picked GPU id followed by the other in-stock ids (cheapest-first)
+        as a fallback chain, or None when nothing was loaded (then the run uses
+        the configured default + curated chain). Empty list = loaded but none
+        available, which the caller treats as a hard stop."""
+        if not self._gpu_loaded:
+            return None
+        if not self._gpu_choices:
+            return []
+        idx = self.gpu_combo.current()
+        if idx < 0 or idx >= len(self._gpu_choices):
+            idx = 0
+        chosen = self._gpu_choices[idx]["id"]
+        chain = [chosen] + [g["id"] for g in self._gpu_choices if g["id"] != chosen]
+        return chain
+
+    def _failure_status(self, code):
+        """A meaningful one-line status for a non-zero exit. The clean output goes
+        to the (separate) log window, not the tab, so the old 'see the messages
+        above' pointed at nothing — this surfaces the actual cause instead and
+        points at 'View log'."""
+        # The common remote case — no rentable GPU — gets a plain-language line.
+        if self.console.find_last(
+                r"no instances currently available|Pod failed to deploy on any of"
+                r"|Gave up creating a pod"):
+            return ("Couldn't start a remote pod — no matching GPU was available "
+                    "just now. Re-check the GPU picker (↻), try another region, or "
+                    "open 'View log' for details.")
+        # Otherwise echo the script's own ERROR / '-> detail' line if there is one.
+        err = self.console.find_last(r"^\s*(ERROR:|->)")
+        if err:
+            err = err.lstrip("-> ").strip()
+            if len(err) > 140:
+                err = err[:139] + "…"
+            return f"Stopped with an error (code {code}): {err}  (See 'View log'.)"
+        return f"Stopped with an error (code {code}) — open 'View log' for details."
+
     # ── Process control ─────────────────────────────────────────────────────
 
     @property
@@ -2181,6 +2319,10 @@ class UpscaleTab(ToolTab):
         # Default the remote toggle ON for a Remote-only install (it's the only
         # way to upscale there); OFF for Local/Both.
         self.remote_var   = tk.BooleanVar(value=(get_install_mode() == "remote"))
+        # Live GPU picker: upscaling needs a heavy card, so floor VRAM at 32 GB;
+        # the persisted preference is runpod.gpu_type_id.
+        self._gpu_min_vram = 32
+        self._gpu_pref_key = "gpu_type_id"
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
@@ -2237,16 +2379,8 @@ class UpscaleTab(ToolTab):
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
 
-        self.remote_chk = ttk.Checkbutton(
-            btns, text="Run on remote pod (RunPod)", variable=self.remote_var)
-        self.remote_chk.pack(side="left", padx=(18, 6))
-        Tooltip(self.remote_chk,
-                "Run the upscaling on a rented RunPod GPU instead of this PC "
-                "(roadmap #1, experimental). Creates a billed pod, streams each "
-                "image to it, and terminates the pod when done. Needs a RunPod "
-                "API key + model volume in Settings → Remote upscaling.")
-
-        self._build_output_area(row=3)
+        self._build_remote_row(row=3)
+        self._build_output_area(row=4)
 
     # ── GUI events specific to the upscaler ─────────────────────────────────
 
@@ -2383,17 +2517,33 @@ class UpscaleTab(ToolTab):
             if not ok_ssh:
                 messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
                 return
+            gpu_chain = self._selected_gpu_chain()
+            if gpu_chain == []:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "No RunPod GPU with at least 32 GB of VRAM is available in your "
+                    "volume's region right now.\n\nTry again in a while, or choose a "
+                    "different region for your model volume in Settings. (Press ↻ to "
+                    "re-check availability.)")
+                return
             if not self.confirm_deadman_safety():
                 return
+            gpu_note = ""
+            if gpu_chain:
+                g = self._gpu_choices[max(0, self.gpu_combo.current())]
+                price = f" (~${g['price']:.2f}/h)" if g.get("price") is not None else ""
+                gpu_note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price}."
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run this batch on a rented RunPod GPU?\n\n"
                     "This creates a BILLED pod, streams each image to it, writes the "
                     "results here, and terminates the pod when the run ends. The pod "
                     "also self-terminates on an idle / max-runtime deadline as a "
-                    "safety net.\n\nProceed?"):
+                    f"safety net.{gpu_note}\n\nProceed?"):
                 return
             extra_env = {"IMGTBX_UPSCALE_REMOTE": "1"}
+            if gpu_chain:
+                extra_env["IMGTBX_GPU_OVERRIDE"] = ",".join(gpu_chain)
         else:
             # Local run requested. A Remote-only install has no local engine
             # (torch + SeedVR2 weren't installed), so a local run would crash on
@@ -2499,7 +2649,7 @@ class UpscaleTab(ToolTab):
             self.progress.set(100)
             self.status_var.set("Done. The upscaled photos are in the output folder.")
         else:
-            self.status_var.set(f"Stopped with an error (code {code}) — see the messages above.")
+            self.status_var.set(self._failure_status(code))
         super().on_exit(code)
 
 
@@ -2537,6 +2687,10 @@ class TagTab(ToolTab):
         # Remote toggle defaults ON for a Remote-only install (the only way to tag
         # there — no local Ollama/torch); OFF for Local/Both.
         self.remote_var = tk.BooleanVar(value=(get_install_mode() == "remote"))
+        # Live GPU picker: the vision model needs only ~6.6 GB, so a 16 GB floor
+        # is plenty; the persisted preference is runpod.tag_gpu_type_id.
+        self._gpu_min_vram = 16
+        self._gpu_pref_key = "tag_gpu_type_id"
         self.scope_var  = tk.StringVar(value=UNDO_SCOPES[0][0])
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
@@ -2579,9 +2733,11 @@ class TagTab(ToolTab):
         for b in (self.start_btn, self.resume_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
 
-        self.remote_chk = ttk.Checkbutton(
-            btns, text="Run on remote pod (RunPod)", variable=self.remote_var)
-        self.remote_chk.pack(side="left", padx=(18, 6))
+        # "Run on remote pod" + the live GPU picker share a dedicated row. The
+        # checkbox tooltip is set here (overriding the generic one) because remote
+        # tagging is the unusual case: tagging runs locally, only the model calls
+        # go over the tunnel.
+        self._build_remote_row(row=3)
         Tooltip(self.remote_chk,
                 "Run the vision model (and the auto-straighten CNN) on a rented "
                 "RunPod GPU instead of this PC (roadmap #1, experimental). Tagging "
@@ -2590,14 +2746,14 @@ class TagTab(ToolTab):
                 "API key + model volume in Settings → Remote upscaling.")
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
-        undo.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        undo.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         ttk.Label(undo, text="Scope:").pack(side="left", padx=(0, 4))
         ttk.Combobox(undo, textvariable=self.scope_var, state="readonly", width=18,
                      values=[label for label, _ in UNDO_SCOPES]).pack(side="left", padx=(0, 16))
         self.undo_btn = ttk.Button(undo, text="Undo this folder…", command=self._undo)
         self.undo_btn.pack(side="left")
 
-        self._build_output_area(row=4)
+        self._build_output_area(row=5)
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
@@ -2665,17 +2821,34 @@ class TagTab(ToolTab):
             if not ok_ssh:
                 messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
                 return
+            gpu_chain = self._selected_gpu_chain()
+            if gpu_chain == []:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "No RunPod GPU with at least 16 GB of VRAM is available in your "
+                    "volume's region right now.\n\nTry again in a while, or choose a "
+                    "different region for your model volume in Settings. (Press ↻ to "
+                    "re-check availability.)")
+                return
             if not self.confirm_deadman_safety():
                 return
+            gpu_note = ""
+            if gpu_chain:
+                g = self._gpu_choices[max(0, self.gpu_combo.current())]
+                price = f" (~${g['price']:.2f}/h)" if g.get("price") is not None else ""
+                gpu_note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price}."
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run Tag & Rename on a rented RunPod GPU?\n\n"
                     "This creates a BILLED pod running the vision model, tags each "
                     "image against it (the files are still read/written here), and "
                     "terminates the pod when the run ends. The pod also "
-                    "self-terminates on an idle / max-runtime deadline.\n\nProceed?"):
+                    f"self-terminates on an idle / max-runtime deadline.{gpu_note}\n\n"
+                    "Proceed?"):
                 return
             extra_env = {"IMGTBX_TAG_REMOTE": "1"}
+            if gpu_chain:
+                extra_env["IMGTBX_GPU_OVERRIDE"] = ",".join(gpu_chain)
         else:
             # A Remote-only install has no local Ollama or torch — refuse a local
             # tag run with a clear message instead of crashing on a missing model.
@@ -2790,7 +2963,7 @@ class TagTab(ToolTab):
             else:
                 self.status_var.set("Done. Descriptions written and files renamed where applicable.")
         else:
-            self.status_var.set(f"Stopped with an error (code {code}) — see the messages above.")
+            self.status_var.set(self._failure_status(code))
         super().on_exit(code)
 
 

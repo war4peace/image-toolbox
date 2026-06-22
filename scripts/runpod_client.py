@@ -37,6 +37,12 @@ import urllib.error
 BASE_URL    = "https://rest.runpod.io/v1"
 _USER_AGENT = "ImageToolbox-RunPod"
 
+# The REST control plane can't list GPU types / prices / availability, but the
+# GraphQL endpoint can (see available_gpus). Cloudflare in front of it rejects a
+# non-browser User-Agent, so GraphQL calls send a browser one.
+GRAPHQL_URL = "https://api.runpod.io/graphql"
+_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
 # Where users create an API key (console) and read how (docs) — surfaced as a
 # link in Settings so a user can get a key without hunting for it.
 CONSOLE_API_KEYS_URL = "https://www.runpod.io/console/user/settings"
@@ -358,6 +364,96 @@ def create_network_volume(api_key, name, size_gb, data_center_id, timeout=60):
 def delete_network_volume(api_key, vol_id, timeout=60):
     """Delete a network volume (frees its monthly storage charge)."""
     return _request("DELETE", f"/networkvolumes/{vol_id}", api_key, timeout=timeout)
+
+
+# ── GPU availability + pricing (GraphQL) ─────────────────────────────────────
+
+def _graphql(api_key, query, variables=None, timeout=30):
+    """Issue one GraphQL POST and return the `data` object. Raises RunPodError on
+    transport/HTTP errors or any GraphQL `errors`. Sends a browser User-Agent —
+    Cloudflare in front of api.runpod.io rejects an unknown one with a 403."""
+    if not api_key:
+        raise RunPodError("No RunPod API key is set (Settings → Remote upscaling).")
+    body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+    req = urllib.request.Request(
+        GRAPHQL_URL, data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "User-Agent":    _BROWSER_UA,
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RunPodError(_http_error_message(exc)) from exc
+    except urllib.error.URLError as exc:
+        raise RunPodError(f"Could not reach RunPod: {exc.reason}") from exc
+    except Exception as exc:                              # noqa: BLE001 (fail-safe)
+        raise RunPodError(f"RunPod GraphQL request failed: {exc}") from exc
+    try:
+        parsed = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise RunPodError("RunPod returned a response that could not be parsed.") from exc
+    if parsed.get("errors"):
+        msg = parsed["errors"][0].get("message", "unknown error")
+        raise RunPodError(f"RunPod GraphQL error: {msg}")
+    return parsed.get("data") or {}
+
+
+_GPU_AVAIL_QUERY = """
+query GpuTypes($dc: String) {
+  gpuTypes {
+    id
+    displayName
+    memoryInGb
+    lowestPrice(input: {gpuCount: 1, secureCloud: true, dataCenterId: $dc}) {
+      uninterruptablePrice
+      stockStatus
+    }
+  }
+}
+"""
+
+
+def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
+    """Return the secure-cloud GPUs that are DEPLOYABLE RIGHT NOW, newest data.
+
+    Queries GraphQL for every GPU type's live price + stock in `data_center_id`
+    (None = RunPod's global view), keeps only those with stock (`stockStatus`
+    set) and at least `min_memory_gb` of VRAM, and returns them sorted by hourly
+    price ascending. Each item is a dict:
+        {"id", "name", "memory_gb", "price", "stock"}
+    where `id` is the value create_pod's `gpuTypeIds` expects. Raises RunPodError
+    on failure (callers run this off a background thread and show the message).
+
+    Unlike the curated GPU_TYPES / TAG_GPU_TYPES picklists, this reflects reality
+    — a card the account can't actually rent in this region never appears, so the
+    UI can't offer a GPU that will only fail at create time.
+    """
+    data = _graphql(api_key, _GPU_AVAIL_QUERY, {"dc": data_center_id or None},
+                    timeout=timeout)
+    out = []
+    for g in data.get("gpuTypes") or []:
+        lp = g.get("lowestPrice") or {}
+        stock = lp.get("stockStatus")
+        price = lp.get("uninterruptablePrice")
+        mem = g.get("memoryInGb") or 0
+        if not stock:                       # out of stock in this region → skip
+            continue
+        if mem < min_memory_gb:
+            continue
+        out.append({
+            "id":        g.get("id"),
+            "name":      g.get("displayName") or g.get("id"),
+            "memory_gb": mem,
+            "price":     price,
+            "stock":     stock,
+        })
+    # Cheapest first; a missing price sorts last so a real quote always wins.
+    out.sort(key=lambda r: (r["price"] is None, r["price"] or 0.0))
+    return out
 
 
 # ── UI-facing helpers (return (ok, message), never raise) ────────────────────

@@ -175,11 +175,16 @@ class RemoteSession:
         region = rp.volume_region(self.api_key, vol_id)
         if not region:
             raise rp.RunPodError(f"Could not read region of volume {vol_id}.")
-        # GPU choice: upscaling needs the heavy card; tagging needs only ~6.6 GB,
-        # so it uses a cheap card with an ORDERED FALLBACK CHAIN (the configured
-        # tag_gpu_type_id first, then the rest of the curated low-tier list) so a
-        # tag run still starts when the preferred card is sold out.
-        if self.mode == "tag":
+        # GPU choice. The GUI's live picker (filtered by VRAM, sorted by price
+        # against real availability) passes its selection + fallbacks as a
+        # comma-separated IMGTBX_GPU_OVERRIDE — preferred since it reflects what is
+        # actually deployable now. Without it (headless / picker failed) fall back
+        # to the configured defaults: a curated cheap chain for tagging (the
+        # vision model needs only ~6.6 GB), the single configured card for upscale.
+        override = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+        if override:
+            gpu_ids = [g.strip() for g in override.split(",") if g.strip()]
+        elif self.mode == "tag":
             primary = self.cfg.get("tag_gpu_type_id") or rp.TAG_GPU_TYPES[0][1]
             gpu_ids = [primary] + [gid for _l, gid in rp.TAG_GPU_TYPES if gid != primary]
         else:

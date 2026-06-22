@@ -293,6 +293,36 @@ Wrinkles to honour when this is built:
   types endpoint at provision time rather than hard-coded — the config default is
   a best guess to be confirmed in Phase 2.
 
+## Live GPU availability + pricing (GraphQL, 0.3.3)
+
+The REST control plane exposes **no** GPU-types/pricing/stock endpoint — that's
+why the picklists (`GPU_TYPES`, `TAG_GPU_TYPES`) were hand-curated, and why they
+went stale: on 2026-06-22 **all four** curated tag cards (RTX 2000 Ada / A4000 /
+A4500 / 4000 Ada) were out of stock in EU-RO-1, so a non-technical user couldn't
+tag at all and the app gave no hint why.
+
+The **GraphQL** endpoint has the data the REST one lacks:
+
+- `POST https://api.runpod.io/graphql` · `Authorization: Bearer <key>` ·
+  **must send a browser `User-Agent`** (Cloudflare 403s an unknown one).
+- Query `gpuTypes { id displayName memoryInGb
+  lowestPrice(input: {gpuCount: 1, secureCloud: true, dataCenterId: $dc}) {
+  uninterruptablePrice stockStatus } }`.
+- `id` is exactly the `gpuTypeIds` value `create_pod` wants
+  (`"NVIDIA GeForce RTX 5090"`); `displayName` is the short name.
+- `lowestPrice.uninterruptablePrice` = on-demand $/h in that DC;
+  `stockStatus` ∈ High/Medium/Low when deployable, **null = out of stock there**.
+
+Wrapped as `runpod_client.available_gpus(api_key, data_center_id, min_memory_gb)`
+→ in-stock GPUs ≥ the VRAM floor, **sorted by price ascending**. The GUI's tab
+pickers call it (off-thread) for the volume's region (≥32 GB upscale, ≥16 GB
+tag), default to the persisted preference when in stock else the cheapest, and
+pass the selection + a price-ordered fallback chain to `RemoteSession` via the
+`IMGTBX_GPU_OVERRIDE` env. Availability fluctuates minute-to-minute, hence the ↻
+refresh button. Surprise from the first run: RTX PRO 4500 (32 GB, $0.74) was
+cheaper than the RTX 5090 ($0.99) for upscaling — exactly the "is a pricier pod
+more cost-efficient per image?" question worth benchmarking.
+
 ## `runpod` config section (shipped in 0.3.1)
 
 The block now in `config.json` (`api_key` blank in the tracked template — a
