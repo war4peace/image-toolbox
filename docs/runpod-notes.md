@@ -313,6 +313,25 @@ The **GraphQL** endpoint has the data the REST one lacks:
 - `lowestPrice.uninterruptablePrice` = on-demand $/h in that DC;
   `stockStatus` ∈ High/Medium/Low when deployable, **null = out of stock there**.
 
+**Gotcha — GraphQL catalog ≠ REST create enum.** The GraphQL `gpuTypes` list is a
+*superset* of the GPU ids the REST `POST /pods` endpoint will accept. Newer cards
+(seen 2026-06-22: `NVIDIA RTX PRO 4500 Blackwell`, `NVIDIA RTX PRO 4000 Blackwell`)
+appear in GraphQL with live stock + price but `create_pod` **rejects them with
+HTTP 400** ("value must be one of …"). So `available_gpus` intersects availability
+with `runpod_client.CREATABLE_GPU_IDS` — the enum from the create schema (dump it
+by POSTing `/pods` with `gpuTypeIds=["__invalid__"]` and reading the 400 body; no
+pod is created). Without the intersection the picker offers a card that only fails
+at create, and the fallback chain wastes attempts 400-ing through phantom GPUs.
+
+**Cost guardrail — price ceiling.** The picker's selection seeds a price-ordered
+fallback chain, but the *automatic* part is capped at `runpod.max_price_per_hour`
+(default $0.50/h; 0 = no cap). Live testing hit the failure this prevents: a
+picked RTX 4000 Ada was sold out at create, the chain fell through the phantom
+Blackwells (400), and landed on an **A100-SXM4-80GB at $1.49/h** — wildly overkill
+for tagging. With the ceiling, only cheaper in-stock cards are tried
+automatically; the user's own explicit pick is honoured regardless (its price is
+shown in the confirm, flagged when above the ceiling).
+
 Wrapped as `runpod_client.available_gpus(api_key, data_center_id, min_memory_gb)`
 → in-stock GPUs ≥ the VRAM floor, **sorted by price ascending**. The GUI's tab
 pickers call it (off-thread) for the volume's region (≥32 GB upscale, ≥16 GB

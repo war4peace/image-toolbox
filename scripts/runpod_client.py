@@ -84,6 +84,37 @@ TAG_GPU_TYPES = [
     ("RTX 4000 Ada — 20 GB (~$0.26/h)",  "NVIDIA RTX 4000 Ada Generation"),
 ]
 
+# GPU type ids the REST /pods endpoint will actually CREATE. This is the enum
+# from the create_pod request schema — and it is NOT the same set GraphQL's
+# gpuTypes catalog returns. GraphQL advertises newer cards (e.g. "NVIDIA RTX PRO
+# 4500 Blackwell", "NVIDIA RTX PRO 4000 Blackwell") with live stock + price that
+# the REST create endpoint rejects with HTTP 400 ("value must be one of …").
+# available_gpus() intersects live availability with THIS set so the picker can
+# never offer a GPU that only fails at create time.
+#
+# To regenerate: POST /pods with gpuTypeIds=["__invalid__"] and read the enum out
+# of the 400 body's "value must be one of …" message (no pod is created).
+CREATABLE_GPU_IDS = frozenset({
+    "NVIDIA GeForce RTX 4090", "NVIDIA A40", "NVIDIA RTX A5000",
+    "NVIDIA GeForce RTX 5090", "NVIDIA H100 80GB HBM3", "NVIDIA GeForce RTX 3090",
+    "NVIDIA RTX A4500", "NVIDIA L40S", "NVIDIA H200", "NVIDIA L4",
+    "NVIDIA RTX 6000 Ada Generation", "NVIDIA A100-SXM4-80GB",
+    "NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A6000", "NVIDIA A100 80GB PCIe",
+    "NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX A4000",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA H100 PCIe",
+    "NVIDIA H100 NVL", "NVIDIA L40", "NVIDIA B200", "NVIDIA GeForce RTX 3080 Ti",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "NVIDIA GeForce RTX 3080",
+    "NVIDIA GeForce RTX 3070", "AMD Instinct MI300X OAM",
+    "NVIDIA GeForce RTX 4080 SUPER", "Tesla V100-PCIE-16GB",
+    "Tesla V100-SXM2-32GB", "NVIDIA RTX 5000 Ada Generation",
+    "NVIDIA GeForce RTX 4070 Ti", "NVIDIA RTX 4000 SFF Ada Generation",
+    "NVIDIA GeForce RTX 3090 Ti", "NVIDIA RTX A2000", "NVIDIA GeForce RTX 4080",
+    "NVIDIA A30", "NVIDIA GeForce RTX 5080", "Tesla V100-FHHL-16GB",
+    "NVIDIA H200 NVL", "Tesla V100-SXM2-16GB",
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", "NVIDIA A5000 Ada",
+    "Tesla V100-PCIE-32GB", "Tesla T4", "NVIDIA RTX A30",
+})
+
 # European data centers only (user is in Romania; network volumes are
 # region-locked and throughput is region-dependent). EU-RO-1 is closest.
 # (label, dataCenterId)
@@ -443,6 +474,9 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
         if not stock:                       # out of stock in this region → skip
             continue
         if mem < min_memory_gb:
+            continue
+        if g.get("id") not in CREATABLE_GPU_IDS:
+            # GraphQL lists it but REST create_pod would 400 — don't offer it.
             continue
         out.append({
             "id":        g.get("id"),

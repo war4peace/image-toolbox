@@ -1282,7 +1282,9 @@ class ToolTab(ttk.Frame):
         self.gpu_combo.pack(side="left")
         Tooltip(self.gpu_combo,
                 "GPUs that can be rented in your volume's region right now, "
-                "cheapest first. Live availability and price from RunPod.")
+                "cheapest first. Live availability and price from RunPod. If your "
+                "pick is unavailable, only cheaper in-stock cards under the price "
+                "ceiling (Settings → Remote) are tried automatically.")
         self.gpu_refresh_btn = ttk.Button(
             rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
         self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
@@ -1353,11 +1355,21 @@ class ToolTab(ttk.Frame):
         self.gpu_pick_var.set("couldn't load list — will use the Settings default")
         self.console.feed(f"[remote] GPU availability check failed: {exc}\n")
 
+    def _fallback_ceiling(self):
+        """Max $/h an AUTOMATIC fallback GPU may cost. 0 / unset = no cap. The
+        default ($0.50) stops a sold-out cheap card from silently escalating the
+        chain to a $1.49+ A100. The user's own explicit pick is never capped."""
+        try:
+            return float(CFG.get("runpod", {}).get("max_price_per_hour", 0.50) or 0)
+        except (TypeError, ValueError):
+            return 0.50
+
     def _selected_gpu_chain(self):
-        """The picked GPU id followed by the other in-stock ids (cheapest-first)
-        as a fallback chain, or None when nothing was loaded (then the run uses
-        the configured default + curated chain). Empty list = loaded but none
-        available, which the caller treats as a hard stop."""
+        """The picked GPU id followed by the other in-stock ids (cheapest-first,
+        capped at the fallback price ceiling) as a fallback chain, or None when
+        nothing was loaded (then the run uses the configured default + curated
+        chain). Empty list = loaded but none available, a hard stop for the
+        caller."""
         if not self._gpu_loaded:
             return None
         if not self._gpu_choices:
@@ -1366,8 +1378,34 @@ class ToolTab(ttk.Frame):
         if idx < 0 or idx >= len(self._gpu_choices):
             idx = 0
         chosen = self._gpu_choices[idx]["id"]
-        chain = [chosen] + [g["id"] for g in self._gpu_choices if g["id"] != chosen]
+        ceiling = self._fallback_ceiling()
+        chain = [chosen]
+        for g in self._gpu_choices:
+            if g["id"] == chosen:
+                continue
+            price = g.get("price")
+            if ceiling and price is not None and price > ceiling:
+                continue            # too pricey to fall back to automatically
+            chain.append(g["id"])
         return chain
+
+    def _gpu_confirm_note(self, gpu_chain):
+        """A short line for the 'run on a billed pod?' confirm: the chosen GPU and
+        price, plus whether a capped cheaper fallback exists."""
+        if not gpu_chain:
+            return ""
+        g = self._gpu_choices[max(0, self.gpu_combo.current())]
+        price = g.get("price")
+        price_str = f" (~${price:.2f}/h)" if price is not None else ""
+        note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price_str}."
+        ceiling = self._fallback_ceiling()
+        if ceiling and price is not None and price > ceiling:
+            note += (f"\n⚠ Above your ${ceiling:.2f}/h fallback ceiling (Settings) — "
+                     f"this is your explicit pick, so it's used anyway.")
+        elif ceiling and len(gpu_chain) > 1:
+            note += (f"\nIf it's unavailable, a cheaper in-stock GPU "
+                     f"(≤ ${ceiling:.2f}/h) is tried automatically.")
+        return note
 
     def _failure_status(self, code):
         """A meaningful one-line status for a non-zero exit. The clean output goes
@@ -2528,11 +2566,7 @@ class UpscaleTab(ToolTab):
                 return
             if not self.confirm_deadman_safety():
                 return
-            gpu_note = ""
-            if gpu_chain:
-                g = self._gpu_choices[max(0, self.gpu_combo.current())]
-                price = f" (~${g['price']:.2f}/h)" if g.get("price") is not None else ""
-                gpu_note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price}."
+            gpu_note = self._gpu_confirm_note(gpu_chain)
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run this batch on a rented RunPod GPU?\n\n"
@@ -2832,11 +2866,7 @@ class TagTab(ToolTab):
                 return
             if not self.confirm_deadman_safety():
                 return
-            gpu_note = ""
-            if gpu_chain:
-                g = self._gpu_choices[max(0, self.gpu_combo.current())]
-                price = f" (~${g['price']:.2f}/h)" if g.get("price") is not None else ""
-                gpu_note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price}."
+            gpu_note = self._gpu_confirm_note(gpu_chain)
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run Tag & Rename on a rented RunPod GPU?\n\n"
@@ -3358,7 +3388,22 @@ class SettingsTab(ttk.Frame):
         Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
                            "completion notification.")
 
-        # GPU type(s) + data center (curated enums — the REST API has no list call).
+        ttk.Label(sec, text="Max fallback (USD/h):").grid(
+            row=2, column=2, sticky="e", padx=6, pady=3)
+        self.runpod_maxprice_var = tk.StringVar(
+            value=str(rp.get("max_price_per_hour", 0.50)))
+        maxprice_spin = ttk.Spinbox(sec, from_=0.0, to=100.0, increment=0.10, width=8,
+                                    format="%.2f", textvariable=self.runpod_maxprice_var)
+        maxprice_spin.grid(row=2, column=3, sticky="w", padx=6, pady=3)
+        Tooltip(maxprice_spin,
+                "Cost guardrail. When your picked GPU is sold out, only cheaper "
+                "in-stock GPUs at or below this hourly price are tried "
+                "automatically — so a run can't silently escalate to an expensive "
+                "card. Your own explicit pick is never capped. 0 = no limit.")
+
+        # GPU defaults + data center. These are the PERSISTED PREFERENCE (curated
+        # lists); each tool tab has a live picker that shows what's actually
+        # deployable now and pre-selects the matching preference when in stock.
         hw = ttk.Frame(sec)
         hw.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
         ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4))
@@ -3640,6 +3685,7 @@ class SettingsTab(ttk.Frame):
         return {
             "api_key":              self.runpod_key_var.get().strip(),
             "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
+            "max_price_per_hour":   _num(self.runpod_maxprice_var, 0.50, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 720, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
@@ -4116,6 +4162,7 @@ class SettingsTab(ttk.Frame):
         rp = CFG.get("runpod", {})
         self.runpod_key_var.set(rp.get("api_key", ""))
         self.runpod_rate_var.set(str(rp.get("hourly_rate", 0.90)))
+        self.runpod_maxprice_var.set(str(rp.get("max_price_per_hour", 0.50)))
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", False)))
