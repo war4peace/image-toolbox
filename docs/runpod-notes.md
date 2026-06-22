@@ -343,6 +343,32 @@ A failed-mount deploy can also leave an **auto-replacement pod** whose id the
 mutation never returned — diag/teardown must sweep by **name**, not just the
 returned id, or a replacement lingers and bills.
 
+**Gotcha — CUDA driver mismatch → `allowedCudaVersions` deploy filter.** The pod
+image (`runpod/pytorch:…cu1281…`) needs host driver CUDA **≥ 12.8**. RunPod
+machines vary: benchmarking landed a CUDA-**12.7** RTX 4090 whose container never
+started (`nvidia-container-cli: requirement error: unsatisfied condition:
+cuda>=12.8`), and the doomed pod burned the whole fallback chain (2×240 s waits ×
+each GPU). `deploy_pod` now passes `allowedCudaVersions` so the pod only lands on
+a machine that can run the image. Verified-live facts:
+
+- the field is **exact-match set membership**, not a `>=` range — so to mean
+  "≥ 12.8" you must enumerate every version ≥ 12.8 (`runpod_client.allowed_cuda_versions`
+  derives this from the image's `cuXYZ` tag against `KNOWN_CUDA_VERSIONS`, listing
+  a couple of not-yet-existing future versions so a newer host isn't excluded).
+- it turns a *random* failure (you might get a 12.7 host and crash) into reliable
+  success — you only ever get a ≥12.8 host — or a clean, fast supply-constraint
+  fallback. It can't conjure compatible machines where none exist for that GPU.
+
+**Limit / future work:** this makes the cu128 image *reliable*, but doesn't let an
+older-driver-only machine run it. To actually use cards whose only hosts are on
+<12.8 drivers you'd need a **lower-CUDA image** — which for tagging is viable
+(only Ollama + the orientation CNN, and orientation falls back to CPU via
+`torch.cuda.is_available()`), but the on-pod venv is built with
+`--system-site-packages` against the image's exact torch (2.9.1+cu128, see
+provision.sh), so a different image needs the **volume re-provisioned** with a
+matching/own torch. Deferred — the filter already makes the current image
+reliable.
+
 **Cost guardrail — price ceiling.** The picker's selection seeds a price-ordered
 fallback chain, but the *automatic* part is capped at `runpod.max_price_per_hour`
 (default $0.50/h; 0 = no cap). Live testing hit the failure this prevents: a

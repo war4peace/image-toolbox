@@ -28,6 +28,7 @@ API surface (verified against rest.runpod.io/v1 OpenAPI, 2026-06):
     DELETE /pods/{id}            terminate_pod
 """
 
+import re
 import json
 import time
 import urllib.request
@@ -226,6 +227,46 @@ def create_pod(api_key, spec, timeout=60):
     return _request("POST", "/pods", api_key, body=spec, timeout=timeout)
 
 
+# RunPod machines report a host driver CUDA version; the deploy filter
+# `allowedCudaVersions` is EXACT-MATCH set membership (verified: values aren't
+# range-compared), so to mean ">= X" we must enumerate every version >= X. A pod
+# image built for cuYYZ won't START on a machine whose driver CUDA is lower
+# (nvidia-container-cli: "unsatisfied condition: cuda>=12.8") — that's the failure
+# that wasted the whole fallback chain on a CUDA-12.7 RTX 4090 in benchmarking.
+# Listing a few not-yet-existing future versions is harmless (they just match
+# nothing); the risk is the other way — omitting a real high version excludes a
+# capable machine, so keep this ahead of RunPod's current max.
+KNOWN_CUDA_VERSIONS = (
+    "12.0", "12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7", "12.8",
+    "12.9", "13.0", "13.1",
+)
+
+
+def _cuda_from_image(image):
+    """Parse the CUDA version a pod image needs from its tag (…cu128… or
+    …cu1281… → "12.8"), or None if not encoded."""
+    m = re.search(r"cu(\d{3,4})", image or "")
+    if not m:
+        return None
+    d = m.group(1)
+    return f"{d[:2]}.{d[2]}"            # '128'/'1281' -> '12.8'
+
+
+def allowed_cuda_versions(image):
+    """Every known CUDA version >= what `image` requires — the value for the
+    deploy filter so the pod only lands on a machine whose driver can run it.
+    None when the image tag carries no cuXYZ hint (then no filter is applied)."""
+    req = _cuda_from_image(image)
+    if not req:
+        return None
+    try:
+        floor = float(req)
+    except ValueError:
+        return None
+    out = [v for v in KNOWN_CUDA_VERSIONS if float(v) >= floor]
+    return out or None
+
+
 _DEPLOY_MUTATION = """
 mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) { id machineId costPerHr }
@@ -272,6 +313,12 @@ def deploy_pod(api_key, spec, timeout=90):
         inp["networkVolumeId"] = vol
         # REST defaults this; GraphQL requires it or the bind-mount fails.
         inp["volumeMountPath"] = spec.get("volumeMountPath", "/workspace")
+    # Only place the pod on a machine whose driver CUDA can run the image — a
+    # CUDA-12.7 host can't start a cu128 image, and that failure burns the whole
+    # GPU fallback chain. Caller may override with spec["allowedCudaVersions"].
+    cuda = spec.get("allowedCudaVersions") or allowed_cuda_versions(inp["imageName"])
+    if cuda:
+        inp["allowedCudaVersions"] = cuda
     data = _graphql(api_key, _DEPLOY_MUTATION, {"input": inp}, timeout=timeout)
     pod = data.get("podFindAndDeployOnDemand")
     if not isinstance(pod, dict) or not pod.get("id"):

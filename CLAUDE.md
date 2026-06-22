@@ -233,7 +233,11 @@ so deploying via GraphQL lets the picker offer the **full** catalog (incl. the
 cheap RTX 2000 Ada at ~$0.24) and matches the website 1:1. The one gotcha GraphQL
 needs spelled out: a mounted network volume requires an explicit `volumeMountPath`
 (REST defaults it) or the container fails with "field Target must not be empty"
-and never gets a public IP; (2) a **price ceiling**
+and never gets a public IP. The deploy also passes **`allowedCudaVersions`**
+(`runpod_client.allowed_cuda_versions`, derived from the image's `cuXYZ` tag) so a
+pod only lands on a host whose driver can run the image — a CUDA-12.7 machine
+can't start the cu128 image, and that used to burn the whole GPU fallback chain;
+(2) a **price ceiling**
 (`runpod.max_price_per_hour`, default **$0.50/h**, Settings → Remote)
 caps the *automatic* fallback chain so a sold-out cheap card can't silently
 escalate to a $1.49+ A100 — the user's own explicit pick is never capped (and the
