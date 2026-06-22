@@ -183,10 +183,33 @@ def _gui_event(kind, payload):
 # it running for the dead-man's switch, None → default (stop only a pod we made).
 _REMOTE_TEARDOWN = None
 
+# The active RemoteSession (roadmap #1), set in main() for a remote run. Lets the
+# run loop ask whether the pod is still alive when an upscale fails, so a
+# dead-man's-switch stop ends the run cleanly instead of looking like an outage.
+REMOTE_SESSION = None
+
 
 def _set_remote_teardown(value):
     global _REMOTE_TEARDOWN
     _REMOTE_TEARDOWN = value
+
+
+def _remote_pod_stopped():
+    """True if the remote pod is no longer RUNNING — its dead-man's switch fired
+    (idle / max-runtime) or it was stopped/terminated. Called only AFTER an
+    upscale request has failed, so a pod that is gone/EXITED/TERMINATED (or
+    unreadable — a terminated pod 404s) means: end the run gracefully (the resume
+    cache continues next time) instead of treating the dropped connection as a
+    recoverable local GPU outage. A still-RUNNING pod returns False, so a genuine
+    transient blip still uses the normal outage path."""
+    if REMOTE_SESSION is None:
+        return False
+    try:
+        import runpod_client as rp
+        status = rp.pod_status(REMOTE_SESSION.api_key, REMOTE_SESSION.pod_id)
+    except Exception:                                  # noqa: BLE001 (fail-safe)
+        return False
+    return status in (None, rp.STATUS_EXITED, rp.STATUS_TERMINATED)
 
 
 def _start_remote_telemetry(engine, interval=10.0):
@@ -1139,6 +1162,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     samples_seen = 0
     slow_streak  = 0
     degraded_stop = False
+    remote_stopped = False    # remote run: the pod's dead-man's switch stopped it
 
     def _trigger_degradation(reason, image, idx, total, grand_elapsed):
         """Announce a degradation episode (GUI + Discord) and stop the run.
@@ -1389,6 +1413,31 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     grand_elapsed=grand_elapsed)
                 degraded_stop = True
 
+            elif _remote_pod_stopped():
+                # Remote run: the upscale failed AND the pod is no longer running —
+                # its dead-man's switch fired (idle / max-runtime) or it was
+                # stopped. This is NOT a recoverable local outage, so end the run
+                # cleanly; the resume cache continues the queue on the next run.
+                logger.tee("  The remote pod has stopped — its dead-man's switch "
+                           "reached the idle / max-runtime limit (or it was "
+                           "stopped). Ending this run cleanly; the resume cache "
+                           "will continue the queue next time.")
+                _gui_event("STATUS", "Remote pod stopped — ending the run (resume cache saved).")
+                send_discord_notification(
+                    title       = "Upscale -- Remote pod stopped",
+                    description = ("The remote pod's dead-man's switch fired (idle "
+                                   "or max-runtime), or the pod was stopped. The run "
+                                   "ended cleanly — the resume cache continues the "
+                                   "queue on the next run."),
+                    color       = 15105570,   # amber
+                    fields      = [
+                        {"name": "Progress",      "value": f"{idx}/{total}"},
+                        {"name": "Total elapsed", "value": fmt_hhmmss(grand_elapsed)},
+                        {"name": "Machine",       "value": os.environ.get("COMPUTERNAME", "unknown")},
+                    ]
+                )
+                remote_stopped = True
+
             elif consecutive_failures >= OUTAGE_THRESHOLD:
                 outage_msg = (
                     f"{consecutive_failures} consecutive image(s) failed. "
@@ -1397,7 +1446,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     f"Last error: {e}"
                 )
                 logger.tee(f"  WARNING: OUTAGE DETECTED ({consecutive_failures} consecutive failures) -- pausing.")
-                logger.tee(f"  Check the log / free up VRAM, then press Space or P to resume.")
+                logger.tee("  Free up VRAM / check the log, then use Resume in the app "
+                           "to continue (or Stop to end the run).")
 
                 send_discord_notification(
                     title       = "Upscale Script -- Repeated Failures Detected",
@@ -1416,7 +1466,6 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     pause._pause_start = time.time()
                     consecutive_failures = 0
 
-                logger.tee("  Press Space/P to resume, or Q to quit gracefully.")
                 if not pause.check():
                     logger.tee("  Stopping at user request.")
                     break
@@ -1431,7 +1480,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     ]
                 )
 
-            if not degraded_stop:
+            if not (degraded_stop or remote_stopped):
                 continue
             # else: fall through so the finally cleans up, then break below.
 
@@ -1441,10 +1490,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             if tmp_path:
                 _safe_remove(tmp_path)
 
-        # Performance watchdog tripped (sustained slow streak or a hard OOM):
-        # stop the run cleanly after this image. The resume cache picks the queue
-        # back up after the user reboots — the known cure for the degraded GPU.
-        if degraded_stop:
+        # Stop the run cleanly after this image when the performance watchdog
+        # tripped (degraded GPU — resume after a reboot) or the remote pod stopped
+        # (dead-man's switch — resume on the next run).
+        if degraded_stop or remote_stopped:
             break
 
     # Persist any cache changes from this pass — including already-done marks
@@ -1472,6 +1521,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "corrupt_files":         corrupt_files,
         "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
         "degraded":              degraded_stop,
+        "remote_stopped":        remote_stopped,
     }
 
 
@@ -1561,7 +1611,7 @@ def main():
     print("")
     print("  Loading SeedVR2 engine (first run may download model weights) ...")
     _gui_event("STATUS", "Loading the AI engine …")
-    global ENGINE
+    global ENGINE, REMOTE_SESSION
     # Remote mode (roadmap #1): the GUI sets IMGTBX_UPSCALE_REMOTE=1 to run the
     # GPU work on a RunPod pod. The queue, resume cache, skip logic and the
     # performance watchdog all stay LOCAL — only the per-image upscale is remote.
@@ -1586,6 +1636,7 @@ def main():
             session = RemoteSession(_CFG.get("runpod", {}), _U, APP_ROOT,
                                     on_event=_remote_status, attach=_attach)
             ENGINE = session.start()
+            REMOTE_SESSION = session   # lets run_pass detect a dead-man's-switch stop
             # Guarantee teardown on any normal/sys.exit path; the on-pod
             # dead-man's switch is the backup if the process is hard-killed.
             # The GUI's "Stop" modal can override the teardown (stop the pod now
@@ -1803,6 +1854,10 @@ def main():
         logger.tee("")
         logger.tee("  GPU performance degraded — auto-stopped, skipping rescan. "
                    "Reboot and re-run; the resume cache continues the queue.")
+    elif stats1.get("remote_stopped"):
+        logger.tee("")
+        logger.tee("  Remote pod stopped (dead-man's switch) — skipping rescan. "
+                   "Re-run to continue; the resume cache picks up the queue.")
     else:
         logger.tee("")
         logger.tee("  Rescanning source directory for any new or renamed files ...")
@@ -1955,6 +2010,7 @@ def main():
     # ── Discord: queue finished / stopped ───────────────────────────────────
     user_quit = bool(stats1.get("user_quit")) or (stats2 is not None and bool(stats2.get("user_quit")))
     degraded  = bool(stats1.get("degraded"))  or (stats2 is not None and bool(stats2.get("degraded")))
+    remote_stopped = bool(stats1.get("remote_stopped")) or (stats2 is not None and bool(stats2.get("remote_stopped")))
 
     # GUI: machine-readable run summary (drives the MQTT last_run topic).
     _gui_event("DONE", json.dumps({
@@ -1966,11 +2022,15 @@ def main():
         "elapsed_seconds": round(grand_elapsed, 1),
         "stopped_by_user": user_quit,
         "degraded":        degraded,
+        "remote_stopped":  remote_stopped,
     }))
     # Degraded takes precedence: a watchdog OOM also bumps total_failed, so check
-    # it first or the run would be mislabelled "Finished with Failures".
+    # it first or the run would be mislabelled "Finished with Failures". A remote
+    # pod stop is next (its last image also counts as a failure).
     if degraded:
         notif_title, notif_color = "Upscale Queue -- Auto-Stopped (GPU Degraded)", 15105570  # orange
+    elif remote_stopped:
+        notif_title, notif_color = "Upscale Queue -- Remote Pod Stopped (resume to continue)", 15105570  # orange
     elif total_failed > 0:
         notif_title, notif_color = "Upscale Queue -- Finished with Failures", 16776960   # yellow
     elif user_quit:

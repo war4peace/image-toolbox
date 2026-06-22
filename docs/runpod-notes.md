@@ -91,9 +91,22 @@ Settled when groundwork started — drives every phase below:
   the same signal just auto-stops for a reboot.)
 - **Dead-man's switch is the organising constraint.** A billed pod must never be
   left running. The app's after-run auto-stop is the *fast* path; a self-stop
-  deadline **enforced on the pod** (max-runtime + idle-timeout, via the
-  pre-installed `runpodctl`) is the *guaranteed* path that survives a dropped
-  connection or a crashed controller. Build the stop path first.
+  deadline **enforced on the pod** (max-runtime + idle-timeout) is the
+  *guaranteed* path that survives a dropped connection or a crashed controller.
+  Build the stop path first.
+- **0 disables a limit (0.3.2).** `deadman.evaluate` treats `max_runtime=0` (and
+  `idle=0`) as "no limit" — so a long overnight run can set **max-runtime 0** and
+  rely on the **idle timeout** as the safety net (the worker touches a heartbeat
+  per image, so idle never fires during active work). The GUI warns if BOTH are 0
+  (no auto-stop at all → a crash leaves the pod billing).
+- **A dead-man's-switch stop ends the run gracefully (0.3.2).** When the pod stops
+  mid-run, the next image's request fails with a connection error. The runners
+  used to treat that as a recoverable local *outage* and pause forever (the
+  GUI can't resume a dead pod). Now, on a failure, `batch_upscale` /
+  `tag_and_rename` check the pod's status (`_remote_pod_stopped` → `pod_status`);
+  if it is gone/EXITED/TERMINATED they **end the run cleanly** (save the resume
+  cache, amber Discord/notify, skip the rescan) instead of pausing — a re-run
+  continues the queue. A still-RUNNING pod keeps the normal outage path.
 
 ## Heavyweight models live on a persistent network volume
 

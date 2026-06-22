@@ -1545,6 +1545,27 @@ class ToolTab(ttk.Frame):
                 "out of video memory.\n\nStart anyway?")
         return True
 
+    def confirm_deadman_safety(self):
+        """For a remote run: warn if BOTH dead-man's-switch limits are 0, which
+        leaves no auto-stop safety net (a crash/dropped connection would leave the
+        pod billing). max-runtime 0 alone is fine — the idle timeout still guards.
+        Returns True to proceed."""
+        rp = CFG.get("runpod", {})
+        try:
+            max_run = int(rp.get("max_runtime_minutes", 720))
+            idle    = int(rp.get("idle_timeout_minutes", 15))
+        except (TypeError, ValueError):
+            return True
+        if max_run <= 0 and idle <= 0:
+            return messagebox.askyesno(
+                APP_TITLE,
+                "Both dead-man's-switch limits are 0 — max runtime AND idle "
+                "timeout.\n\nThe pod will NOT stop itself, so if the app crashes "
+                "or loses connection it keeps billing until you stop it manually "
+                "in the RunPod dashboard.\n\nSet an idle timeout in Settings → "
+                "Remote upscaling for a safety net.\n\nStart anyway?")
+        return True
+
     def on_exit(self, code):
         """Subclasses override for their own UI, then call super().on_exit(code)
         so the shared MQTT 'task finished' state is published once."""
@@ -2362,6 +2383,8 @@ class UpscaleTab(ToolTab):
             if not ok_ssh:
                 messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
                 return
+            if not self.confirm_deadman_safety():
+                return
             if not messagebox.askyesno(
                     APP_TITLE,
                     "Run this batch on a rented RunPod GPU?\n\n"
@@ -2641,6 +2664,8 @@ class TagTab(ToolTab):
                 os.path.expandvars(rp.get("ssh_key_path", "")) or None)
             if not ok_ssh:
                 messagebox.showwarning(APP_TITLE, ssh_info.get("message", "SSH setup failed."))
+                return
+            if not self.confirm_deadman_safety():
                 return
             if not messagebox.askyesno(
                     APP_TITLE,

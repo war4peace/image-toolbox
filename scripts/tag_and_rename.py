@@ -245,12 +245,29 @@ OLLAMA_MODEL = _O.get("model", "qwen2.5vl:7b")
 # orientation CNN is called on the pod via REMOTE_ORIENT. Set up in main().
 REMOTE        = os.environ.get("IMGTBX_TAG_REMOTE") == "1"
 REMOTE_ORIENT = None      # pod analyse(path) -> (degrees, confidence) when remote
+REMOTE_SESSION = None      # the RemoteSession (set in main) — to detect a pod stop
 _REMOTE_TEARDOWN = None    # "stop"/"keep"/None — the GUI Stop modal's choice
 
 
 def _set_remote_teardown(value):
     global _REMOTE_TEARDOWN
     _REMOTE_TEARDOWN = value
+
+
+def _remote_pod_stopped():
+    """True if the remote tag pod is no longer RUNNING — its dead-man's switch
+    fired (idle / max-runtime) or it was stopped. Called after a failure so the
+    run ends cleanly (already-tagged files are skipped on re-run) instead of
+    pausing on what looks like an Ollama outage. A still-RUNNING pod returns
+    False (a transient blip uses the normal outage path)."""
+    if REMOTE_SESSION is None:
+        return False
+    try:
+        import runpod_client as rp
+        status = rp.pod_status(REMOTE_SESSION.api_key, REMOTE_SESSION.pod_id)
+    except Exception:                                  # noqa: BLE001 (fail-safe)
+        return False
+    return status in (None, rp.STATUS_EXITED, rp.STATUS_TERMINATED)
 
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
@@ -1310,7 +1327,7 @@ def _setup_remote_tagging():
 
     Kept out of main() so the `global OLLAMA_URL` reassignment doesn't clash with
     main() reading OLLAMA_URL earlier in its body."""
-    global OLLAMA_URL, REMOTE_ORIENT
+    global OLLAMA_URL, REMOTE_ORIENT, REMOTE_SESSION
     if not REMOTE:
         return None
     import atexit
@@ -1338,6 +1355,7 @@ def _setup_remote_tagging():
         sys.exit(1)
     OLLAMA_URL = session.ollama_url                   # tag_and_rename now calls the pod's Ollama
     REMOTE_ORIENT = engine.analyse                    # straighten detection runs on the pod
+    REMOTE_SESSION = session                          # so the loop can detect a pod stop
 
     def _remote_teardown():
         session.close(stop_pod={"stop": True, "keep": False}.get(_REMOTE_TEARDOWN))
@@ -1740,6 +1758,28 @@ def main():
             folder_stats[dirpath]["failed"] += 1
             total_failed += 1
 
+            # ── Remote pod stopped (dead-man's switch) ───────
+            # If the pod is gone, this isn't a recoverable Ollama outage — end the
+            # run cleanly (re-run continues; already-tagged files are skipped).
+            if _remote_pod_stopped():
+                print("  The remote pod has stopped — its dead-man's switch reached "
+                      "the idle / max-runtime limit (or it was stopped). Ending the "
+                      "run cleanly; re-run to continue.")
+                _gui_event("STATUS", "Remote pod stopped — ending the run.")
+                send_discord_notification(
+                    title       = "Tag & Rename -- Remote pod stopped",
+                    description = ("The remote pod's dead-man's switch fired (idle or "
+                                   "max-runtime), or the pod was stopped. The run ended "
+                                   "cleanly — re-run to continue; tagged files are skipped."),
+                    color       = 15105570,   # amber
+                    fields      = [
+                        {"name": "Progress", "value": f"{idx}/{total}"},
+                        {"name": "Machine",  "value": os.environ.get("COMPUTERNAME", "unknown")},
+                    ],
+                )
+                stop_reason = "remote"
+                break
+
             # ── Outage detection ─────────────────────────────
             if consecutive_fails >= OUTAGE_THRESHOLD:
                 print(f"  WARNING: {consecutive_fails} consecutive failures.")
@@ -1844,7 +1884,9 @@ def main():
     }))
 
     # ── Discord: queue finished / stopped ────────────────────────────────────
-    if stop_reason == "ollama":
+    if stop_reason == "remote":
+        notif_title, notif_color = "Tag & Rename -- Remote Pod Stopped (re-run to continue)", 15105570  # amber
+    elif stop_reason == "ollama":
         notif_title, notif_color = "Tag & Rename -- Stopped (Ollama Unreachable)", 15548997   # red
     elif total_failed > 0:
         notif_title, notif_color = "Tag & Rename -- Finished with Failures", 16776960          # yellow
