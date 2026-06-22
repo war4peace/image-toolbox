@@ -152,6 +152,15 @@ Wrinkles to honour when this is built:
   auto-straighten detection to the pod's `/orient` (rotation stays local PIL).
   bootstrap still never installs Ollama locally. **Known v1 gap:** no remote
   telemetry row for tagging yet (the upscale path has one).
+- **Tag GPU tier — cheap card + fallback chain (0.3.2, benchmarked live).** The
+  vision model uses only **~6.6 GB** VRAM (measured), so tagging runs on a cheap
+  card, NOT the upscale GPU. `runpod.tag_gpu_type_id` (Settings → "Tag GPU")
+  picks the primary; `remote_run` builds an ordered fallback chain from the
+  curated `TAG_GPU_TYPES` (RTX 2000 Ada → A4000 → A4500 → RTX 4000 Ada, all
+  16–20 GB, EU-available, ~$0.24–0.26/h). **Benchmark (RTX 2000 Ada, 16 GB,
+  EU-RO-1):** session up ~32 s, cold inference 24.4 s (model load), **warm
+  ~2.6 s/image**, VRAM 6.6/16 GB, 37 °C — ~3.5–4× cheaper/hour than the RTX 5090
+  ($0.99/h) for near-equivalent tag throughput.
 - **Pillow and the comparison view stay in every mode** — the GUI needs Pillow,
   and the before/after wipe compares the local original against the locally
   downloaded result, so it works unchanged for remote runs.

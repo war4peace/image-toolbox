@@ -175,10 +175,19 @@ class RemoteSession:
         region = rp.volume_region(self.api_key, vol_id)
         if not region:
             raise rp.RunPodError(f"Could not read region of volume {vol_id}.")
+        # GPU choice: upscaling needs the heavy card; tagging needs only ~6.6 GB,
+        # so it uses a cheap card with an ORDERED FALLBACK CHAIN (the configured
+        # tag_gpu_type_id first, then the rest of the curated low-tier list) so a
+        # tag run still starts when the preferred card is sold out.
+        if self.mode == "tag":
+            primary = self.cfg.get("tag_gpu_type_id") or rp.TAG_GPU_TYPES[0][1]
+            gpu_ids = [primary] + [gid for _l, gid in rp.TAG_GPU_TYPES if gid != primary]
+        else:
+            gpu_ids = [self.cfg.get("gpu_type_id", "NVIDIA GeForce RTX 5090")]
         spec = {
             "name": "image-toolbox-remote",
             "imageName": self.cfg.get("image_name") or DEFAULT_IMAGE,
-            "gpuTypeIds": [self.cfg.get("gpu_type_id", "NVIDIA GeForce RTX 5090")],
+            "gpuTypeIds": gpu_ids,
             "gpuCount": 1, "cloudType": "SECURE",
             "dataCenterIds": [region], "networkVolumeId": vol_id,
             "containerDiskInGb": int(self.cfg.get("container_disk_gb", 30)),
@@ -189,14 +198,15 @@ class RemoteSession:
         # registration needed. Additive: account keys still work too.
         if self.public_key:
             spec["env"] = {"PUBLIC_KEY": self.public_key}
-        self._emit(f"Creating pod ({spec['gpuTypeIds'][0]} in {region}) …")
+        chain_note = "" if len(gpu_ids) == 1 else " (+ fallbacks)"
+        self._emit(f"Creating pod ({gpu_ids[0]}{chain_note} in {region}) …")
 
         def ev(kind, attempt, pod_id, info):
             if kind == "created":
                 self.pod_id = pod_id
-                self._emit(f"Pod {pod_id} created (attempt {attempt}); waiting for deploy …")
+                self._emit(f"Pod {pod_id} created on {info} (attempt {attempt}); waiting for deploy …")
             elif kind == "bad":
-                self._emit(f"Pod {pod_id} failed to deploy ({info}); retrying with a fresh pod …")
+                self._emit(f"Pod start failed ({info}); trying the next option …")
             elif kind == "giveup":
                 self._emit(f"Gave up creating a pod: {info}")
 

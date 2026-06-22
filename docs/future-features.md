@@ -92,10 +92,16 @@ tag too. Remaining follow-ups:
   pre-seeding it from bootstrap (defaulting to the nearest EU DC, e.g. EU-RO-1 for
   this user) removes a manual step and prevents a wrong-region volume that no pod
   can then attach. The curated EU list already exists (`EU_DATACENTERS`).
-- **GPU fallback chain when the primary type is unavailable.** RTX 5090 capacity in
-  a single EU DC is intermittent (seen: "not enough free GPUs" on restart, and a
-  dry region failing `create`). When the configured GPU can't be allocated, fall
-  through a prioritized list instead of failing the run. Proposed order: **L40S**
+- **GPU fallback chain — MECHANISM DONE (0.3.2), used for tagging; upscale TODO.**
+  `create_pod_resilient` now treats `spec["gpuTypeIds"]` as an **ordered fallback
+  chain**: each type is tried in turn (a create/capacity error skips to the next
+  immediately; a deploy failure retries the same type) so a run still starts when
+  the preferred GPU is sold out. **Remote Tag & Rename already uses it** — a
+  curated low-tier chain (`TAG_GPU_TYPES`: RTX 2000 Ada → A4000 → A4500 → RTX 4000
+  Ada, all 16–20 GB / ~$0.24–0.26/h, EU-available), since the vision model needs
+  only ~6.6 GB. **Still TODO: give *upscaling* the same treatment** — the upscale
+  path passes a single `gpu_type_id`, so wrap it in a chain too. Proposed order:
+  **L40S**
   (48 GB, Ada, datacenter-reliable, good EU availability) → **RTX PRO 4500
   Blackwell** (32 GB, newest gen, fast) → **A40** (48 GB, Ampere — older/slower but
   cheap and widely available). All four run on the current cu128 / torch 2.9.1

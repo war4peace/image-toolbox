@@ -3160,17 +3160,18 @@ class SettingsTab(ttk.Frame):
         Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
                            "completion notification.")
 
-        # GPU type + data center (curated enums — the REST API has no list call).
+        # GPU type(s) + data center (curated enums — the REST API has no list call).
         hw = ttk.Frame(sec)
         hw.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
-        ttk.Label(hw, text="GPU type:").pack(side="left", padx=(0, 4))
+        ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.runpod_gpu_var = tk.StringVar(
             value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
         gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var,
                                values=runpod_client.GPU_TYPES, width=26)
-        gpu_cmb.pack(side="left")
-        Tooltip(gpu_cmb, "RunPod GPU type id. Pick one or type an unlisted id.")
-        ttk.Label(hw, text="Data center:").pack(side="left", padx=(18, 4))
+        gpu_cmb.grid(row=0, column=1, sticky="w")
+        Tooltip(gpu_cmb, "RunPod GPU for upscaling (the heavy SeedVR2 work). "
+                         "Pick one or type an unlisted id.")
+        ttk.Label(hw, text="Data center:").grid(row=0, column=2, sticky="w", padx=(18, 4))
         self._dc_label_by_id = {dcid: lbl for lbl, dcid in runpod_client.EU_DATACENTERS}
         self._dc_id_by_label = {lbl: dcid for lbl, dcid in runpod_client.EU_DATACENTERS}
         dc_ids = rp.get("data_center_ids") or []
@@ -3179,9 +3180,24 @@ class SettingsTab(ttk.Frame):
             value=self._dc_label_by_id.get(cur_dc, runpod_client.EU_DATACENTERS[0][0]))
         dc_cmb = ttk.Combobox(hw, textvariable=self.runpod_dc_var, state="readonly",
                               values=[lbl for lbl, _ in runpod_client.EU_DATACENTERS], width=24)
-        dc_cmb.pack(side="left")
+        dc_cmb.grid(row=0, column=3, sticky="w")
         Tooltip(dc_cmb, "European data centers only (region-locked network volume; "
                         "throughput is region-dependent). EU-RO-1 is closest to Romania.")
+        # Tag & Rename GPU — the vision model needs only ~6.6 GB, so a cheap
+        # 16-20 GB card is ideal. The chosen card is tried first; the rest of the
+        # curated list is an automatic fallback chain when it is unavailable.
+        ttk.Label(hw, text="Tag GPU:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(5, 0))
+        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
+        self.runpod_tag_gpu_var = tk.StringVar(
+            value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
+        tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var, state="readonly",
+                                   values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES], width=26)
+        tag_gpu_cmb.grid(row=1, column=1, sticky="w", pady=(5, 0))
+        Tooltip(tag_gpu_cmb, "GPU for remote Tag & Rename. The vision model needs "
+                             "only ~6.6 GB, so a cheap card is plenty. If it is "
+                             "unavailable, the others are tried automatically.")
 
         # Network volume (the persistent model store).
         vol = ttk.Frame(sec)
@@ -3430,6 +3446,8 @@ class SettingsTab(ttk.Frame):
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
             "gpu_type_id":      self.runpod_gpu_var.get().strip() or runpod_client.GPU_TYPES[0],
+            "tag_gpu_type_id":  self._tag_gpu_id_by_label.get(
+                self.runpod_tag_gpu_var.get(), runpod_client.TAG_GPU_TYPES[0][1]),
             "data_center_ids":  [dc_id] if dc_id else [],
             "network_volume_id": self._selected_volume_id(),
             # Carried through unchanged (no UI yet) so a save never drops them.
@@ -3904,6 +3922,9 @@ class SettingsTab(ttk.Frame):
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", False)))
         self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        self.runpod_tag_gpu_var.set(self._tag_gpu_label_by_id.get(
+            rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1]),
+            runpod_client.TAG_GPU_TYPES[0][0]))
         dc_ids = rp.get("data_center_ids") or []
         cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
         self.runpod_dc_var.set(

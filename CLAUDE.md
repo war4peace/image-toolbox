@@ -206,8 +206,10 @@ runs Ollama (vision model from the volume) **plus** the orientation CNN in a
 lightweight worker "tag mode" (no SeedVR2, so the VRAM is free for Ollama);
 `tag_and_rename.py` still runs locally (reads/writes the files, does EXIF/rename)
 but its Ollama URL is repointed at an ssh tunnel and auto-straighten detection
-runs on the pod. See the remote-pod module cluster below and
-`docs/runpod-notes.md` / `docs/future-features.md` #1.
+runs on the pod. Tagging uses a **cheap GPU tier** (`runpod.tag_gpu_type_id` →
+an ordered fallback chain of 16–20 GB cards in `TAG_GPU_TYPES`; the vision model
+needs only ~6.6 GB), not the upscale GPU. See the remote-pod module cluster below
+and `docs/runpod-notes.md` / `docs/future-features.md` #1.
 
 ## Codebase structure
 

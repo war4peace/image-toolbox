@@ -63,6 +63,21 @@ GPU_TYPES = [
     "NVIDIA H100 80GB HBM3",
 ]
 
+# Curated low-tier GPUs for remote Tag & Rename. The vision model (qwen2.5vl:7b
+# via Ollama) needs only ~6.6 GB VRAM (benchmarked) and tagging isn't
+# throughput-critical (warm ~2.6 s/image on an RTX 2000 Ada), so a cheap 16-20 GB
+# card is ideal and far cheaper than the upscale GPU. Used as an ORDERED FALLBACK
+# CHAIN: the configured `tag_gpu_type_id` is tried first, then the rest in turn,
+# so a tag run still starts when the preferred card is unavailable. All four are
+# secure-cloud and available in the EU. Prices are point-in-time (EU, 2026-06),
+# informational only. (label, gpuTypeId)
+TAG_GPU_TYPES = [
+    ("RTX 2000 Ada — 16 GB (~$0.24/h)", "NVIDIA RTX 2000 Ada Generation"),
+    ("RTX A4000 — 16 GB (~$0.25/h)",     "NVIDIA RTX A4000"),
+    ("RTX A4500 — 20 GB (~$0.25/h)",     "NVIDIA RTX A4500"),
+    ("RTX 4000 Ada — 20 GB (~$0.26/h)",  "NVIDIA RTX 4000 Ada Generation"),
+]
+
 # European data centers only (user is in Romania; network volumes are
 # region-locked and throughput is region-dependent). EU-RO-1 is closest.
 # (label, dataCenterId)
@@ -243,43 +258,62 @@ def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
 def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
                          on_event=None):
     """Create a pod and wait until it is reachable, retrying with a FRESH pod if
-    it doesn't deploy in time or EXITs early.
+    it doesn't deploy in time or EXITs early — and falling through a GPU chain.
 
     RunPod occasionally hands out a pod that never finishes deploying (a
     misconfigured/unhealthy host) — it sits without an SSH endpoint, or flips to
     EXITED. Rather than wait forever, give each pod a `deploy_timeout`; on failure
-    terminate it and try another, up to `attempts` times. Returns the running pod
-    dict, or raises RunPodError if every attempt fails.
+    terminate it and try another, up to `attempts` times.
+
+    `spec["gpuTypeIds"]` may list **several GPU types**: they are an ORDERED
+    FALLBACK CHAIN. Each type is tried in turn — a create/capacity error moves to
+    the next type immediately, a deploy failure retries the SAME type up to
+    `attempts` times — so a run still starts when the preferred GPU is sold out.
+    A single-element list behaves exactly as before. Returns the running pod dict,
+    or raises RunPodError if no type yields a reachable pod.
 
     `on_event(kind, attempt, pod_id, info)` is called for UI/logging with kind in
-    {"created","status","bad","giveup"}.
+    {"created","status","bad","giveup"}; for "created"/"bad" `info` carries the
+    GPU type being tried.
     """
+    gpu_chain = list(spec.get("gpuTypeIds") or [None])
     last_err = None
-    for attempt in range(1, attempts + 1):
-        pod = create_pod(api_key, spec)
-        pod_id = (pod or {}).get("id")
-        if not pod_id:
-            last_err = f"create returned no pod id: {pod}"
+    for gpu in gpu_chain:
+        gspec = spec if gpu is None else {**spec, "gpuTypeIds": [gpu]}
+        for attempt in range(1, attempts + 1):
+            try:
+                pod = create_pod(api_key, gspec)
+            except RunPodError as exc:
+                # Capacity / unavailable at create time → try the next GPU now
+                # rather than burning this type's remaining attempts.
+                last_err = f"{gpu or '?'}: {exc}"
+                if on_event:
+                    on_event("bad", attempt, None, last_err)
+                break
+            pod_id = (pod or {}).get("id")
+            if not pod_id:
+                last_err = f"{gpu or '?'}: create returned no pod id: {pod}"
+                if on_event:
+                    on_event("bad", attempt, None, last_err)
+                continue
             if on_event:
-                on_event("bad", attempt, None, last_err)
-            continue
-        if on_event:
-            on_event("created", attempt, pod_id, None)
-        try:
-            return wait_until_running(
-                api_key, pod_id, timeout=deploy_timeout, poll=poll,
-                on_status=(lambda s, h, p, a=attempt, pid=pod_id:
-                           on_event("status", a, pid, (s, h, p)) if on_event else None))
-        except RunPodError as exc:
-            last_err = str(exc)
-            if on_event:
-                on_event("bad", attempt, pod_id, last_err)
-            # Tear the bad pod down before trying a fresh one (don't leave it billing).
-            ensure_stopped(api_key, pod_id, terminate=True)
+                on_event("created", attempt, pod_id, gpu)
+            try:
+                return wait_until_running(
+                    api_key, pod_id, timeout=deploy_timeout, poll=poll,
+                    on_status=(lambda s, h, p, a=attempt, pid=pod_id:
+                               on_event("status", a, pid, (s, h, p)) if on_event else None))
+            except RunPodError as exc:
+                last_err = f"{gpu or '?'}: {exc}"
+                if on_event:
+                    on_event("bad", attempt, pod_id, last_err)
+                # Tear the bad pod down before trying again (don't leave it billing).
+                ensure_stopped(api_key, pod_id, terminate=True)
     if on_event:
         on_event("giveup", attempts, None, last_err)
     raise RunPodError(
-        f"Pod failed to deploy after {attempts} attempt(s). Last error: {last_err}")
+        f"Pod failed to deploy on any of {gpu_chain} after {attempts} attempt(s) "
+        f"each. Last error: {last_err}")
 
 
 def volume_region(api_key, vol_id, timeout=30):
