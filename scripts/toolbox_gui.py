@@ -1323,9 +1323,10 @@ class ToolTab(ttk.Frame):
                 key   = rp_cfg.get("api_key", "")
                 vol   = rp_cfg.get("network_volume_id", "").strip()
                 # The pod is created in the VOLUME's region, so price/stock must be
-                # read there — fall back to the configured DC, then global.
+                # read there — fall back to the configured data center, then global.
+                cfg_dcs = rp_cfg.get("data_center_ids") or []
                 dc = (rp.volume_region(key, vol) if vol else None) \
-                    or rp_cfg.get("data_center_id") or None
+                    or (cfg_dcs[0] if cfg_dcs else None)
                 gpus = rp.available_gpus(key, dc, min_memory_gb=min_vram)
                 self.after(0, lambda: self._populate_gpus(gpus, dc))
             except Exception as exc:                     # noqa: BLE001 (UI thread)
@@ -3369,14 +3370,14 @@ class SettingsTab(ttk.Frame):
 
         # ── Remote upscaling (RunPod) ───────────────────────────────────────────
         rp = CFG.get("runpod", {})
-        sec = self._section(body, "Remote upscaling (RunPod) — experimental")
+        sec = self._section(body, "Remote Pod Settings (RunPod.io)")
         sec.columnconfigure(1, weight=1)
 
         desc = ttk.Frame(sec)
         desc.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
         ttk.Label(desc, wraplength=560, foreground="#666",
-                  text=("Upscale on a rented RunPod GPU (roadmap #1) — tick "
-                        "'Run on remote pod' on the Batch Upscaler tab. The API "
+                  text=("Process images on a rented remote pod (RunPod.io). Tick "
+                        "'Run on remote pod (RunPod)' in the appropriate tab. The API "
                         "key authenticates the pod control plane; the auto-stop / "
                         "runtime limits below are the safety net that keeps a "
                         "billed pod from being left running.")
@@ -3467,22 +3468,10 @@ class SettingsTab(ttk.Frame):
         Tooltip(gpu_cmb, "RunPod GPU for upscaling (the heavy SeedVR2 work). This is "
                          "the persisted preference; each tab's live picker shows "
                          "what's actually deployable now and overrides it per run.")
-        ttk.Label(hw, text="Data center:").grid(row=0, column=2, sticky="w", padx=(18, 4))
-        self._dc_label_by_id = {dcid: lbl for lbl, dcid in runpod_client.EU_DATACENTERS}
-        self._dc_id_by_label = {lbl: dcid for lbl, dcid in runpod_client.EU_DATACENTERS}
-        dc_ids = rp.get("data_center_ids") or []
-        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
-        self.runpod_dc_var = tk.StringVar(
-            value=self._dc_label_by_id.get(cur_dc, runpod_client.EU_DATACENTERS[0][0]))
-        dc_cmb = ttk.Combobox(hw, textvariable=self.runpod_dc_var, state="readonly",
-                              values=[lbl for lbl, _ in runpod_client.EU_DATACENTERS], width=24)
-        dc_cmb.grid(row=0, column=3, sticky="w")
-        Tooltip(dc_cmb, "European data centers only (region-locked network volume; "
-                        "throughput is region-dependent). EU-RO-1 is closest to Romania.")
         # Tag & Rename GPU — the vision model needs only ~6.6 GB, so a cheap
         # 16-20 GB card is ideal. The chosen card is tried first; the rest of the
         # curated list is an automatic fallback chain when it is unavailable.
-        ttk.Label(hw, text="Tag GPU:").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(5, 0))
+        ttk.Label(hw, text="Tag GPU:").grid(row=0, column=2, sticky="w", padx=(18, 4))
         self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
         self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
         cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
@@ -3490,22 +3479,64 @@ class SettingsTab(ttk.Frame):
             value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
         tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var, state="readonly",
                                    values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES], width=26)
-        tag_gpu_cmb.grid(row=1, column=1, sticky="w", pady=(5, 0))
+        tag_gpu_cmb.grid(row=0, column=3, sticky="w")
         Tooltip(tag_gpu_cmb, "GPU for remote Tag & Rename. The vision model needs "
                              "only ~6.6 GB, so a cheap card is plenty. If it is "
                              "unavailable, the others are tried automatically.")
 
+        # Region + data center. A model volume is region-locked and can only live
+        # where network storage is supported, so the picker is grouped by region
+        # and offers storage-capable data centers only — this is where the volume
+        # buttons below act. Pods then follow the selected volume's region.
+        dcsel = ttk.Frame(sec)
+        dcsel.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(dcsel, text="Region:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.runpod_region_var = tk.StringVar()
+        region_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_region_var,
+                                  state="readonly", values=runpod_client.REGIONS, width=16)
+        region_cmb.grid(row=0, column=1, sticky="w")
+        region_cmb.bind("<<ComboboxSelected>>", self._on_region_change)
+        Tooltip(region_cmb, "Pick the part of the world to host your model volume "
+                            "and run pods. Choose the one nearest you for the best "
+                            "throughput (network volumes are region-locked).")
+        ttk.Label(dcsel, text="Data center:").grid(row=0, column=2, sticky="w", padx=(18, 4))
+        self.runpod_dc_var = tk.StringVar()
+        self.runpod_dc_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_dc_var,
+                                          state="readonly", values=[], width=26)
+        self.runpod_dc_cmb.grid(row=0, column=3, sticky="w")
+        self.runpod_dc_cmb.bind("<<ComboboxSelected>>", self._on_dc_change)
+        Tooltip(self.runpod_dc_cmb,
+                "Only data centers that support network volumes are listed. The "
+                "model-volume buttons below act in this data center. Refresh to "
+                "pull the live list from RunPod.")
+        ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters).grid(
+            row=0, column=4, sticky="w", padx=(8, 0))
+        # Clear, explicit statement of where the volume actions will take effect.
+        # Created before the seed below, which renders into it via _update_dc_target.
+        self.runpod_dc_target = ttk.Label(sec, text="", foreground="#444")
+        self.runpod_dc_target.grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 0))
+
+        # Seed the picker from the curated list, then point it at the saved DC.
+        dc_ids = rp.get("data_center_ids") or []
+        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
+        self._set_dc_entries(
+            [{"id": dcid, "label": lbl, "region": runpod_client.region_of(dcid)}
+             for lbl, dcid in runpod_client.DATACENTERS],
+            preserve_id=cur_dc)
+
         # Network volume (the persistent model store).
         vol = ttk.Frame(sec)
-        vol.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        vol.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(vol, text="Model volume:").pack(side="left", padx=(0, 4))
         self.runpod_vol_var = tk.StringVar(value=rp.get("network_volume_id", ""))
         self.runpod_vol_cmb = ttk.Combobox(vol, textvariable=self.runpod_vol_var, width=40)
         self.runpod_vol_cmb.pack(side="left")
+        self.runpod_vol_cmb.bind("<<ComboboxSelected>>", self._on_volume_selected)
         Tooltip(self.runpod_vol_cmb,
                 "Persistent RunPod network volume that holds the models (SeedVR2 + "
                 "Ollama) so disposable pods don't re-download them. Format: "
-                "'id | name | size | dc'. Refresh to list, or Create one.")
+                "'id | name | size | dc'. Refresh to list, or Create one. Selecting "
+                "one points the Region/Data center above at where it lives.")
         ttk.Button(vol, text="Refresh", command=self._refresh_volumes).pack(side="left", padx=(6, 0))
         ttk.Button(vol, text="Create…", command=self._create_volume).pack(side="left", padx=(4, 0))
         del_btn = tk.Button(vol, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
@@ -3520,16 +3551,19 @@ class SettingsTab(ttk.Frame):
                           "the pod is terminated automatically when finished.")
 
         safety = ttk.Frame(sec)
-        safety.grid(row=5, column=0, columnspan=4, sticky="w", pady=3)
+        safety.grid(row=7, column=0, columnspan=4, sticky="w", pady=3)
         ttk.Label(safety, text="Auto-stop after:").pack(side="left", padx=(0, 4))
-        self.runpod_maxrun_var = tk.StringVar(value=str(rp.get("max_runtime_minutes", 720)))
+        self.runpod_maxrun_var = tk.StringVar(value=str(rp.get("max_runtime_minutes", 0)))
         maxrun_spin = ttk.Spinbox(safety, from_=0, to=10080, increment=30, width=7,
                                   textvariable=self.runpod_maxrun_var)
         maxrun_spin.pack(side="left")
         ttk.Label(safety, text="min max runtime,").pack(side="left", padx=(4, 12))
         Tooltip(maxrun_spin, "Hard ceiling enforced on the pod itself: it stops "
-                             "after this long no matter what (0 = no limit). The "
-                             "dead-man's switch — survives a dropped connection.")
+                             "after this long no matter what. Defaults to 0 (no "
+                             "limit) so a long batch of many images is never cut off "
+                             "mid-run — the idle timeout below is the dead-man's "
+                             "switch that still ends a billed pod if the connection "
+                             "drops. Set a value only if you want a hard cap.")
         self.runpod_idle_var = tk.StringVar(value=str(rp.get("idle_timeout_minutes", 15)))
         idle_spin = ttk.Spinbox(safety, from_=0, to=1440, increment=5, width=6,
                                 textvariable=self.runpod_idle_var)
@@ -3542,7 +3576,7 @@ class SettingsTab(ttk.Frame):
         term_chk = ttk.Checkbutton(
             sec, text="Terminate (delete) the pod when done, not just stop it",
             variable=self.runpod_terminate_var)
-        term_chk.grid(row=6, column=0, columnspan=4, sticky="w", pady=3)
+        term_chk.grid(row=8, column=0, columnspan=4, sticky="w", pady=3)
         Tooltip(term_chk, "ON (recommended): the disposable pod is deleted when a "
                           "run ends, freeing ALL billing. This NEVER deletes your "
                           "model network volume — that's a separate resource. OFF "
@@ -3551,7 +3585,7 @@ class SettingsTab(ttk.Frame):
                           "pod, so OFF just leaves billing cruft.")
 
         self.runpod_status = ttk.Label(sec, text="", foreground="#666")
-        self.runpod_status.grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.runpod_status.grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
@@ -3563,6 +3597,16 @@ class SettingsTab(ttk.Frame):
         # Baseline for unsaved-changes detection: a snapshot of the form as it
         # mirrors config.json right now. Re-taken on every successful save/revert.
         self._baseline = self._snapshot()
+
+        # Live unsaved-changes indicator. Rather than wire a trace onto dozens of
+        # heterogeneous vars (entries, spinboxes, comboboxes), poll is_dirty() on a
+        # light timer: "Not saved" (red) the moment any field differs from the saved
+        # state, "Saved." (green) right after a successful save, blank when clean and
+        # unsaved-this-session. `_save_status_base` is what to show when clean;
+        # `_save_status_hold` lets a transient message (e.g. a write error) linger.
+        self._save_status_base = ""
+        self._save_status_hold = 0.0
+        self._refresh_save_indicator()
 
         # Probe the saved Ollama URL in the background so the status text already
         # reflects reachability by the time the user opens the Settings tab.
@@ -3737,13 +3781,13 @@ class SettingsTab(ttk.Frame):
             except (ValueError, tk.TclError):
                 return default
         rp = CFG.get("runpod", {})
-        dc_id = self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
+        dc_id = self._selected_dc_id()
         return {
             "api_key":              self.runpod_key_var.get().strip(),
             "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
             "max_price_per_hour_upscale": _num(self.runpod_maxprice_up_var, 1.10, float),
             "max_price_per_hour_tag":     _num(self.runpod_maxprice_tag_var, 0.50, float),
-            "max_runtime_minutes":  _num(self.runpod_maxrun_var, 720, int),
+            "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
             "gpu_type_id":      self.runpod_gpu_var.get().strip() or runpod_client.GPU_TYPES[0],
@@ -3765,6 +3809,122 @@ class SettingsTab(ttk.Frame):
         'id | name | size | dc' after a Refresh, but a raw id (typed/pasted) is
         also accepted."""
         return (self.runpod_vol_var.get().split("|", 1)[0]).strip()
+
+    # ── Region / data-center picker ──────────────────────────────────────────
+    def _set_dc_entries(self, entries, preserve_id=None):
+        """Adopt a list of data-center entries ({id,label,region}) as the picker's
+        source, rebuild the lookup maps, and point the Region/Data center combos at
+        `preserve_id` (kept available even if absent from the list)."""
+        entries = list(entries)
+        if preserve_id and preserve_id not in {e["id"] for e in entries}:
+            entries.append({
+                "id": preserve_id, "label": preserve_id,
+                "region": runpod_client.region_of(preserve_id) or runpod_client.REGIONS[0]})
+        self._dc_entries     = entries
+        self._dc_label_by_id = {e["id"]: e["label"] for e in entries}
+        self._dc_id_by_label = {e["label"]: e["id"] for e in entries}
+        target = preserve_id or self._selected_dc_id()
+        region = (runpod_client.region_of(target)
+                  or self.runpod_region_var.get() or runpod_client.REGIONS[0])
+        self.runpod_region_var.set(region)
+        self._populate_dc_for_region(select_id=target)
+
+    def _populate_dc_for_region(self, select_id=None):
+        """Fill the Data center combo with the DCs in the chosen region, selecting
+        `select_id` if it lives there else the first one."""
+        region = self.runpod_region_var.get()
+        labels = [e["label"] for e in self._dc_entries if e["region"] == region]
+        self.runpod_dc_cmb.configure(values=labels)
+        if labels:
+            lab = self._dc_label_by_id.get(select_id) if select_id else None
+            self.runpod_dc_var.set(lab if lab in labels else labels[0])
+        else:
+            self.runpod_dc_var.set("")
+        self._update_dc_target()
+
+    def _on_region_change(self, *_):
+        self._populate_dc_for_region()
+
+    def _on_dc_change(self, *_):
+        self._update_dc_target()
+
+    def _selected_dc_id(self):
+        """The data-center id currently chosen in the picker ('' if none)."""
+        return self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
+
+    def _update_dc_target(self):
+        """Spell out, in plain language, where the volume buttons will act."""
+        dc = self._selected_dc_id()
+        region = self.runpod_region_var.get()
+        if dc:
+            self.runpod_dc_target.configure(
+                text=f"Volume actions (Create / Provision) act in:  {region}  ·  {dc}",
+                foreground="#444")
+        else:
+            self.runpod_dc_target.configure(
+                text=(f"No network-storage data center in {region} right now — pick "
+                      "another region (Refresh to re-check RunPod for new ones)."),
+                foreground="#b3261e")
+
+    def _sync_region_dc_to(self, dc_id):
+        """Point the Region/Data center pickers at `dc_id` (e.g. a selected
+        volume's region) so the displayed target matches where actions run. Adds an
+        ad-hoc entry if the id isn't already in the list."""
+        if not dc_id:
+            return
+        if dc_id not in self._dc_label_by_id:
+            self._dc_entries.append({
+                "id": dc_id, "label": dc_id,
+                "region": runpod_client.region_of(dc_id) or runpod_client.REGIONS[0]})
+            self._dc_label_by_id[dc_id] = dc_id
+            self._dc_id_by_label[dc_id] = dc_id
+        self.runpod_region_var.set(
+            runpod_client.region_of(dc_id) or self.runpod_region_var.get())
+        self._populate_dc_for_region(select_id=dc_id)
+
+    def _on_volume_selected(self, *_):
+        """When the user picks an existing volume, follow it: a volume is
+        region-locked, so the Region/Data center should reflect where it lives."""
+        parts = self.runpod_vol_var.get().split("|")
+        if len(parts) >= 4:
+            dc = parts[-1].strip()
+            if dc and dc != "?":
+                self._sync_region_dc_to(dc)
+
+    def _refresh_datacenters(self):
+        """Pull the live storage-capable data-center list from RunPod (GraphQL)."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_status.configure(text="Enter a RunPod API key first.",
+                                         foreground="#b3261e")
+            return
+        self.runpod_status.configure(text="Listing data centers…", foreground="#666")
+        keep = self._selected_dc_id()
+
+        def work():
+            try:
+                dcs = runpod_client.data_centers(key)
+                err = None
+            except runpod_client.RunPodError as exc:
+                dcs, err = [], str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_status.configure(text=err, foreground="#b3261e")
+                    return
+                entries = [{
+                    "id": d["id"],
+                    "label": (f'{d["location"]} ({d["id"]})' if d["location"] else d["id"]),
+                    "region": d["region"] or runpod_client.region_of(d["id"]),
+                } for d in dcs]
+                self._set_dc_entries(entries, preserve_id=keep)
+                self.runpod_status.configure(
+                    text=f"{len(entries)} storage-capable data center(s) across "
+                         f"{len({e['region'] for e in entries})} region(s).",
+                    foreground="#1a7f37")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_volumes(self):
         """List the account's network volumes into the combobox (free call)."""
@@ -3791,10 +3951,12 @@ class SettingsTab(ttk.Frame):
                           f"{v.get('size','?')} GB | {v.get('dataCenterId','?')}"
                           for v in vols if isinstance(v, dict)]
                 self.runpod_vol_cmb.configure(values=labels)
-                # Re-select the previously-chosen volume if it is still present.
+                # Re-select the previously-chosen volume if it is still present,
+                # and follow it to its region/data center.
                 match = next((l for l in labels if l.split("|", 1)[0].strip() == keep), None)
                 if match:
                     self.runpod_vol_var.set(match)
+                    self._on_volume_selected()
                 self.runpod_status.configure(
                     text=(f"{len(labels)} network volume(s) on the account."
                           if labels else "No network volumes yet — use Create…"),
@@ -3804,17 +3966,18 @@ class SettingsTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _create_volume(self):
-        """Create a network volume in the selected EU data center (this starts a
-        small monthly storage charge — confirmed first)."""
+        """Create a network volume in the selected region's data center (this
+        starts a small monthly storage charge — confirmed first)."""
         key = self.runpod_key_var.get().strip()
         if not key:
             self.runpod_status.configure(text="Enter a RunPod API key first.",
                                          foreground="#b3261e")
             return
-        dc_id = self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
+        dc_id = self._selected_dc_id()
         if not dc_id:
-            self.runpod_status.configure(text="Pick a data center first.",
-                                         foreground="#b3261e")
+            self.runpod_status.configure(
+                text=f"No storage data center selected for {self.runpod_region_var.get()} "
+                     "— pick another region first.", foreground="#b3261e")
             return
         name = simpledialog.askstring(
             "Create network volume",
@@ -4186,12 +4349,36 @@ class SettingsTab(ttk.Frame):
             self._baseline = self._snapshot()    # the form is now the saved state
             # Apply MQTT changes immediately (connect/disconnect/reconfigure).
             self.app.restart_mqtt()
+            self._save_status_base = "Saved."    # the live indicator renders it green
             self.save_status.configure(text="Saved.", foreground="#1a7f37")
             return True
+        # Write failed — hold the error on screen so the live indicator doesn't
+        # immediately overwrite it with "Not saved".
+        self._save_status_hold = time.time() + 6
         self.save_status.configure(
             text="Could not write config.json (check file permissions).",
             foreground="#b3261e")
         return False
+
+    def _refresh_save_indicator(self):
+        """Light timer that keeps `save_status` reflecting the unsaved-changes
+        state live: 'Not saved' (red) whenever the form differs from the saved
+        state, otherwise the clean-state base text ('Saved.' green after a save,
+        blank before). A transient message (e.g. a write error) is left alone until
+        `_save_status_hold` expires. Polling avoids tracing dozens of mixed vars."""
+        try:
+            if not self.save_status.winfo_exists():
+                return
+            if time.time() >= self._save_status_hold:
+                if self.is_dirty():
+                    self.save_status.configure(text="Not saved", foreground="#b3261e")
+                else:
+                    base = self._save_status_base
+                    self.save_status.configure(
+                        text=base, foreground="#1a7f37" if base == "Saved." else "#666")
+        except Exception:                       # noqa: BLE001 (never let the timer die loudly)
+            pass
+        self.after(400, self._refresh_save_indicator)
 
     def revert(self):
         """Discard unsaved edits: reset every field to the values in CFG."""
@@ -4229,7 +4416,7 @@ class SettingsTab(ttk.Frame):
         self.runpod_rate_var.set(str(rp.get("hourly_rate", 0.90)))
         self.runpod_maxprice_up_var.set(str(rp.get("max_price_per_hour_upscale", 1.10)))
         self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
-        self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 720)))
+        self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
         self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
@@ -4238,13 +4425,13 @@ class SettingsTab(ttk.Frame):
             runpod_client.TAG_GPU_TYPES[0][0]))
         dc_ids = rp.get("data_center_ids") or []
         cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
-        self.runpod_dc_var.set(
-            self._dc_label_by_id.get(cur_dc, runpod_client.EU_DATACENTERS[0][0]))
+        self._sync_region_dc_to(cur_dc)
         self.runpod_vol_var.set(rp.get("network_volume_id", ""))
         for key, (var, typ) in self._seedvr_vars.items():
             if key in ups:
                 var.set(ups[key] if typ is bool else str(ups[key]))
         self._baseline = self._snapshot()
+        self._save_status_base = ""          # discard the "Saved." indicator too
 
 
 # ─────────────────────────────────────────────

@@ -85,13 +85,16 @@ mode" + `ollama serve` on the pod + a second tunnel; `tag_and_rename` runs local
 against the tunnelled Ollama, straighten on the pod) so a Remote-only install can
 tag too. Remaining follow-ups:
 
-- **Region from bootstrap.** Ask the user's region during first-run bootstrap and
-  use it as the default for both (a) creating the model network volume and (b) the
-  target data center when spinning up pods. Today the volume's region is read back
-  and pods are pinned to it (region-locked), but the *initial* choice is implicit —
-  pre-seeding it from bootstrap (defaulting to the nearest EU DC, e.g. EU-RO-1 for
-  this user) removes a manual step and prevents a wrong-region volume that no pod
-  can then attach. The curated EU list already exists (`EU_DATACENTERS`).
+- **Region from bootstrap — MOSTLY DONE (0.3.4); only the bootstrap pre-seed
+  remains.** Settings now has a **world-wide Region + Data center picker**
+  (`runpod_client.data_centers` GraphQL live list, storage-capable DCs only,
+  grouped into Europe / North America / Asia / Oceania via `region_of`), the volume
+  buttons act in the chosen DC with a clear target readout, and selecting an
+  existing volume syncs the picker to its region. So a user anywhere can configure
+  the right region/DC and can't provision a volume in a DC that can't host one. The
+  *remaining* nicety: ask the region during **first-run bootstrap** and pre-seed
+  `data_center_ids` so even the very first volume defaults to the user's nearest
+  region (today it still defaults to EU-RO-1 until they touch the picker).
 - **GPU fallback chain — MECHANISM DONE (0.3.2), used for tagging; upscale TODO.**
   `create_pod_resilient` now treats `spec["gpuTypeIds"]` as an **ordered fallback
   chain**: each type is tried in turn (a create/capacity error skips to the next

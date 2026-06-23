@@ -103,7 +103,10 @@ pipeline options; Discord webhook (with Test); default folders per tool. Setting
 take effect only on **Save**; an **unsaved-changes guard** compares the form
 against `config.json` and shows a Save / Don't save / Cancel prompt when leaving
 the Settings tab or closing the app with pending edits (`SettingsTab.is_dirty` /
-`_collect` / `revert`). Picklists ignore the mouse wheel (0.2.8): `App`
+`_collect` / `revert`). A **live "Not saved" indicator** (0.3.4,
+`_refresh_save_indicator`, a light `after` poll of `is_dirty`) shows red **"Not
+saved"** the moment any field differs from the saved state and green **"Saved."**
+right after a save — reusing the save-bar status label. Picklists ignore the mouse wheel (0.2.8): `App`
 rebinds the `TCombobox`/`TSpinbox` `<MouseWheel>` class bindings
 (`_install_picklist_wheel_guard` / `_picklist_wheel`) so scrolling over a
 combobox/spinbox no longer silently cycles its value (which used to flip a
@@ -199,8 +202,17 @@ on-pod worker that loads SeedVR2 once, fetches each result back, and tears the p
 down — the queue, resume-cache, film-strip and watchdog all stay local; the source
 is never touched (only a copy is uploaded). A **dead-man's switch** on the pod
 (max-runtime + idle-timeout) guarantees a billed pod can't be left running even if
-the connection drops. Models live on a **region-locked network volume** (written
-once, mounted on every pod). Auto-straighten runs **on the pod** (worker `/orient`)
+the connection drops. The max-runtime hard ceiling **defaults to 0 (no limit)**
+(0.3.4) so a long batch of many images is never cut off mid-run — the **idle
+timeout** (default 15 min) is the real switch that ends a billed pod on a dropped
+connection. Models live on a **region-locked network volume** (written
+once, mounted on every pod). Settings has a **world-wide Region + Data center
+picker** (0.3.4, `runpod_client.data_centers` GraphQL live list grouped into
+Europe / North America / Asia / Oceania via `region_of`) that offers
+**storage-capable data centers only** — so a user anywhere picks the right region
+and can't provision a model volume in a DC that can't host one; the volume buttons
+act in the chosen DC (with a clear target readout) and selecting an existing volume
+syncs the picker to its region. Auto-straighten runs **on the pod** (worker `/orient`)
 so the local side needs no torch; a second **telemetry row** shows the pod's
 CPU/RAM/VRAM/temp during a run. **0.3.2 made it usable by a non-technical user:**
 **zero-config SSH** (the app owns an ed25519 key and injects its public half via

@@ -113,17 +113,74 @@ CREATABLE_GPU_IDS = frozenset({
     "Tesla V100-PCIE-32GB", "Tesla T4", "NVIDIA RTX A30",
 })
 
-# European data centers only (user is in Romania; network volumes are
-# region-locked and throughput is region-dependent). EU-RO-1 is closest.
-# (label, dataCenterId)
-EU_DATACENTERS = [
-    ("Romania (EU-RO-1)",        "EU-RO-1"),
-    ("Netherlands (EU-NL-1)",    "EU-NL-1"),
-    ("Sweden (EU-SE-1)",         "EU-SE-1"),
-    ("Czech Republic (EU-CZ-1)", "EU-CZ-1"),
-    ("Iceland (EUR-IS-1)",       "EUR-IS-1"),
-    ("Iceland (EUR-IS-2)",       "EUR-IS-2"),
+# ── Data centers & regions ───────────────────────────────────────────────────
+# Network volumes are region-locked and a model volume can ONLY live in a data
+# center that supports network storage, so the Settings picker is grouped by
+# region and offers storage-capable DCs only — this stops a user provisioning a
+# volume somewhere it (or a pod attaching it) can't actually run.
+#
+# The four UI regions and the data-center id prefixes that map to them. RunPod
+# ids are prefixed by location (EU-RO-1, US-TX-3, AP-JP-1, …); derive a region
+# from any id via region_of().
+REGIONS = ["Europe", "North America", "Asia", "Oceania"]
+
+_REGION_BY_PREFIX = {
+    "EU": "Europe", "EUR": "Europe",
+    "US": "North America", "CA": "North America",
+    "AP": "Asia", "SEA": "Asia",
+    "OC": "Oceania",
+}
+
+
+def region_of(dc_id):
+    """Map a data-center id (e.g. 'EU-RO-1') to one of REGIONS, or '' if unknown."""
+    if not dc_id:
+        return ""
+    prefix = str(dc_id).split("-", 1)[0].upper()
+    return _REGION_BY_PREFIX.get(prefix, "")
+
+
+# Curated fallback list of data centers that support network volumes
+# (storageSupport=True, listed=True), so the picker works offline / before a live
+# refresh. Generated 2026-06 from the GraphQL `dataCenters` query; data_centers()
+# refreshes it live. (label, dataCenterId) — region is derived via region_of().
+# (To regenerate: query `{ dataCenters { id location storageSupport listed } }`
+# and keep storageSupport && listed.) Oceania has no storage-capable DC yet
+# (OC-AU-1 is compute-only), so it appears empty until RunPod adds one — the live
+# refresh will surface it automatically.
+DATACENTERS = [
+    # Europe
+    ("Romania (EU-RO-1)",          "EU-RO-1"),
+    ("Netherlands (EU-NL-1)",      "EU-NL-1"),
+    ("Sweden (EU-SE-1)",           "EU-SE-1"),
+    ("Czech Republic (EU-CZ-1)",   "EU-CZ-1"),
+    ("France (EU-FR-1)",           "EU-FR-1"),
+    ("Iceland (EUR-IS-1)",         "EUR-IS-1"),
+    ("Iceland (EUR-IS-3)",         "EUR-IS-3"),
+    ("Norway (EUR-NO-1)",          "EUR-NO-1"),
+    ("Norway (EUR-NO-2)",          "EUR-NO-2"),
+    # North America
+    ("USA — California (US-CA-2)",   "US-CA-2"),
+    ("USA — Georgia (US-GA-2)",      "US-GA-2"),
+    ("USA — Illinois (US-IL-1)",     "US-IL-1"),
+    ("USA — Kansas (US-KS-2)",       "US-KS-2"),
+    ("USA — Missouri (US-MO-2)",     "US-MO-2"),
+    ("USA — N. Carolina (US-NC-1)",  "US-NC-1"),
+    ("USA — N. Carolina (US-NC-2)",  "US-NC-2"),
+    ("USA — Nebraska (US-NE-1)",     "US-NE-1"),
+    ("USA — Texas (US-TX-3)",        "US-TX-3"),
+    ("USA — Washington (US-WA-1)",   "US-WA-1"),
+    ("Canada — Montreal (CA-MTL-3)", "CA-MTL-3"),
+    ("Canada — Montreal (CA-MTL-4)", "CA-MTL-4"),
+    # Asia
+    ("Japan (AP-JP-1)",            "AP-JP-1"),
+    # Oceania — none with network storage at time of writing.
 ]
+
+# Back-compat alias: some code/docs still refer to EU_DATACENTERS. The picker is
+# now world-wide, but keep the Europe subset available under the old name.
+EU_DATACENTERS = [(lbl, dcid) for lbl, dcid in DATACENTERS
+                  if region_of(dcid) == "Europe"]
 
 
 class RunPodError(Exception):
@@ -591,6 +648,40 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
         })
     # Cheapest first; a missing price sorts last so a real quote always wins.
     out.sort(key=lambda r: (r["price"] is None, r["price"] or 0.0))
+    return out
+
+
+_DC_QUERY = "{ dataCenters { id name location storageSupport listed } }"
+
+
+def data_centers(api_key, storage_only=True, listed_only=True, timeout=30):
+    """Live list of RunPod data centers via GraphQL (the same source the GPU
+    picker uses). Each item:
+        {"id", "location", "region", "storage", "listed"}
+    With `storage_only` (default) only data centers that support network volumes
+    are returned — a model volume can only live where storage exists, so this is
+    exactly what the Settings picker should offer. Sorted by region (UI order)
+    then id. Raises RunPodError on failure (callers run it off a thread and fall
+    back to the curated DATACENTERS list)."""
+    data = _graphql(api_key, _DC_QUERY, {}, timeout=timeout)
+    out = []
+    for d in data.get("dataCenters") or []:
+        if not isinstance(d, dict):
+            continue
+        if listed_only and not d.get("listed"):
+            continue
+        if storage_only and not d.get("storageSupport"):
+            continue
+        did = d.get("id") or ""
+        out.append({
+            "id":       did,
+            "location": d.get("location") or "",
+            "region":   region_of(did),
+            "storage":  bool(d.get("storageSupport")),
+            "listed":   bool(d.get("listed")),
+        })
+    order = {r: i for i, r in enumerate(REGIONS)}
+    out.sort(key=lambda x: (order.get(x["region"], 99), x["id"]))
     return out
 
 

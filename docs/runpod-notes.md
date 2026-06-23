@@ -400,6 +400,24 @@ refresh button. Surprise from the first run: RTX PRO 4500 (32 GB, $0.74) was
 cheaper than the RTX 5090 ($0.99) for upscaling — exactly the "is a pricier pod
 more cost-efficient per image?" question worth benchmarking.
 
+**World-wide region + data-center picker (0.3.4).** The early Settings DC picker
+was an **EU-only** curated enum (`EU_DATACENTERS`, defaulting to EU-RO-1) — fine
+for the original user (Romania) but wrong for anyone else. GraphQL also exposes
+the full data-center catalog: `{ dataCenters { id location storageSupport listed } }`
+(`runpod_client.data_centers`). Crucially it reports **`storageSupport`** — a
+network (model) volume can only live in a DC that supports storage, so the picker
+offers **storage-capable, listed DCs only**, preventing a user from provisioning a
+volume somewhere no pod can then attach it. Settings now has a **Region**
+combo (Europe / North America / Asia / Oceania, derived from the id prefix via
+`runpod_client.region_of`) feeding a **Data center** combo, with a Refresh that
+pulls the live list and a one-line "Volume actions act in: <region> · <dc>" target
+readout. A curated `DATACENTERS` fallback (storage DCs as of 2026-06) makes it work
+offline. Selecting an existing model volume **syncs the picker to that volume's
+region** (it's region-locked, so that's where Create/Provision and pods run).
+Caveat surfaced by the live data: **Oceania has no storage-capable DC** yet
+(OC-AU-1 is compute-only), so that region lists empty until RunPod adds one — the
+UI says so plainly instead of failing at create time.
+
 ## `runpod` config section (shipped in 0.3.1)
 
 The block now in `config.json` (`api_key` blank in the tracked template — a

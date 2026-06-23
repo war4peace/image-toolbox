@@ -92,7 +92,7 @@
         "max_price_per_hour_tag": 0.50,
         "stop_pod_when_done": true,
         "terminate_when_done": true,
-        "max_runtime_minutes": 720,
+        "max_runtime_minutes": 0,
         "idle_timeout_minutes": 15
     }
 }
