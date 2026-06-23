@@ -13,3 +13,6 @@ trcache/
 .setup_complete
 bootstrap.log
 installer/Output/
+
+# Internal-only working copy of the benchmark data (the .csv is the tracked source)
+docs/Benchmarks.xlsx
