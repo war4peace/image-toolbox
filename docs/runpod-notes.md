@@ -424,12 +424,16 @@ just doesn't show up. Simple, no confusing "exists but unusable" message.
 re-lists model volumes**, showing only the one(s) in that DC or a
 **`None | <data center>`** placeholder when there isn't one — so the volume shown
 always matches where a pod would run. The volume combo is read-only (pick, don't
-type), on its own row above the four action buttons so nothing is clipped.
+type); the chosen volume is persisted with its **full display label**
+(`network_volume_label`, alongside the bare `network_volume_id` the run code uses)
+so it reads in full on the next launch instead of showing only the raw id.
 **The Refresh also fills the Upscale/Tag GPU preference combos** with the GPUs the
-selected data center offers + live price (`available_gpus(..., include_out_of_stock=True)`
-— a preference list, so a momentarily sold-out card still shows), partitioned by
-the VRAM floor (≥32 GB upscale, ≥16 GB tag) and defaulting to RTX 5090 / RTX 2000
-Ada (or the current pick if still offered, else cheapest).
+selected data center offers + live price (`available_gpus(..., include_out_of_stock=True)`,
+a preference list so a momentarily sold-out card still shows), partitioned by the
+VRAM floor (>=32 GB upscale, >=16 GB tag) and defaulting to RTX 5090 / RTX 2000 Ada
+(or the current pick if still offered, else cheapest). The Upscale GPU, Tag GPU and
+Model volume comboboxes share one aligned grid column, stacked below the
+Region/Data center row with the volume action buttons beneath them.
 
 ## `runpod` config section (shipped in 0.3.1)
 

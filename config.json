@@ -83,6 +83,7 @@
         "image_name": "",
         "template_id": "",
         "network_volume_id": "",
+        "network_volume_label": "",
         "data_center_ids": [],
         "container_disk_gb": 30,
         "ssh_key_path": "%USERPROFILE%\\.ssh\\id_ed25519_runpod",

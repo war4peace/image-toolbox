@@ -3433,7 +3433,7 @@ class SettingsTab(ttk.Frame):
         # fallback — see _fallback_ceiling. Both on one inline row.
         price = ttk.Frame(sec)
         price.grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=3)
-        ttk.Label(price, text="Max fallback — upscale:").grid(row=0, column=0, sticky="e")
+        ttk.Label(price, text="Max fallback: upscale").grid(row=0, column=0, sticky="e")
         self.runpod_maxprice_up_var = tk.StringVar(
             value=str(rp.get("max_price_per_hour_upscale", 1.10)))
         up_spin = ttk.Spinbox(price, from_=0.0, to=100.0, increment=0.10, width=7,
@@ -3484,47 +3484,87 @@ class SettingsTab(ttk.Frame):
         ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters).grid(
             row=0, column=4, sticky="w", padx=(8, 0))
 
-        # Upscale & Tag GPU preferences, stacked vertically directly under the
-        # Region/Data center row so the Refresh above clearly drives them. They start
-        # as the curated name lists; Refresh repopulates them with the GPUs offered in
-        # the selected DC plus live price (see _populate_settings_gpus).
+        # Upscale GPU, Tag GPU and Model volume share ONE grid (column 0 = labels,
+        # column 1 = comboboxes) so the three comboboxes line up under each other,
+        # directly below the Region/Data center row whose Refresh drives them. The GPU
+        # combos start as the curated name lists; Refresh repopulates them with the
+        # GPUs offered in the selected DC plus live price (see _populate_settings_gpus).
         # `_gpu_id_by_label` maps the shown label back to the gpuTypeId (identity for
         # the curated names, label->id for live entries) so resolution works either way.
-        hw = ttk.Frame(sec)
-        hw.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
-        ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=(0, 2))
+        gv = ttk.Frame(sec)
+        gv.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        _CMB_W = 50      # shared width so all three comboboxes align
+
+        ttk.Label(gv, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=(0, 2))
         self.runpod_gpu_var = tk.StringVar(
             value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
         self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
-        self.runpod_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
-                                           values=runpod_client.GPU_TYPES, width=40)
+        self.runpod_gpu_cmb = ttk.Combobox(gv, textvariable=self.runpod_gpu_var, state="readonly",
+                                           values=runpod_client.GPU_TYPES, width=_CMB_W)
         self.runpod_gpu_cmb.grid(row=0, column=1, sticky="w", pady=(0, 2))
         Tooltip(self.runpod_gpu_cmb,
                 "RunPod GPU for upscaling (the heavy SeedVR2 work). The persisted "
                 "preference; the Refresh above fills this with the GPUs offered in the "
                 "selected data center and their live price. Each tab's live picker "
                 "still overrides it per run.")
+
         # Tag & Rename GPU. The vision model needs only ~6.6 GB, so a cheap 16-20 GB
         # card is ideal; the chosen card is tried first, then the rest as a fallback.
-        ttk.Label(hw, text="Tag GPU:").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        ttk.Label(gv, text="Tag GPU:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(0, 2))
         self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
         self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
         cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
         self.runpod_tag_gpu_var = tk.StringVar(
             value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
-        self.runpod_tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var,
+        self.runpod_tag_gpu_cmb = ttk.Combobox(gv, textvariable=self.runpod_tag_gpu_var,
                                                state="readonly",
                                                values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES],
-                                               width=40)
-        self.runpod_tag_gpu_cmb.grid(row=1, column=1, sticky="w")
+                                               width=_CMB_W)
+        self.runpod_tag_gpu_cmb.grid(row=1, column=1, sticky="w", pady=(0, 2))
         Tooltip(self.runpod_tag_gpu_cmb,
                 "GPU for remote Tag & Rename. The vision model needs only ~6.6 GB, so "
                 "a cheap card is plenty. The Refresh above fills this with the GPUs "
                 "offered in the selected data center and their live price.")
 
+        # Model volume (the persistent model store). Saved WITH its full display label
+        # (network_volume_label) so it reads in full on restart, not just the bare id;
+        # the bare id (network_volume_id) is what the run/provision code consumes.
+        ttk.Label(gv, text="Model volume:").grid(row=2, column=0, sticky="w", padx=(0, 6))
+        saved_vid = rp.get("network_volume_id", "")
+        saved_vlabel = rp.get("network_volume_label", "")
+        vol_initial = (saved_vlabel
+                       if saved_vlabel and saved_vlabel.split("|", 1)[0].strip() == saved_vid
+                       else saved_vid)
+        self.runpod_vol_var = tk.StringVar(value=vol_initial)
+        self.runpod_vol_cmb = ttk.Combobox(gv, textvariable=self.runpod_vol_var,
+                                           state="readonly", width=_CMB_W)
+        self.runpod_vol_cmb.grid(row=2, column=1, sticky="w")
+        self.runpod_vol_cmb.bind("<<ComboboxSelected>>", self._on_volume_selected)
+        Tooltip(self.runpod_vol_cmb,
+                "Persistent RunPod network volume that holds the models (SeedVR2 + "
+                "Ollama) so disposable pods don't re-download them. Format: "
+                "'id | name | size | dc'. Shows the volume(s) in the selected data "
+                "center, or 'None | <data center>' if there isn't one yet. Refresh "
+                "lists them; Create makes one.")
+        # The four volume action buttons on their own row, aligned under the combo.
+        volbtns = ttk.Frame(gv)
+        volbtns.grid(row=3, column=1, sticky="w", pady=(4, 0))
+        ttk.Button(volbtns, text="Refresh", command=self._refresh_volumes).pack(side="left")
+        ttk.Button(volbtns, text="Create…", command=self._create_volume).pack(side="left", padx=(6, 0))
+        del_btn = tk.Button(volbtns, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
+                            cursor="hand2", command=self._delete_volume)
+        del_btn.pack(side="left", padx=(6, 0))
+        Tooltip(del_btn, "Permanently delete the selected network volume AND all "
+                         "models stored on it. Asks for confirmation first.")
+        prov_btn = ttk.Button(volbtns, text="Provision…", command=self._provision_models)
+        prov_btn.pack(side="left", padx=(6, 0))
+        Tooltip(prov_btn, "One-time: fill the selected volume with the models "
+                          "(SeedVR2 + Ollama) by briefly renting a pod. ~10-20 min; "
+                          "the pod is terminated automatically when finished.")
+
         # Where the volume actions act (rendered by the seed below via _update_dc_target).
         self.runpod_dc_target = ttk.Label(sec, text="", foreground="#444")
-        self.runpod_dc_target.grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 0))
+        self.runpod_dc_target.grid(row=5, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 0))
 
         # Picker state: the last-fetched volumes (None until a Refresh, so the
         # filter leaves the saved id alone on first open). Regions/DCs without
@@ -3539,40 +3579,6 @@ class SettingsTab(ttk.Frame):
             [{"id": dcid, "label": lbl, "region": runpod_client.region_of(dcid)}
              for lbl, dcid in runpod_client.DATACENTERS],
             preserve_id=cur_dc)
-
-        # Network volume (the persistent model store). The combobox is wide, so the
-        # four action buttons go on their OWN row beneath it (between the combo and
-        # the volume-actions status line) rather than being pushed off the edge.
-        vol = ttk.Frame(sec)
-        vol.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        volrow = ttk.Frame(vol)
-        volrow.pack(anchor="w", fill="x")
-        ttk.Label(volrow, text="Model volume:").pack(side="left", padx=(0, 4))
-        self.runpod_vol_var = tk.StringVar(value=rp.get("network_volume_id", ""))
-        self.runpod_vol_cmb = ttk.Combobox(volrow, textvariable=self.runpod_vol_var,
-                                           state="readonly", width=56)
-        self.runpod_vol_cmb.pack(side="left")
-        self.runpod_vol_cmb.bind("<<ComboboxSelected>>", self._on_volume_selected)
-        Tooltip(self.runpod_vol_cmb,
-                "Persistent RunPod network volume that holds the models (SeedVR2 + "
-                "Ollama) so disposable pods don't re-download them. Format: "
-                "'id | name | size | dc'. Shows the volume(s) in the selected data "
-                "center, or 'None | <data center>' if there isn't one yet. Refresh "
-                "lists them; Create makes one.")
-        volbtns = ttk.Frame(vol)
-        volbtns.pack(anchor="w", pady=(4, 0))
-        ttk.Button(volbtns, text="Refresh", command=self._refresh_volumes).pack(side="left")
-        ttk.Button(volbtns, text="Create…", command=self._create_volume).pack(side="left", padx=(6, 0))
-        del_btn = tk.Button(volbtns, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
-                            cursor="hand2", command=self._delete_volume)
-        del_btn.pack(side="left", padx=(6, 0))
-        Tooltip(del_btn, "Permanently delete the selected network volume AND all "
-                         "models stored on it. Asks for confirmation first.")
-        prov_btn = ttk.Button(volbtns, text="Provision…", command=self._provision_models)
-        prov_btn.pack(side="left", padx=(6, 0))
-        Tooltip(prov_btn, "One-time: fill the selected volume with the models "
-                          "(SeedVR2 + Ollama) by briefly renting a pod. ~10-20 min; "
-                          "the pod is terminated automatically when finished.")
 
         safety = ttk.Frame(sec)
         safety.grid(row=7, column=0, columnspan=4, sticky="w", pady=3)
@@ -3821,6 +3827,10 @@ class SettingsTab(ttk.Frame):
                 self.runpod_tag_gpu_var.get(), runpod_client.TAG_GPU_TYPES[0][1]),
             "data_center_ids":  [dc_id] if dc_id else [],
             "network_volume_id": self._selected_volume_id(),
+            # The full combobox label ('id | name | size | dc') so it reloads in full
+            # next launch instead of just the bare id; blank when no real volume.
+            "network_volume_label": (self.runpod_vol_var.get()
+                                     if self._selected_volume_id() else ""),
             # Carried through unchanged (no UI yet) so a save never drops them.
             "image_name":       rp.get("image_name", ""),
             "template_id":      rp.get("template_id", ""),
@@ -4548,7 +4558,11 @@ class SettingsTab(ttk.Frame):
         dc_ids = rp.get("data_center_ids") or []
         cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
         self._sync_region_dc_to(cur_dc)
-        self.runpod_vol_var.set(rp.get("network_volume_id", ""))
+        saved_vid = rp.get("network_volume_id", "")
+        saved_vlabel = rp.get("network_volume_label", "")
+        self.runpod_vol_var.set(
+            saved_vlabel if saved_vlabel and saved_vlabel.split("|", 1)[0].strip() == saved_vid
+            else saved_vid)
         for key, (var, typ) in self._seedvr_vars.items():
             if key in ups:
                 var.set(ups[key] if typ is bool else str(ups[key]))
