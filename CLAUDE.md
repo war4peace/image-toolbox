@@ -2,6 +2,12 @@
 
 Guidance for working in this repository.
 
+## Conventions
+
+- **Avoid em-dashes (—) where possible; prefer an alternative** (a colon, comma,
+  parentheses, or "|" in compact UI labels). Applies to UI strings, code comments,
+  and docs.
+
 ## What this is
 
 **Image Toolbox** — an AI-leveraged image toolbox for Windows that **upscales**

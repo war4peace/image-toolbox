@@ -3454,53 +3454,12 @@ class SettingsTab(ttk.Frame):
                     f"escalate to an expensive card ({_kind} cards start at {_cap}). "
                     "Your own explicit pick is never capped. 0 = no limit.")
 
-        # GPU defaults + data center. These are the PERSISTED PREFERENCE (curated
-        # lists); each tool tab has a live picker that shows what's actually
-        # deployable now and pre-selects the matching preference when in stock.
-        hw = ttk.Frame(sec)
-        hw.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
-        # Upscale & Tag GPU preferences. These start as the curated name lists; the
-        # Region/Data center Refresh repopulates them with the GPUs actually offered
-        # in the selected DC + live price (see _populate_settings_gpus). `_gpu_id_by_label`
-        # maps the shown label back to the gpuTypeId — identity for the curated names,
-        # label→id for the live entries — so resolution works in either state.
-        ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4))
-        self.runpod_gpu_var = tk.StringVar(
-            value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
-        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
-        self.runpod_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
-                                           values=runpod_client.GPU_TYPES, width=36)
-        self.runpod_gpu_cmb.grid(row=0, column=1, sticky="w")
-        Tooltip(self.runpod_gpu_cmb,
-                "RunPod GPU for upscaling (the heavy SeedVR2 work). The persisted "
-                "preference; Refresh (next to Data center) fills this with the GPUs "
-                "offered in the selected data center and their live price. Each tab's "
-                "live picker still overrides it per run.")
-        # Tag & Rename GPU — the vision model needs only ~6.6 GB, so a cheap
-        # 16-20 GB card is ideal. The chosen card is tried first; the rest of the
-        # curated list is an automatic fallback chain when it is unavailable.
-        ttk.Label(hw, text="Tag GPU:").grid(row=0, column=2, sticky="w", padx=(18, 4))
-        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
-        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
-        cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
-        self.runpod_tag_gpu_var = tk.StringVar(
-            value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
-        self.runpod_tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var,
-                                               state="readonly",
-                                               values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES],
-                                               width=36)
-        self.runpod_tag_gpu_cmb.grid(row=0, column=3, sticky="w")
-        Tooltip(self.runpod_tag_gpu_cmb,
-                "GPU for remote Tag & Rename. The vision model needs only ~6.6 GB, so "
-                "a cheap card is plenty. Refresh (next to Data center) fills this with "
-                "the GPUs offered in the selected data center and their live price.")
-
-        # Region + data center. A model volume is region-locked and can only live
-        # where network storage is supported, so the picker is grouped by region
-        # and offers storage-capable data centers only — this is where the volume
-        # buttons below act. Pods then follow the selected volume's region.
+        # Region + data center (FIRST, so the Refresh next to it clearly drives the
+        # GPU lists and volume below). A model volume is region-locked and can only
+        # live where network storage is supported, so the picker is grouped by region
+        # and offers storage-capable data centers only. Pods follow the volume's region.
         dcsel = ttk.Frame(sec)
-        dcsel.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        dcsel.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
         ttk.Label(dcsel, text="Region:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.runpod_region_var = tk.StringVar()
         self.runpod_region_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_region_var,
@@ -3520,12 +3479,50 @@ class SettingsTab(ttk.Frame):
         self.runpod_dc_cmb.bind("<<ComboboxSelected>>", self._on_dc_change)
         Tooltip(self.runpod_dc_cmb,
                 "Only data centers that support network volumes are listed. The "
-                "model-volume buttons below act in this data center. Refresh to "
-                "pull the live list from RunPod.")
+                "GPU lists and model volume below apply to this data center. Refresh "
+                "to pull the live list (data centers, GPUs and volumes) from RunPod.")
         ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters).grid(
             row=0, column=4, sticky="w", padx=(8, 0))
-        # Clear, explicit statement of where the volume actions will take effect.
-        # Created before the seed below, which renders into it via _update_dc_target.
+
+        # Upscale & Tag GPU preferences, stacked vertically directly under the
+        # Region/Data center row so the Refresh above clearly drives them. They start
+        # as the curated name lists; Refresh repopulates them with the GPUs offered in
+        # the selected DC plus live price (see _populate_settings_gpus).
+        # `_gpu_id_by_label` maps the shown label back to the gpuTypeId (identity for
+        # the curated names, label->id for live entries) so resolution works either way.
+        hw = ttk.Frame(sec)
+        hw.grid(row=4, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=(0, 2))
+        self.runpod_gpu_var = tk.StringVar(
+            value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
+        self.runpod_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
+                                           values=runpod_client.GPU_TYPES, width=40)
+        self.runpod_gpu_cmb.grid(row=0, column=1, sticky="w", pady=(0, 2))
+        Tooltip(self.runpod_gpu_cmb,
+                "RunPod GPU for upscaling (the heavy SeedVR2 work). The persisted "
+                "preference; the Refresh above fills this with the GPUs offered in the "
+                "selected data center and their live price. Each tab's live picker "
+                "still overrides it per run.")
+        # Tag & Rename GPU. The vision model needs only ~6.6 GB, so a cheap 16-20 GB
+        # card is ideal; the chosen card is tried first, then the rest as a fallback.
+        ttk.Label(hw, text="Tag GPU:").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
+        self.runpod_tag_gpu_var = tk.StringVar(
+            value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
+        self.runpod_tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var,
+                                               state="readonly",
+                                               values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES],
+                                               width=40)
+        self.runpod_tag_gpu_cmb.grid(row=1, column=1, sticky="w")
+        Tooltip(self.runpod_tag_gpu_cmb,
+                "GPU for remote Tag & Rename. The vision model needs only ~6.6 GB, so "
+                "a cheap card is plenty. The Refresh above fills this with the GPUs "
+                "offered in the selected data center and their live price.")
+
+        # Where the volume actions act (rendered by the seed below via _update_dc_target).
         self.runpod_dc_target = ttk.Label(sec, text="", foreground="#444")
         self.runpod_dc_target.grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 0))
 
@@ -3973,9 +3970,9 @@ class SettingsTab(ttk.Frame):
 
     def _fmt_gpu(self, g):
         """Label for a Settings GPU combo entry: name, VRAM, live price, stock."""
-        price = f"${g['price']:.2f}/h" if g.get("price") is not None else "price n/a"
-        tail = "" if g.get("stock") else " — out of stock"
-        return f"{g.get('name', g.get('id'))} — {g.get('memory_gb', 0)} GB — {price}{tail}"
+        price = f"${g['price']:.2f}/h" if g.get("price") is not None else "n/a"
+        tail = "" if g.get("stock") else " | no stock"
+        return f"{g.get('name', g.get('id'))} | {g.get('memory_gb', 0)} GB | {price}{tail}"
 
     def _refresh_settings_gpus(self):
         """Populate the Upscale/Tag GPU comboboxes with the GPUs the selected data
