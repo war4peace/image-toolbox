@@ -414,18 +414,22 @@ pulls the live list and a one-line "Volume actions act in: <region> · <dc>" tar
 readout. A curated `DATACENTERS` fallback (storage DCs as of 2026-06) makes it work
 offline. Selecting an existing model volume **syncs the picker to that volume's
 region** (it's region-locked, so that's where Create/Provision and pods run).
-Caveat surfaced by the live data: **Oceania has no storage-capable DC** yet
-(OC-AU-1 reports `storageSupport:false` — it's a compute-only data center, so it
-shows GPUs in the RunPod web UI but **can't host a network volume**). The picker
-fetches with `storage_only=False` so it can **name** the offending DC: an empty
-region says *"Oceania has OC-AU-1, but RunPod offers no network-volume storage
-there — and the app needs a model volume, so it can't run pods in this region"*
-instead of a bare "none", which had confused the user (who saw OC-AU-1 on the
-website). **Volumes are filtered to the selected data center** (0.3.4 follow-up):
-the Region/DC **Refresh also re-lists model volumes**, showing only the one(s) in
-that DC or a **`None | <data center>`** placeholder when there isn't one — so the
-volume shown always matches where a pod would run. The volume combo is read-only
-(pick, don't type) and wider so the trailing data-center id isn't clipped.
+**Storage support is the hard filter**: a region or data center with no
+network-volume storage is simply **never populated** — only regions with at least
+one storage-capable DC appear, and the DC combo lists only storage DCs. So
+Oceania (whose only DC, OC-AU-1, reports `storageSupport:false` — a compute-only
+data center that shows GPUs on the RunPod website but can't host a network volume)
+just doesn't show up. Simple, no confusing "exists but unusable" message.
+**Volumes are scoped to the selected data center**: the Region/DC **Refresh also
+re-lists model volumes**, showing only the one(s) in that DC or a
+**`None | <data center>`** placeholder when there isn't one — so the volume shown
+always matches where a pod would run. The volume combo is read-only (pick, don't
+type), on its own row above the four action buttons so nothing is clipped.
+**The Refresh also fills the Upscale/Tag GPU preference combos** with the GPUs the
+selected data center offers + live price (`available_gpus(..., include_out_of_stock=True)`
+— a preference list, so a momentarily sold-out card still shows), partitioned by
+the VRAM floor (≥32 GB upscale, ≥16 GB tag) and defaulting to RTX 5090 / RTX 2000
+Ada (or the current pick if still offered, else cheapest).
 
 ## `runpod` config section (shipped in 0.3.1)
 

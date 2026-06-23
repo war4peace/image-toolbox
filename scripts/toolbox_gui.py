@@ -3459,15 +3459,23 @@ class SettingsTab(ttk.Frame):
         # deployable now and pre-selects the matching preference when in stock.
         hw = ttk.Frame(sec)
         hw.grid(row=3, column=0, columnspan=4, sticky="w", pady=3)
+        # Upscale & Tag GPU preferences. These start as the curated name lists; the
+        # Region/Data center Refresh repopulates them with the GPUs actually offered
+        # in the selected DC + live price (see _populate_settings_gpus). `_gpu_id_by_label`
+        # maps the shown label back to the gpuTypeId — identity for the curated names,
+        # label→id for the live entries — so resolution works in either state.
         ttk.Label(hw, text="Upscale GPU:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.runpod_gpu_var = tk.StringVar(
             value=rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
-        gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
-                               values=runpod_client.GPU_TYPES, width=32)
-        gpu_cmb.grid(row=0, column=1, sticky="w")
-        Tooltip(gpu_cmb, "RunPod GPU for upscaling (the heavy SeedVR2 work). This is "
-                         "the persisted preference; each tab's live picker shows "
-                         "what's actually deployable now and overrides it per run.")
+        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
+        self.runpod_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_gpu_var, state="readonly",
+                                           values=runpod_client.GPU_TYPES, width=36)
+        self.runpod_gpu_cmb.grid(row=0, column=1, sticky="w")
+        Tooltip(self.runpod_gpu_cmb,
+                "RunPod GPU for upscaling (the heavy SeedVR2 work). The persisted "
+                "preference; Refresh (next to Data center) fills this with the GPUs "
+                "offered in the selected data center and their live price. Each tab's "
+                "live picker still overrides it per run.")
         # Tag & Rename GPU — the vision model needs only ~6.6 GB, so a cheap
         # 16-20 GB card is ideal. The chosen card is tried first; the rest of the
         # curated list is an automatic fallback chain when it is unavailable.
@@ -3477,12 +3485,15 @@ class SettingsTab(ttk.Frame):
         cur_tg = rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1])
         self.runpod_tag_gpu_var = tk.StringVar(
             value=self._tag_gpu_label_by_id.get(cur_tg, runpod_client.TAG_GPU_TYPES[0][0]))
-        tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var, state="readonly",
-                                   values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES], width=32)
-        tag_gpu_cmb.grid(row=0, column=3, sticky="w")
-        Tooltip(tag_gpu_cmb, "GPU for remote Tag & Rename. The vision model needs "
-                             "only ~6.6 GB, so a cheap card is plenty. If it is "
-                             "unavailable, the others are tried automatically.")
+        self.runpod_tag_gpu_cmb = ttk.Combobox(hw, textvariable=self.runpod_tag_gpu_var,
+                                               state="readonly",
+                                               values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES],
+                                               width=36)
+        self.runpod_tag_gpu_cmb.grid(row=0, column=3, sticky="w")
+        Tooltip(self.runpod_tag_gpu_cmb,
+                "GPU for remote Tag & Rename. The vision model needs only ~6.6 GB, so "
+                "a cheap card is plenty. Refresh (next to Data center) fills this with "
+                "the GPUs offered in the selected data center and their live price.")
 
         # Region + data center. A model volume is region-locked and can only live
         # where network storage is supported, so the picker is grouped by region
@@ -3492,13 +3503,15 @@ class SettingsTab(ttk.Frame):
         dcsel.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Label(dcsel, text="Region:").grid(row=0, column=0, sticky="w", padx=(0, 4))
         self.runpod_region_var = tk.StringVar()
-        region_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_region_var,
-                                  state="readonly", values=runpod_client.REGIONS, width=16)
-        region_cmb.grid(row=0, column=1, sticky="w")
-        region_cmb.bind("<<ComboboxSelected>>", self._on_region_change)
-        Tooltip(region_cmb, "Pick the part of the world to host your model volume "
-                            "and run pods. Choose the one nearest you for the best "
-                            "throughput (network volumes are region-locked).")
+        self.runpod_region_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_region_var,
+                                              state="readonly", values=runpod_client.REGIONS,
+                                              width=16)
+        self.runpod_region_cmb.grid(row=0, column=1, sticky="w")
+        self.runpod_region_cmb.bind("<<ComboboxSelected>>", self._on_region_change)
+        Tooltip(self.runpod_region_cmb,
+                "Pick the part of the world to host your model volume and run pods. "
+                "Only regions with a storage-capable data center are listed. Choose "
+                "the one nearest you for the best throughput (volumes are region-locked).")
         ttk.Label(dcsel, text="Data center:").grid(row=0, column=2, sticky="w", padx=(18, 4))
         self.runpod_dc_var = tk.StringVar()
         self.runpod_dc_cmb = ttk.Combobox(dcsel, textvariable=self.runpod_dc_var,
@@ -3517,12 +3530,10 @@ class SettingsTab(ttk.Frame):
         self.runpod_dc_target.grid(row=6, column=0, columnspan=4, sticky="w", padx=2, pady=(2, 0))
 
         # Picker state: the last-fetched volumes (None until a Refresh, so the
-        # filter leaves the saved id alone on first open) and the listed-but-
-        # storage-less DCs per region (populated on Refresh) used to explain an
-        # empty region — e.g. Oceania's OC-AU-1 exists for compute but can't host a
-        # network volume, so it's correctly excluded from the picker.
-        self._all_volumes   = None
-        self._dc_unsupported = {}
+        # filter leaves the saved id alone on first open). Regions/DCs without
+        # network-volume storage are simply never populated, so there's no
+        # special-case to carry (a compute-only DC like OC-AU-1 just doesn't appear).
+        self._all_volumes = None
 
         # Seed the picker from the curated list, then point it at the saved DC.
         dc_ids = rp.get("data_center_ids") or []
@@ -3532,12 +3543,16 @@ class SettingsTab(ttk.Frame):
              for lbl, dcid in runpod_client.DATACENTERS],
             preserve_id=cur_dc)
 
-        # Network volume (the persistent model store).
+        # Network volume (the persistent model store). The combobox is wide, so the
+        # four action buttons go on their OWN row beneath it (between the combo and
+        # the volume-actions status line) rather than being pushed off the edge.
         vol = ttk.Frame(sec)
         vol.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Label(vol, text="Model volume:").pack(side="left", padx=(0, 4))
+        volrow = ttk.Frame(vol)
+        volrow.pack(anchor="w", fill="x")
+        ttk.Label(volrow, text="Model volume:").pack(side="left", padx=(0, 4))
         self.runpod_vol_var = tk.StringVar(value=rp.get("network_volume_id", ""))
-        self.runpod_vol_cmb = ttk.Combobox(vol, textvariable=self.runpod_vol_var,
+        self.runpod_vol_cmb = ttk.Combobox(volrow, textvariable=self.runpod_vol_var,
                                            state="readonly", width=56)
         self.runpod_vol_cmb.pack(side="left")
         self.runpod_vol_cmb.bind("<<ComboboxSelected>>", self._on_volume_selected)
@@ -3547,15 +3562,17 @@ class SettingsTab(ttk.Frame):
                 "'id | name | size | dc'. Shows the volume(s) in the selected data "
                 "center, or 'None | <data center>' if there isn't one yet. Refresh "
                 "lists them; Create makes one.")
-        ttk.Button(vol, text="Refresh", command=self._refresh_volumes).pack(side="left", padx=(6, 0))
-        ttk.Button(vol, text="Create…", command=self._create_volume).pack(side="left", padx=(4, 0))
-        del_btn = tk.Button(vol, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
+        volbtns = ttk.Frame(vol)
+        volbtns.pack(anchor="w", pady=(4, 0))
+        ttk.Button(volbtns, text="Refresh", command=self._refresh_volumes).pack(side="left")
+        ttk.Button(volbtns, text="Create…", command=self._create_volume).pack(side="left", padx=(6, 0))
+        del_btn = tk.Button(volbtns, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
                             cursor="hand2", command=self._delete_volume)
-        del_btn.pack(side="left", padx=(4, 0))
+        del_btn.pack(side="left", padx=(6, 0))
         Tooltip(del_btn, "Permanently delete the selected network volume AND all "
                          "models stored on it. Asks for confirmation first.")
-        prov_btn = ttk.Button(vol, text="Provision…", command=self._provision_models)
-        prov_btn.pack(side="left", padx=(12, 0))
+        prov_btn = ttk.Button(volbtns, text="Provision…", command=self._provision_models)
+        prov_btn.pack(side="left", padx=(6, 0))
         Tooltip(prov_btn, "One-time: fill the selected volume with the models "
                           "(SeedVR2 + Ollama) by briefly renting a pod. ~10-20 min; "
                           "the pod is terminated automatically when finished.")
@@ -3800,7 +3817,9 @@ class SettingsTab(ttk.Frame):
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
-            "gpu_type_id":      self.runpod_gpu_var.get().strip() or runpod_client.GPU_TYPES[0],
+            "gpu_type_id":      self._gpu_id_by_label.get(
+                self.runpod_gpu_var.get(),
+                self.runpod_gpu_var.get().strip() or runpod_client.GPU_TYPES[0]),
             "tag_gpu_type_id":  self._tag_gpu_id_by_label.get(
                 self.runpod_tag_gpu_var.get(), runpod_client.TAG_GPU_TYPES[0][1]),
             "data_center_ids":  [dc_id] if dc_id else [],
@@ -3834,9 +3853,16 @@ class SettingsTab(ttk.Frame):
         self._dc_entries     = entries
         self._dc_label_by_id = {e["id"]: e["label"] for e in entries}
         self._dc_id_by_label = {e["label"]: e["id"] for e in entries}
+        # Only offer regions that actually have a storage-capable DC (so e.g.
+        # Oceania, with only the compute-only OC-AU-1, simply doesn't appear).
+        avail_regions = [r for r in runpod_client.REGIONS
+                         if any(e["region"] == r for e in entries)]
+        self.runpod_region_cmb.configure(values=avail_regions)
         target = preserve_id or self._selected_dc_id()
-        region = (runpod_client.region_of(target)
-                  or self.runpod_region_var.get() or runpod_client.REGIONS[0])
+        region = runpod_client.region_of(target)
+        if region not in avail_regions:
+            region = self.runpod_region_var.get() if self.runpod_region_var.get() in avail_regions \
+                else (avail_regions[0] if avail_regions else "")
         self.runpod_region_var.set(region)
         self._populate_dc_for_region(select_id=target)
 
@@ -3866,28 +3892,19 @@ class SettingsTab(ttk.Frame):
         return self._dc_id_by_label.get(self.runpod_dc_var.get(), "")
 
     def _update_dc_target(self):
-        """Spell out, in plain language, where the volume buttons will act — and,
-        when a region has no storage-capable DC, why (e.g. Oceania's OC-AU-1 is a
-        compute-only data center that can't host a network volume)."""
+        """Spell out, in plain language, where the volume buttons will act. Regions
+        without a storage-capable DC are never offered, so a missing selection just
+        means 'nothing picked yet'."""
         dc = self._selected_dc_id()
         region = self.runpod_region_var.get()
         if dc:
             self.runpod_dc_target.configure(
                 text=f"Volume actions (Create / Provision) act in:  {region}  ·  {dc}",
                 foreground="#444")
-            return
-        unsupported = (getattr(self, "_dc_unsupported", {}) or {}).get(region) or []
-        if unsupported:
-            self.runpod_dc_target.configure(
-                text=(f"{region} has {', '.join(unsupported)}, but RunPod offers no "
-                      "network-volume storage there — and the app needs a model "
-                      "volume, so it can't run pods in this region. Pick another."),
-                foreground="#b3261e")
         else:
             self.runpod_dc_target.configure(
-                text=(f"No data center in {region} supports network volumes (which "
-                      "the app requires). Refresh to re-check, or pick another region."),
-                foreground="#b3261e")
+                text="Pick a region and data center for the model volume.",
+                foreground="#666")
 
     def _sync_region_dc_to(self, dc_id):
         """Point the Region/Data center pickers at `dc_id` (e.g. a selected
@@ -3915,10 +3932,9 @@ class SettingsTab(ttk.Frame):
                 self._sync_region_dc_to(dc)
 
     def _refresh_datacenters(self):
-        """Pull the live data-center list from RunPod (GraphQL). Storage-capable
-        DCs populate the picker; the listed-but-storage-less ones (e.g. OC-AU-1) are
-        remembered so an empty region can explain itself. Also refreshes the model
-        volumes for the selected DC."""
+        """Pull the live storage-capable data-center list from RunPod (GraphQL) and
+        populate the Region/Data center pickers. Also refreshes the model volumes
+        and the Upscale/Tag GPU lists for the selected data center."""
         key = self.runpod_key_var.get().strip()
         if not key:
             self.runpod_status.configure(text="Enter a RunPod API key first.",
@@ -3929,7 +3945,7 @@ class SettingsTab(ttk.Frame):
 
         def work():
             try:
-                dcs = runpod_client.data_centers(key, storage_only=False)
+                dcs = runpod_client.data_centers(key)      # storage-capable only
                 err = None
             except runpod_client.RunPodError as exc:
                 dcs, err = [], str(exc)
@@ -3938,28 +3954,79 @@ class SettingsTab(ttk.Frame):
                 if err:
                     self.runpod_status.configure(text=err, foreground="#b3261e")
                     return
-                entries, unsupported = [], {}
-                for d in dcs:
-                    region = d["region"] or runpod_client.region_of(d["id"])
-                    if d.get("storage"):
-                        entries.append({
-                            "id": d["id"],
-                            "label": (f'{d["location"]} ({d["id"]})'
-                                      if d["location"] else d["id"]),
-                            "region": region})
-                    else:
-                        unsupported.setdefault(region, []).append(d["id"])
-                self._dc_unsupported = unsupported
+                entries = [{
+                    "id": d["id"],
+                    "label": (f'{d["location"]} ({d["id"]})' if d["location"] else d["id"]),
+                    "region": d["region"] or runpod_client.region_of(d["id"]),
+                } for d in dcs]
                 self._set_dc_entries(entries, preserve_id=keep)
                 self.runpod_status.configure(
                     text=f"{len(entries)} storage-capable data center(s) across "
                          f"{len({e['region'] for e in entries})} region(s).",
                     foreground="#1a7f37")
-                # Also refresh the volumes for the (now-selected) data center.
+                # Also refresh volumes + GPU lists for the (now-selected) DC.
                 self._refresh_volumes()
+                self._refresh_settings_gpus()
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _fmt_gpu(self, g):
+        """Label for a Settings GPU combo entry: name, VRAM, live price, stock."""
+        price = f"${g['price']:.2f}/h" if g.get("price") is not None else "price n/a"
+        tail = "" if g.get("stock") else " — out of stock"
+        return f"{g.get('name', g.get('id'))} — {g.get('memory_gb', 0)} GB — {price}{tail}"
+
+    def _refresh_settings_gpus(self):
+        """Populate the Upscale/Tag GPU comboboxes with the GPUs the selected data
+        center offers, each with its live price. Out-of-stock cards are included
+        (these are a stored PREFERENCE, not a now-deployable pick) so the defaults
+        (RTX 5090 / RTX 2000 Ada) are offered even when momentarily sold out."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            return
+        dc = self._selected_dc_id() or None
+
+        def work():
+            try:
+                gpus = runpod_client.available_gpus(key, dc, min_memory_gb=0,
+                                                    include_out_of_stock=True)
+                err = None
+            except runpod_client.RunPodError as exc:
+                gpus, err = [], str(exc)
+
+            def apply():
+                if err or not gpus:
+                    return                  # keep the curated lists on failure
+                self._populate_settings_gpus(gpus)
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_settings_gpus(self, gpus):
+        """Fill both GPU combos from a live availability list, partitioned by the
+        VRAM floor (≥32 GB upscale, ≥16 GB tag), keeping the current pick if it is
+        still offered else defaulting to RTX 5090 / RTX 2000 Ada else cheapest."""
+        ups = [g for g in gpus if (g.get("memory_gb") or 0) >= 32]
+        tag = [g for g in gpus if (g.get("memory_gb") or 0) >= 16]
+        self._fill_gpu_combo(self.runpod_gpu_cmb, self.runpod_gpu_var, ups,
+                             "_gpu_id_by_label", "NVIDIA GeForce RTX 5090")
+        self._fill_gpu_combo(self.runpod_tag_gpu_cmb, self.runpod_tag_gpu_var, tag,
+                             "_tag_gpu_id_by_label", "NVIDIA RTX 2000 Ada Generation")
+
+    def _fill_gpu_combo(self, cmb, var, gpus, id_map_attr, default_id):
+        """Set a GPU combo's values to live entries and select the current pick (by
+        resolved id) if still present, else default_id, else the first (cheapest)."""
+        if not gpus:
+            return
+        labels  = [self._fmt_gpu(g) for g in gpus]
+        id_by_label = {lbl: g["id"] for lbl, g in zip(labels, gpus)}
+        cur_id = getattr(self, id_map_attr, {}).get(var.get())
+        setattr(self, id_map_attr, id_by_label)
+        cmb.configure(values=labels)
+        want = cur_id if any(g["id"] == cur_id for g in gpus) else default_id
+        sel = next((lbl for lbl, g in zip(labels, gpus) if g["id"] == want), labels[0])
+        var.set(sel)
 
     def _refresh_volumes(self, select_id=None):
         """Fetch the account's network volumes (free call), cache them, and show the
@@ -4471,7 +4538,13 @@ class SettingsTab(ttk.Frame):
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
+        # Reset the GPU combos to the curated lists (discard any live-refresh state).
+        self.runpod_gpu_cmb.configure(values=runpod_client.GPU_TYPES)
+        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
         self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self.runpod_tag_gpu_cmb.configure(values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES])
         self.runpod_tag_gpu_var.set(self._tag_gpu_label_by_id.get(
             rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1]),
             runpod_client.TAG_GPU_TYPES[0][0]))

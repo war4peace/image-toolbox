@@ -609,7 +609,8 @@ query GpuTypes($dc: String) {
 """
 
 
-def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
+def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
+                   include_out_of_stock=False):
     """Return the secure-cloud GPUs that are DEPLOYABLE RIGHT NOW, newest data.
 
     Queries GraphQL for every GPU type's live price + stock in `data_center_id`
@@ -623,6 +624,10 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
     Unlike the curated GPU_TYPES / TAG_GPU_TYPES picklists, this reflects reality
     — a card the account can't actually rent in this region never appears, so the
     UI can't offer a GPU that will only fail at create time.
+
+    `include_out_of_stock=True` keeps cards with no current stock (their `stock`
+    is None) — for the Settings GPU *preference* lists, which should still offer a
+    card that's only momentarily sold out. The live per-run pickers leave it False.
     """
     data = _graphql(api_key, _GPU_AVAIL_QUERY, {"dc": data_center_id or None},
                     timeout=timeout)
@@ -632,7 +637,7 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30):
         stock = lp.get("stockStatus")
         price = lp.get("uninterruptablePrice")
         mem = g.get("memoryInGb") or 0
-        if not stock:                       # out of stock in this region → skip
+        if not stock and not include_out_of_stock:   # out of stock here → skip
             continue
         if mem < min_memory_gb:
             continue
