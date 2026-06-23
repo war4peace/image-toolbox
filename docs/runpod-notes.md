@@ -415,8 +415,17 @@ readout. A curated `DATACENTERS` fallback (storage DCs as of 2026-06) makes it w
 offline. Selecting an existing model volume **syncs the picker to that volume's
 region** (it's region-locked, so that's where Create/Provision and pods run).
 Caveat surfaced by the live data: **Oceania has no storage-capable DC** yet
-(OC-AU-1 is compute-only), so that region lists empty until RunPod adds one — the
-UI says so plainly instead of failing at create time.
+(OC-AU-1 reports `storageSupport:false` — it's a compute-only data center, so it
+shows GPUs in the RunPod web UI but **can't host a network volume**). The picker
+fetches with `storage_only=False` so it can **name** the offending DC: an empty
+region says *"Oceania has OC-AU-1, but RunPod offers no network-volume storage
+there — and the app needs a model volume, so it can't run pods in this region"*
+instead of a bare "none", which had confused the user (who saw OC-AU-1 on the
+website). **Volumes are filtered to the selected data center** (0.3.4 follow-up):
+the Region/DC **Refresh also re-lists model volumes**, showing only the one(s) in
+that DC or a **`None | <data center>`** placeholder when there isn't one — so the
+volume shown always matches where a pod would run. The volume combo is read-only
+(pick, don't type) and wider so the trailing data-center id isn't clipped.
 
 ## `runpod` config section (shipped in 0.3.1)
 
