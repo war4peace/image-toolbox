@@ -198,6 +198,56 @@ a full uninstall.
 
 ---
 
+## Remote GPU cost (RunPod, experimental)
+
+If your PC has no capable NVIDIA GPU, the toolbox can run a batch on a rented
+[RunPod](https://runpod.io) GPU instead (tick *Run on remote pod* on the tab;
+experimental). It rents a pod, streams one image at a time, fetches the results
+back, and tears the pod down. Your source files are never uploaded as-is, only
+copies. The tables below estimate what a run costs.
+
+The figures come from benchmarking a 100-image sample of typical digital-camera
+photos through the in-app remote-pod runner (v0.3.4), on RunPod secure cloud,
+EU region, June 2026. **`$/image` is the steady-state cost of each additional
+image** (the first image of every run is much slower because the model loads into
+VRAM once); the per-run columns include that one-time model load, which is why a
+small run costs a little more than `$/image × N`.
+
+### Upscaling (Batch Upscaler)
+
+| GPU | $/h | ~sec/img | $/image | 100 | 1,000 | 10,000 | 100,000 |
+|-----|----:|---------:|--------:|----:|------:|-------:|--------:|
+| **RTX 5090** *(best value)* | 0.99 | 12.5 | $0.0034 | $0.36 | $3.46 | $34.50 | $344 |
+| RTX PRO 4500 Blackwell | 0.74 | 22.8 | $0.0047 | $0.48 | $4.70 | $47.00 | $469 |
+| RTX PRO 6000 Blackwell WS | 1.89 | 16.2 | $0.0085 | $0.87 | $8.52 | $85.00 | $850 |
+| B200 | 5.89 | 10.7 | $0.0176 | $1.83 | $17.63 | $175.70 | $1,756 |
+
+The **RTX 5090** is both the cheapest per image *and* near the fastest: the B200
+finishes a 100-image run only ~3 minutes sooner for five times the price.
+
+### Tag & Rename
+
+| GPU | $/h | ~sec/img | $/image | 100 | 1,000 | 10,000 | 100,000 |
+|-----|----:|---------:|--------:|----:|------:|-------:|--------:|
+| **RTX 2000 Ada** *(cheapest)* | 0.24 | 4.1 | $0.0003 | $0.03 | $0.27 | $2.70 | $27 |
+| NVIDIA L4 | 0.39 | 3.4 | $0.0004 | $0.04 | $0.38 | $3.70 | $37 |
+| **RTX 5090** *(fastest)* | 0.99 | 1.4 | $0.0004 | $0.05 | $0.39 | $3.80 | $38 |
+| RTX PRO 4500 Blackwell | 0.74 | 2.1 | $0.0004 | $0.06 | $0.46 | $4.40 | $44 |
+| RTX PRO 4000 Blackwell | 0.57 | 2.9 | $0.0005 | $0.07 | $0.48 | $4.60 | $46 |
+| A100 80GB PCIe | 1.39 | 2.5 | $0.0010 | $0.14 | $0.99 | $9.60 | $95 |
+
+Tagging is cheap on any of these: a 16 GB **RTX 2000 Ada** tags 10,000 photos for
+under $3. (Tag & Rename also runs on a local GPU at no GPU cost: the dev RTX 3090
+tagged 100 photos in under six minutes.)
+
+> **Caveats:** prices are point-in-time and vary by availability and region (the
+> in-app GPU picker shows live prices). The estimates exclude the ~2–3 minutes of
+> billed pod boot/teardown and the image upload/download time, so real bills run a
+> little higher — most noticeably on very small runs. Source data:
+> [`docs/Benchmarks.csv`](/docs/Benchmarks.csv).
+
+---
+
 ## Samples
 
 The [samples](/samples/) folder contains [original images](/samples/original/)
