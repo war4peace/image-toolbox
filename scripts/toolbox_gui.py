@@ -88,7 +88,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)

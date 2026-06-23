@@ -7,8 +7,10 @@ Wraps the standalone SeedVR2 pipeline (seedvr2/inference_cli.py, the same code
 that powers the ComfyUI node) so batch_upscale.py can upscale images directly:
 
   - No ComfyUI install, no HTTP upload/submit/poll/download round-trip.
-  - DiT and VAE models are loaded ONCE and kept cached (offloaded to system
-    RAM between images), instead of being re-prepared for every image.
+  - DiT and VAE models are loaded ONCE and kept cached, instead of being
+    re-prepared for every image. On a small GPU they are parked in system RAM
+    between images; on a big-VRAM card (>= vram_resident_threshold_gb, default
+    80 GB) they stay resident on the GPU, skipping the per-image CPU round trip.
   - Images are loaded with PIL and EXIF orientation is applied, matching the
     behaviour of ComfyUI's LoadImage node (the standalone CLI's own loader
     ignores orientation tags, which old camera JPEGs rely on).
@@ -89,11 +91,52 @@ class UpscaleEngine:
             )
         self.device_name = torch.cuda.get_device_name(0)
 
+    def _resident_offload_device(self, settings):
+        """
+        Pick where the cached DiT/VAE are parked *between images*.
+
+        Default behaviour keeps them in system RAM ("cpu") — the right call on a
+        small local GPU that can't spare the VRAM. But on a big-VRAM card the
+        per-image CPU↔GPU round trip (~14 GB DiT + the VAE, every image, over
+        PCIe) is pure waste: the card can hold both models resident, so we park
+        the offload on the GPU itself instead. This is what made powerful remote
+        pods (H100/H200 80 GB, RTX Pro 6000 96 GB) benchmark so inefficiently —
+        an 80 GB card was behaving as if it had 8.
+
+        Returns (offload_device, resident_bool). Fails safe to ("cpu", False) on
+        any error, so a detection hiccup can never make a run worse.
+        """
+        # The 80 GB default is deliberately conservative. Going resident pins
+        # the ~14 GB DiT in VRAM during the VAE decode too (today's CPU offload
+        # *phases* them — DiT off to RAM, then VAE decodes with the card to
+        # itself), so it shrinks the decode headroom by the DiT's footprint.
+        # 80 GB leaves ~64 GB for the (image-dependent, sometimes ballooning)
+        # decode spike; a 40-48 GB card would leave only ~24-32 GB and could OOM
+        # on a hard 4K image. To safely lower this for a future 64 GB (or 48 GB)
+        # card, don't just drop the threshold — pair it with decode_tiled, which
+        # bounds the VAE-decode spike so ballooning can't OOM.
+        threshold = float(settings.get("vram_resident_threshold_gb", 80))
+        if threshold <= 0:
+            return "cpu", False
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return "cpu", False
+            total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            if total_gb >= threshold:
+                return "cuda:0", True
+        except Exception:
+            pass
+        return "cpu", False
+
     def _build_args(self, settings):
         """
         Build the full argument namespace through the CLI's own parser so we
         inherit every default and stay compatible with upstream changes.
         """
+        offload_device, resident = self._resident_offload_device(settings)
+        self.resident = resident                 # exposed for callers/tests
+
         argv = [
             os.path.join(self.repo_dir, "inference_cli.py"),
             "__engine__",                                    # dummy input, never used
@@ -104,12 +147,18 @@ class UpscaleEngine:
             "--batch_size",        "1",                      # single image per call
             "--color_correction",  settings.get("color_correction", "lab"),
             "--attention_mode",    settings.get("attention_mode", "sdpa"),
-            # Keep models in memory across images, parked in system RAM
+            # Keep models in memory across images. On a small GPU they park in
+            # system RAM; on a big-VRAM card they stay resident on the GPU.
             "--cache_dit", "--cache_vae",
-            "--dit_offload_device", "cpu",
-            "--vae_offload_device", "cpu",
+            "--dit_offload_device", offload_device,
+            "--vae_offload_device", offload_device,
         ]
-        blocks_to_swap = int(settings.get("blocks_to_swap", 0))
+        if resident:
+            print(f"📌 Big-VRAM GPU detected — keeping DiT + VAE resident on "
+                  f"{offload_device} (no per-image CPU offload).", flush=True)
+        # Block-swap trades speed for VRAM; it directly contradicts keeping the
+        # model resident, so a resident run never swaps regardless of config.
+        blocks_to_swap = 0 if resident else int(settings.get("blocks_to_swap", 0))
         if blocks_to_swap > 0:
             argv += ["--blocks_to_swap", str(blocks_to_swap)]
         if settings.get("encode_tiled", False):

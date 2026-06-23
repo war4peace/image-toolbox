@@ -157,17 +157,65 @@ tag too. Remaining follow-ups:
     safety-net alongside the time/idle dead-man's switch.
   - Caveat: GraphQL is the legacy, semi-supported API — keep it in one isolated,
     fail-safe helper (no balance → skip the funds checks, never block on it).
-- **Multiple remote providers (investigate).** RunPod is the only backend today.
-  Investigate alternatives (e.g. **vast.ai**, and others) so the user could pick a
-  remote-pod supplier — for price, GPU availability, or region (a user outside the
-  EU may have no nearby RunPod DC). This means abstracting the provider behind a
-  thin interface: create/start/stop/terminate, an SSH endpoint, a model-volume
-  equivalent, and per-hour cost / balance. The pod-side worker, the streaming
-  engine, the dead-man's switch and the queue/watchdog are all provider-agnostic
-  already, so the work is a provider adapter + a Settings picker — not a rewrite.
-  vast.ai's model differs (a marketplace of individual hosts, per-host pricing,
-  its own CLI/API and no managed network volumes), so feasibility hinges on
-  whether a persistent model store and reliable SSH can be had per provider.
+- **Multiple remote providers (investigated 2026-06-23: vast.ai NOT pursued for
+  now).** RunPod is the only backend today. The idea was to let the user pick a
+  remote-pod supplier (for price, GPU availability, or region, since a user outside
+  the EU may have no nearby RunPod DC) behind a thin provider interface
+  (create/start/stop/terminate, an SSH endpoint, a model-store equivalent, per-hour
+  cost). The motivation is real: RunPod GPU stock is often thin (all four curated
+  tag cards were out of stock in EU-RO-1 on 2026-06-22), and vast.ai is a far
+  larger marketplace.
+
+  **Architecture finding (still true, reusable for any future provider).** The
+  pod-side worker (`pod/worker.py`), the streaming engine
+  (`remote_upscale_engine.py`), the dead-man's switch, and the local
+  queue/resume/watchdog/film-strip are all provider-agnostic. Most of
+  `remote_run.py` (SSH/SCP, worker launch, tunnels, heartbeat) is generic given an
+  SSH endpoint plus a writable filesystem holding the venv and models. What is
+  RunPod-specific and would need a sibling adapter: the whole control plane
+  (`runpod_client.py`: pod CRUD, GPU stock/price, data centers, network volumes,
+  regions, the `allowedCudaVersions` / GraphQL deploy path), the `spec` dict and
+  `PUBLIC_KEY` injection in `remote_run._create_pod`, the `/workspace` assumptions
+  in `pod/provision.sh`, the RunPod-API self-stop in `pod/deadman.py`, and the
+  heavily RunPod-shaped Settings panel plus per-tab pickers in `toolbox_gui.py`
+  (~250 references). So a port would be a provider seam (a `RunPodProvider`
+  wrapping today's client, a new `VastProvider`) plus a GUI selector, not a rewrite
+  of the run mechanics. The GUI is the largest mechanical lift, not the adapter.
+
+  **Showstoppers (vast.ai, from manual pricing research).** Two billing dimensions
+  that RunPod does not charge make vast.ai a poor fit for THIS app's design:
+
+  1. **Steep storage pricing.** vast.ai bills both container disk and volumes at
+     roughly **$0.33 to $0.40 /GB/mo** (a sampled machine: 16 GB disk $5.33/mo,
+     10 GB volume $3.33/mo, i.e. ~$0.33/GB/mo). RunPod charges **$0.07/GB/mo** for
+     a network volume. The ~24 GB model store (SeedVR2 16 GB + venv + Ollama 6 GB)
+     costs ~$1.6/mo on RunPod versus ~$8 to $10/mo on vast.ai, about 5x more.
+  2. **Metered internet, both directions.** vast.ai bills bandwidth at
+     **$40/TB ingress AND egress**; RunPod includes bandwidth at no charge. This
+     directly taxes the app's core design: the streaming model uploads every source
+     image and downloads every result (see "Decided design" in `runpod-notes.md`),
+     and a model-baked image would be a large recurring pull on every fresh host.
+     A bandwidth-metered provider penalises exactly the traffic pattern the app
+     depends on.
+
+  Compounding these, vast.ai has **no region-wide network volume**: its volumes are
+  host-local, which pins a fast start to one physical machine and so defeats the
+  availability gain that motivated the look in the first place. The only portable
+  model-store option left is a ~24 GB baked Docker image, which is both new
+  build/push infra (the project has none today) and a bandwidth-metered pull per
+  new host.
+
+  **Decision: not pursued for the time being.** The combination of pricier storage,
+  metered bandwidth on a streaming-heavy design, and no managed network volume
+  removes the cost/availability advantage that was the entire point. This also
+  explains why RunPod is so dominant and sought-after for this kind of workload:
+  free bandwidth plus cheap, region-wide network storage that mounts on disposable
+  pods are precisely what a stream-one-image-at-a-time, disposable-pod app needs.
+  If this is ever revisited, vet a candidate provider against this checklist BEFORE
+  any code: (a) free or cheap ingress/egress, (b) cheap region-wide persistent
+  storage that mounts on disposable instances, (c) reliable SSH with key injection.
+  The provider-seam refactor above is only worth building once a candidate clears
+  (a) and (b).
 
 ## 2. HTTP interface — Hard
 Spin up a small HTTP server with a UI that mirrors the application UI.
