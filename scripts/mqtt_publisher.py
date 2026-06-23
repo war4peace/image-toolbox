@@ -287,19 +287,39 @@ class MqttClient:
             self.publish(topic, payload, retain=retain)
 
     def stop(self, last_used=None):
-        """Publish a clean 'offline' (and optional last_used), then disconnect."""
+        """Publish a clean 'offline' (and optional last_used), then disconnect.
+
+        The teardown runs on a daemon thread with a BOUNDED join so it can never
+        freeze the caller: `loop_stop()` joins paho's network thread, and that join
+        can stall on the UI thread regardless of broker health (a healthy broker
+        was confirmed when this froze on Save/exit). This is called from the GUI
+        thread (restart_mqtt / _on_close). If the teardown can't finish quickly the
+        thread is abandoned (daemon, dies with the process) and the caller
+        proceeds; the broker still delivers the LWT 'offline' when the dropped
+        socket times out, so nothing is lost."""
         client = self._client
         self._client = None
+        self._connected = False
         if client is None:
             return
-        try:
-            if last_used is not None:
-                client.publish(LAST_USED_TOPIC, str(last_used), qos=1, retain=True)
-            client.publish(AVAILABILITY_TOPIC, OFFLINE, qos=1, retain=True)
-            import time as _time
-            _time.sleep(0.3)        # let the network loop flush before stopping
-            client.loop_stop()
-            client.disconnect()
-        except Exception:
-            pass
-        self._connected = False
+
+        def _teardown():
+            try:
+                if last_used is not None:
+                    client.publish(LAST_USED_TOPIC, str(last_used), qos=1, retain=True)
+                client.publish(AVAILABILITY_TOPIC, OFFLINE, qos=1, retain=True)
+                import time as _time
+                _time.sleep(0.3)        # let the network loop flush before stopping
+                # disconnect() BEFORE loop_stop(): closing the socket wakes the
+                # network loop's select immediately, so loop_stop()'s thread-join
+                # returns at once instead of waiting out paho's ~1 s loop timeout
+                # (the join, on the UI thread, was the real Save/exit stall — not
+                # broker reachability, which stays fine).
+                client.disconnect()
+                client.loop_stop()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_teardown, name="mqtt-stop", daemon=True)
+        t.start()
+        t.join(timeout=2.0)            # never block the UI thread on a dead broker

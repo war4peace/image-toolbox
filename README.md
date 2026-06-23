@@ -206,44 +206,63 @@ experimental). It rents a pod, streams one image at a time, fetches the results
 back, and tears the pod down. Your source files are never uploaded as-is, only
 copies. The tables below estimate what a run costs.
 
-The figures come from benchmarking a 100-image sample of typical digital-camera
-photos through the in-app remote-pod runner (v0.3.4), on RunPod secure cloud,
-EU region, June 2026. **`$/image` is the steady-state cost of each additional
-image** (the first image of every run is much slower because the model loads into
-VRAM once); the per-run columns include that one-time model load, which is why a
-small run costs a little more than `$/image × N`.
+The figures below come from benchmarking a 100-image sample of typical
+digital-camera photos through the in-app remote-pod runner, on RunPod secure
+cloud (EU region, June 2026), across roughly fifteen GPUs. `~sec/img` and
+`$/100` are whole-run averages over the 100 images (they include the one-time
+model load on the first image, so larger runs cost a little less per image).
+Upscaling figures use the resident-VRAM offload added in 0.3.5, where the SeedVR2
+models stay in GPU memory for the whole run.
 
 ### Upscaling (Batch Upscaler)
 
-| GPU | $/h | ~sec/img | $/image | 100 | 1,000 | 10,000 | 100,000 |
-|-----|----:|---------:|--------:|----:|------:|-------:|--------:|
-| **RTX 5090** *(best value)* | 0.99 | 12.5 | $0.0034 | $0.36 | $3.46 | $34.50 | $344 |
-| RTX PRO 4500 Blackwell | 0.74 | 22.8 | $0.0047 | $0.48 | $4.70 | $47.00 | $469 |
-| RTX PRO 6000 Blackwell WS | 1.89 | 16.2 | $0.0085 | $0.87 | $8.52 | $85.00 | $850 |
-| B200 | 5.89 | 10.7 | $0.0176 | $1.83 | $17.63 | $175.70 | $1,756 |
+| GPU | $/h | ~sec/img | $/100 images |
+|-----|----:|---------:|-------------:|
+| **NVIDIA A40** *(best value)* | 0.44 | 15.7 | **$0.19** |
+| NVIDIA RTX A6000 | 0.49 | 14.3 | $0.19 |
+| RTX 5090 † | 0.99 | 12.9 | $0.36 |
+| **RTX PRO 6000 Blackwell** *(fast pick)* | 2.09 | 7.5 | $0.44 |
+| A100 80GB SXM4 | 1.49 | 14.0 | $0.58 |
+| H100 80GB HBM3 | 3.29 | 8.8 | $0.81 |
+| **NVIDIA B200** *(fastest)* | 5.89 | 5.9 | $0.96 |
+| NVIDIA H200 | 4.39 | 7.9 | $0.96 |
 
-The **RTX 5090** is both the cheapest per image *and* near the fastest: the B200
-finishes a 100-image run only ~3 minutes sooner for five times the price.
+† The RTX 5090 (32 GB) cannot hold both models resident, so it runs in the slower
+CPU-offload mode, yet it stays the best value among sub-40 GB cards.
+
+**Findings.** The mid-VRAM Ampere cards (A40, A6000 at about $0.19 per 100 images)
+are the value winners: slower per image than a 5090 but far cheaper per hour, and
+the resident-VRAM offload is what makes them viable. For raw speed the B200 leads
+(5.9 sec/img) but at five times the cost, while the **RTX PRO 6000** is the sane
+fast pick, beating both Hopper cards (H100, H200) at a fraction of their price.
+SeedVR2 upscaling rewards newer architectures: Blackwell over Hopper over Ampere
+on raw speed.
 
 ### Tag & Rename
 
-| GPU | $/h | ~sec/img | $/image | 100 | 1,000 | 10,000 | 100,000 |
-|-----|----:|---------:|--------:|----:|------:|-------:|--------:|
-| **RTX 2000 Ada** *(cheapest)* | 0.24 | 4.1 | $0.0003 | $0.03 | $0.27 | $2.70 | $27 |
-| NVIDIA L4 | 0.39 | 3.4 | $0.0004 | $0.04 | $0.38 | $3.70 | $37 |
-| **RTX 5090** *(fastest)* | 0.99 | 1.4 | $0.0004 | $0.05 | $0.39 | $3.80 | $38 |
-| RTX PRO 4500 Blackwell | 0.74 | 2.1 | $0.0004 | $0.06 | $0.46 | $4.40 | $44 |
-| RTX PRO 4000 Blackwell | 0.57 | 2.9 | $0.0005 | $0.07 | $0.48 | $4.60 | $46 |
-| A100 80GB PCIe | 1.39 | 2.5 | $0.0010 | $0.14 | $0.99 | $9.60 | $95 |
+| GPU | $/h | ~sec/img | $/100 images |
+|-----|----:|---------:|-------------:|
+| **NVIDIA RTX A4500** *(best value)* | 0.25 | 3.5 | **$0.025** |
+| NVIDIA RTX 2000 Ada | 0.24 | 5.8 | $0.039 |
+| RTX PRO 4000 Blackwell | 0.57 | 6.0 | $0.10 |
+| RTX PRO 4500 Blackwell | 0.74 | 4.7 | $0.10 |
+| RTX PRO 6000 Blackwell | 2.09 | 2.7 | $0.16 |
+| A100 80GB PCIe | 1.39 | 4.6 | $0.18 |
+| **H100 80GB HBM3** *(fastest)* | 3.29 | 2.4 | $0.22 |
+| NVIDIA H200 | 4.39 | 2.6 | $0.32 |
+| NVIDIA B200 | 5.89 | 3.2 | $0.53 |
 
-Tagging is cheap on any of these: a 16 GB **RTX 2000 Ada** tags 10,000 photos for
-under $3. (Tag & Rename also runs on a local GPU at no GPU cost: the dev RTX 3090
-tagged 100 photos in under six minutes.)
+**Findings.** Tagging is light: the vision model needs only ~6.6 GB, so the big
+datacenter cards are wildly overprovisioned and barely faster. The fastest card
+(H100, 2.4 sec/img) is only about 13% quicker than the RTX A4500 yet costs
+13 times as much per hour. Pick a cheap card: an **RTX A4500** or **RTX 2000 Ada**
+tags 10,000 photos for around $2.50. (Tag & Rename also runs on a local GPU at no
+GPU cost: a local RTX 3090 tagged 100 photos in under six minutes.)
 
 > **Caveats:** prices are point-in-time and vary by availability and region (the
-> in-app GPU picker shows live prices). The estimates exclude the ~2–3 minutes of
-> billed pod boot/teardown and the image upload/download time, so real bills run a
-> little higher — most noticeably on very small runs. Source data:
+> in-app GPU picker shows live prices). The estimates exclude the billed pod
+> boot/teardown (~2 to 3 minutes) and the image upload/download time, so real
+> bills run a little higher, most noticeably on very small runs. Source data:
 > [`docs/Benchmarks.csv`](/docs/Benchmarks.csv).
 
 ---

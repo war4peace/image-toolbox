@@ -88,7 +88,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -3598,9 +3598,24 @@ class SettingsTab(ttk.Frame):
         idle_spin = ttk.Spinbox(safety, from_=0, to=1440, increment=5, width=6,
                                 textvariable=self.runpod_idle_var)
         idle_spin.pack(side="left")
-        ttk.Label(safety, text="min idle timeout").pack(side="left", padx=(4, 0))
+        ttk.Label(safety, text="min idle timeout").pack(side="left", padx=(4, 12))
         Tooltip(idle_spin, "Stop the pod after this many minutes with no work "
                            "(0 = no idle limit).")
+
+        ttk.Label(safety, text="·  Provision:").pack(side="left", padx=(0, 4))
+        self.runpod_provrun_var = tk.StringVar(value=str(rp.get("provision_max_runtime_minutes", 60)))
+        provrun_spin = ttk.Spinbox(safety, from_=30, to=240, increment=15, width=5,
+                                   textvariable=self.runpod_provrun_var)
+        provrun_spin.pack(side="left")
+        ttk.Label(safety, text="min ceiling").pack(side="left", padx=(4, 0))
+        Tooltip(provrun_spin, "Hard ceiling for the temporary model-provisioning "
+                              "pod's dead-man's switch: it self-terminates after "
+                              "this long even if the app is closed or the "
+                              "provisioning window is force-killed, so a stuck "
+                              "download can't leave a pod billing. The download "
+                              "normally takes 10-20 min; 60 leaves headroom. (Idle "
+                              "timeout doesn't apply here — no heartbeat is written "
+                              "during a download.)")
 
         self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", True)))
         term_chk = ttk.Checkbutton(
@@ -3819,6 +3834,7 @@ class SettingsTab(ttk.Frame):
             "max_price_per_hour_tag":     _num(self.runpod_maxprice_tag_var, 0.50, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
+            "provision_max_runtime_minutes": _num(self.runpod_provrun_var, 60, int),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
             "gpu_type_id":      self._gpu_id_by_label.get(
                 self.runpod_gpu_var.get(),
@@ -4282,17 +4298,80 @@ class SettingsTab(ttk.Frame):
         win = tk.Toplevel(self)
         win.title("Provisioning the model volume")
         win.geometry("780x460")
-        body = ttk.Frame(win, padding=8)
-        body.pack(fill="both", expand=True)
-        txt = tk.Text(body, wrap="word", font=("Consolas", 9), state="disabled")
+        # Match the Batch Upscaler / Tag & Rename log console palette (LogPane):
+        # dark background, light text, flat relief.
+        win.configure(bg="#15181d")
+        body = tk.Frame(win, bg="#15181d")
+        body.pack(fill="both", expand=True, padx=8, pady=8)
+        txt = tk.Text(body, wrap="word", font=("Consolas", 9), state="disabled",
+                      background="#15181d", foreground="#d7dde4",
+                      insertbackground="#d7dde4", relief="flat", padx=8, pady=6)
         sb = ttk.Scrollbar(body, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
 
+        # A model download streams a tqdm/curl progress bar: thousands of updates
+        # for a 15 GB file. Render it like a terminal — a carriage return rewrites
+        # the current line instead of appending a fresh one — so the Text widget
+        # stays small. Without this it grew unbounded until each insert/see got so
+        # slow the Tk main loop starved and Windows flagged the window "Not
+        # Responding". A hard line cap is a defensive backstop for tools that emit
+        # a newline per update.
+        MAX_LINES = 600
+        # A "still working" heartbeat for the silent stretches: pip building/
+        # installing ~30 packages, a big weight download, `ollama pull` — all emit
+        # nothing for minutes, which looks identical to a hang. When the pod has
+        # been quiet this long, show a single self-updating line so the user knows
+        # it's alive (and isn't tempted to force-kill, which would orphan/strand
+        # the provisioning pod).
+        HB_AFTER = 10.0          # seconds of silence before the heartbeat appears
+        HB_EVERY = 5.0           # refresh the heartbeat (its counter) this often
+        last_activity = time.monotonic()
+        last_hb = 0.0
+        hb_active = False        # a heartbeat line is currently the last line
+
+        def _clear_heartbeat():
+            nonlocal hb_active
+            if hb_active:
+                txt.delete("end-1c linestart", "end-1c")
+                hb_active = False
+
         def append(s):
+            nonlocal last_activity
             txt.configure(state="normal")
-            txt.insert("end", s)
+            _clear_heartbeat()   # real output supersedes the transient heartbeat
+            for token in re.split(r"(\r\n|\r|\n)", s):
+                if not token:
+                    continue
+                if token in ("\n", "\r\n"):
+                    txt.insert("end", "\n")
+                elif token == "\r":
+                    # Carriage return: drop the current (in-progress) line so the
+                    # next text overwrites it — collapses a progress bar to one line.
+                    txt.delete("end-1c linestart", "end-1c")
+                else:
+                    txt.insert("end", token)
+            excess = int(txt.index("end-1c").split(".")[0]) - MAX_LINES
+            if excess > 0:
+                txt.delete("1.0", f"{excess + 1}.0")
+            txt.see("end")
+            txt.configure(state="disabled")
+            last_activity = time.monotonic()
+
+        def heartbeat():
+            nonlocal hb_active, last_hb
+            txt.configure(state="normal")
+            if hb_active:
+                txt.delete("end-1c linestart", "end-1c")   # overwrite the previous
+            elif txt.get("end-1c linestart", "end-1c"):     # last line has content
+                txt.insert("end", "\n")                     # give the heartbeat its own line
+            secs = int(time.monotonic() - last_activity)
+            txt.insert("end", f"  … still working on the pod — no new output for "
+                              f"{secs}s. Large downloads and installs run silent; "
+                              f"please wait …")
+            hb_active = True
+            last_hb = time.monotonic()
             txt.see("end")
             txt.configure(state="disabled")
 
@@ -4341,6 +4420,10 @@ class SettingsTab(ttk.Frame):
                         text="Provisioning failed — see the window for details.",
                         foreground="#b3261e")
             else:
+                # No output for a while but the process is alive → reassure the user.
+                now = time.monotonic()
+                if (now - last_activity) >= HB_AFTER and (now - last_hb) >= HB_EVERY:
+                    heartbeat()
                 win.after(80, pump)
 
         threading.Thread(target=reader, daemon=True).start()
@@ -4544,6 +4627,7 @@ class SettingsTab(ttk.Frame):
         self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
+        self.runpod_provrun_var.set(str(rp.get("provision_max_runtime_minutes", 60)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
         # Reset the GPU combos to the curated lists (discard any live-refresh state).
         self.runpod_gpu_cmb.configure(values=runpod_client.GPU_TYPES)
@@ -5575,6 +5659,15 @@ class App(tk.Tk):
         # Don't let unsaved Settings edits vanish on exit.
         if self.settings_tab.is_dirty() and self._confirm_unsaved("closing") == "cancel":
             return
+        # Time each teardown step. If the close is slow (it once flagged "Not
+        # Responding"), the per-step breakdown is written to logs/close_timing.log
+        # so the real culprit is recorded instead of inferred.
+        t0 = time.perf_counter()
+        marks = []
+
+        def mark(label):
+            marks.append((label, time.perf_counter() - t0))
+
         busy = [t for t in (self.upscale_tab, self.tag_tab, self.conciliate_tab) if t.running]
         if busy:
             if not messagebox.askyesno(
@@ -5589,15 +5682,36 @@ class App(tk.Tk):
                         t.proc.wait(timeout=5)
                     except Exception:
                         t.terminate()
+            mark("stop-tasks")
         # Persist the main window layout and the shared log window's layout.
         self._save_geometry()
         if self.log_window is not None and self.log_window.winfo_exists():
             self.log_window.save_geometry()
         if self.comparison_window is not None and self.comparison_window.winfo_exists():
             self.comparison_window.save_geometry()
+        mark("save-geometry")
         # Record last-used time and announce going offline before we exit.
         self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))
+        mark("stop-mqtt")
+        self._log_close_timing(marks)
         self.destroy()
+
+    def _log_close_timing(self, marks, slow_threshold=1.5):
+        """Append the close-path step timings to logs/close_timing.log, but only
+        when the close was slow — so a clean exit stays silent and a stall is
+        captured with its real breakdown. Best-effort, never raises."""
+        try:
+            total = marks[-1][1] if marks else 0.0
+            if total < slow_threshold:
+                return
+            log_dir = os.path.join(APP_ROOT, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            stamp = datetime.datetime.now().isoformat(timespec="seconds")
+            steps = "  ".join(f"{label}={secs:.2f}s" for label, secs in marks)
+            with open(os.path.join(log_dir, "close_timing.log"), "a", encoding="utf-8") as f:
+                f.write(f"{stamp}  total={total:.2f}s  {steps}\n")
+        except Exception:                       # noqa: BLE001 (diagnostics must never block exit)
+            pass
 
 
 def main():

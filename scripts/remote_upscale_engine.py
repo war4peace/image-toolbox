@@ -53,6 +53,10 @@ class RemoteUpscaleEngine:
         self._tunnel = self._open_tunnel(known_hosts)
         info = self._wait_health(ready_timeout)
         self.device_name = info.get("device", "remote")
+        # Whether the pod's engine kept DiT + VAE resident on the GPU (big-VRAM
+        # cards). Surfaced so the local log can confirm it — the engine's own
+        # "Big-VRAM GPU detected" line is printed on the pod, not here.
+        self.resident = bool(info.get("resident", False))
 
     # ── tunnel ────────────────────────────────────────────────────────────────
 

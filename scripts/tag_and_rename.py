@@ -702,8 +702,22 @@ def analyse_image(path, language="English"):
         data    = payload,
         headers = {"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
-        result = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        # Surface Ollama's ACTUAL error. A 500's response body carries the real
+        # cause (model-runner crash, CUDA "no kernel image" on an unsupported
+        # arch, OOM, corrupt model) — the bare "HTTP Error 500: Internal Server
+        # Error" hides it, which sent us chasing the wrong thing (a "venv" issue).
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:                              # noqa: BLE001 (best-effort)
+            pass
+        raise RuntimeError(
+            f"Ollama HTTP {exc.code} from /api/generate"
+            + (f": {detail}" if detail else f" ({exc.reason})")) from exc
 
     raw   = result.get("response", "").strip()
     lines = [l.strip() for l in raw.splitlines() if l.strip()]

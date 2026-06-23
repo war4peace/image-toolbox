@@ -191,6 +191,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             body = json.dumps({"status": "ok",
                                "device": getattr(_ENGINE, "device_name", "?"),
+                               "resident": bool(getattr(_ENGINE, "resident", False)),
                                "version": _VERSION,
                                "mode": _MODE,
                                "count": _COUNT}).encode()

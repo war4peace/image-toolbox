@@ -49,7 +49,23 @@ fi
 #    conflicting torch/CUDA — the failure mode of an earlier --target attempt).
 #    The light deps install into the venv and persist on the volume.
 echo "---- creating venv at $VENV (reusing the image's torch 2.9.1+cu128) ----"
-rm -rf "$VENV"
+# Wipe the existing venv before rebuilding. On the network volume, a file held
+# open by ANOTHER pod (e.g. a still-running worker's /workspace/venv/bin/python,
+# with numpy/PIL/torchvision .so mmap'd) makes `rm -rf` NFS-silly-rename it and
+# report "Directory not empty" — fatal under `set -e`, aborting the whole
+# provision at step 2. So: try a plain wipe, and if the dir survives (busy),
+# rename it aside (succeeds even with open handles) so venv creation always gets
+# a clean path. The leftover is best-effort deleted. The right fix operationally
+# is to not provision while a pod still mounts the volume, but this keeps a 20-min
+# provision from dying on one stray handle.
+if [ -e "$VENV" ]; then
+  rm -rf "$VENV" 2>/dev/null || true
+  if [ -e "$VENV" ]; then
+    echo "  venv busy (open handle on the volume?) — moving it aside"
+    mv "$VENV" "${VENV}.old.$$" 2>/dev/null || true
+    rm -rf "${VENV}.old.$$" 2>/dev/null || true
+  fi
+fi
 python -m venv --system-site-packages "$VENV"
 grep -ivE '^torch($|[<>=~ ])|^torchvision' "$SEEDVR2_DIR/requirements.txt" > /tmp/reqs.txt
 # The image ships torch 2.9.1+cu128 and torchaudio 2.9.1 but NO torchvision.
@@ -94,14 +110,23 @@ PY
 # 4. Ollama + vision model to the volume ---------------------------------------
 echo "---- installing ollama ----"
 command -v ollama >/dev/null 2>&1 || curl -fsSL https://ollama.com/install.sh | sh
-# Cache the ollama BINARY on the volume too (not just the models): a disposable
+# Cache the ollama RUNTIME on the volume (not just the models): a disposable
 # run-pod for remote Tag & Rename then reuses it without re-downloading. The
 # remote_run tag session prefers /workspace/ollama/bin/ollama, falling back to a
-# fresh install only if this is missing (an older volume).
+# fresh install if it (or its lib) is missing (an older volume).
+# Modern Ollama is TWO parts: the `ollama` binary AND a lib/ollama/ dir holding
+# the separate `llama-server` + GPU-runner libs. Caching only the binary leaves
+# the reused pod unable to start the model server ("llama-server binary not
+# found"), 500-ing every inference — so cache the lib dir too. The cached binary
+# resolves it at <bindir>/../lib/ollama, i.e. /workspace/ollama/lib/ollama.
 OLLAMA_SRC="$(command -v ollama || true)"
 if [ -n "$OLLAMA_SRC" ]; then
-  mkdir -p "$VOL/ollama/bin"
+  mkdir -p "$VOL/ollama/bin" "$VOL/ollama/lib/ollama"
   cp -f "$OLLAMA_SRC" "$VOL/ollama/bin/ollama" 2>/dev/null || true
+  for libdir in /usr/local/lib/ollama /usr/lib/ollama "$(dirname "$OLLAMA_SRC")/../lib/ollama"; do
+    [ -d "$libdir" ] || continue
+    cp -rf "$libdir/." "$VOL/ollama/lib/ollama/" 2>/dev/null && break
+  done
 fi
 export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
 pkill -f "ollama serve" 2>/dev/null || true

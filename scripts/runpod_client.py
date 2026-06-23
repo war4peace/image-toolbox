@@ -524,6 +524,43 @@ def volume_region(api_key, vol_id, timeout=30):
     return vol.get("dataCenterId") if isinstance(vol, dict) else None
 
 
+def _pod_volume_id(pod):
+    """The network volume id a pod has attached, or None. The REST pod object has
+    exposed it both flat (`networkVolumeId`) and nested (`networkVolume.id`) across
+    API versions, so check both."""
+    if not isinstance(pod, dict):
+        return None
+    v = pod.get("networkVolumeId")
+    if v:
+        return v
+    nv = pod.get("networkVolume")
+    return nv.get("id") if isinstance(nv, dict) else None
+
+
+def pods_using_volume(api_key, vol_id, timeout=30):
+    """Return the pods that currently have network volume `vol_id` attached, as
+    a list of {"id", "name", "status"}.
+
+    Used as a provisioning pre-flight: rebuilding the venv on a volume that a
+    running pod still mounts corrupts that pod's live worker and NFS-blocks the
+    `rm -rf` (the file is held open → "Directory not empty"). Best-effort —
+    returns [] on any list failure or an API version that omits the volume field,
+    so a transient hiccup never blocks provisioning (the move-aside in
+    provision.sh is the backstop)."""
+    if not vol_id:
+        return []
+    try:
+        pods = list_pods(api_key, timeout=timeout)
+    except RunPodError:
+        return []
+    out = []
+    for p in pods:
+        if _pod_volume_id(p) == vol_id:
+            out.append({"id": p.get("id"), "name": p.get("name"),
+                        "status": p.get("desiredStatus")})
+    return out
+
+
 # ── network volumes (the persistent model store) ─────────────────────────────
 
 def list_network_volumes(api_key, timeout=30):

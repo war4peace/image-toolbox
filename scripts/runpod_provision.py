@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import time
+import tempfile
 import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,8 +35,18 @@ CONFIG     = os.path.join(APP_ROOT, "config.json")
 STATE      = os.path.join(APP_ROOT, "logs", "runpod_dev_state.json")
 KNOWN_HOSTS = os.path.join(APP_ROOT, "logs", "runpod_known_hosts")
 PROVISION_SH = os.path.join(APP_ROOT, "pod", "provision.sh")
+DEADMAN_PY   = os.path.join(APP_ROOT, "pod", "deadman.py")
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
+
+# Provisioning runs NO GPU compute — it is a pure download + pip + `ollama pull`
+# job (provision.sh) — so it does not need the expensive upscale card the run
+# uses. Pick the cheapest in-stock GPU in the volume's region and pass the rest
+# as an ordered fallback chain, so a single sold-out card can't fail provisioning
+# (the real win is availability, not just cost). A small VRAM floor is a sanity
+# guard only; nothing here needs the memory.
+PROVISION_MIN_VRAM_GB = 8     # sanity floor; provisioning uses no VRAM
+PROVISION_MAX_CHAIN   = 6     # bound how many cards we try before giving up
 
 
 def _load_config():
@@ -102,6 +113,109 @@ def _scp(host, port, key, local, remote):
             local, f"root@{host}:{remote}"]
     print(f"  $ scp {os.path.basename(local)} -> root@{host}:{remote}")
     return subprocess.run(args, check=True, stdin=subprocess.DEVNULL)
+
+
+def _wait_for_ssh(host, port, key, timeout=180, poll=5):
+    """Wait until the pod's sshd actually ACCEPTS a connection.
+
+    RunPod publishes the port-22 mapping (so `ssh_endpoint` returns host:port, and
+    `wait_until_running` returns) a little BEFORE sshd is listening — so an
+    immediate scp/ssh can hit 'Connection refused' (exit 255) and crash the run.
+    This happened on a slower data center (EUR-IS-1) where EU-SE-1 had got lucky.
+    Probe with a trivial `ssh … true` until it succeeds or `timeout` elapses;
+    connection noise is swallowed so only the outcome is logged. Returns True once
+    SSH answers, False on timeout (the caller may still try and surface the real
+    error)."""
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            res = subprocess.run(
+                ["ssh", *_ssh_opts(key, port), f"root@{host}", "true"],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            if res.returncode == 0:
+                print(f"  SSH ready (after {attempt} probe(s)).", flush=True)
+                return True
+        except Exception:                                # noqa: BLE001 (best-effort probe)
+            pass
+        time.sleep(poll)
+    return False
+
+
+def _provision_gpu_chain(key, rpc, region):
+    """Build the ordered GPU fallback chain for a provisioning pod: the cheapest
+    in-stock cards in `region` first (provisioning needs no GPU power), with the
+    configured `gpu_type_id` appended as a last-ditch fallback. Falls back to just
+    the configured card if the live availability query fails, so provisioning
+    still works offline-of-GraphQL."""
+    configured = rpc.get("gpu_type_id", "NVIDIA GeForce RTX 5090")
+    try:
+        avail = rp.available_gpus(key, data_center_id=region,
+                                  min_memory_gb=PROVISION_MIN_VRAM_GB)
+    except rp.RunPodError as exc:
+        print(f"  (live GPU availability lookup failed: {exc};", flush=True)
+        print(f"   using the configured GPU {configured})", flush=True)
+        return [configured]
+    chain = [g["id"] for g in avail[:PROVISION_MAX_CHAIN]]
+    if configured not in chain:
+        chain.append(configured)          # last-ditch fallback to the saved pick
+    if not chain:                          # region returned nothing in stock
+        return [configured]
+    if avail:
+        c = avail[0]
+        print(f"  cheapest available in {region}: {c['name']} @ ${c['price']}/h "
+              f"({c['memory_gb']} GB VRAM); {len(chain)}-card fallback chain", flush=True)
+    return chain
+
+
+def _arm_provision_deadman(host, port, ssh_key, api_key, pod_id, ceiling_min):
+    """Arm the on-pod dead-man's switch on the provisioning pod as a backstop to
+    this process's finally-teardown.
+
+    `cmd_setup_volume` terminates the pod in a `finally`, which covers errors
+    INSIDE this process — but NOT this process being killed (e.g. the GUI is
+    force-closed because the provisioning window looked hung during a long
+    download). This daemon self-terminates the pod after `ceiling_min` even then,
+    so a stuck provisioning can never leave a pod billing.
+
+    Idle timeout is DISABLED here: no worker writes a heartbeat during
+    provisioning, so the deadman's idle check would (wrongly) fire mid-download.
+    The hard max-runtime ceiling is the only guard. Best-effort: any failure to
+    arm is logged and ignored (the finally is still the primary teardown)."""
+    if not os.path.exists(DEADMAN_PY):
+        print(f"  (deadman.py missing at {DEADMAN_PY}; skipping the provisioning "
+              f"dead-man's switch)", flush=True)
+        return False
+    try:
+        _scp(host, port, ssh_key, DEADMAN_PY, "/root/deadman.py")
+        # The pod self-terminates via the REST API (runpodctl isn't reliably
+        # pre-authed on a deploy-API pod), so it needs the key in a 0600 file.
+        kf = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        kf.write(api_key)
+        kf.close()
+        try:
+            _scp(host, port, ssh_key, kf.name, "/root/.rp_key")
+            _ssh(host, port, ssh_key, "chmod 600 /root/.rp_key", check=False)
+        finally:
+            os.remove(kf.name)
+        # The volume venv does not exist yet (provision.sh builds it), so run the
+        # stdlib-only deadman with the image's system python. setsid detaches it so
+        # this ssh call returns immediately (a plain `& ` would keep ssh hanging).
+        inner = (
+            "echo $$ > /root/deadman.pid; "
+            "exec env RUNPOD_API_KEY=\"$(cat /root/.rp_key)\" python "
+            f"/root/deadman.py --pod-id {pod_id} --terminate "
+            f"--max-runtime-min {int(ceiling_min)} --idle-timeout-min 0")
+        launch = (
+            "([ -f /root/deadman.pid ] && kill \"$(cat /root/deadman.pid)\" 2>/dev/null); sleep 1; "
+            f"setsid sh -c '{inner}' < /dev/null > /root/deadman.log 2>&1 & echo armed")
+        _ssh(host, port, ssh_key, launch, check=False)
+        return True
+    except Exception as exc:                              # noqa: BLE001 (fail-safe)
+        print(f"  (could not arm the provisioning dead-man's switch: {exc};", flush=True)
+        print("   this process still terminates the pod on exit)", flush=True)
+        return False
 
 
 def _endpoint_or_die(rpc):
@@ -379,6 +493,21 @@ def cmd_setup_volume(rpc, args):
     if not os.path.exists(PROVISION_SH):
         sys.exit(f"Missing {PROVISION_SH}")
 
+    # Pre-flight: refuse to provision a volume a RUNNING pod still mounts —
+    # rebuilding the venv under a live worker corrupts it and NFS-blocks the wipe
+    # ("Directory not empty" on held-open .so files). Best-effort; an unreadable
+    # pod list never blocks provisioning.
+    busy = [p for p in rp.pods_using_volume(key, vol_id)
+            if p.get("status") == rp.STATUS_RUNNING]
+    if busy:
+        names = ", ".join(p["id"] + (f" ({p['name']})" if p.get("name") else "")
+                          for p in busy)
+        sys.exit(
+            f"Volume {vol_id} is still attached to a running pod: {names}.\n"
+            "Provisioning rebuilds the venv on the volume, which corrupts that "
+            "pod's live worker and blocks the rebuild. Terminate the pod first "
+            "(the run's Stop, or it self-stops on its idle timeout), then retry.")
+
     # Ensure the app's SSH key exists and grab its public half for PUBLIC_KEY.
     try:
         kp, pub, _created = ssh_setup.ensure_keypair(
@@ -387,11 +516,11 @@ def cmd_setup_volume(rpc, args):
         sys.exit(f"SSH setup failed: {exc}")
 
     image = rpc.get("image_name") or DEFAULT_IMAGE
-    gpu   = rpc.get("gpu_type_id", "NVIDIA GeForce RTX 5090")
+    gpu_chain = _provision_gpu_chain(key, rpc, region)
     spec = {
         "name":              "image-toolbox-provision",
         "imageName":         image,
-        "gpuTypeIds":        [gpu],
+        "gpuTypeIds":        gpu_chain,
         "gpuCount":          1,
         "cloudType":         "SECURE",
         "dataCenterIds":     [region],
@@ -403,15 +532,16 @@ def cmd_setup_volume(rpc, args):
         spec["env"] = {"PUBLIC_KEY": pub}
 
     print(f"Provisioning the model volume {vol_id} in {region}.", flush=True)
-    print(f"  GPU {gpu}, image {image}. This downloads ~22 GB to the volume and", flush=True)
+    print(f"  GPU {gpu_chain[0]}, image {image}. This downloads ~22 GB to the volume and", flush=True)
     print("  can take 10-20 minutes. The pod is terminated automatically when done.", flush=True)
     print("  *** a pod is now BILLING until provisioning finishes ***", flush=True)
 
     def on_event(kind, attempt, pod_id, info):
         if kind == "created":
             _save_state({"pod_id": pod_id, "created_at": time.time(),
-                         "region": region, "gpu": gpu})
-            print(f"  [attempt {attempt}] created pod {pod_id}; waiting for RUNNING + SSH …", flush=True)
+                         "region": region, "gpu": info})
+            print(f"  [attempt {attempt}] created pod {pod_id} on {info}; "
+                  f"waiting for RUNNING + SSH …", flush=True)
         elif kind == "status":
             s, h, p = info
             print(f"    status={s} ssh={h}:{p}", flush=True)
@@ -428,6 +558,20 @@ def cmd_setup_volume(rpc, args):
         host, port = rp.ssh_endpoint(pod)
         if not host:
             sys.exit("Pod became ready but published no SSH endpoint.")
+        # The endpoint is published before sshd is actually listening, so wait for
+        # SSH to answer before any scp — otherwise the first transfer hits
+        # 'Connection refused' and crashes the run (seen on a slow DC).
+        print("  Waiting for the pod's SSH service to accept connections …", flush=True)
+        if not _wait_for_ssh(host, port, kp):
+            print("  (SSH still refusing after the wait; attempting the transfers "
+                  "anyway) …", flush=True)
+        # Backstop the finally-teardown: if THIS process is killed before it can
+        # terminate the pod (e.g. the GUI is force-closed mid-download), the on-pod
+        # dead-man's switch still self-terminates after the configured ceiling.
+        ceiling = int(rpc.get("provision_max_runtime_minutes", 60))
+        print(f"  Arming the provisioning dead-man's switch "
+              f"(self-terminate after {ceiling} min) …", flush=True)
+        _arm_provision_deadman(host, port, kp, key, pod_id, ceiling)
         _scp(host, port, kp, PROVISION_SH, "/root/provision.sh")
         dit = rpc.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
         env = (f"DIT_MODEL='{os.environ.get('DIT_MODEL', dit)}' "

@@ -111,6 +111,32 @@ class RemoteSession:
         subprocess.run(args, check=True, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True)
 
+    def _wait_for_ssh(self, timeout=180, poll=5):
+        """Wait until the pod's sshd actually ACCEPTS a connection before the first
+        scp. RunPod publishes the port-22 mapping (so ssh_endpoint returns a
+        host:port) a little BEFORE sshd is listening, so an immediate transfer can
+        hit 'Connection refused' (exit 255) and abort the run — seen on slower data
+        centers. Probe with `ssh … true` until it answers; a reused pod answers on
+        the first try. Returns True once reachable, False on timeout (the caller
+        proceeds and lets the real transfer surface the error)."""
+        deadline = time.time() + timeout
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            try:
+                res = subprocess.run(
+                    ["ssh", *_ssh_base(self.key_path, self.ssh_port, self.known_hosts),
+                     f"root@{self.host}", "true"],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                if res.returncode == 0:
+                    if attempt > 1:
+                        self._emit(f"SSH ready (after {attempt} probe(s)).")
+                    return True
+            except Exception:                            # noqa: BLE001 (best-effort probe)
+                pass
+            time.sleep(poll)
+        return False
+
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
     def start(self):
@@ -128,6 +154,9 @@ class RemoteSession:
                 self._emit(f"Reusing running pod {self.pod_id} ({self.host}).")
             else:
                 self._create_pod()
+        # Gate the first scp on sshd actually answering (the endpoint is published
+        # before sshd listens). A reused pod clears this immediately.
+        self._wait_for_ssh()
         self._push_files()
         self._start_worker()
         if self.mode == "tag":
@@ -141,7 +170,10 @@ class RemoteSession:
             self._open_ollama_tunnel()
             self._emit(f"Remote tagging ready (Ollama at {self.ollama_url}).")
         else:
-            self._emit(f"Remote engine ready on {self.engine.device_name}.")
+            vram = (" (big-VRAM: DiT + VAE kept resident on the GPU)"
+                    if getattr(self.engine, "resident", False)
+                    else " (per-image CPU offload)")
+            self._emit(f"Remote engine ready on {self.engine.device_name}.{vram}")
         return self.engine
 
     def _emit(self, msg):
@@ -299,15 +331,22 @@ class RemoteSession:
     def _start_ollama(self):
         """Start `ollama serve` on the pod (remote Tag & Rename), serving the
         vision model from the network volume. The models live on the volume
-        (provision.sh) but the ollama BINARY normally does not, so resolve it from
+        (provision.sh) but the ollama RUNTIME normally does not, so resolve it from
         PATH → a volume cache → an on-the-fly install. Skips if already up (reused
         pod). setsid + redirect-on-the-backgrounded-command so the ssh call
-        returns (same rule as the worker launch)."""
+        returns (same rule as the worker launch).
+
+        The cached binary is only trusted when its companion `llama-server` lib is
+        also cached (/workspace/ollama/lib/ollama) — an older volume cached just
+        the binary, which can't start the model server and 500s every inference.
+        Requiring the lib makes such a volume self-heal: it falls through to a
+        fresh install (which ships the full runtime) instead of serving a broken
+        ollama."""
         self._emit("Starting Ollama on the pod (vision model from the volume) …")
         launch = (
             "if curl -sf localhost:11434/api/version >/dev/null 2>&1; then echo OLLAMA_UP; exit 0; fi; "
             "OLLAMA_BIN=$(command -v ollama || true); "
-            "{ [ -z \"$OLLAMA_BIN\" ] && [ -x /workspace/ollama/bin/ollama ]; } && OLLAMA_BIN=/workspace/ollama/bin/ollama; "
+            "{ [ -z \"$OLLAMA_BIN\" ] && [ -x /workspace/ollama/bin/ollama ] && [ -e /workspace/ollama/lib/ollama/llama-server ]; } && OLLAMA_BIN=/workspace/ollama/bin/ollama; "
             "if [ -z \"$OLLAMA_BIN\" ]; then curl -fsSL https://ollama.com/install.sh | sh >/root/ollama_install.log 2>&1; "
             "OLLAMA_BIN=$(command -v ollama || echo /usr/local/bin/ollama); fi; "
             "export OLLAMA_MODELS=/workspace/models/ollama OLLAMA_HOST=127.0.0.1:11434; "

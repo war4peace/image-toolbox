@@ -231,7 +231,13 @@ runs Ollama (vision model from the volume) **plus** the orientation CNN in a
 lightweight worker "tag mode" (no SeedVR2, so the VRAM is free for Ollama);
 `tag_and_rename.py` still runs locally (reads/writes the files, does EXIF/rename)
 but its Ollama URL is repointed at an ssh tunnel and auto-straighten detection
-runs on the pod. Tagging uses a **cheap GPU tier** (`runpod.tag_gpu_type_id` →
+runs on the pod. `provision.sh` caches the full **Ollama runtime** on the volume
+(the `ollama` binary **and** its `lib/ollama/` dir, which holds the separate
+`llama-server` + GPU runners — caching only the binary 500s every inference with
+"llama-server binary not found"); `remote_run._start_ollama` trusts the cached
+runtime only when `llama-server` is present, else it falls through to a fresh
+install (so an older binary-only volume self-heals). Tagging uses a **cheap GPU
+tier** (`runpod.tag_gpu_type_id` →
 an ordered fallback chain of 16–20 GB cards in `TAG_GPU_TYPES`; the vision model
 needs only ~6.6 GB), not the upscale GPU. **0.3.3 added a live GPU picker** next
 to each tab's "Run on remote pod" toggle: it queries RunPod's **GraphQL** endpoint
