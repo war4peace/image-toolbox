@@ -163,20 +163,34 @@ Everything that used to require hand-editing `config.json` is here:
   from the models installed on your machine.
 - **Auto-straighten** toggle and confidence threshold for Tag & Rename.
 - **Resolution Target** (4K / 2K / 1080p) and the **skip-cutoff** percentage.
-- **SeedVR settings** (attention mode, color correction, models, tiling, etc.).
-- **Discord webhook** with a **Test** button.
+- **SeedVR settings** (attention mode, VAE tiling, outage threshold, etc.).
+- **Discord webhook**, **Telegram bot** and **ntfy** notifications, each with a
+  **Test** button (Telegram also has a **Detect** button to find your chat ID).
 - **Default folders** for each tool, also settable from each tab's
   *Save as Default* button.
 
 > **Maintainers:** before committing or sharing `config.json`, clear personal
-> data from **Default folders**, the **Discord webhook**, and the **MQTT**
-> section — keeping only the `client_id` default (`image-toolbox-beededbe`).
+> data from **Default folders**, the **Notifications** section (Discord webhook,
+> Telegram bot token and chat ID, ntfy topic/token), and the **MQTT** section —
+> keeping only the `client_id` default (`image-toolbox-beededbe`).
 
 ### Notifications
 
-Set a **Discord webhook** (in Settings) to get a message when a queue finishes —
-for both the Upscaler and Tag & Rename — and on errors (repeated failures, an
-engine that fails to start, Ollama going unreachable).
+Get a message when a queue finishes (for both the Upscaler and Tag & Rename) and
+on errors (repeated failures, an engine that fails to start, Ollama going
+unreachable). Three backends, configured in Settings → Notifications, all optional
+and independent:
+
+- **Discord** — paste a channel **webhook** URL.
+- **Telegram** — create a bot with **@BotFather**, paste its **bot token**, open
+  the bot and press **Start**, then click **Detect** to fill in your chat ID.
+- **ntfy** — make up a **topic** name, subscribe to it in the [ntfy](https://ntfy.sh)
+  app, and enter it here (the **server** defaults to the public `https://ntfy.sh`;
+  point it at your own server if you self-host). On the public server anyone who
+  knows the topic can read it, so pick an unguessable name.
+
+Each has a **Test** button. Whatever you configure (any combination, or none)
+receives the same alerts.
 
 ---
 
@@ -188,9 +202,10 @@ Settings live in `config.json` next to the app, with these sections:
 |------------|----------------------------------------------------------------------|
 | `seedvr2`  | Paths to the engine repo, model weights, and the venv Python.        |
 | `ollama`   | Ollama server URL and the vision model for tagging.                  |
-| `upscale`  | Resolution target, skip-cutoff, SeedVR pipeline options, webhook.    |
+| `upscale`  | Resolution target, skip-cutoff, SeedVR pipeline options.            |
 | `tagging`  | Resolution threshold, timeouts, camera-filename patterns, etc.       |
 | `defaults` | Pinned default folders for each tool.                                |
+| `notifications` | Discord webhook, Telegram bot token/chat ID, ntfy server/topic. |
 
 You normally never edit this file by hand — use the **Settings** tab. The
 installer never overwrites your `config.json` on upgrade, and removes it only on

@@ -70,6 +70,7 @@ import mqtt_publisher
 import system_telemetry
 import taskbar_progress
 import runpod_client
+import notifications
 import ssh_setup
 # Single-instance guard is optional — a packaging miss must not brick startup.
 try:
@@ -88,7 +89,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -283,32 +284,9 @@ def ollama_list_models(url, timeout=5):
         return False, str(exc)
 
 
-def test_discord_webhook(url, timeout=10):
-    """
-    Verify a Discord webhook by GETting its metadata (same check setup.ps1 does).
-    Returns (ok, message) — message names the channel on success.
-    """
-    url = (url or "").strip()
-    if not url:
-        return False, "No webhook URL entered."
-    try:
-        # Discord's Cloudflare front returns 403 to the default urllib
-        # User-Agent, so present a browser-like one (matches the send path).
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        channel = data.get("name") or data.get("channel_id") or "?"
-        return True, f"Webhook OK — connected to channel: {channel}"
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            return False, "Invalid webhook (401 Unauthorized) — check the URL."
-        if exc.code == 404:
-            return False, "Webhook not found (404) — it may have been deleted."
-        return False, f"HTTP {exc.code} {exc.reason}"
-    except Exception as exc:
-        return False, f"Could not reach webhook: {exc}"
+# Discord/Telegram probes live in notifications.py (shared with the runners).
+# test_discord_webhook stays as a thin alias so existing callers keep working.
+test_discord_webhook = notifications.test_discord
 
 
 def _resolve_python():
@@ -3346,11 +3324,15 @@ class SettingsTab(ttk.Frame):
             row += 1
 
         # ── Notifications ───────────────────────────────────────────────────────
+        # Settings live in the "notifications" config section; resolve_settings()
+        # also reads the legacy upscale.discord_webhook_url so existing installs
+        # keep their webhook until the next Save migrates it.
+        notif = notifications.resolve_settings(CFG)
         sec = self._section(body, "Notifications")
         sec.columnconfigure(1, weight=1)
 
-        ttk.Label(sec, text="Discord Webhook:").grid(row=0, column=0, sticky="w", pady=3)
-        self.webhook_var = tk.StringVar(value=ups.get("discord_webhook_url", ""))
+        ttk.Label(sec, text="Discord webhook:").grid(row=0, column=0, sticky="w", pady=3)
+        self.webhook_var = tk.StringVar(value=notif.get("discord_webhook_url", ""))
         webhook_entry = ttk.Entry(sec, textvariable=self.webhook_var)
         webhook_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         Tooltip(webhook_entry,
@@ -3358,6 +3340,46 @@ class SettingsTab(ttk.Frame):
         ttk.Button(sec, text="Test", command=self._test_webhook).grid(row=0, column=2, pady=3)
         self.webhook_status = ttk.Label(sec, text="", foreground="#666")
         self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(sec, text="Telegram bot token:").grid(row=2, column=0, sticky="w", pady=3)
+        self.tg_token_var = tk.StringVar(value=notif.get("telegram_bot_token", ""))
+        tg_token_entry = ttk.Entry(sec, textvariable=self.tg_token_var)
+        tg_token_entry.grid(row=2, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(tg_token_entry,
+                "Optional. In Telegram, create a bot with @BotFather and paste the "
+                "token it gives you here. Leave empty to disable Telegram alerts.")
+        ttk.Button(sec, text="Test", command=self._test_telegram).grid(row=2, column=2, pady=3)
+
+        ttk.Label(sec, text="Telegram chat ID:").grid(row=3, column=0, sticky="w", pady=3)
+        self.tg_chat_var = tk.StringVar(value=notif.get("telegram_chat_id", ""))
+        tg_chat_entry = ttk.Entry(sec, textvariable=self.tg_chat_var)
+        tg_chat_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(tg_chat_entry,
+                "Where to send alerts. Open your bot in Telegram and press Start "
+                "(or send it any message), then click Detect to fill this in.")
+        ttk.Button(sec, text="Detect", command=self._detect_telegram).grid(row=3, column=2, pady=3)
+        self.tg_status = ttk.Label(sec, text="", foreground="#666")
+        self.tg_status.grid(row=4, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(sec, text="ntfy server:").grid(row=5, column=0, sticky="w", pady=3)
+        self.ntfy_server_var = tk.StringVar(value=notif.get("ntfy_server", "https://ntfy.sh"))
+        ntfy_server_entry = ttk.Entry(sec, textvariable=self.ntfy_server_var)
+        ntfy_server_entry.grid(row=5, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(ntfy_server_entry,
+                "The ntfy server to publish to. Leave as https://ntfy.sh for the "
+                "free public server, or point it at your own self-hosted ntfy.")
+
+        ttk.Label(sec, text="ntfy topic:").grid(row=6, column=0, sticky="w", pady=3)
+        self.ntfy_topic_var = tk.StringVar(value=notif.get("ntfy_topic", ""))
+        ntfy_topic_entry = ttk.Entry(sec, textvariable=self.ntfy_topic_var)
+        ntfy_topic_entry.grid(row=6, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(ntfy_topic_entry,
+                "A topic name you make up, then subscribe to in the ntfy app. On the "
+                "public server anyone who knows the topic can read it, so pick an "
+                "unguessable name. Leave empty to disable ntfy alerts.")
+        ttk.Button(sec, text="Test", command=self._test_ntfy).grid(row=6, column=2, pady=3)
+        self.ntfy_status = ttk.Label(sec, text="", foreground="#666")
+        self.ntfy_status.grid(row=7, column=1, columnspan=2, sticky="w", padx=6)
 
         # ── Home Assistant (MQTT) ───────────────────────────────────────────────
         mqtt = CFG.get("mqtt", {})
@@ -3514,6 +3536,33 @@ class SettingsTab(ttk.Frame):
         ok, msg = test_discord_webhook(self.webhook_var.get())
         self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
 
+    def _detect_telegram(self):
+        """Read the bot's recent updates and fill in the chat ID. The user must
+        have pressed Start (or messaged the bot) first."""
+        self.tg_status.configure(text="Detecting chat…", foreground="#666")
+        self.tg_status.update_idletasks()
+        chat_id, msg = notifications.detect_telegram_chat(self.tg_token_var.get())
+        if chat_id:
+            self.tg_chat_var.set(chat_id)
+        self.tg_status.configure(text=msg, foreground="#1a7f37" if chat_id else "#b3261e")
+
+    def _test_telegram(self):
+        """Verify the token and send a test message to the configured chat."""
+        self.tg_status.configure(text="Testing…", foreground="#666")
+        self.tg_status.update_idletasks()
+        ok, msg = notifications.test_telegram(self.tg_token_var.get(), self.tg_chat_var.get())
+        self.tg_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _test_ntfy(self):
+        """Publish a test message to the configured ntfy topic. The auth token (if
+        any, for a self-hosted server) is config-only — read it from CFG."""
+        self.ntfy_status.configure(text="Testing…", foreground="#666")
+        self.ntfy_status.update_idletasks()
+        token = CFG.get("notifications", {}).get("ntfy_token", "")
+        ok, msg = notifications.test_ntfy(
+            self.ntfy_server_var.get(), self.ntfy_topic_var.get(), token)
+        self.ntfy_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
     def _check_updates(self):
         """Manual update check from Settings (always reports the outcome, and
         shows the prompt for an available update even if it was skipped before)."""
@@ -3632,7 +3681,6 @@ class SettingsTab(ttk.Frame):
             if label == self.restarget_var.get():
                 ups["max_resolution"], ups["resolution"] = pmx, prs
                 break
-        ups["discord_webhook_url"] = self.webhook_var.get().strip()
         ups["auto_straighten"] = bool(self.up_straighten_var.get())
         try:
             up_conf = round(float(self.up_straighten_conf_var.get()), 2)
@@ -3680,6 +3728,13 @@ class SettingsTab(ttk.Frame):
             },
             "updates": {"auto_check": bool(self.auto_update_var.get())},
             "mqtt": self._mqtt_fields(),
+            "notifications": {
+                "discord_webhook_url": self.webhook_var.get().strip(),
+                "telegram_bot_token":  self.tg_token_var.get().strip(),
+                "telegram_chat_id":    self.tg_chat_var.get().strip(),
+                "ntfy_server":         self.ntfy_server_var.get().strip(),
+                "ntfy_topic":          self.ntfy_topic_var.get().strip(),
+            },
         }
         return sections, errors
 
@@ -3711,6 +3766,8 @@ class SettingsTab(ttk.Frame):
                 target.pop("enabled", None)   # MQTT is now gated by host being set
             if name == "runpod":
                 target.pop("max_price_per_hour", None)   # 0.3.4: split per task
+            if name == "upscale":
+                target.pop("discord_webhook_url", None)  # 0.3.8: moved to notifications
             target.update(values)
 
         if save_config():
@@ -3772,7 +3829,12 @@ class SettingsTab(ttk.Frame):
         self.watchdog_var.set(bool(ups.get("watchdog_enabled", True)))
         self.watchdog_factor_var.set(float(ups.get("watchdog_factor", 3.0)))
         self.watchdog_consec_var.set(int(ups.get("watchdog_consecutive", 2)))
-        self.webhook_var.set(ups.get("discord_webhook_url", ""))
+        notif = notifications.resolve_settings(CFG)
+        self.webhook_var.set(notif.get("discord_webhook_url", ""))
+        self.tg_token_var.set(notif.get("telegram_bot_token", ""))
+        self.tg_chat_var.set(notif.get("telegram_chat_id", ""))
+        self.ntfy_server_var.set(notif.get("ntfy_server", "https://ntfy.sh"))
+        self.ntfy_topic_var.set(notif.get("ntfy_topic", ""))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))
         self.mqtt_port_var.set(str(mqtt.get("port", 1883)))

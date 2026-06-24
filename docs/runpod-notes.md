@@ -105,7 +105,7 @@ Settled when groundwork started — drives every phase below:
   GUI can't resume a dead pod). Now, on a failure, `batch_upscale` /
   `tag_and_rename` check the pod's status (`_remote_pod_stopped` → `pod_status`);
   if it is gone/EXITED/TERMINATED they **end the run cleanly** (save the resume
-  cache, amber Discord/notify, skip the rescan) instead of pausing — a re-run
+  cache, amber notification, skip the rescan) instead of pausing — a re-run
   continues the queue. A still-RUNNING pod keeps the normal outage path.
 
 ## Heavyweight models live on a persistent network volume
@@ -480,9 +480,13 @@ The most valuable bit: never leave a billed pod idle.
 - If the API stop call fails, tell the user to stop it manually and show the
   pod ID — don't fail silently.
 
-## Discord completion embed
+## Completion notification
 
 Send on completion (green `0x2ecc71` / `3066993`), with fields:
 duration, estimated cost, hourly rate, processed count, average time per image,
-pod ID, completed-at timestamp. The app's Python `send_discord_notification`
-already covers the general case; remote runs would just add the cost/pod fields.
+pod ID, completed-at timestamp. The runners call `send_notification(...)` →
+`notifications.notify(...)` (0.3.8), which fans out to every configured backend
+(Discord webhook + Telegram bot + ntfy); it already covers the general case, so remote
+runs would just add the cost/pod fields. Telegram has no embed colours, so the
+green status colour shows as a leading emoji there, and on ntfy as an emoji tag
+plus priority.

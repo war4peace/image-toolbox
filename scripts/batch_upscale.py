@@ -51,6 +51,7 @@ except Exception:
     pass
 
 import db
+import notifications
 
 # ─────────────────────────────────────────────
 #  CONFIG  –  loaded from config.json
@@ -97,7 +98,7 @@ IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"
 OUTPUT_SUBDIR       = _U.get("output_subdir",    "upscaled")
 RESOLUTION          = _U.get("resolution",       2160)
 MAX_RESOLUTION      = _U.get("max_resolution",   3840)
-DISCORD_WEBHOOK_URL = _U.get("discord_webhook_url", "")
+NOTIFY              = notifications.resolve_settings(_CFG)
 OUTAGE_THRESHOLD    = _U.get("outage_threshold", 3)
 
 # Performance watchdog (0.3.0). On a clean boot the 3090 upscales at a steady
@@ -282,44 +283,17 @@ def _is_oom_error(exc):
 
 
 # ─────────────────────────────────────────────
-#  DISCORD NOTIFICATION
+#  NOTIFICATIONS  (Discord + Telegram, see notifications.py)
 # ─────────────────────────────────────────────
 
-def send_discord_notification(title, description, color, fields=None):
+def send_notification(title, description, color, fields=None):
     """
-    Send an embed message to the configured Discord webhook.
-    Silently does nothing if DISCORD_WEBHOOK_URL is empty.
+    Fan out an alert to every configured backend (Discord webhook, Telegram bot).
+    No-op for any backend that isn't configured; fail-safe.
     color: integer (e.g. 15548997 = red, 16776960 = yellow, 3066993 = green).
     fields: list of {"name": str, "value": str} dicts, or None.
     """
-    if not DISCORD_WEBHOOK_URL:
-        return
-    embed = {
-        "title":       title,
-        "description": description,
-        "color":       color,
-        "fields":      fields or [],
-    }
-    payload = json.dumps({
-        "username": "Upscale Bot",
-        "embeds":   [embed],
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK_URL, data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try: body = exc.read().decode("utf-8", "replace")
-        except Exception: pass
-        print(f"  [Discord] Failed to send notification: HTTP {exc.code} {exc.reason} -- {body}")
-    except Exception as exc:
-        print(f"  [Discord] Failed to send notification: {exc}")
+    notifications.notify(NOTIFY, title, description, color, fields, username="Upscale Bot")
 
 
 # ─────────────────────────────────────────────
@@ -1175,7 +1149,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         _gui_event("DEGRADED", json.dumps({
             "reason": reason, "image": image, "idx": idx, "total": total,
         }))
-        send_discord_notification(
+        send_notification(
             title       = "Upscale Script -- Performance Degradation Detected",
             description = reason,
             color       = 15105570,        # orange
@@ -1423,7 +1397,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                            "stopped). Ending this run cleanly; the resume cache "
                            "will continue the queue next time.")
                 _gui_event("STATUS", "Remote pod stopped — ending the run (resume cache saved).")
-                send_discord_notification(
+                send_notification(
                     title       = "Upscale -- Remote pod stopped",
                     description = ("The remote pod's dead-man's switch fired (idle "
                                    "or max-runtime), or the pod was stopped. The run "
@@ -1449,7 +1423,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 logger.tee("  Free up VRAM / check the log, then use Resume in the app "
                            "to continue (or Stop to end the run).")
 
-                send_discord_notification(
+                send_notification(
                     title       = "Upscale Script -- Repeated Failures Detected",
                     description = outage_msg,
                     color       = 15548997,
@@ -1470,7 +1444,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     logger.tee("  Stopping at user request.")
                     break
 
-                send_discord_notification(
+                send_notification(
                     title       = "Upscale Script -- Resumed",
                     description = "Script resumed after outage pause.",
                     color       = 3066993,
@@ -1661,7 +1635,7 @@ def main():
         if not REMOTE:
             print("Make sure this script runs inside the toolbox venv, e.g.:")
             print(f"  {os.path.join(APP_ROOT, '.venv', 'Scripts', 'python.exe')} scripts\\batch_upscale.py <source_dir>")
-        send_discord_notification(
+        send_notification(
             title       = "Upscale Script -- Engine Failed to Start",
             description = f"Could not initialize the {where}.\n{e}",
             color       = 15548997,   # red
@@ -2040,7 +2014,7 @@ def main():
         notif_title, notif_color = "Upscale Queue -- Stopped by User", 16776960          # yellow
     else:
         notif_title, notif_color = "Upscale Queue -- Finished", 3066993                  # green
-    send_discord_notification(
+    send_notification(
         title       = notif_title,
         description = ", ".join(parts),
         color       = notif_color,

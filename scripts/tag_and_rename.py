@@ -66,6 +66,7 @@ except Exception:
     pass
 
 import db
+import notifications
 
 # App root = parent of scripts/. config.json, logs/ and the trcache/ import
 # folder live at the app root, not beside this module.
@@ -304,38 +305,19 @@ PROCESSED_MARKER    = "TaggedBy:Image Toolbox (https://github.com/war4peace/imag
 # the rebrand are not re-processed after an upgrade.
 LEGACY_MARKERS      = ("TaggedBy:tag_and_rename",)
 
-# Discord webhook is shared with the upscaler — it lives in the "upscale"
-# section of config.json (kept there for backward compatibility with setup.ps1
-# and the remote PowerShell scripts).
-DISCORD_WEBHOOK_URL = _CFG.get("upscale", {}).get("discord_webhook_url", "")
+# Notification backends (Discord webhook + Telegram bot) live in the
+# "notifications" section of config.json; resolve_settings() also reads the legacy
+# upscale.discord_webhook_url location for backward compatibility.
+NOTIFY = notifications.resolve_settings(_CFG)
 
 
-def send_discord_notification(title, description, color, fields=None):
+def send_notification(title, description, color, fields=None):
     """
-    Send an embed message to the configured Discord webhook.
-    Silently does nothing if DISCORD_WEBHOOK_URL is empty.
+    Fan out an alert to every configured backend (Discord webhook, Telegram bot).
+    No-op for any backend that isn't configured; fail-safe.
     color: integer (e.g. 15548997 = red, 16776960 = yellow, 3066993 = green).
     """
-    if not DISCORD_WEBHOOK_URL:
-        return
-    embed = {"title": title, "description": description,
-             "color": color, "fields": fields or []}
-    payload = json.dumps({"username": "Tag & Rename Bot", "embeds": [embed]}).encode()
-    try:
-        req = urllib.request.Request(
-            DISCORD_WEBHOOK_URL, data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            })
-        urllib.request.urlopen(req, timeout=10)
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try: body = exc.read().decode("utf-8", "replace")
-        except Exception: pass
-        print(f"  [Discord] Failed to send notification: HTTP {exc.code} {exc.reason} -- {body}")
-    except Exception as exc:
-        print(f"  [Discord] Failed to send notification: {exc}")
+    notifications.notify(NOTIFY, title, description, color, fields, username="Tag & Rename Bot")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1837,7 +1819,7 @@ def main():
                       "the idle / max-runtime limit (or it was stopped). Ending the "
                       "run cleanly; re-run to continue.")
                 _gui_event("STATUS", "Remote pod stopped — ending the run.")
-                send_discord_notification(
+                send_notification(
                     title       = "Tag & Rename -- Remote pod stopped",
                     description = ("The remote pod's dead-man's switch fired (idle or "
                                    "max-runtime), or the pod was stopped. The run ended "
@@ -1854,7 +1836,7 @@ def main():
             # ── Outage detection ─────────────────────────────
             if consecutive_fails >= OUTAGE_THRESHOLD:
                 print(f"  WARNING: {consecutive_fails} consecutive failures.")
-                send_discord_notification(
+                send_notification(
                     title       = "Tag & Rename -- Repeated Failures Detected",
                     description = (f"{consecutive_fails} consecutive image(s) failed. "
                                    f"Ollama may be unreachable or the model unloaded.\n"
@@ -1965,7 +1947,7 @@ def main():
         notif_title, notif_color = "Tag & Rename -- Stopped by User", 16776960                 # yellow
     else:
         notif_title, notif_color = "Tag & Rename -- Finished", 3066993                         # green
-    send_discord_notification(
+    send_notification(
         title       = notif_title,
         description = f"{total_processed} processed, {total_rotated} rotated, {total_skipped} already tagged, {total_failed} failed",
         color       = notif_color,

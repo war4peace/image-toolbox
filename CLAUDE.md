@@ -139,7 +139,25 @@ first). Toggle + factor/consecutive in Settings → Upscaling; `watchdog_min_sam
 is config-only. Built as a reusable health signal for remote-pod upscaling
 (future #1). See `WATCHDOG_*` and `_trigger_degradation` in `batch_upscale.py`.
 
-**Notifications** — Discord webhook on queue completion and on errors. A
+**Notifications** — alerts on queue completion and on errors, fanned out to every
+configured backend (0.3.8): a **Discord** webhook, a **Telegram** bot, and **ntfy**
+(public ntfy.sh or a self-hosted server). All backends live in one stdlib module,
+`notifications.py` (`notify()` + `send_discord`/`send_telegram`/`send_ntfy` + the
+GUI's Test/Detect helpers); the runners call the unified `send_notification(...)`,
+so there is a single source of truth instead of the old per-runner copies. Settings
+(Settings → Notifications) hold the Discord webhook; a Telegram **bot token** +
+**chat ID** (a **Detect** button reads the bot's `getUpdates` to fill the chat ID
+automatically: the user just creates a bot via @BotFather and presses Start); and
+an **ntfy server** (default `https://ntfy.sh`) + **topic**. Each has a **Test**
+button. Config lives in a dedicated `notifications` section (`discord_webhook_url`,
+`telegram_bot_token`, `telegram_chat_id`, `ntfy_server`, `ntfy_topic`, plus a
+config-only `ntfy_token` for self-hosted auth); `resolve_settings()` reads the
+legacy `upscale.discord_webhook_url` as a fallback and the next Settings save
+migrates it. Each backend is independent and fail-safe (one being misconfigured
+never blocks another, and none ever raise into a run). Discord's status colour has
+no equivalent in the others, so it maps to a leading emoji on Telegram and to an
+emoji tag + priority on ntfy (red errors go out at priority 5 so they buzz
+louder). A
 **taskbar flash** (0.3.0, `App.flash_attention` via ctypes `FlashWindowEx`,
 Windows-only, fail-safe) fires on run completion (every tool) and on a watchdog
 degradation episode, so an unattended run catches the eye while the user is in
@@ -300,6 +318,7 @@ counts give a sense of weight:
 | `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
 | `system_telemetry.py` (~180 lines) | System telemetry sampler (Feature #3a). Stdlib-only, read-only, best-effort: `CpuSampler` reads CPU usage from Windows `GetSystemTimes` (`ctypes`) as a delta between calls; `sample_ram()` reads physical RAM via `GlobalMemoryStatusEx`; `sample_gpu()` shells out to `nvidia-smi` for VRAM used/total and temperature. All fail safe to `None`. The GPU query blocks (spawns a process), so the GUI samples from a background thread. |
 | `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
+| `notifications.py` (~330 lines) | Shared notification layer (0.3.8). The single source of truth for the queue-complete / error alerts, fanning out to **Discord** (webhook embed), **Telegram** (Bot API HTML message) and **ntfy** (HTTP publish to a topic; public ntfy.sh or self-hosted). `resolve_settings(cfg)` pulls the `notifications` config section (legacy `upscale.discord_webhook_url` fallback, ntfy server default `https://ntfy.sh`); `notify(settings, title, desc, color, fields)` sends to every configured backend, fail-safe; `send_discord`/`send_telegram`/`send_ntfy` are the per-backend senders. GUI helpers: `test_discord`, `test_telegram`, `detect_telegram_chat` (reads the bot's `getUpdates` for the chat ID), `test_ntfy`. Status colour maps to a Telegram emoji and to an ntfy emoji tag + priority (red = priority 5). Stdlib only (`urllib`, `html`); the runners replaced their duplicated `send_discord_notification` with `send_notification` → `notify`. |
 | `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |
 | `single_instance.py` (~80 lines) | Windows single-instance guard (0.3.3). `acquire()` (called first in `main()`) takes a per-session named mutex (`CreateMutexW`); a second launch detects `ERROR_ALREADY_EXISTS`, foregrounds the existing window and shows a native message box, then exits — so two copies can't share the SQLite cache / resume caches and corrupt them. Kernel-released on process death (no stale lock, unlike a PID file). ctypes only, fail-safe (any error / non-Windows = allow launch). |
 | `taskbar_progress.py` (~170 lines) | Windows taskbar progress bar (0.3.0). `TaskbarProgress` wraps the shell `ITaskbarList3` COM interface **driven straight from ctypes** (manual GUID + vtable calls — no comtypes/pywin32, no new dependency), painting run progress onto the app's taskbar button: `set_progress(done, total)` (green fill), `set_state("indeterminate"/"error"/"none")`, `clear()`. Windows-only, fail-safe (disables itself on any COM failure); all calls come from the GUI/UI thread. Driven via `App.taskbar_*`. |
@@ -308,7 +327,10 @@ counts give a sense of weight:
 Configuration & state:
 
 - `config.json` — persistent settings: `seedvr2`, `ollama`, `upscale`,
-  `tagging`, `defaults`, `mqtt`, `updates`, `runpod` sections. Edited via the
+  `tagging`, `defaults`, `mqtt`, `updates`, `runpod`, `notifications` sections.
+  (`notifications` = Discord webhook + Telegram bot token/chat ID + ntfy
+  server/topic, 0.3.8; the Discord URL migrated out of `upscale` on first save.)
+  Edited via the
   Settings tab; preserved across installer upgrades. **Don't hand-edit in normal
   flow**, and the tracked copy is a credential-free template — never commit real
   `mqtt` broker credentials or the `runpod` API key. `runpod.ssh_key_path` may be
