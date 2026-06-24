@@ -727,6 +727,86 @@ def data_centers(api_key, storage_only=True, listed_only=True, timeout=30):
     return out
 
 
+# The REST /pods object omits the GPU type and data center (only id/name/status/
+# costPerHr come back), so the pod list is fetched via GraphQL — the same source
+# the RunPod console uses — which exposes a clean machine.gpuDisplayName. The data
+# center field name on the pod's machine isn't certain across schema versions, and
+# GraphQL 400s the WHOLE query on one unknown field, so try a few machine
+# sub-selections richest-first and remember the first the API accepts.
+_PODS_MACHINE_SELECTIONS = (
+    "gpuDisplayName dataCenterId",
+    "gpuDisplayName location",
+    "gpuDisplayName",
+)
+_pods_machine_sel = None        # the sub-selection known to work (memoised)
+
+
+def _pods_query(machine_sel):
+    return ("query Pods { myself { pods { id name desiredStatus costPerHr "
+            "gpuCount machine { " + machine_sel + " } } } }")
+
+
+def _normalize_gql_pod(p):
+    m = p.get("machine") if isinstance(p.get("machine"), dict) else {}
+    dc = m.get("dataCenterId") or m.get("location") or "?"
+    return {
+        "id":           p.get("id", ""),
+        "name":         p.get("name") or p.get("id", ""),
+        "status":       p.get("desiredStatus") or "?",
+        "gpu":          m.get("gpuDisplayName") or "?",
+        "gpu_count":    p.get("gpuCount"),
+        "data_center":  dc,
+        "region":       region_of(dc) or "?",      # derived locally from the id
+        "cost":         p.get("costPerHr"),
+    }
+
+
+def _normalize_rest_pod(p):
+    machine = p.get("machine") if isinstance(p.get("machine"), dict) else {}
+    gpu_obj = p.get("gpu") if isinstance(p.get("gpu"), dict) else {}
+    dc = (p.get("dataCenterId") or machine.get("dataCenterId")
+          or machine.get("location") or "?")
+    return {
+        "id":           p.get("id", ""),
+        "name":         p.get("name") or p.get("id", ""),
+        "status":       p.get("desiredStatus") or p.get("status") or "?",
+        "gpu":          (p.get("gpuTypeId") or machine.get("gpuDisplayName")
+                         or gpu_obj.get("displayName") or gpu_obj.get("id") or "?"),
+        "gpu_count":    p.get("gpuCount"),
+        "data_center":  dc,
+        "region":       region_of(dc) or "?",      # derived locally from the id
+        "cost":         p.get("costPerHr"),
+    }
+
+
+def list_pods_detailed(api_key, timeout=30):
+    """Return the account's pods with clean, typed fields, each:
+        {id, name, status, gpu, gpu_count, data_center, cost}
+
+    Prefers GraphQL (`myself.pods`) because the REST pod object omits the GPU type
+    and data center; falls back to REST /pods if every GraphQL attempt fails (so
+    the list still works, just with '?' for the missing fields)."""
+    global _pods_machine_sel
+    selections = ([_pods_machine_sel] if _pods_machine_sel
+                  else list(_PODS_MACHINE_SELECTIONS))
+    last_err = None
+    for sel in selections:
+        try:
+            data = _graphql(api_key, _pods_query(sel), timeout=timeout)
+        except RunPodError as exc:
+            last_err = exc
+            continue
+        _pods_machine_sel = sel        # remember the field set the API accepted
+        pods = ((data.get("myself") or {}).get("pods")) or []
+        return [_normalize_gql_pod(p) for p in pods if isinstance(p, dict)]
+    # Every GraphQL attempt failed → REST fallback (id/name/status/cost at least).
+    try:
+        return [_normalize_rest_pod(p) for p in list_pods(api_key, timeout=timeout)
+                if isinstance(p, dict)]
+    except RunPodError:
+        raise last_err or RunPodError("Could not list pods.")
+
+
 # ── UI-facing helpers (return (ok, message), never raise) ────────────────────
 
 def test_connection(api_key, timeout=15):

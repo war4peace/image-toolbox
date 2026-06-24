@@ -10,7 +10,7 @@ that powers the ComfyUI node) so batch_upscale.py can upscale images directly:
   - DiT and VAE models are loaded ONCE and kept cached, instead of being
     re-prepared for every image. On a small GPU they are parked in system RAM
     between images; on a big-VRAM card (>= vram_resident_threshold_gb, default
-    80 GB) they stay resident on the GPU, skipping the per-image CPU round trip.
+    40 GB) they stay resident on the GPU, skipping the per-image CPU round trip.
   - Images are loaded with PIL and EXIF orientation is applied, matching the
     behaviour of ComfyUI's LoadImage node (the standalone CLI's own loader
     ignores orientation tags, which old camera JPEGs rely on).
@@ -100,22 +100,22 @@ class UpscaleEngine:
         per-image CPU↔GPU round trip (~14 GB DiT + the VAE, every image, over
         PCIe) is pure waste: the card can hold both models resident, so we park
         the offload on the GPU itself instead. This is what made powerful remote
-        pods (H100/H200 80 GB, RTX Pro 6000 96 GB) benchmark so inefficiently —
-        an 80 GB card was behaving as if it had 8.
+        pods (A100/H100/H200 40-80 GB, RTX Pro 6000 96 GB) benchmark so
+        inefficiently — a big card was behaving as if it had 8.
 
         Returns (offload_device, resident_bool). Fails safe to ("cpu", False) on
         any error, so a detection hiccup can never make a run worse.
         """
-        # The 80 GB default is deliberately conservative. Going resident pins
-        # the ~14 GB DiT in VRAM during the VAE decode too (today's CPU offload
-        # *phases* them — DiT off to RAM, then VAE decodes with the card to
-        # itself), so it shrinks the decode headroom by the DiT's footprint.
-        # 80 GB leaves ~64 GB for the (image-dependent, sometimes ballooning)
-        # decode spike; a 40-48 GB card would leave only ~24-32 GB and could OOM
-        # on a hard 4K image. To safely lower this for a future 64 GB (or 48 GB)
-        # card, don't just drop the threshold — pair it with decode_tiled, which
-        # bounds the VAE-decode spike so ballooning can't OOM.
-        threshold = float(settings.get("vram_resident_threshold_gb", 80))
+        # The 40 GB default is set from real testing: a resident run peaked at
+        # 36.6 GB VRAM on a 4K batch, so any 40+ GB card holds both models with
+        # room to spare. Going resident pins the ~14 GB DiT in VRAM during the
+        # VAE decode too (today's CPU offload *phases* them — DiT off to RAM,
+        # then VAE decodes with the card to itself), so it shrinks the decode
+        # headroom by the DiT's footprint; at 40 GB the measured peak still fits.
+        # If a future card sits *below* 40 GB and you want it resident anyway,
+        # don't just drop the threshold — pair it with decode_tiled, which bounds
+        # the VAE-decode spike so ballooning can't OOM.
+        threshold = float(settings.get("vram_resident_threshold_gb", 40))
         if threshold <= 0:
             return "cpu", False
         try:

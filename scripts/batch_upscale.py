@@ -1637,6 +1637,9 @@ def main():
                                     on_event=_remote_status, attach=_attach)
             ENGINE = session.start()
             REMOTE_SESSION = session   # lets run_pass detect a dead-man's-switch stop
+            # Tell the GUI which pod is live, so the RunPod tab won't offer to
+            # terminate the pod this run depends on (cleared when the run exits).
+            _gui_event("POD", session.pod_id or "")
             # Guarantee teardown on any normal/sys.exit path; the on-pod
             # dead-man's switch is the backup if the process is hard-killed.
             # The GUI's "Stop" modal can override the teardown (stop the pod now

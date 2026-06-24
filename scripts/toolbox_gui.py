@@ -88,7 +88,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -396,10 +396,16 @@ def _geometry_on_screen(win, geo):
 class Tooltip:
     """Small hover tooltip attached to a widget."""
 
-    def __init__(self, widget, text, delay=500):
+    # Wrap long tooltips onto several short lines instead of one very wide line.
+    # A pixel width (Tk's wraplength) reads better than hand-inserted breaks and
+    # applies to every tooltip in the app at once.
+    WRAP_PX = 360
+
+    def __init__(self, widget, text, delay=500, wraplength=WRAP_PX):
         self.widget = widget
         self.text   = text
         self.delay  = delay
+        self.wraplength = wraplength
         self._after = None
         self._tip   = None
         widget.bind("<Enter>", self._schedule, add="+")
@@ -420,6 +426,7 @@ class Tooltip:
         self._tip.wm_geometry(f"+{x}+{y}")
         tk.Label(self._tip, text=self.text, background="#ffffe0",
                  relief="solid", borderwidth=1, font=("Segoe UI", 9),
+                 wraplength=self.wraplength, justify="left",
                  padx=6, pady=2).pack()
 
     def _cancel(self):
@@ -1137,6 +1144,7 @@ class ToolTab(ttk.Frame):
         self._hold          = ""      # ambiguous marker prefix held back
         self._log_path      = None    # current log file (from LOG events)
         self.tool_name      = "program"         # overridden by each tool tab
+        self.active_pod_id  = None              # remote pod this run uses (POD events)
         self.console        = ConsoleBuffer()   # clean output stream (backlog + live)
         self._phase_text    = "Ready."          # activity/phase line (prep + final)
         self._final_top     = ""                # summary line shown above the final message
@@ -1289,7 +1297,7 @@ class ToolTab(ttk.Frame):
                 "GPUs that can be rented in your volume's region right now, "
                 "cheapest first. Live availability and price from RunPod. If your "
                 "pick is unavailable, only cheaper in-stock cards under the price "
-                "ceiling (Settings → Remote) are tried automatically.")
+                "ceiling (RunPod tab) are tried automatically.")
         self.gpu_refresh_btn = ttk.Button(
             rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
         self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
@@ -1619,6 +1627,11 @@ class ToolTab(ttk.Frame):
         elif kind == "LOG" and payload:
             self._log_path = payload
             self.viewlog_btn.configure(state="normal")
+        elif kind == "POD":
+            # Remote run reports the pod it's using (payload empty = none). The
+            # RunPod tab uses this to protect the live pod from being terminated.
+            self.active_pod_id = payload or None
+            self.app.notify_active_pods_changed()
         elif kind == "DEGRADED" and payload:
             # Performance watchdog tripped in the runner (sustained slow streak or
             # a hard OOM): it is auto-stopping. Surface it and flash for attention —
@@ -1754,8 +1767,8 @@ class ToolTab(ttk.Frame):
                 "Both dead-man's-switch limits are 0 — max runtime AND idle "
                 "timeout.\n\nThe pod will NOT stop itself, so if the app crashes "
                 "or loses connection it keeps billing until you stop it manually "
-                "in the RunPod dashboard.\n\nSet an idle timeout in Settings → "
-                "Remote upscaling for a safety net.\n\nStart anyway?")
+                "in the RunPod dashboard.\n\nSet an idle timeout in the RunPod "
+                "tab for a safety net.\n\nStart anyway?")
         return True
 
     def on_exit(self, code):
@@ -1766,6 +1779,10 @@ class ToolTab(ttk.Frame):
         strip = getattr(self, "strip", None)
         if strip is not None:
             strip.clear_current()
+        # The run is over: its pod (if any) is no longer protected from terminate.
+        if self.active_pod_id is not None:
+            self.active_pod_id = None
+            self.app.notify_active_pods_changed()
         self.app.taskbar_clear()        # remove the taskbar progress/error bar
         self._stop_telemetry()
         # One immediate idle sample so the row reflects VRAM freeing up right
@@ -2566,7 +2583,7 @@ class UpscaleTab(ToolTab):
                 messagebox.showwarning(
                     APP_TITLE,
                     "Remote upscaling needs a RunPod API key and a model volume.\n"
-                    "Set them in Settings → Remote upscaling (RunPod).")
+                    "Set them in the RunPod tab.")
                 return
             # Zero-config SSH: make sure the app's key exists before we create a
             # pod (the pod trusts its public half via PUBLIC_KEY). Auto-generates
@@ -2802,7 +2819,7 @@ class TagTab(ToolTab):
                 "RunPod GPU instead of this PC (roadmap #1, experimental). Tagging "
                 "itself runs locally; only the model calls go over an SSH tunnel. "
                 "Creates a billed pod and terminates it when done. Needs a RunPod "
-                "API key + model volume in Settings → Remote upscaling.")
+                "API key + model volume in the RunPod tab.")
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
         undo.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
@@ -2873,7 +2890,7 @@ class TagTab(ToolTab):
                 messagebox.showwarning(
                     APP_TITLE,
                     "Remote tagging needs a RunPod API key and a model volume.\n"
-                    "Set them in Settings → Remote upscaling (RunPod).")
+                    "Set them in the RunPod tab.")
                 return
             ok_ssh, ssh_info = ssh_setup.setup(
                 os.path.expandvars(rp.get("ssh_key_path", "")) or None)
@@ -3039,15 +3056,23 @@ _SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
                    "upscale_cutoff_pct", "output_subdir", "debug",
                    "auto_straighten", "straighten_min_confidence",
                    "watchdog_enabled", "watchdog_factor", "watchdog_consecutive",
-                   "watchdog_min_samples"}
+                   "watchdog_min_samples",
+                   # These are intentionally hidden from the UI: the defaults are
+                   # the right ones and a non-technical user can't meaningfully
+                   # change them (DiT/VAE model = the 7B FP16 + FP16 VAE combo;
+                   # color_correction = LAB; blocks_to_swap is a VRAM/speed lever
+                   # that only matters on a VRAM-starved card). The values stay in
+                   # config.json (merged on save) for advanced hand-edits.
+                   "dit_model", "vae_model",
+                   "color_correction", "blocks_to_swap",
+                   # Resident-offload threshold: a numeric tuning knob (default
+                   # 40 GB, see upscale_engine) that no end user should touch;
+                   # config.json only.
+                   "vram_resident_threshold_gb"}
 
 # Friendly labels for the generic SeedVR fields.
 _SEEDVR_LABELS = {
     "attention_mode":   "Attention mode",
-    "color_correction": "Color correction",
-    "dit_model":        "DiT model",
-    "vae_model":        "VAE model",
-    "blocks_to_swap":   "Blocks to swap",
     "encode_tiled":     "VAE encode tiled",
     "decode_tiled":     "VAE decode tiled",
     "encode_tile_size": "Encode tile size",
@@ -3058,7 +3083,6 @@ _SEEDVR_LABELS = {
 # Suggested values for the free-text enum fields (editable — type anything).
 _SEEDVR_CHOICES = {
     "attention_mode":   ["sdpa", "flash_attn", "sage"],
-    "color_correction": ["lab", "wavelet", "none"],
 }
 
 
@@ -3130,118 +3154,130 @@ class SettingsTab(ttk.Frame):
         sec = self._section(body, "Ollama")
         sec.columnconfigure(1, weight=1)
 
+        # URL + model picker + a single Check on one row. "Check" both verifies
+        # the URL is reachable AND refreshes the model list (the two used to be
+        # separate buttons). The model combobox is read-only (pick from what's
+        # actually installed) and ~130 px wide.
         ttk.Label(sec, text="Ollama URL:").grid(row=0, column=0, sticky="w", pady=3)
         self.ollama_url_var = tk.StringVar(value=ollama.get("url", "http://127.0.0.1:11434"))
         ttk.Entry(sec, textvariable=self.ollama_url_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(sec, text="Check", command=self._check_ollama).grid(row=0, column=2, pady=3)
-
-        ttk.Label(sec, text="Ollama model:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(sec, text="Model:").grid(row=0, column=2, sticky="e", padx=(6, 4), pady=3)
         self.ollama_model_var = tk.StringVar(value=ollama.get("model", "qwen2.5vl:7b"))
-        self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var)
-        self.ollama_model_cmb.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(sec, text="Refresh", command=self._refresh_models).grid(row=1, column=2, pady=3)
+        self.ollama_model_cmb = ttk.Combobox(sec, textvariable=self.ollama_model_var,
+                                             state="readonly", width=16)
+        self.ollama_model_cmb.grid(row=0, column=3, sticky="w", pady=3)
+        Tooltip(self.ollama_model_cmb,
+                "Vision model used for tagging. Pick from the models installed on "
+                "the Ollama server; press Check to (re)load the list.")
+        ttk.Button(sec, text="Check", command=self._check_ollama).grid(
+            row=0, column=4, padx=(8, 0), pady=3)
 
         self.ollama_status = ttk.Label(sec, text="", foreground="#666")
-        self.ollama_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
+        self.ollama_status.grid(row=1, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 0))
 
         # ── Tag & Rename ───────────────────────────────────────────────────────
         sec = self._section(body, "Tag & Rename")
-        sec.columnconfigure(1, weight=1)
+
+        # All Tag & Rename settings on one row.
+        strip = ttk.Frame(sec)
+        strip.grid(row=0, column=0, sticky="w", pady=3)
 
         self.straighten_var = tk.BooleanVar(value=bool(tag.get("auto_straighten", True)))
-        chk = ttk.Checkbutton(sec, text="Auto-straighten rotated photos",
+        chk = ttk.Checkbutton(strip, text="Auto-straighten rotated photos",
                               variable=self.straighten_var)
-        chk.grid(row=0, column=0, sticky="w", pady=3)
+        chk.pack(side="left")
         Tooltip(chk, "Detects sideways photos and rotates them upright before tagging. "
                      "Only confident calls are acted on; ambiguous ones are left alone.")
 
-        conf = ttk.Frame(sec)
-        conf.grid(row=0, column=1, sticky="w", padx=18, pady=3)
-        ttk.Label(conf, text="Confidence threshold:").pack(side="left", padx=(0, 4))
+        ttk.Label(strip, text="Confidence threshold:").pack(side="left", padx=(18, 4))
         self.straighten_conf_var = tk.DoubleVar(
             value=float(tag.get("straighten_min_confidence", 0.9)))
-        spin = ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+        spin = ttk.Spinbox(strip, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
                            textvariable=self.straighten_conf_var)
         spin.pack(side="left")
         Tooltip(spin, "0.50–1.00   (higher = fewer, safer rotations)")
 
-        imgsz = ttk.Frame(sec)
-        imgsz.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
-        ttk.Label(imgsz, text="Max image size sent to model:").pack(side="left", padx=(0, 4))
+        ttk.Label(strip, text="Max image size sent to model:").pack(side="left", padx=(18, 4))
         self.tag_maxpx_var = tk.IntVar(value=int(tag.get("max_image_px", 1280)))
-        maxpx_spin = ttk.Spinbox(imgsz, from_=0, to=4096, increment=128, width=6,
+        maxpx_spin = ttk.Spinbox(strip, from_=0, to=4096, increment=128, width=6,
                                  textvariable=self.tag_maxpx_var)
         maxpx_spin.pack(side="left")
-        ttk.Label(imgsz, text="px (longest edge; 0 = full resolution)").pack(side="left", padx=(4, 0))
+        ttk.Label(strip, text="px").pack(side="left", padx=(4, 0))
         Tooltip(maxpx_spin,
-                "The image is downscaled to this longest edge before going to the "
-                "vision model (your source files are never changed). Large photos "
-                "otherwise OOM small-VRAM GPUs into an HTTP 400 — 1280 px is plenty "
-                "for describing and titling. Higher = more detail + more VRAM.")
+                "The image is downscaled to this longest edge (in pixels) before "
+                "going to the vision model (your source files are never changed). "
+                "Large photos otherwise OOM small-VRAM GPUs into an HTTP 400 — "
+                "1280 px is plenty for describing and titling. Higher = more detail "
+                "+ more VRAM. 0 = full resolution (not recommended).")
 
         # ── Upscaling targets ──────────────────────────────────────────────────
         sec = self._section(body, "Upscaling")
-        sec.columnconfigure(1, weight=1)
 
-        strip = ttk.Frame(sec)
-        strip.grid(row=0, column=0, columnspan=2, sticky="w", pady=3)
-
-        ttk.Label(strip, text="Resolution Target:").pack(side="left", padx=(0, 4))
+        # Two aligned columns on a shared grid: column 0 holds the Resolution
+        # Target and the two checkboxes; column 1 (Skip images over / Confidence
+        # threshold / Slowdown factor) lines up vertically because column 0 sizes
+        # to its widest item (the watchdog checkbox), so column 1's left edge is
+        # the same on every row.
+        c0 = ttk.Frame(sec)
+        c0.grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(c0, text="Resolution Target:").pack(side="left", padx=(0, 4))
         self.restarget_var = tk.StringVar(value=self._current_preset_label(ups))
-        restarget_cmb = ttk.Combobox(strip, textvariable=self.restarget_var, state="readonly",
+        restarget_cmb = ttk.Combobox(c0, textvariable=self.restarget_var, state="readonly",
                                      values=[p[0] for p in RESOLUTION_PRESETS], width=16)
         restarget_cmb.pack(side="left")
         Tooltip(restarget_cmb, "longer edge / shorter edge, in pixels")
 
-        ttk.Label(strip, text="Skip images over:").pack(side="left", padx=(24, 4))
+        skip = ttk.Frame(sec)
+        skip.grid(row=0, column=1, sticky="w", padx=(18, 0), pady=3)
+        ttk.Label(skip, text="Skip images over:").pack(side="left", padx=(0, 4))
         self.cutoff_var = tk.IntVar(value=int(ups.get("upscale_cutoff_pct", 66)))
-        cut_spin = ttk.Spinbox(strip, from_=0, to=99, width=4, textvariable=self.cutoff_var)
+        cut_spin = ttk.Spinbox(skip, from_=0, to=99, width=4, textvariable=self.cutoff_var)
         cut_spin.pack(side="left")
-        ttk.Label(strip, text="% of target resolution").pack(side="left", padx=(4, 0))
+        ttk.Label(skip, text="% of target resolution").pack(side="left", padx=(4, 0))
         Tooltip(cut_spin, "Percentage of the target resolution.   (0 = upscale everything eligible)")
 
-        strip2 = ttk.Frame(sec)
-        strip2.grid(row=1, column=0, columnspan=2, sticky="w", pady=3)
         self.up_straighten_var = tk.BooleanVar(value=bool(ups.get("auto_straighten", True)))
-        up_chk = ttk.Checkbutton(strip2, text="Auto-straighten rotated photos before upscaling",
+        up_chk = ttk.Checkbutton(sec, text="Auto-straighten photos",
                                  variable=self.up_straighten_var)
-        up_chk.pack(side="left")
+        up_chk.grid(row=1, column=0, sticky="w", pady=3)
         Tooltip(up_chk, "Rotates a sideways photo upright BEFORE upscaling so the result still "
                         "fits a 4K screen. Without this, the upscaler targets the wrong axis and "
                         "the image no longer fits once Tag & Rename straightens it. The source is "
                         "never modified (a temp copy is rotated and upscaled).")
-        ttk.Label(strip2, text="Confidence threshold:").pack(side="left", padx=(18, 4))
+        conf = ttk.Frame(sec)
+        conf.grid(row=1, column=1, sticky="w", padx=(18, 0), pady=3)
+        ttk.Label(conf, text="Confidence threshold:").pack(side="left", padx=(0, 4))
         self.up_straighten_conf_var = tk.DoubleVar(
             value=float(ups.get("straighten_min_confidence", 0.9)))
-        up_spin = ttk.Spinbox(strip2, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+        up_spin = ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
                               textvariable=self.up_straighten_conf_var)
         up_spin.pack(side="left")
         Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)")
 
-        strip3 = ttk.Frame(sec)
-        strip3.grid(row=2, column=0, columnspan=2, sticky="w", pady=3)
         self.watchdog_var = tk.BooleanVar(value=bool(ups.get("watchdog_enabled", True)))
         wd_chk = ttk.Checkbutton(
-            strip3, text="Performance watchdog (auto-stop on GPU degradation)",
+            sec, text="Performance watchdog (auto-stop)",
             variable=self.watchdog_var)
-        wd_chk.pack(side="left")
+        wd_chk.grid(row=2, column=0, sticky="w", pady=3)
         Tooltip(wd_chk,
                 "Watches per-image upscale time. If it degrades to a sustained multiple of the "
                 "normal speed (the GPU thrashing VRAM into system RAM) OR hits a hard out-of-memory "
                 "error, the run auto-stops after the current image and you're notified (log, Discord, "
                 "taskbar flash). The resume cache continues the queue after you reboot — the known cure.")
-        ttk.Label(strip3, text="Slowdown factor:").pack(side="left", padx=(18, 4))
+        wd = ttk.Frame(sec)
+        wd.grid(row=2, column=1, sticky="w", padx=(18, 0), pady=3)
+        ttk.Label(wd, text="Slowdown factor:").pack(side="left", padx=(0, 4))
         self.watchdog_factor_var = tk.DoubleVar(value=float(ups.get("watchdog_factor", 3.0)))
-        wf_spin = ttk.Spinbox(strip3, from_=1.5, to=10.0, increment=0.5, width=6, format="%.1f",
+        wf_spin = ttk.Spinbox(wd, from_=1.5, to=10.0, increment=0.5, width=6, format="%.1f",
                               textvariable=self.watchdog_factor_var)
         wf_spin.pack(side="left")
         Tooltip(wf_spin, "How many times slower than the run's healthy rate (per megapixel) "
                          "counts as 'slow' (e.g. 3×).")
-        ttk.Label(strip3, text="for").pack(side="left", padx=(12, 4))
+        ttk.Label(wd, text="for").pack(side="left", padx=(12, 4))
         self.watchdog_consec_var = tk.IntVar(value=int(ups.get("watchdog_consecutive", 2)))
-        wc_spin = ttk.Spinbox(strip3, from_=1, to=10, width=4, textvariable=self.watchdog_consec_var)
+        wc_spin = ttk.Spinbox(wd, from_=1, to=10, width=4, textvariable=self.watchdog_consec_var)
         wc_spin.pack(side="left")
-        ttk.Label(strip3, text="images in a row").pack(side="left", padx=(4, 0))
+        ttk.Label(wd, text="images in a row").pack(side="left", padx=(4, 0))
         Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a single odd image).")
 
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
@@ -3251,43 +3287,57 @@ class SettingsTab(ttk.Frame):
         def _lbl(key):
             return _SEEDVR_LABELS.get(key, key.replace("_", " ").capitalize())
 
-        # Controls grouped onto shared rows for a compact layout.
-        seedvr_rows = [
-            ["attention_mode", "color_correction"],
-            ["dit_model", "vae_model"],
-            ["blocks_to_swap", "outage_threshold"],
-            ["encode_tiled", "decode_tiled", "encode_tile_size", "decode_tile_size"],
-        ]
-
         placed = set()
-        row = 0
-        for group in seedvr_rows:
-            keys = [k for k in group if k in present]
-            if not keys:
-                continue
-            # Rows with more than a simple pair are packed tightly to the left in
-            # their own frame, so they don't inherit the wide column alignment of
-            # the two-control rows above.
-            if len(keys) > 2:
-                strip = ttk.Frame(sec)
-                strip.grid(row=row, column=0, columnspan=4, sticky="w", pady=3)
-                for i, key in enumerate(keys):
-                    ttk.Label(strip, text=f"{_lbl(key)}:").pack(
-                        side="left", padx=(0 if i == 0 else 24, 4))
-                    self._make_seedvr_control(strip, key, present[key]).pack(side="left")
-                    placed.add(key)
-            else:
-                col = 0
-                for key in keys:
-                    ttk.Label(sec, text=f"{_lbl(key)}:").grid(
-                        row=row, column=col, sticky="w", pady=3, padx=(0 if col == 0 else 14, 4))
-                    self._make_seedvr_control(sec, key, present[key]).grid(
-                        row=row, column=col + 1, sticky="w", pady=3)
-                    placed.add(key)
-                    col += 2
-            row += 1
+
+        # Goal: fit every SeedVR control on ONE row even at the app's minimum
+        # width. So they live in a single tight, left-packed strip with short
+        # group labels and narrow controls, rather than the old two-row grid.
+        strip = ttk.Frame(sec)
+        strip.grid(row=0, column=0, sticky="w", pady=3)
+
+        def _grp(text, pad_left):
+            ttk.Label(strip, text=text).pack(side="left", padx=(pad_left, 4))
+
+        if "attention_mode" in present:
+            _grp("Attention mode:", 0)
+            self._make_seedvr_control(strip, "attention_mode", present["attention_mode"],
+                                      width=9, readonly=True).pack(side="left")
+            placed.add("attention_mode")
+
+        if "outage_threshold" in present:
+            _grp("Outage threshold:", 14)
+            self._make_seedvr_control(strip, "outage_threshold", present["outage_threshold"],
+                                      width=3).pack(side="left")
+            placed.add("outage_threshold")
+
+        # VAE Tiled: two checkboxes whose own labels read Encode / Decode.
+        if "encode_tiled" in present or "decode_tiled" in present:
+            _grp("VAE Tiled:", 14)
+            if "encode_tiled" in present:
+                self._make_seedvr_control(strip, "encode_tiled", present["encode_tiled"],
+                                          text="Encode").pack(side="left")
+                placed.add("encode_tiled")
+            if "decode_tiled" in present:
+                self._make_seedvr_control(strip, "decode_tiled", present["decode_tiled"],
+                                          text="Decode").pack(side="left", padx=(6, 0))
+                placed.add("decode_tiled")
+
+        # Tile Size: two narrow spinboxes labelled Encode / Decode.
+        if "encode_tile_size" in present or "decode_tile_size" in present:
+            _grp("Tile Size:", 14)
+            if "encode_tile_size" in present:
+                _grp("Encode", 0)
+                self._make_seedvr_control(strip, "encode_tile_size",
+                                          present["encode_tile_size"], width=6).pack(side="left")
+                placed.add("encode_tile_size")
+            if "decode_tile_size" in present:
+                _grp("Decode", 8)
+                self._make_seedvr_control(strip, "decode_tile_size",
+                                          present["decode_tile_size"], width=6).pack(side="left")
+                placed.add("decode_tile_size")
 
         # Any unrecognised keys fall back to one-per-row generic controls.
+        row = 1
         for key, value in present.items():
             if key in placed:
                 continue
@@ -3309,24 +3359,6 @@ class SettingsTab(ttk.Frame):
         self.webhook_status = ttk.Label(sec, text="", foreground="#666")
         self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
 
-        # ── Updates ─────────────────────────────────────────────────────────────
-        sec = self._section(body, "Updates")
-        sec.columnconfigure(1, weight=1)
-
-        ttk.Label(sec, text=f"Current version: {APP_VERSION}").grid(
-            row=0, column=0, sticky="w", pady=3)
-        self.check_update_btn = ttk.Button(
-            sec, text="Check for updates now", command=self._check_updates)
-        self.check_update_btn.grid(row=0, column=2, pady=3)
-
-        self.auto_update_var = tk.BooleanVar(value=update_auto_check_enabled())
-        ttk.Checkbutton(sec, text="Check for updates on startup",
-                        variable=self.auto_update_var).grid(
-            row=1, column=0, sticky="w", pady=3)
-
-        self.update_status = ttk.Label(sec, text="", foreground="#666")
-        self.update_status.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
-
         # ── Home Assistant (MQTT) ───────────────────────────────────────────────
         mqtt = CFG.get("mqtt", {})
         sec = self._section(body, "Home Assistant (MQTT)")
@@ -3346,32 +3378,448 @@ class SettingsTab(ttk.Frame):
         self.mqtt_cid_var  = tk.StringVar(
             value=mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
 
+        # Broker host with a fixed "mqtt://" hint so it's clear only the hostname
+        # or IP goes in the field (the scheme/port aren't typed here).
         ttk.Label(sec, text="Broker host:").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Entry(sec, textvariable=self.mqtt_host_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        hostrow = ttk.Frame(sec)
+        hostrow.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
+        ttk.Label(hostrow, text="mqtt://").pack(side="left")
+        ttk.Entry(hostrow, textvariable=self.mqtt_host_var).pack(side="left", fill="x", expand=True)
         ttk.Label(sec, text="Port:").grid(row=1, column=2, sticky="e", pady=3)
         ttk.Spinbox(sec, from_=1, to=65535, width=7,
                     textvariable=self.mqtt_port_var).grid(row=1, column=3, sticky="w", padx=6, pady=3)
 
-        ttk.Label(sec, text="Username:").grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Entry(sec, textvariable=self.mqtt_user_var).grid(row=2, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Label(sec, text="Password:").grid(row=3, column=0, sticky="w", pady=3)
-        ttk.Entry(sec, textvariable=self.mqtt_pass_var, show="•").grid(
-            row=3, column=1, sticky="ew", padx=6, pady=3)
-        self.mqtt_test_btn = ttk.Button(sec, text="Test", command=self._test_mqtt)
-        self.mqtt_test_btn.grid(row=3, column=2, columnspan=2, sticky="e", padx=6, pady=3)
+        # Username, Password, Test and Publish now share one row. Client ID has no
+        # control (mqtt_cid_var still carries it through to config.json) — it's an
+        # advanced field a non-technical user never needs; edit config.json to change.
+        urow = ttk.Frame(sec)
+        urow.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(urow, text="Username:").pack(side="left")
+        ttk.Entry(urow, textvariable=self.mqtt_user_var, width=16).pack(side="left", padx=(4, 0))
+        ttk.Label(urow, text="Password:").pack(side="left", padx=(12, 0))
+        ttk.Entry(urow, textvariable=self.mqtt_pass_var, show="•", width=16).pack(side="left", padx=(4, 0))
+        self.mqtt_test_btn = ttk.Button(urow, text="Test", command=self._test_mqtt)
+        self.mqtt_test_btn.pack(side="left", padx=(12, 0))
+        ttk.Button(urow, text="Publish now", command=self._publish_mqtt).pack(side="left", padx=(6, 0))
 
-        ttk.Label(sec, text="Client ID:").grid(row=4, column=0, sticky="w", pady=3)
-        ttk.Entry(sec, textvariable=self.mqtt_cid_var).grid(row=4, column=1, sticky="ew", padx=6, pady=3)
-
-        ttk.Button(sec, text="Publish now", command=self._publish_mqtt).grid(
-            row=4, column=2, columnspan=2, sticky="e", padx=6, pady=3)
         self.mqtt_status = ttk.Label(sec, text="", foreground="#666")
-        self.mqtt_status.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.mqtt_status.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+
+        # ── Updates (kept last: rarely changed, low priority) ────────────────────
+        sec = self._section(body, "Updates")
+        row = ttk.Frame(sec)
+        row.grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(row, text=f"Current version: {APP_VERSION}").pack(side="left")
+        self.auto_update_var = tk.BooleanVar(value=update_auto_check_enabled())
+        ttk.Checkbutton(row, text="Check for updates on startup",
+                        variable=self.auto_update_var).pack(side="left", padx=(18, 0))
+        self.check_update_btn = ttk.Button(
+            row, text="Check for updates now", command=self._check_updates)
+        self.check_update_btn.pack(side="left", padx=(18, 0))
+        self.update_status = ttk.Label(sec, text="", foreground="#666")
+        self.update_status.grid(row=1, column=0, sticky="w", padx=6, pady=(4, 0))
+
+        # ── Save bar ────────────────────────────────────────────────────────────
+        bar = ttk.Frame(body, padding=(8, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
+        self.save_status = ttk.Label(bar, text="", foreground="#666")
+        self.save_status.pack(side="left", padx=12)
+
+        # Baseline for unsaved-changes detection: a snapshot of the form as it
+        # mirrors config.json right now. Re-taken on every successful save/revert.
+        self._baseline = self._snapshot()
+
+        # Live unsaved-changes indicator. Rather than wire a trace onto dozens of
+        # heterogeneous vars (entries, spinboxes, comboboxes), poll is_dirty() on a
+        # light timer: "Not saved" (red) the moment any field differs from the saved
+        # state, "Saved." (green) right after a successful save, blank when clean and
+        # unsaved-this-session. `_save_status_base` is what to show when clean;
+        # `_save_status_hold` lets a transient message (e.g. a write error) linger.
+        self._save_status_base = ""
+        self._save_status_hold = 0.0
+        self._refresh_save_indicator()
+
+        # Probe the saved Ollama URL in the background so the status text already
+        # reflects reachability by the time the user opens the Settings tab.
+        self._check_ollama()
+
+    def _make_seedvr_control(self, parent, key, value, width=None, readonly=False, text=None):
+        """Build the editable control for a SeedVR field and register its var.
+        Returns the widget (caller positions it). `width` overrides the default
+        char-width; `readonly` makes a combobox pick-only; `text` labels a
+        checkbutton (so the field's own word sits beside the box)."""
+        if isinstance(value, bool):
+            var = tk.BooleanVar(value=value)
+            widget = ttk.Checkbutton(parent, variable=var, text=text or "")
+            self._seedvr_vars[key] = (var, bool)
+        elif isinstance(value, int):
+            var = tk.StringVar(value=str(value))
+            widget = ttk.Spinbox(parent, from_=0, to=100000,
+                                 width=width if width is not None else 8, textvariable=var)
+            self._seedvr_vars[key] = (var, int)
+        else:
+            var = tk.StringVar(value=str(value))
+            if key in _SEEDVR_CHOICES:
+                widget = ttk.Combobox(parent, textvariable=var,
+                                      values=_SEEDVR_CHOICES[key],
+                                      state="readonly" if readonly else "normal",
+                                      width=width if width is not None else 16)
+            else:
+                widget = ttk.Entry(parent, textvariable=var,
+                                  width=width if width is not None else 22)
+            self._seedvr_vars[key] = (var, str)
+        return widget
+
+    def _section(self, parent, title):
+        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
+        lf.pack(fill="x", padx=10, pady=(10, 0))
+        return lf
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _current_preset_label(self, ups):
+        mx, rs = int(ups.get("max_resolution", 3840)), int(ups.get("resolution", 2160))
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if pmx == mx and prs == rs:
+                return label
+        return RESOLUTION_PRESETS[0][0]
+
+    def _check_ollama(self):
+        """Probe the Ollama URL off the UI thread and report reachability."""
+        url = self.ollama_url_var.get().strip()
+        self.ollama_status.configure(text="Checking Ollama…", foreground="#666")
+
+        def work():
+            installed = ollama_installed()
+            ok, value = ollama_list_models(url)
+            self.after(0, lambda: self._apply_ollama_check(ok, value, installed))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_ollama_check(self, ok, value, installed):
+        if ok:
+            self.ollama_model_cmb.configure(values=value)
+            inst = "installed" if installed else "not on PATH"
+            self.ollama_status.configure(
+                text=f"Reachable — {len(value)} model(s) available (ollama executable {inst}).",
+                foreground="#1a7f37")
+        else:
+            inst = "Ollama executable found on PATH." if installed else \
+                   "Ollama executable not found on PATH."
+            self.ollama_status.configure(
+                text=f"Not reachable at this URL — {value}. {inst}", foreground="#b3261e")
+
+    def _test_webhook(self):
+        ok, msg = test_discord_webhook(self.webhook_var.get())
+        self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _check_updates(self):
+        """Manual update check from Settings (always reports the outcome, and
+        shows the prompt for an available update even if it was skipped before)."""
+        self.check_update_btn.configure(state="disabled")
+        self.update_status.configure(text="Checking for updates…", foreground="#666")
+
+        def work():
+            status, payload = updater.check_for_update(APP_VERSION)
+            self.after(0, lambda: self._apply_update_check(status, payload))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_update_check(self, status, payload):
+        self.check_update_btn.configure(state="normal")
+        if status == "update":
+            self.update_status.configure(
+                text=f"Version {payload.version} is available.", foreground="#1a7f37")
+            self.app.show_update_dialog(payload)
+        elif status == "current":
+            self.update_status.configure(
+                text=f"You're on the latest version ({payload}).", foreground="#1a7f37")
+        else:
+            self.update_status.configure(text=payload, foreground="#b3261e")
+
+    def _mqtt_fields(self):
+        """The MQTT settings currently in the form (so Test works pre-Save)."""
+        try:
+            port = int(self.mqtt_port_var.get())
+        except (ValueError, tk.TclError):
+            port = 1883
+        return {
+            "host":      self.mqtt_host_var.get().strip(),
+            "port":      port,
+            "username":  self.mqtt_user_var.get().strip(),
+            "password":  self.mqtt_pass_var.get(),
+            "client_id": self.mqtt_cid_var.get().strip() or mqtt_publisher.DEFAULT_CLIENT_ID,
+        }
+
+    def _test_mqtt(self):
+        cfg = self._mqtt_fields()
+        if not cfg["host"]:
+            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
+            return
+        self.mqtt_test_btn.configure(state="disabled")
+        self.mqtt_status.configure(text="Testing connection…", foreground="#666")
+
+        def work():
+            ok, msg = mqtt_publisher.test_connection(cfg)
+            def apply():
+                self.mqtt_test_btn.configure(state="normal")
+                self.mqtt_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _publish_mqtt(self):
+        cfg = self._mqtt_fields()
+        if not cfg["host"]:
+            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
+            return
+        self.mqtt_status.configure(text="Publishing…", foreground="#666")
+
+        def work():
+            status, payload = updater.check_for_update(APP_VERSION)
+            update_available = (status == "update")
+            ok, msg = mqtt_publisher.publish_state(cfg, {
+                mqtt_publisher.VERSION_TOPIC:        APP_VERSION,
+                mqtt_publisher.UPDATE_TOPIC:         "yes" if update_available else "no",
+                mqtt_publisher.LATEST_VERSION_TOPIC: payload.version if update_available else APP_VERSION,
+            })
+            self.after(0, lambda: self.mqtt_status.configure(
+                text=msg, foreground="#1a7f37" if ok else "#b3261e"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pick_folder(self, var):
+        folder = filedialog.askdirectory(title="Choose a folder")
+        if folder:
+            var.set(os.path.normpath(folder))
+
+    def load_defaults(self):
+        """Refresh the default-folder fields from config (called when a tab's
+        Save-as-Default button updates them, so both views stay in sync)."""
+        defs = CFG.get("defaults", {})
+        self.default_src_var.set(defs.get("upscale_source", ""))
+        self.default_out_var.set(defs.get("upscale_output", ""))
+        self.default_tag_var.set(defs.get("tag_folder", ""))
+        self.default_corig_var.set(defs.get("conciliate_original", ""))
+        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+
+    def _collect(self):
+        """Build the config sections the form currently describes, without
+        touching CFG. Returns (sections, errors): `sections` maps section name →
+        proposed {key: value}; `errors` names any field that failed validation.
+        Shared by _save (apply) and the unsaved-changes detection (compare)."""
+        errors = []
+        seedvr_out = {}
+        for key, (var, typ) in self._seedvr_vars.items():
+            raw = var.get()
+            if typ is int:
+                try:
+                    seedvr_out[key] = int(str(raw).strip())
+                except ValueError:
+                    errors.append(_SEEDVR_LABELS.get(key, key))
+            elif typ is bool:
+                seedvr_out[key] = bool(var.get())
+            else:
+                seedvr_out[key] = str(raw).strip()
+
+        ups = {}
+        try:
+            ups["upscale_cutoff_pct"] = max(0, min(99, int(self.cutoff_var.get())))
+        except (ValueError, tk.TclError):
+            errors.append("Skip images over")
+        for label, pmx, prs in RESOLUTION_PRESETS:
+            if label == self.restarget_var.get():
+                ups["max_resolution"], ups["resolution"] = pmx, prs
+                break
+        ups["discord_webhook_url"] = self.webhook_var.get().strip()
+        ups["auto_straighten"] = bool(self.up_straighten_var.get())
+        try:
+            up_conf = round(float(self.up_straighten_conf_var.get()), 2)
+        except (ValueError, tk.TclError):
+            up_conf = 0.9
+        ups["straighten_min_confidence"] = min(1.0, max(0.5, up_conf))
+        ups["watchdog_enabled"] = bool(self.watchdog_var.get())
+        try:
+            wd_factor = round(float(self.watchdog_factor_var.get()), 1)
+        except (ValueError, tk.TclError):
+            wd_factor = 3.0
+        ups["watchdog_factor"] = min(10.0, max(1.5, wd_factor))
+        try:
+            ups["watchdog_consecutive"] = max(1, min(10, int(self.watchdog_consec_var.get())))
+        except (ValueError, tk.TclError):
+            ups["watchdog_consecutive"] = 2
+        ups.update(seedvr_out)
+
+        try:
+            conf = round(float(self.straighten_conf_var.get()), 2)
+        except (ValueError, tk.TclError):
+            conf = 0.9
+        try:
+            max_px = max(0, int(self.tag_maxpx_var.get()))
+        except (ValueError, tk.TclError):
+            max_px = 1280
+
+        sections = {
+            "ollama": {
+                "url":   self.ollama_url_var.get().strip() or "http://127.0.0.1:11434",
+                "model": self.ollama_model_var.get().strip(),
+            },
+            "upscale": ups,
+            "defaults": {
+                "upscale_source": self.default_src_var.get().strip(),
+                "upscale_output": self.default_out_var.get().strip(),
+                "tag_folder":     self.default_tag_var.get().strip(),
+                "conciliate_original":  self.default_corig_var.get().strip(),
+                "conciliate_processed": self.default_cproc_var.get().strip(),
+            },
+            "tagging": {
+                "auto_straighten": bool(self.straighten_var.get()),
+                "straighten_min_confidence": min(1.0, max(0.5, conf)),
+                "max_image_px": max_px,
+            },
+            "updates": {"auto_check": bool(self.auto_update_var.get())},
+            "mqtt": self._mqtt_fields(),
+        }
+        return sections, errors
+
+    def _snapshot(self):
+        """A stable, comparable key for the form's current contents — the basis
+        for unsaved-changes detection. Invalid input counts as 'changed'."""
+        sections, errors = self._collect()
+        return json.dumps(sections, sort_keys=True), bool(errors)
+
+    def is_dirty(self):
+        """True if the form differs from the last-saved (baseline) state."""
+        try:
+            return self._snapshot() != self._baseline
+        except Exception:
+            return False
+
+    def _save(self):
+        """Persist the form to config.json. Returns True on success; on a
+        validation error it warns and returns False (nothing is written)."""
+        sections, errors = self._collect()
+        if errors:
+            messagebox.showwarning(
+                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
+            return False
+
+        for name, values in sections.items():
+            target = CFG.setdefault(name, {})
+            if name == "mqtt":
+                target.pop("enabled", None)   # MQTT is now gated by host being set
+            if name == "runpod":
+                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
+            target.update(values)
+
+        if save_config():
+            self._baseline = self._snapshot()    # the form is now the saved state
+            # Apply MQTT changes immediately (connect/disconnect/reconfigure).
+            self.app.restart_mqtt()
+            self._save_status_base = "Saved."    # the live indicator renders it green
+            self.save_status.configure(text="Saved.", foreground="#1a7f37")
+            return True
+        # Write failed — hold the error on screen so the live indicator doesn't
+        # immediately overwrite it with "Not saved".
+        self._save_status_hold = time.time() + 6
+        self.save_status.configure(
+            text="Could not write config.json (check file permissions).",
+            foreground="#b3261e")
+        return False
+
+    def _refresh_save_indicator(self):
+        """Light timer that keeps `save_status` reflecting the unsaved-changes
+        state live: 'Not saved' (red) whenever the form differs from the saved
+        state, otherwise the clean-state base text ('Saved.' green after a save,
+        blank before). A transient message (e.g. a write error) is left alone until
+        `_save_status_hold` expires. Polling avoids tracing dozens of mixed vars."""
+        try:
+            if not self.save_status.winfo_exists():
+                return
+            if time.time() >= self._save_status_hold:
+                if self.is_dirty():
+                    self.save_status.configure(text="Not saved", foreground="#b3261e")
+                else:
+                    base = self._save_status_base
+                    self.save_status.configure(
+                        text=base, foreground="#1a7f37" if base == "Saved." else "#666")
+        except Exception:                       # noqa: BLE001 (never let the timer die loudly)
+            pass
+        self.after(400, self._refresh_save_indicator)
+
+    def revert(self):
+        """Discard unsaved edits: reset every field to the values in CFG."""
+        ollama = CFG.get("ollama", {})
+        ups    = CFG.get("upscale", {})
+        defs   = CFG.get("defaults", {})
+        tag    = CFG.get("tagging", {})
+        mqtt   = CFG.get("mqtt", {})
+        self.default_src_var.set(defs.get("upscale_source", ""))
+        self.default_out_var.set(defs.get("upscale_output", ""))
+        self.default_tag_var.set(defs.get("tag_folder", ""))
+        self.default_corig_var.set(defs.get("conciliate_original", ""))
+        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
+        self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
+        self.straighten_var.set(bool(tag.get("auto_straighten", True)))
+        self.tag_maxpx_var.set(int(tag.get("max_image_px", 1280)))
+        self.straighten_conf_var.set(float(tag.get("straighten_min_confidence", 0.9)))
+        self.restarget_var.set(self._current_preset_label(ups))
+        self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
+        self.up_straighten_var.set(bool(ups.get("auto_straighten", True)))
+        self.up_straighten_conf_var.set(float(ups.get("straighten_min_confidence", 0.9)))
+        self.watchdog_var.set(bool(ups.get("watchdog_enabled", True)))
+        self.watchdog_factor_var.set(float(ups.get("watchdog_factor", 3.0)))
+        self.watchdog_consec_var.set(int(ups.get("watchdog_consecutive", 2)))
+        self.webhook_var.set(ups.get("discord_webhook_url", ""))
+        self.auto_update_var.set(update_auto_check_enabled())
+        self.mqtt_host_var.set(mqtt.get("host", ""))
+        self.mqtt_port_var.set(str(mqtt.get("port", 1883)))
+        self.mqtt_user_var.set(mqtt.get("username", ""))
+        self.mqtt_pass_var.set(mqtt.get("password", ""))
+        self.mqtt_cid_var.set(mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
+        for key, (var, typ) in self._seedvr_vars.items():
+            if key in ups:
+                var.set(ups[key] if typ is bool else str(ups[key]))
+        self._baseline = self._snapshot()
+        self._save_status_base = ""          # discard the "Saved." indicator too
+
+
+# ─────────────────────────────────────────────
+#  TAB 5 — RUNPOD (remote pod settings)
+# ─────────────────────────────────────────────
+
+class RunPodTab(ttk.Frame):
+    """Remote-pod (RunPod) settings, split out of SettingsTab (0.3.7) into its own
+    tab because the section grew large and complex. Self-contained: it owns its
+    save bar, unsaved-changes detection and revert, all scoped to the `runpod`
+    block of config.json only (SettingsTab writes every other section)."""
+
+    def __init__(self, notebook, app):
+        super().__init__(notebook)
+        self.app = app
+        self._all_volumes = None
+        self._pods_data = []      # last-fetched pod dicts (for the pods list)
+        self._pod_rows = {}       # tree row id -> {"id", "active"}
+        self._build()
+
+    def _section(self, parent, title):
+        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
+        lf.pack(fill="x", padx=10, pady=(10, 0))
+        return lf
+
+    def _build(self):
+        sf = _ScrollFrame(self)
+        sf.pack(fill="both", expand=True)
+        body = sf.body
 
         # ── Remote upscaling (RunPod) ───────────────────────────────────────────
+        # No LabelFrame: this is now its own tab, so the content sits directly on
+        # the page (a plain padded frame, packed so it coexists with the save bar).
         rp = CFG.get("runpod", {})
-        sec = self._section(body, "Remote Pod Settings (RunPod.io)")
-        sec.columnconfigure(1, weight=1)
+        sec = ttk.Frame(body, padding=(10, 8))
+        sec.pack(fill="x", padx=10, pady=(10, 0))
 
         desc = ttk.Frame(sec)
         desc.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
@@ -3393,46 +3841,38 @@ class SettingsTab(ttk.Frame):
                 "Opens the RunPod console (Settings → API Keys → Create API Key). "
                 f"Docs: {runpod_client.DOCS_API_KEYS_URL}")
 
-        # Zero-config SSH: the app owns a dedicated key and hands its public half
-        # to every pod via PUBLIC_KEY, so the user never runs ssh-keygen or pastes
-        # a key into the RunPod website. The button generates/locates it on demand;
-        # a run also auto-ensures it, so this is a convenience, not a prerequisite.
-        ssh_row = ttk.Frame(desc)
-        ssh_row.pack(anchor="w", pady=(6, 0))
-        self.runpod_ssh_btn = ttk.Button(ssh_row, text="Set up SSH key",
+        # First row, all inline: API key + Test + Set up SSH key + SSH-ready status.
+        keyrow = ttk.Frame(sec)
+        keyrow.grid(row=1, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(keyrow, text="API key:").pack(side="left")
+        self.runpod_key_var = tk.StringVar(value=rp.get("api_key", ""))
+        key_entry = ttk.Entry(keyrow, textvariable=self.runpod_key_var, show="•", width=44)
+        key_entry.pack(side="left", padx=(4, 0))
+        Tooltip(key_entry, "RunPod API key (rest.runpod.io). Stored locally in "
+                           "config.json; never committed.")
+        self.runpod_test_btn = ttk.Button(keyrow, text="Test", command=self._test_runpod)
+        self.runpod_test_btn.pack(side="left", padx=(6, 0))
+        # Zero-config SSH: the app owns a dedicated key and hands its public half to
+        # every pod via PUBLIC_KEY, so the user never runs ssh-keygen or pastes a key
+        # into the RunPod website. A run also auto-ensures it; this button is a
+        # convenience, not a prerequisite.
+        self.runpod_ssh_btn = ttk.Button(keyrow, text="Set up SSH key",
                                          command=self._setup_ssh)
-        self.runpod_ssh_btn.pack(side="left")
-        self.runpod_ssh_status = ttk.Label(ssh_row, text="", foreground="#666")
-        self.runpod_ssh_status.pack(side="left", padx=(8, 0))
+        self.runpod_ssh_btn.pack(side="left", padx=(6, 0))
         Tooltip(self.runpod_ssh_btn,
                 "Generates the dedicated SSH key the app uses to reach rented "
                 "pods (one-time). Its public half is sent to each pod "
                 "automatically — you never paste a key into the RunPod website.")
+        self.runpod_ssh_status = ttk.Label(keyrow, text="", foreground="#666")
+        self.runpod_ssh_status.pack(side="left", padx=(8, 0))
         self._refresh_ssh_status()
-
-        ttk.Label(sec, text="API key:").grid(row=1, column=0, sticky="w", pady=3)
-        self.runpod_key_var = tk.StringVar(value=rp.get("api_key", ""))
-        key_entry = ttk.Entry(sec, textvariable=self.runpod_key_var, show="•")
-        key_entry.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        Tooltip(key_entry, "RunPod API key (rest.runpod.io). Stored locally in "
-                           "config.json; never committed.")
-        self.runpod_test_btn = ttk.Button(sec, text="Test", command=self._test_runpod)
-        self.runpod_test_btn.grid(row=1, column=2, columnspan=2, sticky="e", padx=6, pady=3)
-
-        ttk.Label(sec, text="Hourly rate (USD):").grid(row=2, column=0, sticky="w", pady=3)
-        self.runpod_rate_var = tk.StringVar(value=str(rp.get("hourly_rate", 0.90)))
-        rate_spin = ttk.Spinbox(sec, from_=0.0, to=100.0, increment=0.10, width=8,
-                                format="%.2f", textvariable=self.runpod_rate_var)
-        rate_spin.grid(row=2, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(rate_spin, "Used only to estimate the cost of a run for the "
-                           "completion notification.")
 
         # Cost guardrail — the automatic-fallback price ceiling, split PER TASK:
         # tagging runs on $0.24 cards (cap stays low), but the cheapest viable
         # upscale card is ~$0.74, so a shared $0.50 cap left upscaling with no
         # fallback — see _fallback_ceiling. Both on one inline row.
         price = ttk.Frame(sec)
-        price.grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=3)
+        price.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
         ttk.Label(price, text="Max fallback: upscale").grid(row=0, column=0, sticky="e")
         self.runpod_maxprice_up_var = tk.StringVar(
             value=str(rp.get("max_price_per_hour_upscale", 1.10)))
@@ -3543,9 +3983,11 @@ class SettingsTab(ttk.Frame):
         Tooltip(self.runpod_vol_cmb,
                 "Persistent RunPod network volume that holds the models (SeedVR2 + "
                 "Ollama) so disposable pods don't re-download them. Format: "
-                "'id | name | size | dc'. Shows the volume(s) in the selected data "
-                "center, or 'None | <data center>' if there isn't one yet. Refresh "
-                "lists them; Create makes one.")
+                "'id | name | size | dc'. The list shows ALL volumes on your "
+                "account; the one in the selected data center (or 'None | <data "
+                "center>') is pre-selected. Picking a volume from another region "
+                "switches the Region / Data center / GPU pickers to match it. "
+                "Refresh lists them; Create makes one.")
         # The four volume action buttons on their own row, aligned under the combo.
         volbtns = ttk.Frame(gv)
         volbtns.grid(row=3, column=1, sticky="w", pady=(4, 0))
@@ -3632,189 +4074,144 @@ class SettingsTab(ttk.Frame):
         self.runpod_status = ttk.Label(sec, text="", foreground="#666")
         self.runpod_status.grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
-        # ── Save bar ────────────────────────────────────────────────────────────
+        # ── Your pods ───────────────────────────────────────────────────────────
+        # List every pod on the account (running or exited) with a Terminate
+        # control, so the user can clean up billing without visiting the RunPod
+        # website. A pod a live remote run depends on is marked '(in use)' and
+        # can't be terminated here.
+        pods = ttk.Frame(body, padding=(10, 8))
+        pods.pack(fill="x", padx=10, pady=(10, 0))
+        hdr = ttk.Frame(pods)
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text="Your pods", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Button(hdr, text="Refresh", command=self._refresh_pods).pack(side="left", padx=(10, 0))
+        self.runpod_pods_term_btn = tk.Button(
+            hdr, text="Terminate selected…", fg="#b3261e", activeforeground="#b3261e",
+            cursor="hand2", state="disabled", command=self._terminate_pod)
+        self.runpod_pods_term_btn.pack(side="left", padx=(6, 0))
+        Tooltip(self.runpod_pods_term_btn,
+                "Permanently delete the selected pod, freeing all its billing. This "
+                "never touches your model network volume. A pod a remote run is "
+                "using right now is marked '(in use)' and can't be terminated here "
+                "— stop that run first.")
+
+        tree = ttk.Treeview(pods,
+                            columns=("name", "status", "gpu", "region", "dc", "cost"),
+                            show="headings", height=5, selectmode="browse")
+        for col, txt, w, anchor in (("name", "Name / id", 170, "w"),
+                                    ("status", "Status", 85, "w"),
+                                    ("gpu", "GPU", 150, "w"),
+                                    ("region", "Region", 105, "w"),
+                                    ("dc", "Data center", 95, "w"),
+                                    ("cost", "$/hr", 55, "e")):
+            tree.heading(col, text=txt)
+            tree.column(col, width=w, anchor=anchor, stretch=(col == "gpu"))
+        tree.pack(fill="x", pady=(6, 0))
+        tree.bind("<<TreeviewSelect>>", lambda _e: self._refresh_terminate_state())
+        self.runpod_pods_tree = tree
+        self.runpod_pods_status = ttk.Label(pods, text="", foreground="#666")
+        self.runpod_pods_status.pack(anchor="w", pady=(4, 0))
+
+        # ── Save bar ────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
         ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
         self.save_status = ttk.Label(bar, text="", foreground="#666")
         self.save_status.pack(side="left", padx=12)
 
-        # Baseline for unsaved-changes detection: a snapshot of the form as it
-        # mirrors config.json right now. Re-taken on every successful save/revert.
+        # Baseline + live "Not saved" indicator, same pattern as SettingsTab.
         self._baseline = self._snapshot()
-
-        # Live unsaved-changes indicator. Rather than wire a trace onto dozens of
-        # heterogeneous vars (entries, spinboxes, comboboxes), poll is_dirty() on a
-        # light timer: "Not saved" (red) the moment any field differs from the saved
-        # state, "Saved." (green) right after a successful save, blank when clean and
-        # unsaved-this-session. `_save_status_base` is what to show when clean;
-        # `_save_status_hold` lets a transient message (e.g. a write error) linger.
         self._save_status_base = ""
         self._save_status_hold = 0.0
         self._refresh_save_indicator()
 
-        # Probe the saved Ollama URL in the background so the status text already
-        # reflects reachability by the time the user opens the Settings tab.
-        self._check_ollama()
+    # ── save / unsaved-changes machinery (runpod-scoped) ───────────────
 
-    def _make_seedvr_control(self, parent, key, value):
-        """Build the editable control for a SeedVR field and register its var.
-        Returns the widget (caller positions it with .grid)."""
-        if isinstance(value, bool):
-            var = tk.BooleanVar(value=value)
-            widget = ttk.Checkbutton(parent, variable=var)
-            self._seedvr_vars[key] = (var, bool)
-        elif isinstance(value, int):
-            var = tk.StringVar(value=str(value))
-            widget = ttk.Spinbox(parent, from_=0, to=100000, width=8, textvariable=var)
-            self._seedvr_vars[key] = (var, int)
-        else:
-            var = tk.StringVar(value=str(value))
-            if key in _SEEDVR_CHOICES:
-                widget = ttk.Combobox(parent, textvariable=var,
-                                      values=_SEEDVR_CHOICES[key], width=16)
-            else:
-                widget = ttk.Entry(parent, textvariable=var, width=22)
-            self._seedvr_vars[key] = (var, str)
-        return widget
+    def _collect(self):
+        """The runpod section the form currently describes, as ({"runpod": {...}},
+        errors). Kept in SettingsTab's (sections, errors) shape so the save/dirty
+        helpers below mirror it exactly."""
+        return {"runpod": self._runpod_fields()}, []
 
-    def _section(self, parent, title):
-        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=(10, 8))
-        lf.pack(fill="x", padx=10, pady=(10, 0))
-        return lf
+    def _snapshot(self):
+        sections, errors = self._collect()
+        return json.dumps(sections, sort_keys=True), bool(errors)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
-    def _current_preset_label(self, ups):
-        mx, rs = int(ups.get("max_resolution", 3840)), int(ups.get("resolution", 2160))
-        for label, pmx, prs in RESOLUTION_PRESETS:
-            if pmx == mx and prs == rs:
-                return label
-        return RESOLUTION_PRESETS[0][0]
-
-    def _check_ollama(self):
-        """Probe the Ollama URL off the UI thread and report reachability."""
-        url = self.ollama_url_var.get().strip()
-        self.ollama_status.configure(text="Checking Ollama…", foreground="#666")
-
-        def work():
-            installed = ollama_installed()
-            ok, value = ollama_list_models(url)
-            self.after(0, lambda: self._apply_ollama_check(ok, value, installed))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _apply_ollama_check(self, ok, value, installed):
-        if ok:
-            self.ollama_model_cmb.configure(values=value)
-            inst = "installed" if installed else "not on PATH"
-            self.ollama_status.configure(
-                text=f"Reachable — {len(value)} model(s) available (ollama executable {inst}).",
-                foreground="#1a7f37")
-        else:
-            inst = "Ollama executable found on PATH." if installed else \
-                   "Ollama executable not found on PATH."
-            self.ollama_status.configure(
-                text=f"Not reachable at this URL — {value}. {inst}", foreground="#b3261e")
-
-    def _refresh_models(self):
-        url = self.ollama_url_var.get().strip()
-        self.ollama_status.configure(text="Refreshing models…", foreground="#666")
-
-        def work():
-            ok, value = ollama_list_models(url)
-            self.after(0, lambda: self._apply_refresh_models(ok, value))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _apply_refresh_models(self, ok, value):
-        if ok:
-            self.ollama_model_cmb.configure(values=value)
-            self.ollama_status.configure(
-                text=f"Found {len(value)} model(s)." if value else "No models installed.",
-                foreground="#1a7f37" if value else "#666")
-        else:
-            self.ollama_status.configure(text=f"Could not list models — {value}",
-                                         foreground="#b3261e")
-
-    def _test_webhook(self):
-        ok, msg = test_discord_webhook(self.webhook_var.get())
-        self.webhook_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
-
-    def _check_updates(self):
-        """Manual update check from Settings (always reports the outcome, and
-        shows the prompt for an available update even if it was skipped before)."""
-        self.check_update_btn.configure(state="disabled")
-        self.update_status.configure(text="Checking for updates…", foreground="#666")
-
-        def work():
-            status, payload = updater.check_for_update(APP_VERSION)
-            self.after(0, lambda: self._apply_update_check(status, payload))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _apply_update_check(self, status, payload):
-        self.check_update_btn.configure(state="normal")
-        if status == "update":
-            self.update_status.configure(
-                text=f"Version {payload.version} is available.", foreground="#1a7f37")
-            self.app.show_update_dialog(payload)
-        elif status == "current":
-            self.update_status.configure(
-                text=f"You're on the latest version ({payload}).", foreground="#1a7f37")
-        else:
-            self.update_status.configure(text=payload, foreground="#b3261e")
-
-    def _mqtt_fields(self):
-        """The MQTT settings currently in the form (so Test works pre-Save)."""
+    def is_dirty(self):
         try:
-            port = int(self.mqtt_port_var.get())
-        except (ValueError, tk.TclError):
-            port = 1883
-        return {
-            "host":      self.mqtt_host_var.get().strip(),
-            "port":      port,
-            "username":  self.mqtt_user_var.get().strip(),
-            "password":  self.mqtt_pass_var.get(),
-            "client_id": self.mqtt_cid_var.get().strip() or mqtt_publisher.DEFAULT_CLIENT_ID,
-        }
+            return self._snapshot() != self._baseline
+        except Exception:
+            return False
 
-    def _test_mqtt(self):
-        cfg = self._mqtt_fields()
-        if not cfg["host"]:
-            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
-            return
-        self.mqtt_test_btn.configure(state="disabled")
-        self.mqtt_status.configure(text="Testing connection…", foreground="#666")
+    def _save(self):
+        sections, errors = self._collect()
+        if errors:
+            messagebox.showwarning(
+                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
+            return False
+        for name, values in sections.items():
+            target = CFG.setdefault(name, {})
+            if name == "runpod":
+                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
+            target.update(values)
+        if save_config():
+            self._baseline = self._snapshot()
+            self._save_status_base = "Saved."
+            self.save_status.configure(text="Saved.", foreground="#1a7f37")
+            return True
+        self._save_status_hold = time.time() + 6
+        self.save_status.configure(
+            text="Could not write config.json (check file permissions).",
+            foreground="#b3261e")
+        return False
 
-        def work():
-            ok, msg = mqtt_publisher.test_connection(cfg)
-            def apply():
-                self.mqtt_test_btn.configure(state="normal")
-                self.mqtt_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
-            self.after(0, apply)
+    def _refresh_save_indicator(self):
+        """Light timer mirroring SettingsTab's: 'Not saved' (red) when the form
+        differs from the saved state, 'Saved.' (green) right after a save."""
+        try:
+            if not self.save_status.winfo_exists():
+                return
+            if time.time() >= self._save_status_hold:
+                if self.is_dirty():
+                    self.save_status.configure(text="Not saved", foreground="#b3261e")
+                else:
+                    base = self._save_status_base
+                    self.save_status.configure(
+                        text=base, foreground="#1a7f37" if base == "Saved." else "#666")
+        except Exception:                       # noqa: BLE001
+            pass
+        self.after(400, self._refresh_save_indicator)
 
-        threading.Thread(target=work, daemon=True).start()
-
-    def _publish_mqtt(self):
-        cfg = self._mqtt_fields()
-        if not cfg["host"]:
-            self.mqtt_status.configure(text="Enter the broker host first.", foreground="#b3261e")
-            return
-        self.mqtt_status.configure(text="Publishing…", foreground="#666")
-
-        def work():
-            status, payload = updater.check_for_update(APP_VERSION)
-            update_available = (status == "update")
-            ok, msg = mqtt_publisher.publish_state(cfg, {
-                mqtt_publisher.VERSION_TOPIC:        APP_VERSION,
-                mqtt_publisher.UPDATE_TOPIC:         "yes" if update_available else "no",
-                mqtt_publisher.LATEST_VERSION_TOPIC: payload.version if update_available else APP_VERSION,
-            })
-            self.after(0, lambda: self.mqtt_status.configure(
-                text=msg, foreground="#1a7f37" if ok else "#b3261e"))
-
-        threading.Thread(target=work, daemon=True).start()
+    def revert(self):
+        """Discard unsaved edits: reset every runpod field to the values in CFG."""
+        rp = CFG.get("runpod", {})
+        self.runpod_key_var.set(rp.get("api_key", ""))
+        self.runpod_maxprice_up_var.set(str(rp.get("max_price_per_hour_upscale", 1.10)))
+        self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
+        self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
+        self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
+        self.runpod_provrun_var.set(str(rp.get("provision_max_runtime_minutes", 60)))
+        self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
+        # Reset the GPU combos to the curated lists (discard any live-refresh state).
+        self.runpod_gpu_cmb.configure(values=runpod_client.GPU_TYPES)
+        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
+        self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
+        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
+        self.runpod_tag_gpu_cmb.configure(values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES])
+        self.runpod_tag_gpu_var.set(self._tag_gpu_label_by_id.get(
+            rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1]),
+            runpod_client.TAG_GPU_TYPES[0][0]))
+        dc_ids = rp.get("data_center_ids") or []
+        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
+        self._sync_region_dc_to(cur_dc)
+        saved_vid = rp.get("network_volume_id", "")
+        saved_vlabel = rp.get("network_volume_label", "")
+        self.runpod_vol_var.set(
+            saved_vlabel if saved_vlabel and saved_vlabel.split("|", 1)[0].strip() == saved_vid
+            else saved_vid)
+        self._baseline = self._snapshot()
+        self._save_status_base = ""
 
     def _runpod_fields(self):
         """The RunPod settings currently in the form (so Test works pre-Save).
@@ -3829,7 +4226,6 @@ class SettingsTab(ttk.Frame):
         dc_id = self._selected_dc_id()
         return {
             "api_key":              self.runpod_key_var.get().strip(),
-            "hourly_rate":          _num(self.runpod_rate_var, 0.90, float),
             "max_price_per_hour_upscale": _num(self.runpod_maxprice_up_var, 1.10, float),
             "max_price_per_hour_tag":     _num(self.runpod_maxprice_tag_var, 0.50, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
@@ -3847,7 +4243,10 @@ class SettingsTab(ttk.Frame):
             # next launch instead of just the bare id; blank when no real volume.
             "network_volume_label": (self.runpod_vol_var.get()
                                      if self._selected_volume_id() else ""),
-            # Carried through unchanged (no UI yet) so a save never drops them.
+            # Carried through unchanged (no UI) so a save never drops them.
+            # hourly_rate has no UI control (live GPU prices + the per-task ceilings
+            # replaced it); only the `status` dev CLI still reads it for a cost estimate.
+            "hourly_rate":      rp.get("hourly_rate", 0.90),
             "image_name":       rp.get("image_name", ""),
             "template_id":      rp.get("template_id", ""),
             "container_disk_gb": rp.get("container_disk_gb", 30),
@@ -3947,12 +4346,15 @@ class SettingsTab(ttk.Frame):
 
     def _on_volume_selected(self, *_):
         """When the user picks an existing volume, follow it: a volume is
-        region-locked, so the Region/Data center should reflect where it lives."""
+        region-locked, so the Region/Data center should reflect where it lives, and
+        the Upscale/Tag GPU lists should refresh for that data center. Picking a
+        volume from another region is thus the reverse of changing the DC by hand."""
         parts = self.runpod_vol_var.get().split("|")
         if len(parts) >= 4:
             dc = parts[-1].strip()
             if dc and dc != "?":
                 self._sync_region_dc_to(dc)
+                self._refresh_settings_gpus()
 
     def _refresh_datacenters(self):
         """Pull the live storage-capable data-center list from RunPod (GraphQL) and
@@ -4061,7 +4463,6 @@ class SettingsTab(ttk.Frame):
                                          foreground="#b3261e")
             return
         self.runpod_status.configure(text="Listing network volumes…", foreground="#666")
-        want = select_id or self._selected_volume_id()
 
         def work():
             try:
@@ -4075,37 +4476,63 @@ class SettingsTab(ttk.Frame):
                     self.runpod_status.configure(text=err, foreground="#b3261e")
                     return
                 self._all_volumes = [v for v in vols if isinstance(v, dict)]
-                n = self._apply_volume_filter(select_id=want)
+                # select_id forces a pick (e.g. a just-created volume); a plain
+                # Refresh (None) lets the filter follow the selected data center.
+                total, n = self._apply_volume_filter(select_id=select_id)
                 dc = self._selected_dc_id() or "the selected data center"
-                self.runpod_status.configure(
-                    text=(f"{n} model volume(s) in {dc}." if n else
-                          f"No model volume in {dc} yet — use Create…"),
-                    foreground="#1a7f37" if n else "#666")
+                if total:
+                    self.runpod_status.configure(
+                        text=(f"{total} volume(s) on your account · {n} in {dc}."
+                              if n else
+                              f"{total} volume(s) on your account · none in {dc} "
+                              "(use Create…)."),
+                        foreground="#1a7f37")
+                else:
+                    self.runpod_status.configure(
+                        text="No network volumes on your account yet — use Create…",
+                        foreground="#666")
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _volume_label(self, v):
+        return (f"{v.get('id','')} | {v.get('name','?')} | "
+                f"{v.get('size','?')} GB | {v.get('dataCenterId','?')}")
+
     def _apply_volume_filter(self, select_id=None):
-        """Show only the cached volumes that live in the selected data center; when
-        there are none, a single 'None | <data center>' placeholder. Returns the
-        count of real volumes shown. No-op (returns 0) before the first fetch, so
-        the saved id stays visible on first open."""
+        """Populate the Model volume combobox with ALL of the account's volumes (so
+        the user can see and pick any volume without hunting region-by-region), and
+        select the one in the currently-selected data center — or a 'None | <dc>'
+        placeholder when that DC has none. Returns (total, in_dc) counts; (0, 0)
+        before the first fetch, so the saved id stays visible on first open."""
         if self._all_volumes is None:
-            return 0
+            return (0, 0)
         dc = self._selected_dc_id()
-        vols = [v for v in self._all_volumes if v.get("dataCenterId") == dc] if dc else []
-        if vols:
-            labels = [f"{v.get('id','')} | {v.get('name','?')} | "
-                      f"{v.get('size','?')} GB | {v.get('dataCenterId','?')}"
-                      for v in vols]
-        else:
+        all_labels = [self._volume_label(v) for v in self._all_volumes]
+        in_dc = [v for v in self._all_volumes if v.get("dataCenterId") == dc] if dc else []
+        # A DC with no volume still needs a readable selection: prepend a
+        # 'None | <dc>' placeholder (kept first so it's easy to spot in the list).
+        values = list(all_labels)
+        placeholder = None
+        if not in_dc:
             dc_label = self._dc_label_by_id.get(dc, dc) if dc else "(no data center)"
-            labels = [f"None | {dc_label}"]
-        self.runpod_vol_cmb.configure(values=labels)
-        want = select_id or self._selected_volume_id()
-        match = next((l for l in labels if l.split("|", 1)[0].strip() == want), None) if want else None
-        self.runpod_vol_var.set(match or labels[0])
-        return len(vols)
+            placeholder = f"None | {dc_label}"
+            values = [placeholder] + values
+        self.runpod_vol_cmb.configure(values=values)
+        # Selection: an explicit target wins; else keep the current pick when it
+        # belongs to this DC; else the DC's own volume; else the placeholder. So a
+        # DC change follows the DC, while a Refresh keeps a still-valid selection.
+        cur = self._selected_volume_id()
+        want = select_id or (cur if any(v.get("id") == cur and v.get("dataCenterId") == dc
+                                        for v in self._all_volumes) else None)
+        sel = (next((l for l in all_labels if l.split("|", 1)[0].strip() == want), None)
+               if want else None)
+        if sel is None and in_dc:
+            sel = self._volume_label(in_dc[0])
+        if sel is None:
+            sel = placeholder or (values[0] if values else "")
+        self.runpod_vol_var.set(sel)
+        return (len(self._all_volumes), len(in_dc))
 
     def _create_volume(self):
         """Create a network volume in the selected region's data center (this
@@ -4202,6 +4629,137 @@ class SettingsTab(ttk.Frame):
                 self.runpod_status.configure(
                     text=f"Deleted volume {vid}.", foreground="#1a7f37")
                 self._refresh_volumes()
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── Your pods (list + terminate) ──────────────────────────────────────────
+    def _active_pod_ids(self):
+        app = getattr(self, "app", None)
+        return app.active_remote_pod_ids() if app is not None else set()
+
+    def _refresh_pods(self):
+        """Fetch every pod on the account (running or exited) and show it."""
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_pods_status.configure(text="Enter a RunPod API key first.",
+                                              foreground="#b3261e")
+            return
+        self.runpod_pods_status.configure(text="Listing pods…", foreground="#666")
+
+        def work():
+            try:
+                pods = runpod_client.list_pods_detailed(key)
+                err = None
+            except runpod_client.RunPodError as exc:
+                pods, err = [], str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_pods_status.configure(text=err, foreground="#b3261e")
+                    return
+                self._pods_data = [p for p in pods if isinstance(p, dict)]
+                self._render_pods()
+                n = len(self._pods_data)
+                self.runpod_pods_status.configure(
+                    text=(f"{n} pod(s) on your account." if n
+                          else "No pods on your account."),
+                    foreground="#1a7f37" if n else "#666")
+            self.after(0, apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pod_fields(self, p):
+        """Display tuple for one pod from a normalized runpod_client record
+        ({id, name, status, gpu, gpu_count, region, data_center, cost})."""
+        pid = p.get("id", "")
+        name = p.get("name") or pid
+        status = p.get("status") or "?"
+        gpu = p.get("gpu") or "?"
+        cnt = p.get("gpu_count")
+        if cnt and gpu != "?":
+            gpu = f"{cnt}× {gpu}"
+        region = p.get("region") or "?"
+        dc = p.get("data_center") or "?"
+        cost = p.get("cost")
+        cost = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
+        return pid, name, status, gpu, region, dc, cost
+
+    def _render_pods(self):
+        """Rebuild the pods tree from the cached data, marking the live pod(s)."""
+        tree = self.runpod_pods_tree
+        if not tree.winfo_exists():
+            return
+        tree.delete(*tree.get_children())
+        self._pod_rows = {}
+        active = self._active_pod_ids()
+        for p in self._pods_data:
+            pid, name, status, gpu, region, dc, cost = self._pod_fields(p)
+            is_active = pid in active
+            shown = f"{status} · in use" if is_active else status
+            row = tree.insert("", "end", values=(name, shown, gpu, region, dc, cost))
+            self._pod_rows[row] = {"id": pid, "active": is_active}
+        self._refresh_terminate_state()
+
+    def _refresh_terminate_state(self):
+        """Enable Terminate only when a selected pod is not in use by a live run."""
+        if not self.runpod_pods_term_btn.winfo_exists():
+            return
+        sel = self.runpod_pods_tree.selection()
+        info = self._pod_rows.get(sel[0]) if sel else None
+        ok = bool(info) and not info["active"] and info["id"] not in self._active_pod_ids()
+        self.runpod_pods_term_btn.configure(state="normal" if ok else "disabled")
+
+    def on_active_pods_changed(self):
+        """A remote run started/ended: re-mark the list and the Terminate button."""
+        if self._pods_data:
+            self._render_pods()
+        else:
+            self._refresh_terminate_state()
+
+    def _terminate_pod(self):
+        sel = self.runpod_pods_tree.selection()
+        info = self._pod_rows.get(sel[0]) if sel else None
+        if not info:
+            return
+        pid = info["id"]
+        # Re-check liveness at click time (a run may have started since render).
+        if info["active"] or pid in self._active_pod_ids():
+            self.runpod_pods_status.configure(
+                text="That pod is in use by a running remote task — stop it first.",
+                foreground="#b3261e")
+            self._refresh_terminate_state()
+            return
+        key = self.runpod_key_var.get().strip()
+        if not key:
+            self.runpod_pods_status.configure(text="Enter a RunPod API key first.",
+                                              foreground="#b3261e")
+            return
+        vals = self.runpod_pods_tree.item(sel[0], "values")
+        label = f"{vals[0]} ({pid})" if vals else pid
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Terminate this pod?\n\n  {label}\n\n"
+                "This permanently deletes the pod and frees its billing. It does "
+                "NOT touch your model network volume. This cannot be undone.",
+                icon="warning", default="no"):
+            return
+        self.runpod_pods_status.configure(text="Terminating pod…", foreground="#666")
+
+        def work():
+            try:
+                runpod_client.terminate_pod(key, pid)
+                err = None
+            except runpod_client.RunPodError as exc:
+                err = str(exc)
+
+            def apply():
+                if err:
+                    self.runpod_pods_status.configure(text=err, foreground="#b3261e")
+                    return
+                self.runpod_pods_status.configure(
+                    text=f"Terminated pod {pid}.", foreground="#1a7f37")
+                self._refresh_pods()
             self.after(0, apply)
 
         threading.Thread(target=work, daemon=True).start()
@@ -4428,231 +4986,6 @@ class SettingsTab(ttk.Frame):
 
         threading.Thread(target=reader, daemon=True).start()
         win.after(80, pump)
-
-    def _pick_folder(self, var):
-        folder = filedialog.askdirectory(title="Choose a folder")
-        if folder:
-            var.set(os.path.normpath(folder))
-
-    def load_defaults(self):
-        """Refresh the default-folder fields from config (called when a tab's
-        Save-as-Default button updates them, so both views stay in sync)."""
-        defs = CFG.get("defaults", {})
-        self.default_src_var.set(defs.get("upscale_source", ""))
-        self.default_out_var.set(defs.get("upscale_output", ""))
-        self.default_tag_var.set(defs.get("tag_folder", ""))
-        self.default_corig_var.set(defs.get("conciliate_original", ""))
-        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
-
-    def _collect(self):
-        """Build the config sections the form currently describes, without
-        touching CFG. Returns (sections, errors): `sections` maps section name →
-        proposed {key: value}; `errors` names any field that failed validation.
-        Shared by _save (apply) and the unsaved-changes detection (compare)."""
-        errors = []
-        seedvr_out = {}
-        for key, (var, typ) in self._seedvr_vars.items():
-            raw = var.get()
-            if typ is int:
-                try:
-                    seedvr_out[key] = int(str(raw).strip())
-                except ValueError:
-                    errors.append(_SEEDVR_LABELS.get(key, key))
-            elif typ is bool:
-                seedvr_out[key] = bool(var.get())
-            else:
-                seedvr_out[key] = str(raw).strip()
-
-        ups = {}
-        try:
-            ups["upscale_cutoff_pct"] = max(0, min(99, int(self.cutoff_var.get())))
-        except (ValueError, tk.TclError):
-            errors.append("Skip images over")
-        for label, pmx, prs in RESOLUTION_PRESETS:
-            if label == self.restarget_var.get():
-                ups["max_resolution"], ups["resolution"] = pmx, prs
-                break
-        ups["discord_webhook_url"] = self.webhook_var.get().strip()
-        ups["auto_straighten"] = bool(self.up_straighten_var.get())
-        try:
-            up_conf = round(float(self.up_straighten_conf_var.get()), 2)
-        except (ValueError, tk.TclError):
-            up_conf = 0.9
-        ups["straighten_min_confidence"] = min(1.0, max(0.5, up_conf))
-        ups["watchdog_enabled"] = bool(self.watchdog_var.get())
-        try:
-            wd_factor = round(float(self.watchdog_factor_var.get()), 1)
-        except (ValueError, tk.TclError):
-            wd_factor = 3.0
-        ups["watchdog_factor"] = min(10.0, max(1.5, wd_factor))
-        try:
-            ups["watchdog_consecutive"] = max(1, min(10, int(self.watchdog_consec_var.get())))
-        except (ValueError, tk.TclError):
-            ups["watchdog_consecutive"] = 2
-        ups.update(seedvr_out)
-
-        try:
-            conf = round(float(self.straighten_conf_var.get()), 2)
-        except (ValueError, tk.TclError):
-            conf = 0.9
-        try:
-            max_px = max(0, int(self.tag_maxpx_var.get()))
-        except (ValueError, tk.TclError):
-            max_px = 1280
-
-        sections = {
-            "ollama": {
-                "url":   self.ollama_url_var.get().strip() or "http://127.0.0.1:11434",
-                "model": self.ollama_model_var.get().strip(),
-            },
-            "upscale": ups,
-            "defaults": {
-                "upscale_source": self.default_src_var.get().strip(),
-                "upscale_output": self.default_out_var.get().strip(),
-                "tag_folder":     self.default_tag_var.get().strip(),
-                "conciliate_original":  self.default_corig_var.get().strip(),
-                "conciliate_processed": self.default_cproc_var.get().strip(),
-            },
-            "tagging": {
-                "auto_straighten": bool(self.straighten_var.get()),
-                "straighten_min_confidence": min(1.0, max(0.5, conf)),
-                "max_image_px": max_px,
-            },
-            "updates": {"auto_check": bool(self.auto_update_var.get())},
-            "mqtt": self._mqtt_fields(),
-            "runpod": self._runpod_fields(),
-        }
-        return sections, errors
-
-    def _snapshot(self):
-        """A stable, comparable key for the form's current contents — the basis
-        for unsaved-changes detection. Invalid input counts as 'changed'."""
-        sections, errors = self._collect()
-        return json.dumps(sections, sort_keys=True), bool(errors)
-
-    def is_dirty(self):
-        """True if the form differs from the last-saved (baseline) state."""
-        try:
-            return self._snapshot() != self._baseline
-        except Exception:
-            return False
-
-    def _save(self):
-        """Persist the form to config.json. Returns True on success; on a
-        validation error it warns and returns False (nothing is written)."""
-        sections, errors = self._collect()
-        if errors:
-            messagebox.showwarning(
-                APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
-            return False
-
-        for name, values in sections.items():
-            target = CFG.setdefault(name, {})
-            if name == "mqtt":
-                target.pop("enabled", None)   # MQTT is now gated by host being set
-            if name == "runpod":
-                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
-            target.update(values)
-
-        if save_config():
-            self._baseline = self._snapshot()    # the form is now the saved state
-            # Apply MQTT changes immediately (connect/disconnect/reconfigure).
-            self.app.restart_mqtt()
-            self._save_status_base = "Saved."    # the live indicator renders it green
-            self.save_status.configure(text="Saved.", foreground="#1a7f37")
-            return True
-        # Write failed — hold the error on screen so the live indicator doesn't
-        # immediately overwrite it with "Not saved".
-        self._save_status_hold = time.time() + 6
-        self.save_status.configure(
-            text="Could not write config.json (check file permissions).",
-            foreground="#b3261e")
-        return False
-
-    def _refresh_save_indicator(self):
-        """Light timer that keeps `save_status` reflecting the unsaved-changes
-        state live: 'Not saved' (red) whenever the form differs from the saved
-        state, otherwise the clean-state base text ('Saved.' green after a save,
-        blank before). A transient message (e.g. a write error) is left alone until
-        `_save_status_hold` expires. Polling avoids tracing dozens of mixed vars."""
-        try:
-            if not self.save_status.winfo_exists():
-                return
-            if time.time() >= self._save_status_hold:
-                if self.is_dirty():
-                    self.save_status.configure(text="Not saved", foreground="#b3261e")
-                else:
-                    base = self._save_status_base
-                    self.save_status.configure(
-                        text=base, foreground="#1a7f37" if base == "Saved." else "#666")
-        except Exception:                       # noqa: BLE001 (never let the timer die loudly)
-            pass
-        self.after(400, self._refresh_save_indicator)
-
-    def revert(self):
-        """Discard unsaved edits: reset every field to the values in CFG."""
-        ollama = CFG.get("ollama", {})
-        ups    = CFG.get("upscale", {})
-        defs   = CFG.get("defaults", {})
-        tag    = CFG.get("tagging", {})
-        mqtt   = CFG.get("mqtt", {})
-        self.default_src_var.set(defs.get("upscale_source", ""))
-        self.default_out_var.set(defs.get("upscale_output", ""))
-        self.default_tag_var.set(defs.get("tag_folder", ""))
-        self.default_corig_var.set(defs.get("conciliate_original", ""))
-        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
-        self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
-        self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
-        self.straighten_var.set(bool(tag.get("auto_straighten", True)))
-        self.tag_maxpx_var.set(int(tag.get("max_image_px", 1280)))
-        self.straighten_conf_var.set(float(tag.get("straighten_min_confidence", 0.9)))
-        self.restarget_var.set(self._current_preset_label(ups))
-        self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
-        self.up_straighten_var.set(bool(ups.get("auto_straighten", True)))
-        self.up_straighten_conf_var.set(float(ups.get("straighten_min_confidence", 0.9)))
-        self.watchdog_var.set(bool(ups.get("watchdog_enabled", True)))
-        self.watchdog_factor_var.set(float(ups.get("watchdog_factor", 3.0)))
-        self.watchdog_consec_var.set(int(ups.get("watchdog_consecutive", 2)))
-        self.webhook_var.set(ups.get("discord_webhook_url", ""))
-        self.auto_update_var.set(update_auto_check_enabled())
-        self.mqtt_host_var.set(mqtt.get("host", ""))
-        self.mqtt_port_var.set(str(mqtt.get("port", 1883)))
-        self.mqtt_user_var.set(mqtt.get("username", ""))
-        self.mqtt_pass_var.set(mqtt.get("password", ""))
-        self.mqtt_cid_var.set(mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
-        rp = CFG.get("runpod", {})
-        self.runpod_key_var.set(rp.get("api_key", ""))
-        self.runpod_rate_var.set(str(rp.get("hourly_rate", 0.90)))
-        self.runpod_maxprice_up_var.set(str(rp.get("max_price_per_hour_upscale", 1.10)))
-        self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
-        self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
-        self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
-        self.runpod_provrun_var.set(str(rp.get("provision_max_runtime_minutes", 60)))
-        self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
-        # Reset the GPU combos to the curated lists (discard any live-refresh state).
-        self.runpod_gpu_cmb.configure(values=runpod_client.GPU_TYPES)
-        self._gpu_id_by_label = {name: name for name in runpod_client.GPU_TYPES}
-        self.runpod_gpu_var.set(rp.get("gpu_type_id", runpod_client.GPU_TYPES[0]))
-        self._tag_gpu_label_by_id = {gid: lbl for lbl, gid in runpod_client.TAG_GPU_TYPES}
-        self._tag_gpu_id_by_label = {lbl: gid for lbl, gid in runpod_client.TAG_GPU_TYPES}
-        self.runpod_tag_gpu_cmb.configure(values=[lbl for lbl, _ in runpod_client.TAG_GPU_TYPES])
-        self.runpod_tag_gpu_var.set(self._tag_gpu_label_by_id.get(
-            rp.get("tag_gpu_type_id", runpod_client.TAG_GPU_TYPES[0][1]),
-            runpod_client.TAG_GPU_TYPES[0][0]))
-        dc_ids = rp.get("data_center_ids") or []
-        cur_dc = dc_ids[0] if dc_ids else "EU-RO-1"
-        self._sync_region_dc_to(cur_dc)
-        saved_vid = rp.get("network_volume_id", "")
-        saved_vlabel = rp.get("network_volume_label", "")
-        self.runpod_vol_var.set(
-            saved_vlabel if saved_vlabel and saved_vlabel.split("|", 1)[0].strip() == saved_vid
-            else saved_vid)
-        for key, (var, typ) in self._seedvr_vars.items():
-            if key in ups:
-                var.set(ups[key] if typ is bool else str(ups[key]))
-        self._baseline = self._snapshot()
-        self._save_status_base = ""          # discard the "Saved." indicator too
-
 
 # ─────────────────────────────────────────────
 #  TAB 3 — CONCILIATION
@@ -5184,7 +5517,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.minsize(780, 560)
+        self.minsize(900, 560)
         try:
             ttk.Style(self).theme_use("vista")
         except tk.TclError:
@@ -5203,10 +5536,12 @@ class App(tk.Tk):
         self.tag_tab        = TagTab(self.nb, self)
         self.conciliate_tab = ConciliateTab(self.nb, self)
         self.settings_tab   = SettingsTab(self.nb, self)
+        self.runpod_tab     = RunPodTab(self.nb, self)
         self.nb.add(self.upscale_tab,    text="  Batch Upscaler  ")
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
         self.nb.add(self.conciliate_tab, text="  Conciliation  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
+        self.nb.add(self.runpod_tab,     text="  RunPod  ")
         # Bottom status bar with a right-aligned "Report an issue" link (Future
         # Feature #3). Packed before the notebook so it reserves the bottom strip;
         # always visible regardless of the active tab.
@@ -5337,46 +5672,72 @@ class App(tk.Tk):
 
     # ── Unsaved-settings guard ───────────────────────────────────────────────
 
+    def _config_tab_name(self, widget):
+        """Name of a settings-style (save-bar) tab, or None for any other tab."""
+        if widget is self.settings_tab:
+            return "Settings"
+        if widget is self.runpod_tab:
+            return "RunPod"
+        return None
+
     def _on_tab_changed(self, event=None):
-        """When leaving the Settings tab with unsaved edits, prompt to save."""
+        """When leaving a settings-style tab (Settings or RunPod) with unsaved
+        edits, prompt to save."""
         if self._suppress_tab_event:
             return
         try:
             new_widget = self.nb.nametowidget(self.nb.select())
         except Exception:
             return
-        leaving_settings = (self._prev_tab_widget is self.settings_tab
-                            and new_widget is not self.settings_tab)
-        if leaving_settings and self.settings_tab.is_dirty():
-            if self._confirm_unsaved("leaving") == "cancel":
-                # Bounce back to Settings without re-triggering this handler.
+        prev = self._prev_tab_widget
+        prev_name = self._config_tab_name(prev)
+        if prev_name and new_widget is not prev and prev.is_dirty():
+            if self._confirm_unsaved("leaving", prev, prev_name) == "cancel":
+                # Bounce back to the tab we tried to leave, without re-triggering.
                 self._suppress_tab_event = True
                 try:
-                    self.nb.select(self.settings_tab)
+                    self.nb.select(prev)
                 finally:
                     self._suppress_tab_event = False
-                return   # _prev_tab_widget stays on Settings
+                return   # _prev_tab_widget stays on the settings tab
         self._prev_tab_widget = new_widget
         # Entering a tool tab: fill any empty folder field from the pinned
         # default, so a default set in Settings after startup takes effect.
         if isinstance(new_widget, ToolTab):
             new_widget.restore_defaults_if_empty()
 
-    def _confirm_unsaved(self, context):
-        """Modal Save / Don't save / Cancel prompt for unsaved Settings edits.
-        Returns 'ok' (handled — safe to proceed) or 'cancel' (stay put).
-        `context` is 'leaving' or 'closing' for the wording."""
-        verb = "closing" if context == "closing" else "leaving the Settings tab"
+    def _confirm_unsaved(self, context, tab=None, name="Settings"):
+        """Modal Save / Don't save / Cancel prompt for unsaved edits in a
+        settings-style tab. Returns 'ok' (handled — safe to proceed) or 'cancel'
+        (stay put). `context` is 'leaving' or 'closing' for the wording."""
+        tab = tab or self.settings_tab
+        verb = "closing" if context == "closing" else f"leaving the {name} tab"
         ans = messagebox.askyesnocancel(
             APP_TITLE,
-            f"You have unsaved changes in Settings.\n\nSave them before {verb}?")
+            f"You have unsaved changes in {name}.\n\nSave them before {verb}?")
         if ans is None:
             return "cancel"
         if ans:
-            return "ok" if self.settings_tab._save() else "cancel"
+            return "ok" if tab._save() else "cancel"
         # "Don't save" — discard the edits so the form matches config.json again.
-        self.settings_tab.revert()
+        tab.revert()
         return "ok"
+
+    def active_remote_pod_ids(self):
+        """Pod ids currently in use by a running remote task, so the RunPod tab
+        won't offer to terminate a pod a live run depends on."""
+        ids = set()
+        for t in (self.upscale_tab, self.tag_tab):
+            pid = getattr(t, "active_pod_id", None)
+            if pid and t.running:
+                ids.add(pid)
+        return ids
+
+    def notify_active_pods_changed(self):
+        """A remote run started/ended: let the RunPod tab re-mark its pod list."""
+        rt = getattr(self, "runpod_tab", None)
+        if rt is not None:
+            rt.on_active_pods_changed()
 
     def other_tab(self, tab):
         return self.tag_tab if tab is self.upscale_tab else self.upscale_tab
@@ -5656,9 +6017,10 @@ class App(tk.Tk):
         self._update_dialog = UpdateDialog(self, info)
 
     def _on_close(self):
-        # Don't let unsaved Settings edits vanish on exit.
-        if self.settings_tab.is_dirty() and self._confirm_unsaved("closing") == "cancel":
-            return
+        # Don't let unsaved Settings / RunPod edits vanish on exit.
+        for tab, name in ((self.settings_tab, "Settings"), (self.runpod_tab, "RunPod")):
+            if tab.is_dirty() and self._confirm_unsaved("closing", tab, name) == "cancel":
+                return
         # Time each teardown step. If the close is slow (it once flagged "Not
         # Responding"), the per-step breakdown is written to logs/close_timing.log
         # so the real culprit is recorded instead of inferred.

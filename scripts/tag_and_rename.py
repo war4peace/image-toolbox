@@ -1423,6 +1423,9 @@ def _setup_remote_tagging():
     OLLAMA_URL = session.ollama_url                   # tag_and_rename now calls the pod's Ollama
     REMOTE_ORIENT = engine.analyse                    # straighten detection runs on the pod
     REMOTE_SESSION = session                          # so the loop can detect a pod stop
+    # Tell the GUI which pod is live, so the RunPod tab won't offer to terminate
+    # the pod this run depends on (cleared when the run exits).
+    _gui_event("POD", session.pod_id or "")
     _start_remote_telemetry(engine)                   # feed the GUI's 'Remote pod' row
 
     def _remote_teardown():
