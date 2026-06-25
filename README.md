@@ -4,14 +4,20 @@ AI-leveraged image toolbox for Windows: **upscale** low-resolution photos, and
 **describe & rename** them using a local vision model. Built to revive personal
 photo collections and old pictures taken with early digital cameras.
 
-> ## ⚠️ Work in progress — do NOT use it on important data.
+> ## ⚠️ The application is offered as-is.
+> ### ⚠️ The author can't be held responsible for data loss.
 > Always test on a small, disposable sample first. I am not responsible for data
-> loss. Use this tool at your own risk. *(That said: the upscaler never modifies
-> your source files — it only writes new images to a separate output folder.)*
+> loss. Use this tool at your own risk. 
+> *(That said: the application never modifies your original images, unless you 
+> specifically tell it to. Guardrails are put in place so that it is clear when (and how) 
+> your original data is modified.)*
 
-The toolbox runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upscaling
-pipeline **directly in-process** — no ComfyUI, no server to start. Tagging uses a
-local [Ollama](https://ollama.com) vision model. Everything runs on your machine.
+Batch Upscaler runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upscaling pipeline **directly in-process**.
+No ComfyUI, no server to start. Image tagging uses [Ollama](https://ollama.com) vision models.
+* Local work: Everything runs on your machine.
+* Remote pods: Images are sent via SSH to the remote pod **only**.
+* ***No data is sent to third parties, ever. All your data is under your direct control.***
+
 
 ---
 
@@ -23,13 +29,21 @@ No Git, no Python knowledge required:
 2. **Run it** and click through the installer (no administrator rights needed).
 3. **Double-click** the *Image Toolbox* shortcut.
 
-The first launch opens a setup window that downloads the required components
-(Python, PyTorch with CUDA, the SeedVR2 engine — about 3 GB) and then starts the
-app. It also offers to install [Ollama](https://ollama.com) and the vision model
-used by **Tag & Rename** (~6 GB; optional — upscaling works without it, and you
-can decline). The first upscale you run additionally downloads the AI upscaling
-model weights (~16 GB) automatically. Everything the setup prints is saved to
-`bootstrap.log` next to the app for later review.
+The installer offers options to use it locally (taking advantage of your local, powerful GPU)
+or on a remote machine using RunPod.io infrastructure.
+*Note: I have no business relationship with runpod.io. The only (mutual) "advantage"*
+*(in a manner of speaking) is: when you create an account on RunPod from the application, my*
+*referral link is used. This gives both me and you an extra credit of 5 USD when you add*
+*at least 10 USD to your runpod account.*
+
+
+The first launch opens a setup window that downloads the required components:
+Python, PyTorch with CUDA, the SeedVR2 engine (about 3 GB, if you also picked 
+the option to use local resources) and then starts the app. It also offers to install
+[Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works 
+without it, and you can decline). The first upscale process you run additionally downloads
+the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved 
+to `bootstrap.log` in the application folder (useful for troubleshooting).
 
 > **Windows SmartScreen note:** because the installer is a new, unsigned
 > download, Windows may show *"Windows protected your PC — Unknown publisher"*.
@@ -37,10 +51,20 @@ model weights (~16 GB) automatically. Everything the setup prints is saved to
 > public source in this repository by GitHub Actions; you can verify the build on
 > the repository's **Actions** tab.
 
-**Requirements:** Windows 10/11 (64-bit), an NVIDIA GPU with current drivers
-(8 GB VRAM minimum), an internet connection, and ~25 GB of free disk space
-(plus ~6 GB if you install the tagging model). PyTorch ships its own CUDA
-runtime, so a separate CUDA Toolkit install is **not** required.
+**Requirements:**
+
+***Local* Upscaling / Tagging:**
+* Windows 10/11 (64-bit)
+* An NVIDIA GPU with current drivers (16 GB VRAM minimum)
+* An internet connection
+* ~25 GB of free disk space (plus ~6 GB if you install the tagging model). 
+(PyTorch ships its own CUDA runtime, so a separate CUDA Toolkit install is **not** required).
+
+***Remote* Upscaling / Tagging:**
+* Windows 10/11 (64-bit)
+* An internet connection
+* ~3 GB of free disk space (Python infrastructure for application functionality)
+* A runpod.io account (which you can create via a link from the installer, or separately)
 
 ---
 
@@ -84,8 +108,20 @@ so you can mix and match freely.
 
 ## The app
 
-`scripts\toolbox_gui.py` is a Windows GUI (pure Python standard-library tkinter —
-no extra packages) with four tabs.
+Windows GUI (pure Python standard-library tkinter, no extra packages) with five tabs.
+
+### Common features
+
+- **Update checker** makes sure you don't miss updates. Update straight from the app.
+- **Telemetry rows** (for local and/or remote machine): CPU / RAM / VRAM / GPU.
+- **Live feedback:** two-row status (current + previous file), a progress bar,
+  and an estimated time remaining that refreshes after each image.
+- **Live preview**: Batches of 100 images are loaded into a "preview" pane,
+  allowing you to open images, perform a live comparison (upscaled images),
+  context menu (right-click images) with common actions. 
+- **Resizable thumbnails** in the film strip area.
+- **Notification support**: Currently supports *Discord*, *Telegram* and *ntfy.sh*.
+- **MQTT integration** (e.g. for Home Assistant).
 
 ### Batch Upscaler
 
@@ -104,49 +140,48 @@ no extra packages) with four tabs.
   (corrupt files are listed at the end so you can review them); a **second pass**
   re-scans the source when the batch finishes and processes anything new that
   appeared while it ran.
-- **Live feedback:** a thumbnail wall, two-row status (current + previous file),
-  a progress bar, and an estimated time remaining that refreshes after each image.
-- **Pause / resume / stop** are buttons; a stop finishes the current image first
+- **Pause / resume / stop** buttons; a stop finishes the current image first
   so a file is never left half-written.
+- **Log window**: Displays more detailed information in a separate window.  
 - **Works with mapped network drives.**
 
 ### Tag & Rename
 
-- Analyses each image with a local Ollama vision model, writes a description into
-  EXIF, and renames the file to `OriginalName_Condensed_Description.ext`.
+Analyses each image with a local/remote Ollama vision model, writes a 
+  description into EXIF, and renames the file to `OriginalName_Condensed_Description.ext`.
 - **Auto-straighten** (on by default): a small local CNN detects photos shot with
-  the camera held sideways and rotates them upright *before* tagging — which also
+  the camera held sideways and rotates them upright *before* tagging, which also
   improves the descriptions. Only confident calls are acted on; upside-down and
   ambiguous images are left alone and logged, so a photo is never wrongly rotated.
   Toggle it and tune the confidence threshold in **Settings**; rotations are
   reverted by **Undo** like everything else.
 - **Selectable description language**, plus force-tag / force-rename options.
-- **One-click Undo** restores file names, EXIF descriptions, or both — every
+- **One-click Undo** restores file names, EXIF descriptions, or both. Every
   change is recorded to an undo cache before anything is modified.
-- Already-tagged files are detected and skipped on re-runs.
+- Already-tagged files are detected and skipped on re-runs (unless forced, optional).
 - **The vision model is your choice** (set it in **Settings**). The default is
-  [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) — the most accurate of
-  the models tried, reading faint on-screen text and inferring fine detail; it
-  needs ~16 GB VRAM (a 16 GB+ GPU). If you have less VRAM, switch to
-  [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast and light (~7.6 GB
-  VRAM, runs on an 8 GB GPU), with a welcome habit of describing only what it can
-  clearly see instead of guessing. In testing, `llava:34b` was the slowest,
-  heaviest *and* least accurate of the models tried — it's not recommended.
+  [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) — the most accurate of the models tried, reading faint on-screen text 
+  and inferring fine detail; it   needs ~16 GB VRAM (a 16 GB+ GPU). 
+  If you have less VRAM, switch to [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast and light (~7.6 GB
+  VRAM, runs on an 8 GB GPU), with a welcome habit of describing 
+  only what it can clearly see instead of guessing. 
+  In testing, `llava:34b` was the slowest, heaviest *and* least accurate 
+  of the models tried. It's the least recommended option.
 
 ### Conciliation
 
 Once you're happy with the upscaled (and optionally tagged & renamed) results,
 **Conciliation** moves them back into your original folder tree so the originals
-are replaced by their high-quality versions — no manual shuffling.
+are replaced by their high-quality versions. No manual shuffling required.
 
 - Pick an **Original Photos** folder and a **Processed Photos** folder, then
   **Scan / Preview**. Nothing is touched until you click **Run**: the preview
-  shows a per-folder summary (how many will be *replaced*, how many images have
-  *no match*, and how many non-image files are *kept*).
+  shows a per-folder summary (how many will be *replaced*, how many images 
+  have *no match*, and how many non-image files are *kept*).
 - Each original is matched to its processed counterpart using the cache
-  database, falling back to filename matching when there's no cache — so it works
+  database, falling back to filename matching when there's no cache. It works
   for both upscaled-only and upscaled-then-tagged/renamed files.
-- Two operations: **Archive originals** (default — moves each original into an
+- Two operations: **Archive originals** (default; moves each original into an
   `__Archive__` subfolder) or **Delete originals** (permanent, with an extra
   confirmation). The processed file then takes the original's place, keeping its
   descriptive name if it was tagged.
@@ -157,17 +192,19 @@ are replaced by their high-quality versions — no manual shuffling.
 
 ### Settings
 
-Everything that used to require hand-editing `config.json` is here:
+Most of what is used to require hand-editing `config.json` is here:
 
 - **Ollama URL** with a reachability check, and a **model** picklist populated
   from the models installed on your machine.
 - **Auto-straighten** toggle and confidence threshold for Tag & Rename.
 - **Resolution Target** (4K / 2K / 1080p) and the **skip-cutoff** percentage.
-- **SeedVR settings** (attention mode, VAE tiling, outage threshold, etc.).
+- **SeedVR settings** (attention mode, VAE tiling, outage threshold).
 - **Discord webhook**, **Telegram bot** and **ntfy** notifications, each with a
   **Test** button (Telegram also has a **Detect** button to find your chat ID).
 - **Default folders** for each tool, also settable from each tab's
   *Save as Default* button.
+- **MQTT** settings (host, port, credentials, test button, manual publish button)
+- **Update checker** settings.
 
 > **Maintainers:** before committing or sharing `config.json`, clear personal
 > data from **Default folders**, the **Notifications** section (Discord webhook,
@@ -213,13 +250,13 @@ a full uninstall.
 
 ---
 
-## Remote GPU cost (RunPod, experimental)
+## Remote GPU cost (RunPod)
 
 If your PC has no capable NVIDIA GPU, the toolbox can run a batch on a rented
-[RunPod](https://runpod.io) GPU instead (tick *Run on remote pod* on the tab;
-experimental). It rents a pod, streams one image at a time, fetches the results
-back, and tears the pod down. Your source files are never uploaded as-is, only
-copies. The tables below estimate what a run costs.
+[RunPod](https://runpod.io) GPU instead (tick *Run on remote pod* on the tab). 
+It rents a pod, streams one image at a time, fetches the results
+back, and tears the pod down upon completion. Your source files are always copied,
+not moved, to the remote pod. The tables below estimate what a run costs.
 
 The figures below come from benchmarking a 100-image sample of typical
 digital-camera photos through the in-app remote-pod runner, on RunPod secure
@@ -229,7 +266,7 @@ model load on the first image, so larger runs cost a little less per image).
 Upscaling figures use the resident-VRAM offload added in 0.3.5, where the SeedVR2
 models stay in GPU memory for the whole run.
 
-### Upscaling (Batch Upscaler)
+### Remote Upscaling (Batch Upscaler)
 
 | GPU | $/h | ~sec/img | $/100 images |
 |-----|----:|---------:|-------------:|
@@ -253,7 +290,7 @@ fast pick, beating both Hopper cards (H100, H200) at a fraction of their price.
 SeedVR2 upscaling rewards newer architectures: Blackwell over Hopper over Ampere
 on raw speed.
 
-### Tag & Rename
+### Remote Tag & Rename
 
 | GPU | $/h | ~sec/img | $/100 images |
 |-----|----:|---------:|-------------:|
