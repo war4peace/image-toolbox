@@ -109,18 +109,41 @@ def _gui_event(kind, payload):
 
 
 class _TeeOutput:
-    """Mirrors everything written to stdout into the session log file."""
+    """Mirrors everything written to stdout into the session log file. Each line
+    in the FILE is prefixed with a wall-clock timestamp (0.3.9) so the on-disk
+    log can reconstruct run timing; stdout itself is untouched (the GUI window
+    adds its own per-line timestamp, and markers bypass the file entirely)."""
 
     def __init__(self, stream, fh):
         self.raw = stream     # _gui_event writes markers here, bypassing the log
         self._fh = fh
+        self._fh_line_start = True   # next file character begins a fresh line
 
     def write(self, data):
         self.raw.write(data)
         try:
-            self._fh.write(data)
+            self._fh.write(self._stamp_for_file(data))
         except Exception:
             pass
+
+    def _stamp_for_file(self, data):
+        """Insert a '<date> | <time> | ' prefix at the start of each new line of
+        `data` for the session log. \\r is passed through; one timestamp per
+        write() call is shared by the lines in that chunk (they arrive together)."""
+        if not data:
+            return data
+        ts = time.strftime("%Y-%m-%d | %H:%M:%S")
+        out = []
+        for part in re.split("(\n)", data):
+            if part == "\n":
+                out.append("\n")
+                self._fh_line_start = True
+            elif part:
+                if self._fh_line_start:
+                    out.append(f"{ts} | ")
+                    self._fh_line_start = False
+                out.append(part)
+        return "".join(out)
 
     def flush(self):
         self.raw.flush()
@@ -1408,6 +1431,9 @@ def _setup_remote_tagging():
     # Tell the GUI which pod is live, so the RunPod tab won't offer to terminate
     # the pod this run depends on (cleared when the run exits).
     _gui_event("POD", session.pod_id or "")
+    # The pod's real billed rate ($/h) drives the GUI's live cost readout.
+    if session.cost_per_hr is not None:
+        _gui_event("RCOST", f"{session.cost_per_hr}")
     _start_remote_telemetry(engine)                   # feed the GUI's 'Remote pod' row
 
     def _remote_teardown():
@@ -1788,8 +1814,9 @@ def main():
             _gui_event("RESULT", json.dumps([new_path, "ok"]))
             # GUI ETA: elapsed, images processed this session, position, total.
             # Averaged over processed count, not the counter (which also
-            # advances on skipped/already-tagged files).
-            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}")
+            # advances on skipped/already-tagged files). Trailing 'P' marks the
+            # real processing phase for the GUI's live cost readout.
+            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}|P")
 
         except Exception as e:
             img_elapsed   = time.time() - img_start

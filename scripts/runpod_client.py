@@ -324,6 +324,16 @@ def allowed_cuda_versions(image):
     return out or None
 
 
+def is_consumer_gpu(gpu_id):
+    """True for consumer GeForce cards. They do NOT support CUDA forward
+    compatibility, so a newer-CUDA image won't START on a host with an older
+    driver (an RTX 4090 @ 12.7 can't launch a cu128 image). Datacenter/pro cards
+    (A100, H100, H200, B200, A40, A6000, L4/L40, RTX PRO/RTX A…) DO forward-compat
+    and run the same image on older drivers. Used to decide whether a deploy
+    should pin a CUDA-version floor (see deploy_pod)."""
+    return "geforce" in (gpu_id or "").lower()
+
+
 _DEPLOY_MUTATION = """
 mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) { id machineId costPerHr }
@@ -370,10 +380,23 @@ def deploy_pod(api_key, spec, timeout=90):
         inp["networkVolumeId"] = vol
         # REST defaults this; GraphQL requires it or the bind-mount fails.
         inp["volumeMountPath"] = spec.get("volumeMountPath", "/workspace")
-    # Only place the pod on a machine whose driver CUDA can run the image — a
-    # CUDA-12.7 host can't start a cu128 image, and that failure burns the whole
-    # GPU fallback chain. Caller may override with spec["allowedCudaVersions"].
-    cuda = spec.get("allowedCudaVersions") or allowed_cuda_versions(inp["imageName"])
+    # CUDA driver floor — applied ONLY to consumer GeForce cards. A GeForce card
+    # has no CUDA forward-compat, so a cu128 image won't START on a host driver
+    # below 12.8 (an RTX 4090 @ 12.7 failed exactly this, which is why the floor
+    # exists). Datacenter/pro cards DO forward-compat and run the image on older
+    # drivers, so a floor only hurts them: it excludes every in-stock host whose
+    # driver is older than the image (e.g. A100 PCIe @ 12.4–12.7 in EU-RO-1, which
+    # run cu128 fine) and surfaces as "no instances available" even when the
+    # console shows the card available. Omit it for them, matching the website
+    # deploy that works. An explicit spec override always wins.
+    explicit = spec.get("allowedCudaVersions")
+    gpu0 = gpu_ids[0] if gpu_ids else ""
+    if explicit:
+        cuda = explicit
+    elif is_consumer_gpu(gpu0):
+        cuda = allowed_cuda_versions(inp["imageName"])
+    else:
+        cuda = None
     if cuda:
         inp["allowedCudaVersions"] = cuda
     data = _graphql(api_key, _DEPLOY_MUTATION, {"input": inp}, timeout=timeout)

@@ -51,6 +51,9 @@ Source: "..\pod\*.sh";            DestDir: "{app}\pod"; Flags: ignoreversion
 Source: "..\bootstrap.ps1";       DestDir: "{app}"; Flags: ignoreversion
 Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
+; Author benchmark data — drives the remote-pod "$ / 100 images" cost estimate
+; (benchmarks.py reads it from {app}\docs).
+Source: "..\docs\Benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "toolbox.ico";            DestDir: "{app}"; Flags: ignoreversion
 ; Never overwrite the user's configuration on upgrades, never delete it on uninstall
 Source: "..\config.json";         DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall

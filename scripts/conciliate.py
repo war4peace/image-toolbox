@@ -101,16 +101,21 @@ class Logger:
         self._fh.write(f"\n{'=' * 64}\nConciliation session: {ts}\n"
                        f"Original: {original_root}\n{'=' * 64}\n")
 
+    def _ts(self):
+        return datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+
     def tee(self, msg=""):
+        # Stdout stays clean (the GUI window adds its own timestamp); the on-disk
+        # log carries a per-line timestamp (0.3.9) for run-timing reconstruction.
         print(msg)
         try:
-            self._fh.write(msg + "\n")
+            self._fh.write(f"{self._ts()} | {msg}\n")
         except Exception:
             pass
 
     def log_only(self, msg):
         try:
-            self._fh.write(msg + "\n")
+            self._fh.write(f"{self._ts()} | {msg}\n")
         except Exception:
             pass
 

@@ -74,6 +74,10 @@ class RemoteSession:
         self.host = attach[1] if attach else None
         self.ssh_port = attach[2] if attach else None
         self.engine = None
+        # Real billed rate of the deployed pod ($/h). Filled when the pod is
+        # created (or read back for a reused pod); the runner forwards it to the
+        # GUI's live cost readout. None until known.
+        self.cost_per_hr = None
         self.worker_version = self._worker_version()
 
     def _worker_version(self):
@@ -151,6 +155,7 @@ class RemoteSession:
             if found:
                 self.pod_id, self.host, self.ssh_port = found
                 self._attach = found
+                self.cost_per_hr = self._read_pod_cost(self.pod_id)
                 self._emit(f"Reusing running pod {self.pod_id} ({self.host}).")
             else:
                 self._create_pod()
@@ -251,6 +256,22 @@ class RemoteSession:
                                       deploy_timeout=240, poll=8, on_event=ev)
         self.pod_id = pod.get("id")
         self.host, self.ssh_port = rp.ssh_endpoint(pod)
+        # The deploy/running pod dict carries costPerHr — the REAL billed rate of
+        # whichever GPU in the fallback chain actually deployed, so the live cost
+        # readout reflects the bill, not the picked card.
+        self.cost_per_hr = pod.get("costPerHr")
+        if self.cost_per_hr is None:
+            self.cost_per_hr = self._read_pod_cost(self.pod_id)
+
+    def _read_pod_cost(self, pod_id):
+        """Best-effort $/h for an existing pod (reused, or when the deploy
+        response omitted it). Fail-safe: None on any error."""
+        if not pod_id:
+            return None
+        try:
+            return rp.get_pod(self.api_key, pod_id).get("costPerHr")
+        except Exception:                                # noqa: BLE001 (best-effort)
+            return None
 
     def _push_files(self):
         self._emit("Uploading worker + dead-man's switch to the pod …")

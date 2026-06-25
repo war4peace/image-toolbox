@@ -356,21 +356,16 @@ class Logger:
         return datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
 
     def tee(self, msg, timestamp=False):
-        """Print to terminal and write to log file."""
-        if timestamp:
-            line = f"{self._ts()} | {msg}"
-        else:
-            line = msg
-        print(line)
-        self._fh.write(line + "\n")
+        """Print to terminal and write to log file. Every file line carries a
+        timestamp (0.3.9) so the on-disk log reconstructs run timing; stdout
+        stays clean (the GUI window adds its own per-line timestamp). The legacy
+        `timestamp` flag is kept for call-site compatibility but no longer needed."""
+        print(msg)
+        self._fh.write(f"{self._ts()} | {msg}\n")
 
     def log_only(self, msg, timestamp=False):
-        """Write to log file only (not printed to terminal)."""
-        if timestamp:
-            line = f"{self._ts()} | {msg}"
-        else:
-            line = msg
-        self._fh.write(line + "\n")
+        """Write to log file only (not printed to terminal); always timestamped."""
+        self._fh.write(f"{self._ts()} | {msg}\n")
 
     def terminal_only(self, msg):
         """Print to terminal only (not written to log)."""
@@ -1327,9 +1322,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             folder_stats[dirpath]["processed"] += 1
             total_processed += 1
             # GUI ETA: pause-excluded elapsed, images actually processed this
-            # session, current position and total. The GUI averages over the
-            # processed count (NOT the counter, which also advances on skips).
-            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}")
+            # session, current position and total. The trailing 'P' marks this as
+            # the real image-PROCESSING phase (scan/verify/eligibility ETAs omit
+            # it), so the GUI only tracks cost while images are actually upscaled.
+            # The GUI averages over the processed count (NOT the counter, which
+            # also advances on skips).
+            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}|P")
 
             # ── Performance watchdog: degradation detection ──────────────────
             # Seconds per output megapixel vs the run's healthy minimum. The
@@ -1614,6 +1612,9 @@ def main():
             # Tell the GUI which pod is live, so the RunPod tab won't offer to
             # terminate the pod this run depends on (cleared when the run exits).
             _gui_event("POD", session.pod_id or "")
+            # The pod's real billed rate ($/h) drives the GUI's live cost readout.
+            if session.cost_per_hr is not None:
+                _gui_event("RCOST", f"{session.cost_per_hr}")
             # Guarantee teardown on any normal/sys.exit path; the on-pod
             # dead-man's switch is the backup if the process is hard-killed.
             # The GUI's "Stop" modal can override the teardown (stop the pod now

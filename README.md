@@ -263,8 +263,10 @@ digital-camera photos through the in-app remote-pod runner, on RunPod secure
 cloud (EU region, June 2026), across roughly fifteen GPUs. `~sec/img` and
 `$/100` are whole-run averages over the 100 images (they include the one-time
 model load on the first image, so larger runs cost a little less per image).
-Upscaling figures use the resident-VRAM offload added in 0.3.5, where the SeedVR2
-models stay in GPU memory for the whole run.
+Where a card was benchmarked more than once, the figures average its valid runs
+(any run flagged degraded by the performance watchdog is left out). Upscaling
+figures use the resident-VRAM offload added in 0.3.5, where the SeedVR2 models
+stay in GPU memory for the whole run.
 
 ### Remote Upscaling (Batch Upscaler)
 
@@ -274,7 +276,8 @@ models stay in GPU memory for the whole run.
 | NVIDIA RTX A6000 | 0.49 | 14.3 | $0.19 |
 | RTX 5090 † | 0.99 | 12.9 | $0.36 |
 | **RTX PRO 6000 Blackwell** *(fast pick)* | 2.09 | 7.5 | $0.44 |
-| A100 80GB SXM4 | 1.49 | 14.0 | $0.58 |
+| A100 80GB PCIe | 1.39 | 13.8 | $0.53 |
+| A100 80GB SXM4 | 1.49 | 13.7 | $0.56 |
 | H100 80GB HBM3 | 3.29 | 8.8 | $0.81 |
 | **NVIDIA B200** *(fastest)* | 5.89 | 5.9 | $0.96 |
 | NVIDIA H200 | 4.39 | 7.9 | $0.96 |
@@ -287,6 +290,9 @@ are the value winners: slower per image than a 5090 but far cheaper per hour, an
 the resident-VRAM offload is what makes them viable. For raw speed the B200 leads
 (5.9 sec/img) but at five times the cost, while the **RTX PRO 6000** is the sane
 fast pick, beating both Hopper cards (H100, H200) at a fraction of their price.
+The two A100 80GB variants land mid-pack at ~13.8 sec/img (the PCIe a touch
+cheaper per 100 than the SXM4): capable but unremarkable for upscaling, since the
+cheaper Ampere cards are far better value and the newer cards are far faster.
 SeedVR2 upscaling rewards newer architectures: Blackwell over Hopper over Ampere
 on raw speed.
 

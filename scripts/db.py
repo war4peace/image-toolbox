@@ -104,6 +104,23 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     size  INTEGER,
     hash  TEXT
 );
+
+-- Per-user GPU timing for the remote-pod cost estimator (0.3.9). Cumulative
+-- images + processing seconds per (task, gpu_id), accumulated from finished
+-- remote runs, so a future run on the same card warm-starts its "$ / 100 images"
+-- estimate from the user's OWN history instead of "N/A". TIME only, never cost
+-- (cost is derived as time x the live hourly rate, so it stays correct as RunPod
+-- prices move). `task` matches the benchmark labels (Tag & rename / the two
+-- upscale variants); `gpu_id` is the exact RunPod GPU id.
+CREATE TABLE IF NOT EXISTS gpu_perf (
+    task    TEXT NOT NULL,
+    gpu_id  TEXT NOT NULL,
+    runs    INTEGER NOT NULL DEFAULT 0,
+    images  INTEGER NOT NULL DEFAULT 0,
+    seconds REAL    NOT NULL DEFAULT 0,
+    updated TEXT,
+    PRIMARY KEY (task, gpu_id)
+);
 """
 
 _conn = None   # one connection per process
@@ -133,6 +150,51 @@ def get_conn():
 
 def _norm(p):
     return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+
+# ─────────────────────────────────────────────
+#  GPU PERFORMANCE (remote cost estimator)
+# ─────────────────────────────────────────────
+
+def record_gpu_perf(conn, task, gpu_id, images, seconds, min_images=20):
+    """Accumulate a finished remote run's GPU timing for (task, gpu_id). Stores
+    cumulative images + processing seconds (a lifetime average); a run shorter
+    than `min_images` is ignored as too noisy to trust. TIME only — never cost."""
+    if not task or not gpu_id:
+        return
+    try:
+        images  = int(images)
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if images < min_images or seconds <= 0:
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "INSERT INTO gpu_perf (task, gpu_id, runs, images, seconds, updated) "
+        "VALUES (?, ?, 1, ?, ?, ?) "
+        "ON CONFLICT(task, gpu_id) DO UPDATE SET "
+        "runs = runs + 1, images = images + excluded.images, "
+        "seconds = seconds + excluded.seconds, updated = excluded.updated",
+        (task, gpu_id, images, seconds, now))
+    conn.commit()
+
+
+def get_gpu_perf(conn, task, gpu_id, min_images=100):
+    """The user's own seconds-per-100-images for (task, gpu_id), or None until
+    there is enough recorded history (< `min_images` cumulative). Used to
+    supersede the author benchmark once the user has run this GPU enough."""
+    if not task or not gpu_id:
+        return None
+    row = conn.execute(
+        "SELECT images, seconds FROM gpu_perf WHERE task = ? AND gpu_id = ?",
+        (task, gpu_id)).fetchone()
+    if not row:
+        return None
+    images, seconds = row["images"], row["seconds"]
+    if not images or images < min_images or not seconds or seconds <= 0:
+        return None
+    return seconds / images * 100.0
 
 
 # ─────────────────────────────────────────────

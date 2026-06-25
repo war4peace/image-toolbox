@@ -89,7 +89,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.3.9"
 
 if crash_logger:
     crash_logger.set_version(APP_VERSION)
@@ -455,6 +455,17 @@ def _fmt_eta(seconds):
     return ", ".join(f"{v:02d}{suffix}" for v, suffix in parts)
 
 
+# Tooltips for the remote-pod "$ / 100 images" readout (0.3.9): the estimate is
+# author-benchmark-derived before/through image 99, then recomputed from the live
+# run once 100 images have been measured.
+COST100_TIP_BENCH = ("Estimated cost per 100 images, derived from the author's "
+                     "benchmarks for the selected GPU.")
+COST100_TIP_USER  = ("Estimated cost per 100 images, derived from your own "
+                     "previous runs on this GPU.")
+COST100_TIP_RUN   = ("Cost per 100 images, calculated from the current run "
+                     "(time over the last 100 images x this pod's hourly rate).")
+
+
 class ProgressBar(tk.Canvas):
     """A determinate progress bar that draws its own percentage on the fill."""
 
@@ -584,11 +595,23 @@ class TelemetryRow(ttk.Frame):
 #  LOG PANE
 # ─────────────────────────────────────────────
 
+def _log_hms():
+    """Wall-clock time prefix for a log line in the GUI window (HH:MM:SS). The
+    on-disk log uses a fuller date+time (runs can span days); a live session
+    window only needs the time of day."""
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
 class LogPane(ttk.Frame):
     """
     Read-only text console. Understands carriage returns the way a terminal
     does (an in-place progress update erases the current line), so the
     scripts' live counters render correctly instead of flooding the log.
+
+    Each line is prefixed with a wall-clock '[HH:MM:SS]' timestamp (0.3.9), to
+    help reconstruct total run time and correlate the log with external events.
+    Live chunks are stamped here at render time (≈ arrival); backlog text is
+    fed pre-stamped (stamp=False) from ConsoleBuffer's recorded per-line times.
     """
 
     MAX_LINES = 4000
@@ -616,8 +639,15 @@ class LogPane(ttk.Frame):
         # A carriage return only repositions the cursor — the line is erased
         # when the overwriting text arrives, possibly in a later chunk.
         self._pending_cr = False
+        # True when the next real token starts a fresh line (so a timestamp is
+        # due). Tracked across chunks; a \r-overwrite restarts the line too.
+        self._at_line_start = True
 
-    def feed(self, data):
+    def feed(self, data, stamp=True):
+        """Render a chunk. `stamp=True` prefixes a '[HH:MM:SS]' to each new line
+        as it is drawn (live output); `stamp=False` renders the text verbatim
+        (pre-stamped backlog) while still tracking line-start state so the next
+        live chunk continues correctly."""
         data = sanitize(data.replace("\r\n", "\n"))
         if not data:
             return
@@ -627,6 +657,7 @@ class LogPane(ttk.Frame):
         for token in re.split("([\r\n])", data):
             if token == "\n":
                 self._pending_cr = False
+                self._at_line_start = True
                 t.insert("end", "\n")
             elif token == "\r":
                 self._pending_cr = True
@@ -634,6 +665,10 @@ class LogPane(ttk.Frame):
                 if self._pending_cr:
                     self._pending_cr = False
                     t.delete("end-1c linestart", "end-1c")
+                    self._at_line_start = True
+                if stamp and self._at_line_start:
+                    t.insert("end", f"[{_log_hms()}] ")
+                self._at_line_start = False
                 t.insert("end", token)
         lines = int(t.index("end-1c").split(".")[0])
         if lines > self.MAX_LINES:
@@ -646,6 +681,8 @@ class LogPane(ttk.Frame):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
+        self._pending_cr    = False
+        self._at_line_start = True
 
 
 # ─────────────────────────────────────────────
@@ -669,6 +706,7 @@ class ConsoleBuffer:
 
     def __init__(self):
         self._lines       = [""]      # current line is _lines[-1]
+        self._times       = [None]    # parallel: wall-clock HH:MM:SS per line
         self._pending_cr  = False
         self._observers   = []
 
@@ -687,26 +725,45 @@ class ConsoleBuffer:
             if token == "\n":
                 self._pending_cr = False
                 self._lines.append("")
+                self._times.append(None)
             elif token == "\r":
                 self._pending_cr = True
             elif token:
                 if self._pending_cr:
                     self._pending_cr = False
                     self._lines[-1] = ""
+                    self._times[-1] = None
+                # Stamp the line the moment its first character arrives, so the
+                # backlog shows when each line actually happened (not when a log
+                # window was later opened).
+                if self._times[-1] is None:
+                    self._times[-1] = _log_hms()
                 self._lines[-1] += token
         if len(self._lines) > self.MAX_LINES:
-            del self._lines[:len(self._lines) - self.MAX_LINES]
+            cut = len(self._lines) - self.MAX_LINES
+            del self._lines[:cut]
+            del self._times[:cut]
         for cb in list(self._observers):
             cb(data)
 
     def clear(self):
         self._lines      = [""]
+        self._times      = [None]
         self._pending_cr = False
         for cb in list(self._observers):
             cb(None)
 
     def text(self):
         return "\n".join(self._lines)
+
+    def text_timestamped(self):
+        """Backlog text with each recorded line prefixed by its '[HH:MM:SS]'.
+        Used when a log window opens, so old lines keep their real times; the
+        raw `_lines` stay un-prefixed so the regex helpers below are unaffected."""
+        out = []
+        for line, ts in zip(self._lines, self._times):
+            out.append(f"[{ts}] {line}" if ts else line)
+        return "\n".join(out)
 
     def last_image_lines(self, n):
         """The last n lines that look like per-image processing lines
@@ -764,7 +821,7 @@ class LogViewer(tk.Toplevel):
         self.pane = LogPane(body)
         self.pane.pack(fill="both", expand=True)
 
-        self.pane.feed(console.text())
+        self.pane.feed(console.text_timestamped(), stamp=False)
         self.pane.text.see("end")
         console.add_observer(self._on_console)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -779,7 +836,7 @@ class LogViewer(tk.Toplevel):
         self._console.remove_observer(self._on_console)
         self._console = console
         self.pane.clear()
-        self.pane.feed(console.text())
+        self.pane.feed(console.text_timestamped(), stamp=False)
         self.pane.text.see("end")
         console.add_observer(self._on_console)
 
@@ -1139,6 +1196,22 @@ class ToolTab(ttk.Frame):
         self.telemetry_interval_ms  = None      # set by periodic tabs (Tag/Conciliate)
         self._telemetry_job         = None      # periodic sampler `after` id
         self._telemetry_img_job     = None      # upscaler per-image sample `after` id
+        # Remote-pod live cost tracking (0.3.9). `_remote_rate` = the deployed
+        # pod's real $/h (from the RCOST event; None on local runs). The combined
+        # "Est. Time Remaining / Cost" field and the per-100-images readout derive
+        # from it. `_proc_history` is a per-image (processed, elapsed) trail used
+        # for the sliding last-100-images cost once 100+ images are done.
+        self._remote_rate   = None
+        self._proc_history  = []
+        self._cost100_real  = False             # True once 100+ images measured
+        self._bench_task    = None              # "tag"/"upscale", set by each tab
+        self.cost100_var    = None              # per-100 readout (built per tab)
+        self.cost100_tip    = None              # its (dynamic) tooltip
+        # GPU id + benchmark task this run uses, snapshotted at launch so the
+        # run's measured timing can be recorded on completion (db.gpu_perf) to
+        # warm-start a future run's estimate. None on local runs (nothing to bill).
+        self._run_gpu_id    = None
+        self._run_task      = None
 
     # ── UI helpers ──────────────────────────────────────────────────────────
 
@@ -1146,9 +1219,12 @@ class ToolTab(ttk.Frame):
         """Progress bar + two-row status + full-width image preview wall."""
         pf = ttk.Frame(self)
         pf.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 2))
-        ttk.Label(pf, text="Est. Time Remaining:").pack(side="left")
+        # Label flips to ".../ Cost" on a remote run (when a $/h rate is known);
+        # the value then carries "<time> / $<remaining cost>" (0.3.9).
+        self.eta_label_var = tk.StringVar(value="Est. Time Remaining:")
+        ttk.Label(pf, textvariable=self.eta_label_var).pack(side="left")
         self.eta_var = tk.StringVar(value="—")
-        ttk.Label(pf, textvariable=self.eta_var, width=20, anchor="e",
+        ttk.Label(pf, textvariable=self.eta_var, width=34, anchor="e",
                   font=("Consolas", 9)).pack(side="left", padx=(4, 12))
         self.progress = ProgressBar(pf, width=260)
         self.progress.pack(side="left", fill="x", expand=True)
@@ -1280,6 +1356,16 @@ class ToolTab(ttk.Frame):
             rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
         self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
         Tooltip(self.gpu_refresh_btn, "Re-check availability and pricing.")
+        # Estimated $ / 100 images (0.3.9). Benchmark-derived before a run; switches
+        # to a live figure once 100 images are processed. Hidden on local runs.
+        self.cost100_var = tk.StringVar(value="")
+        self.cost100_lbl = ttk.Label(rr, textvariable=self.cost100_var,
+                                     anchor="w", foreground="#2f6f3f")
+        self.cost100_lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
+        self.cost100_tip = Tooltip(self.cost100_lbl, COST100_TIP_BENCH)
+        # The GPU selection drives the benchmark estimate.
+        self.gpu_combo.bind("<<ComboboxSelected>>",
+                            lambda _e: self._update_cost100_estimate(), add="+")
         self._gpu_choices = []      # parallel to the combobox values (dicts)
         self._gpu_loaded  = False   # True after a successful fetch
         # A Remote-only install defaults the toggle on — load the list up front.
@@ -1290,6 +1376,11 @@ class ToolTab(ttk.Frame):
         on = bool(self.remote_var.get())
         self.gpu_combo.configure(state="readonly" if on else "disabled")
         self.gpu_refresh_btn.configure(state="normal" if on else "disabled")
+        # The $/100 readout is meaningful only for a billed remote run.
+        if on:
+            self._update_cost100_estimate()
+        elif self.cost100_var is not None:
+            self.cost100_var.set("")
         if on and not self._gpu_loaded:
             self._refresh_gpus()
 
@@ -1339,6 +1430,7 @@ class ToolTab(ttk.Frame):
         pref = CFG.get("runpod", {}).get(getattr(self, "_gpu_pref_key", ""), "")
         idx = next((i for i, g in enumerate(gpus) if g["id"] == pref), 0)
         self.gpu_combo.current(idx)
+        self._update_cost100_estimate()
 
     def _gpu_error(self, exc):
         self.gpu_refresh_btn.configure(state="normal")
@@ -1346,6 +1438,100 @@ class ToolTab(ttk.Frame):
         self._gpu_loaded  = False
         self.gpu_pick_var.set("couldn't load list — will use the Settings default")
         self.console.feed(f"[remote] GPU availability check failed: {exc}\n")
+
+    # ── $ / 100 images readout (0.3.9) ───────────────────────────────────────
+
+    def _selected_gpu(self):
+        """The GPU dict currently picked in the combobox, or None."""
+        if not self._gpu_choices:
+            return None
+        idx = self.gpu_combo.current()
+        if idx < 0 or idx >= len(self._gpu_choices):
+            idx = 0
+        return self._gpu_choices[idx]
+
+    def _bench_task_for(self, gpu):
+        """The Benchmarks.csv 'Task' that applies to this tab + GPU. Tagging is
+        one task; upscaling splits by VRAM (resident vs pod-RAM offload), the same
+        40 GB threshold the engine uses."""
+        import benchmarks
+        if self._bench_task == "tag":
+            return benchmarks.TASK_TAG
+        thr = CFG.get("upscale", {}).get("vram_resident_threshold_gb", 40)
+        return benchmarks.upscale_task(gpu.get("memory_gb"), thr)
+
+    def _update_cost100_estimate(self):
+        """Refresh the per-100-images readout from the author's benchmarks for the
+        selected GPU (called pre-run and on GPU change). A live run overrides this
+        once it has measured 100 images (_update_cost100_live)."""
+        if self.cost100_var is None or self._cost100_real:
+            return
+        if not self.remote_var.get():
+            self.cost100_var.set("")
+            return
+        g = self._selected_gpu()
+        if not g:
+            self.cost100_var.set("")
+            return
+        import benchmarks
+        # Precedence: the user's own history on this exact GPU (once they have
+        # enough) -> the author benchmark -> N/A. The tooltip names the source.
+        secs, source = benchmarks.estimate_seconds_per_100(
+            self._bench_task_for(g), g.get("id"), g.get("name"))
+        price = g.get("price")
+        if self.cost100_tip is not None:
+            self.cost100_tip.text = COST100_TIP_USER if source == "user" else COST100_TIP_BENCH
+        if secs is None or price is None:
+            self.cost100_var.set("~ N/A / 100 images")
+        else:
+            cost = secs / 3600.0 * float(price)
+            self.cost100_var.set(f"~ ${cost:,.2f} / 100 images")
+
+    def _update_cost100_live(self, processed, elapsed):
+        """Recompute the per-100-images cost from the current run once 100 images
+        have been processed: time over the last 100 images x the pod's $/h. Before
+        100 the benchmark estimate stands."""
+        if (self.cost100_var is None or self._remote_rate is None
+                or processed < 100 or len(self._proc_history) < 101):
+            return
+        p0, e0 = self._proc_history[-101]           # exactly 100 images back
+        dp, de = processed - p0, elapsed - e0
+        if dp <= 0 or de <= 0:
+            return
+        cost = (de / dp) * 100 / 3600.0 * self._remote_rate
+        self.cost100_var.set(f"${cost:,.2f} / 100 images")
+        if not self._cost100_real:
+            self._cost100_real = True
+            if self.cost100_tip is not None:
+                self.cost100_tip.text = COST100_TIP_RUN
+
+    def _snapshot_cost_run(self, remote):
+        """Remember the GPU id + benchmark task this run uses, so its measured
+        timing can be recorded on completion (db.gpu_perf) and warm-start future
+        $/100 estimates. Local runs record nothing (no GPU bill)."""
+        g = self._selected_gpu() if remote else None
+        self._run_gpu_id = g.get("id") if g else None
+        self._run_task   = self._bench_task_for(g) if g else None
+
+    def _record_gpu_perf(self, payload):
+        """On a finished remote run, accumulate this GPU's measured timing
+        (db.gpu_perf) so a later run on the same card warm-starts its $/100
+        estimate from real data. Time only; keyed by GPU id + benchmark task.
+        Best-effort: any DB error is swallowed."""
+        if self._remote_rate is None or not self._run_gpu_id or not self._run_task:
+            return
+        try:
+            data    = json.loads(payload) if payload else {}
+            images  = int(data.get("processed") or 0)
+            seconds = float(data.get("elapsed_seconds") or 0.0)
+        except (ValueError, TypeError):
+            return
+        try:
+            import db
+            db.record_gpu_perf(db.get_conn(), self._run_task, self._run_gpu_id,
+                               images, seconds)
+        except Exception:                       # noqa: BLE001 (best-effort)
+            pass
 
     def _fallback_ceiling(self):
         """Max $/h an AUTOMATIC fallback GPU may cost. 0 / unset = no cap. Stops a
@@ -1610,6 +1796,16 @@ class ToolTab(ttk.Frame):
             # RunPod tab uses this to protect the live pod from being terminated.
             self.active_pod_id = payload or None
             self.app.notify_active_pods_changed()
+        elif kind == "RCOST" and payload:
+            # The deployed pod's real billed rate ($/h). Arms the live cost
+            # readouts: flip the ETA label to include cost and recompute the
+            # $/100 estimate against the actual rate.
+            try:
+                self._remote_rate = float(payload)
+            except ValueError:
+                self._remote_rate = None
+            if self._remote_rate is not None:
+                self.eta_label_var.set("Est. Time Remaining / Cost:")
         elif kind == "DEGRADED" and payload:
             # Performance watchdog tripped in the runner (sustained slow streak or
             # a hard OOM): it is auto-stopping. Surface it and flash for attention —
@@ -1629,6 +1825,7 @@ class ToolTab(ttk.Frame):
         elif kind == "DONE":
             self._last_done = payload   # JSON summary; published to MQTT on exit
             self.app.flash_attention()  # catch the eye when a long run finishes
+            self._record_gpu_perf(payload)   # learn this GPU's timing for next time
 
     def _reset_stream_state(self):
         """Reset the marker parser, console and preview strip before a new run."""
@@ -1640,6 +1837,13 @@ class ToolTab(ttk.Frame):
         self.preview_name.set("")
         self._final_top = ""
         self.eta_var.set("—")
+        # Reset remote-pod cost tracking; RCOST (re)arms it for a remote run, and
+        # the $/100 readout falls back to the benchmark estimate.
+        self._remote_rate  = None
+        self._proc_history = []
+        self._cost100_real = False
+        self.eta_label_var.set("Est. Time Remaining:")
+        self._update_cost100_estimate()
 
     def _tick(self):
         """Every poll cycle: display freshly decoded strip thumbnails."""
@@ -1666,19 +1870,24 @@ class ToolTab(ttk.Frame):
         self.app.mqtt_publish({mqtt_publisher.TASK_PROGRESS_TOPIC: f"{cur}/{tot}"})
 
     def _handle_eta(self, payload):
-        """ETA event from the running tool: 'elapsed|processed|idx|total'.
+        """ETA event from the running tool: 'elapsed|processed|idx|total[|P]'.
         Estimate = (elapsed / images actually processed this session) ×
         images still to go. Using the processed count — not the position
         counter, which also advances on skipped files — keeps the average
-        per-image time honest. The elapsed value is pause-excluded."""
+        per-image time honest. The elapsed value is pause-excluded. A trailing
+        'P' marks the image-processing phase, which arms the remote-pod cost
+        readouts (scan/verify/eligibility ETAs omit it)."""
+        parts = payload.split("|")
         try:
-            elapsed, processed, idx, total = payload.split("|")
-            elapsed   = float(elapsed)
-            processed = int(processed)
-            idx       = int(idx)
-            total     = int(total)
-        except ValueError:
+            elapsed   = float(parts[0])
+            processed = int(parts[1])
+            idx       = int(parts[2])
+            total     = int(parts[3])
+        except (ValueError, IndexError):
             return
+        # A trailing 'P' marks the real image-processing phase (scan/verify/
+        # eligibility ETAs omit it): only then do we track remote-pod cost.
+        processing = len(parts) > 4 and parts[4] == "P"
         if total > 0:
             self.progress.set(idx * 100 / total)
             self.app.taskbar_progress(idx, total)
@@ -1689,8 +1898,23 @@ class ToolTab(ttk.Frame):
         if processed > 0 and total > 0:
             avg       = elapsed / processed
             remaining = max(0, total - idx)
-            self.eta_var.set(_fmt_eta(avg * remaining))
-            mqtt_values[mqtt_publisher.TASK_ETA_TOPIC] = _fmt_eta(avg * remaining)
+            eta_txt   = _fmt_eta(avg * remaining)
+            # On a billed remote run, pair the remaining time with the remaining
+            # cost (cost-to-go = images left x avg per-image time x the pod's $/h).
+            if processing and self._remote_rate is not None:
+                rem_cost = remaining * avg / 3600.0 * self._remote_rate
+                self.eta_var.set(f"{eta_txt} / ${rem_cost:,.2f}")
+                # Seed a (0 images, ~0 s) boundary so the 100th image yields an
+                # exact last-100 window (otherwise the live figure lags by one).
+                if not self._proc_history:
+                    self._proc_history.append((0, 0.0))
+                self._proc_history.append((processed, elapsed))
+                if len(self._proc_history) > 150:
+                    self._proc_history.pop(0)
+                self._update_cost100_live(processed, elapsed)
+            else:
+                self.eta_var.set(eta_txt)
+            mqtt_values[mqtt_publisher.TASK_ETA_TOPIC] = eta_txt
             mqtt_values[mqtt_publisher.TASK_AVG_TOPIC] = f"{avg:.1f}"
             # Last-image time = work done since the previous ETA tick.
             d_proc = processed - self._mqtt_prev_processed
@@ -2372,6 +2596,7 @@ class UpscaleTab(ToolTab):
         # the persisted preference is runpod.gpu_type_id.
         self._gpu_min_vram = 32
         self._gpu_pref_key = "gpu_type_id"
+        self._bench_task   = "upscale"   # $/100 readout: upscale benchmark rows
         # Upscale fallback ceiling: the cheapest viable 32 GB card is ~$0.74, so a
         # $0.50 cap would leave upscaling with no automatic fallback (see
         # _fallback_ceiling). $1.10 covers the RTX 5090 value pick, blocks A100/B200.
@@ -2613,6 +2838,7 @@ class UpscaleTab(ToolTab):
 
         self.progress.set(0)
         self._reset_stream_state()
+        self._snapshot_cost_run(remote)
         self.status_var.set(
             "Starting the remote pod (first run takes a few minutes) …" if remote
             else "Starting — loading the AI engine (the first run can take a few minutes) …")
@@ -2741,6 +2967,7 @@ class TagTab(ToolTab):
         # is plenty; the persisted preference is runpod.tag_gpu_type_id.
         self._gpu_min_vram = 16
         self._gpu_pref_key = "tag_gpu_type_id"
+        self._bench_task   = "tag"       # $/100 readout: tag benchmark rows
         # Tag fallback ceiling: tagging runs fine on $0.24–0.39 cards, so a low cap
         # keeps a sold-out cheap card from escalating to a pricey one.
         self._gpu_price_key     = "max_price_per_hour_tag"
@@ -2924,6 +3151,7 @@ class TagTab(ToolTab):
         self._mode = "tag"
         self.progress.set(0)
         self._reset_stream_state()
+        self._snapshot_cost_run(remote)
         self.eta_var.set("calculating…")
         self.status_var.set(
             "Starting the remote pod (first run takes a few minutes) …" if remote

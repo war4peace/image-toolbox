@@ -278,7 +278,15 @@ needs spelled out: a mounted network volume requires an explicit `volumeMountPat
 and never gets a public IP. The deploy also passes **`allowedCudaVersions`**
 (`runpod_client.allowed_cuda_versions`, derived from the image's `cuXYZ` tag) so a
 pod only lands on a host whose driver can run the image — a CUDA-12.7 machine
-can't start the cu128 image, and that used to burn the whole GPU fallback chain;
+can't start the cu128 image, and that used to burn the whole GPU fallback chain.
+**This floor is applied to consumer GeForce cards only** (`is_consumer_gpu`): they
+have no CUDA forward-compat, so the image won't start on an older driver.
+Datacenter/pro cards (A100, H100, B200, A40/A6000, L4/L40, RTX PRO/RTX A…) DO
+forward-compat and run the image on older drivers, so a floor only *excludes*
+otherwise-deployable in-stock hosts (an A100 PCIe @ 12.4–12.7 in EU-RO-1 runs
+cu128 fine, yet the floor refused it with "no instances available" while the
+console showed the card available) — so the deploy omits the floor for them,
+matching the website deploy that works;
 (2) a **per-task price ceiling**
 (`runpod.max_price_per_hour_upscale` default **$1.10/h**,
 `runpod.max_price_per_hour_tag` default **$0.50/h**, Settings → Remote)

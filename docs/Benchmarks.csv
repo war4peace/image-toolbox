@@ -22,3 +22,5 @@ Tag & rename,NVIDIA H100 80GB HBM3,$3.29/h,1,100,00:01:16,00:04:01,N/A,Finished 
 Tag & rename,NVIDIA H200,$4.39/h,1,100,00:00:36,00:04:22,N/A,Finished successfully.
 Tag & rename,NVIDIA RTX A4500,$0.25/h,1,100,00:00:46,00:05:54,N/A,Finished successfully.
 Batch Upscaler (in-VRAM DiT+VAE),NVIDIA B200,$5.89/h,1,100,00:00:43,00:12:52,N/A,Finished successfully. WATCHDOG: image #73 took 00:18 for 2880x2160 (~3.7x the healthy rate) [1/2]
+Batch Upscaler (in-VRAM DiT+VAE),NVIDIA A100-SXM4-80GB,$1.49/h,1,100,00:01:15,00:22:15,N/A,Finished successfully.
+Batch Upscaler (in-VRAM DiT+VAE),NVIDIA A100 80GB PCIe,$1.39/h,1,100,00:02:02,00:22:59,N/A,Finished successfully.
