@@ -6,6 +6,7 @@ db/
 seedvr2/
 models/
 test_output/
+benchmark-videos/
 *.log
 gui_settings.json
 __pycache__/

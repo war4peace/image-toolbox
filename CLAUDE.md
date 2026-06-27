@@ -376,7 +376,8 @@ Engine, packaging & CI:
   when cutting a release, the tag `-m` message IS what users read.
 - `tools/git-clean-webhook.py` — repo maintenance helper.
 - `docs/` — `future-features.md` (roadmap + feasibility), `runpod-notes.md`
-  (notes for future remote-pod upscaling).
+  (notes for future remote-pod upscaling), `video-upscaler.md` (design & plan for
+  the planned RunPod-only Video Upscaler tool, future-features #2).
 
 ## Architecture notes for changes
 

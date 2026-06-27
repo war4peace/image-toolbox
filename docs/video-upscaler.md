@@ -1,0 +1,660 @@
+# Video Upscaler (design & plan)
+
+Design and planning notes for the **Video Upscaler**, a major new
+**RunPod-only** feature: upscale a collection of videos with SeedVR2, the same
+engine the Batch Upscaler already uses for stills. UI tab name: **"Video
+Upscaler"**.
+
+> Status: **planning only.** Nothing here is built yet. Per-frame timing numbers
+> are carried over from the image path's benchmarks and MUST be re-measured for
+> the temporal-batch video path before the cost estimator is trusted (see
+> "Benchmark prerequisite"). This doc is the single source of truth for the
+> feature; `docs/future-features.md` #2 is just a pointer here.
+
+---
+
+## 1. Goal & scope
+
+- **Input:** a folder (or selection) of videos. Clips of a few seconds up to
+  ~1 hour, source resolutions roughly 320x240 to 1280x800 (old camera footage is
+  the motivating case).
+- **Output:** an upscaled copy per video to a user-chosen **target** (1080p /
+  1440p / 4K), using the **same "first reachable edge wins" fit math** as the
+  Batch Upscaler (`compute_seedvr2_resolution` / `_skip_for_dims` in
+  `batch_upscale.py`), applied per-video from the frame dimensions.
+- **Never touch the source.** Source videos are read-only; everything happens on
+  copies in a temp folder and a separate output tree (same promise the upscaler
+  already keeps for images).
+- **No rotation.** Skip the orientation/auto-straighten step entirely (videos are
+  not sideways camera photos). This removes the whole `orientation.py` dependency
+  from this path.
+- **RunPod-only by design.** Local SeedVR2 video is both too slow (a diffusion
+  pass per frame) and exposed to the GPU-degradation bug that motivated remote
+  upscaling (#1). This feature never offers a local path.
+- **Shared config & database.** No new config file and no new database. Settings
+  live in a new `video` section of the existing `config.json`; resume/queue state
+  lives in new tables in the existing `db/cache.db`. See sections 9 and 10.
+
+## 2. The engine already does this
+
+SeedVR2 is a *video* upscaler; the app simply never uses that side.
+`seedvr2/inference_cli.py` has mature native video support the image path
+bypasses:
+
+- **Streaming chunk processing** (`--chunk_size`): memory-bounded frame loading so
+  a long file never loads fully into RAM.
+- **Temporal attention window** (`--batch_size`, must be `4n+1`: 1, 5, 9, ...):
+  the consecutive frames denoised together. The main quality/coherence lever.
+- **Cross-boundary blending** (`--temporal_overlap`, `--prepend_frames`,
+  `--uniform_batch_size`).
+- **FFMPEG writer with 10-bit x265** (`--video_backend ffmpeg --10bit`), fps
+  read-and-preserve, and the common containers
+  (`.mp4/.avi/.mov/.mkv/.webm/.flv/.wmv/.m4v`).
+
+So this is an **orchestration + UX + tuning** feature, not an upscaler build.
+
+## 3. Terminology (kept distinct on purpose)
+
+| Term | Meaning | Layer |
+|---|---|---|
+| **segment** | a local ffmpeg split of the source video; the unit of work the queue tracks | our orchestration |
+| **chunk** | SeedVR2's internal `chunk_size` frame-streaming setting | the engine |
+
+These are different things at different layers. The doc never uses "chunk" to mean
+a segment.
+
+## 4. Architecture: segment = queue item
+
+Do **not** treat a video as one giant remote job. Split each source into short
+segments locally, and make **a segment the unit of work**, exactly like an image
+is on the Batch Upscaler today. This reuses #1's per-item streaming machinery
+almost wholesale.
+
+```
+source.mp4 ──ffmpeg split──> seg000.mp4 seg001.mp4 ... segNNN.mp4   (temp folder)
+                  │
+                  ├─ per segment: upload ─> pod upscales ─> download upscaled seg
+                  │                         (queue/resume/cost/heartbeat stay local)
+                  ▼
+   concat upscaled segments ──> mux original audio ──> output/source.mp4
+```
+
+### Pipeline
+
+1. **Split** the source into segment *copies* in a temp folder (source read-only):
+   `ffmpeg -c copy -f segment` (lossless stream-copy). Cuts land only on
+   keyframes, so each segment is *at least* the target length, **rounded UP to the
+   next keyframe** (not down). Normal footage (keyframes every 1-10 s) yields
+   ~60-70 s segments at a 60 s target, which is fine. See section 6.1 for the
+   sparse-keyframe fallback.
+2. **Stream per segment** over the existing pod path: upload one segment, the pod
+   upscales it (SeedVR2 video path with the tuned settings), download the upscaled
+   segment. The local queue, resume-cache, cost tracking, dead-man's-switch
+   heartbeat, and notifications all stay local and barely change.
+3. **Reassemble** locally once all of a video's segments are done: ffmpeg `concat`
+   demuxer over the upscaled segments, then mux the **original audio** back in
+   (`-map 0:v -map 1:a -c copy`). Run the duration-drift check (section 6.3) and
+   surface a warning if input and output diverge.
+
+### Why this beats a single-streaming-file job
+
+- **Segment-level resume:** a dropped pod loses one in-flight segment, not a
+  multi-day job. No partial-mp4 checkpointing.
+- **Reuse:** the local queue/resume/cost code is the same shape as the image path.
+- **Multi-pod parallelism (future):** independent segment files can be spread
+  across several pods for ~Nx faster wall-clock at the same total cost. The
+  single-streaming-file model cannot do this. Not in v1, but the architecture
+  leaves the door open.
+
+## 5. Cost is the dominant constraint, paid in installments
+
+SeedVR2 runs **one diffusion pass per output frame**, so cost scales with frame
+count and *output* resolution (low-res sources get no discount: a 320x240 frame
+upscaled to 4K costs the same as any 4K frame). **Temporal batching makes this far
+cheaper than the single-image rate** (see the measured benchmark in section 7):
+warm throughput is **~0.74 s/frame at 1080p** on the test card, roughly 10x better
+than the carried-over single-image 7.6 s/frame. Per-frame at the test card
+(RTX PRO 6000, 7B fp16, $2.09/h), 1-minute clip @ 30 fps:
+
+| Clip @ 30 fps | Frames | 1080p (~0.74 s/f) | 1440p (~1.9 s/f) | 4K (~6.6 s/f) |
+|---|---|---|---|---|
+| 30 s | 900 | ~0.4 h / $0.39 | ~0.5 h / $1.0 | ~1.7 h / $3.5 |
+| 1 min | 1,800 | ~0.4 h / $0.77 | ~0.95 h / $2.0 | ~3.3 h / $6.9 |
+| 10 min | 18,000 | ~3.7 h / $7.7 | ~9.5 h / $20 | ~33 h / $69 |
+| 1 hour | 108,000 | ~22 h / $46 | ~57 h / $119 | ~198 h / $414 |
+
+Caveats: these are **first-pass, single-card** numbers on a 96 GB RTX PRO 6000 (the
+batch_size ceiling card). The cost estimator must still be calibrated on the cards
+users actually rent (RTX 5090 32 GB etc.), where per-frame may be slower but $/h is
+lower, so total cost could land similar or better; that run is pending (section 13).
+4K is ~9x the 1080p rate and needs a big-VRAM card (4K ceiling was batch 5 on 96 GB).
+Splitting is free (local ffmpeg) and RunPod bandwidth is free, so segmenting costs
+nothing extra, **but it also saves nothing**: it buys resilience and parallelism,
+not speed.
+
+### Installments (a first-class UX goal, not an accident of resume)
+
+There is no reason to spend $46 (1080p) to $400+ (4K) up front on Grandma's
+hour-long birthday video. Because
+resume is per-segment, a user can upscale one minute today and another next week,
+and the partial result is always a usable, already-reassembled video of the
+segments done so far. To make that deliberate:
+
+- **Frame-count cost/time estimator shown before every run**: `frames = duration x
+  fps`; `est = frames x per-frame-rate(target) x $/h`. **Hard confirmation** above
+  a configurable threshold (`video.cost_confirm_usd`, default e.g. $10). This is
+  the single most important UX element: without it a user walks away from a 1-hour
+  4K video and returns to a ~$400 bill.
+- **Per-run cap** (`video.per_run_minute_cap` / `video.per_run_cost_cap`): "process
+  up to N minutes / $X this run, then stop." Makes the installment model one click,
+  not manual file-splitting.
+
+## 6. Decisions locked in
+
+### 6.1 Keyframes: round-up is fine; re-encode only the pathological cases
+
+**Decision:** rounding segment length up to the next keyframe is acceptable. Only
+when keyframes are **extremely sparse** does the re-encode fallback kick in.
+
+- Every decodable video has frame 0 as a keyframe, so "no keyframes at all" means a
+  *corrupt* file: skip + log, exactly as the image path handles a corrupt image.
+- `-c copy` can only cut on keyframes, so a long GOP forces a long minimum segment
+  (a 2-min GOP forces 2-min segments; an hour-long single GOP yields one
+  un-splittable segment).
+- **Implementation:** `ffprobe` the keyframe interval first. If the resulting
+  segment length would exceed a threshold (`video.max_segment_seconds`, default
+  e.g. 120 s = 2x the 60 s target), fall back to a **forced-keyframe re-encode**
+  for that video only (`-force_key_frames "expr:gte(t,n_forced*<seg>)"`), then
+  segment the re-encoded copy. Quality is a non-issue (SeedVR2 hallucinates detail,
+  so a visually-lossless intermediate is far above what it needs); the real cost of
+  the fallback is time + disk for a full re-encode, so prefer `-c copy` and
+  re-encode only when forced. The re-encode runs **locally** with the encoder chosen
+  per 6.4 (nvenc if available, else CPU).
+
+### 6.2 Segment edges: fixed seed per video (v1), revisit only if visible
+
+**Decision:** start with a **single fixed seed for the whole source video** (not
+per-segment-random like the image path), then **visually inspect** the results. If
+segment boundaries are not obvious, keep this simple solution; only escalate if and
+when artifacts demand it.
+
+- Independent per-segment processing loses temporal blending *across* the cut, so
+  the same continuous motion gets slightly different hallucinated detail on each
+  side (a subtle texture "pop", once per segment). Usually invisible on noisy /
+  cut-heavy old footage.
+- The fixed seed removes the seed component of the pop for free. That is the entire
+  v1 mitigation.
+- **Deferred options, documented for later (do NOT build in v1):**
+  (2) overlap + trim (split a few frames early, drop the overlap on reassembly);
+  (3) the proper fix, `--prepend_frames` context-carry: build each segment's input
+  locally as `[tail of previous segment] + [this segment]` and pass
+  `--prepend_frames = tail_length` so SeedVR2 upscales with shared context and
+  auto-removes the prepend from output. (3) still composes with multi-pod
+  parallelism because the overlapped inputs are built locally before upload.
+
+### 6.3 Duration drift: detection + warnings are mandatory in v1
+
+**Decision:** short videos may show no detectable drift; long videos will need
+manual review. Either way the app must **at least detect and warn** when the output
+diverges from the input. It does not silently "fix" anything.
+
+- **Detect (required in v1):** compare input vs output **total frame count** and
+  **runtime/duration** (via `ffprobe`), and check that
+  `sum(upscaled segment frame counts) == source frame count`. Any divergence beyond
+  a small tolerance (e.g. > 1 frame, or > ~50 ms) raises a clear warning in the log,
+  the UI, and the completion notification, and the output is flagged "review
+  recommended". Keep the upscaled segments either way.
+- **Causes, worst-first:** *fps drift* (output fps != source, or a VFR source) ->
+  progressive lip-sync drift, the dangerous one; *frame-count drift* (VFR sources,
+  fps rounding: the per-segment assertion below catches it); a *constant offset* ->
+  fixed desync. Note `--uniform_batch_size` is **not** a frame-count risk: SeedVR2
+  trims all temporal padding (both its `4n+1` padding and the uniform padding) back
+  to the original frame count on decode, so output frames == input frames
+  (verified: `generation_phases.py` saves `ori_length` at line 366 and slices back
+  to it at lines 950-957).
+- **Prevent where cheap:** normalise to **CFR** before segmenting (`-vsync cfr`)
+  to kill the main VFR cause. Detection still runs regardless.
+- **Do not** stretch audio with `atempo` to force a match (it shifts pitch). On a
+  real mismatch, warn and leave it for the user, since by mux time progressive
+  drift is unfixable cleanly. The up-front CFR normalize + per-segment frame-count
+  assertion are what actually prevent it.
+
+### 6.4 ffmpeg: bundled, and all container work stays local
+
+**Decision:** the app owns a bundled ffmpeg, and **all** container-level work
+(probe / split / CFR-normalize / re-encode / reassemble / audio-mux) runs
+**locally**. The pod stays a thin SeedVR2-only worker. Re-encode location is chosen
+by **local GPU capability, not video size**.
+
+- **Bundle ffmpeg via `bootstrap.ps1` download** (not baked into the installer),
+  matching how PyTorch / SeedVR weights are delivered, so the installer stays tiny
+  and the version is pinned and known-good (gyan.dev `release-essentials` build:
+  GPLv3, bundles nvenc + libx264/libx265; see 13 for the exact pin). **Needed in
+  *both* install modes:** even a Remote-only install
+  must have local ffmpeg for split/reassemble/mux, so this is the one heavy local
+  component Remote-only cannot skip. Note the **GPL** angle (an ffmpeg with
+  x264/x265 is GPL): ship its license, same as the vendored SeedVR2.
+- **Split is free; re-encode is the only expensive part, and only a minority of
+  videos need it.** A `-c copy` split is instant, lossless stream-copy on any CPU,
+  no GPU. Most old home videos are CFR with sane GOPs and a decodable codec, so they
+  split locally with `-c copy` *regardless of size*. A re-encode is triggered only
+  by: VFR (CFR-normalize, 6.3), a sparse GOP (forced keyframes, 6.1), or a codec the
+  pod's opencv/ffmpeg can't decode. When triggered, fold it into the segmenting pass
+  (one `ffmpeg` invocation: `-vsync cfr` + `-force_key_frames` + `-f segment`).
+- **Why local, not on the pod:** the re-encode is negligible next to the upscale
+  (even a slow CPU x265 of a 30-min SD clip is minutes; upscaling it is days), while
+  uploading the whole file to re-encode on the pod would break **segment-level
+  resume** (a dropped pod loses the whole upload, not one segment) and bloat the
+  pod into an ffmpeg orchestrator. Keeping all ffmpeg local preserves the clean
+  per-segment resume model and the thin-pod philosophy, for a sub-1% time cost.
+- **Encoder choice by local capability (the only local codec decision):** Local /
+  Both install (CUDA GPU + nvenc-enabled build) -> **nvenc**, h265 if supported else
+  h264 (auto-detect). Remote-only install (no capable GPU) -> CPU libx265/libx264
+  fallback, with a "re-encode pre-pass may be slow on this machine" notice. Quality
+  here barely matters (SeedVR2 hallucinates detail), so a fast encode is plenty.
+- **The deliverable's codec is decided on the pod, so there is no local output-codec
+  choice.** SeedVR2's own `FFMPEGVideoWriter` encodes each upscaled segment (x264, or
+  x265 10-bit via `video_backend ffmpeg` + `use_10bit`). Local **reassembly is
+  `-c copy` concat + `-c copy` audio mux** with no re-encode of the result, so all
+  segments share identical codec params (same worker settings) and concat stays
+  lossless.
+
+## 7. SeedVR2 video settings + benchmark prerequisite
+
+The real R&D, with no shortcut. The video-only knobs (none used by the image path)
+need tuning on a pod against a few representative clips. Drive it from
+`scripts/benchmarks.py`.
+
+- **`batch_size`** (`4n+1`): main quality lever (temporal coherence). Measured
+  (see results below): throughput gains **saturate by ~bs 9-13** (most of the win is
+  bs1 -> bs5 -> bs9), and peak VRAM **plateaus** (it does not grow linearly, because
+  the video VAE compresses the temporal axis), so a moderate window is the sweet
+  spot. The VRAM ceiling is the real limit and is set by **output resolution**: on
+  96 GB, 1080p and 1440p never OOM up to bs89, but **4K tops out at bs 5**.
+- **`temporal_overlap`**: suppress seams between internal batches.
+- **`chunk_size`**: VRAM bound for frame loading **and the system-RAM bound** (8); the
+  worker must always set it > 0 so output frames stream out instead of accumulating.
+- **`uniform_batch_size`**: pad the final short batch to avoid temporal artifacts
+  from a small last batch. Safe for frame count: SeedVR2 trims the padding back to
+  the original length on decode (confirmed, see 6.3), so it never changes the output
+  frame count.
+- **`color_correction lab`**: same default as the image path.
+- **`seed`**: one fixed value per source video (per 6.2).
+- **Segment length** (`video.segment_seconds`): a new tuning variable. Shorter
+  segments give finer resume + more parallelism + more boundary seams + more
+  overhead; longer the reverse. Default ~60 s; let the benchmark refine it.
+
+The benchmark must also produce trustworthy **per-frame rates per (target x card)**
+to feed the cost estimator (section 5), replacing the carried-over image numbers.
+
+**Test asset:** `benchmark-videos/Pisici.AVI` (gitignored, local-only): an original
+320x240, 30 fps, 2m44s (~4,920 frames) old-camera clip, the exact motivating
+case. The harness (`pod/bench_video.py`) reads short windows from it per config to
+measure throughput + VRAM cheaply; a full-video 1080p run is ~1 h of compute
+(~$2 on the test card), useful as one end-to-end correctness pass but not per config.
+
+### Measured results (first pass: RTX PRO 6000 Blackwell, 96 GB, 7B fp16, 2026-06-27)
+
+Warm per-frame (one temporal window of N frames; bs1 is overhead-dominated), and
+peak VRAM, on `pod/bench_video.py`. **`per-frame` excludes model load**; the card
+keeps DiT+VAE resident (>=40 GB), so these are best-case (a 32 GB card offloads DiT
+and will differ):
+
+| Target (output) | bs1 | bs5 | bs9 | bs13 | bs21 | floor | VRAM | ceiling |
+|---|---|---|---|---|---|---|---|---|
+| 1080p (1440x1080) | 1.44 | 0.81 | 0.76 | 0.74 | 0.70 | ~0.67 (bs89) | plateau ~50 GB | none <=bs89 |
+| 1440p (1920x1440) | 2.71 | 2.04 | 1.98 | 1.96 | 1.91 | ~1.88 (bs89) | plateau ~71 GB | none <=bs89 |
+| 4K (2880x2160) | 6.64 | 6.63 | OOM | - | - | 6.63 | bs5 = 81 GB | **bs5** |
+
+Findings that shaped the plan: (1) **temporal batching is ~10x faster per frame than
+single-image** (1080p warm ~0.7 s vs the carried-over 7.6 s); (2) **gains saturate by
+~bs 9-13**, so a moderate window is the operating point, not the max; (3) **VRAM
+plateaus** (temporal VAE compression), so batch_size is bounded by a per-resolution
+ceiling, not a linear climb; (4) **4K needs a big-VRAM card** (bs5 ceiling at 96 GB,
+no batching speedup) and is ~9x the 1080p cost; (5) **load-all vs streaming RAM
+confirmed** (see 8): load-all ~50 MB/frame (~90 GB for a 1-min 1080p segment),
+streaming flat. Still pending (section 13): the same throughput/VRAM grid on the
+cards users actually rent (RTX 5090 etc.) for the real cost calibration.
+
+### Measured results (second pass: B200, 180 GB, 7B fp16, 2026-06-27)
+
+Same harness, full ladder. The B200 was benchmarked while it was briefly in stock in
+EU-RO-1 (not normally available there: see section 13). 178 GB usable, DiT+VAE
+resident, $5.89/h. (4K stopped at bs45: per-frame had already saturated and VRAM was
+pinned, so bs61/bs89 were skipped to save pod time.)
+
+| Target (output) | bs1 | bs5 | bs9 | bs13 | bs21 | floor | VRAM | ceiling |
+|---|---|---|---|---|---|---|---|---|
+| 1080p (1440x1080) | 0.93 | 0.45 | 0.42 | 0.41 | 0.38 | ~0.35 (bs89) | plateau ~49 GB | none <=bs89 |
+| 1440p (1920x1440) | 1.83 | 1.73 | 1.71 | 1.70 | 1.66 | ~1.63 (bs61) | plateau ~74 GB | none <=bs89 |
+| 4K (2880x2160) | 4.34 | 6.81 | 6.55 | 6.43 | 6.29 | ~6.19 (bs45) | plateau ~135 GB | none <=bs45 |
+
+B200 vs PRO 6000 (both 7B fp16, resident, warm bs13): **1080p ~1.8x faster**
+(0.41 vs 0.74 s/frame), **1440p ~1.15x** (1.70 vs 1.96), **4K ~1.03x** (6.43 vs 6.63).
+Two structural differences beyond raw speed: (a) the B200 **removes the 4K batch
+ceiling** the PRO 6000 hit: 4K ran bs5->bs45 sitting at a flat **135 GB** (vs the PRO
+6000's bs5 = 81 GB hard ceiling); 4K per-frame is **flat from bs9 on**, so the extra
+VRAM buys no *throughput*, but it is **not wasted: a larger window is a continuity
+lever, not just a memory cost** (see the batch-size/continuity note below). (b) **4K
+bs1 (4.34 s) is faster per-frame than any batched 4K** (~6.2-6.8 s), same shape seen on
+the PRO 6000 (bs1 ~= bs5): the temporal-attention pass doesn't speed up 4K, it only
+adds cross-frame coherence, so at 4K you pay for continuity, you don't get it free as
+at 1080p. The takeaway: the B200's *throughput* win is concentrated at **1080p** (where
+it nearly doubles it), exactly the target a fast card should serve; at 4K per-frame is
+card-independent, so a cheaper big-VRAM card matches it on $/frame **at equal window
+size** but a bigger card buys a bigger 4K window (more continuity), which an 80 GB card
+caps at ~bs5. **load-all vs streaming RAM is host-side and card-independent**:
+re-measured on the B200, load-all still balloons and streaming stays flat (see section
+8): the worker streams regardless of GPU.
+
+### Measured results (third pass: H200 SXM, 141 GB, 7B fp16, 2026-06-27)
+
+Same harness, in EU-FR-1 (the second region-locked volume, `lpla3ia3l0`). 140 GB usable,
+resident, $4.39/h. Run to push the **batch-size-until-OOM** question (continuity ceiling).
+
+| Target (output) | bs1 | bs5 | bs9 | bs13 | bs45 | bs89 | per-frame floor | VRAM |
+|---|---|---|---|---|---|---|---|---|
+| 1080p | (B200/PRO 6000 cover it; H200 is overkill here) ||||||| ~49 GB plateau |
+| 1440p (1920x1440) | 2.31 | 2.15 | 2.08 | 1.99 | 1.90 | 1.89 | ~1.88 | plateau ~71-77 GB |
+| 4K (2880x2160) | 6.01 | 7.86 | 7.34 | 7.24 | - | - | ~7.2 | plateau ~128 GB |
+
+H200 is ~15% slower per-frame than the B200 at 1440p (1.9 vs 1.64) and 4K (7.2 vs 6.4),
+for ~$1.50/h less. **The decisive finding: VRAM plateaus at every target** (1080p ~49 GB,
+1440p ~71-77 GB, 4K ~128 GB on H200 / ~135 GB on B200), jumping to the plateau by ~bs9 and
+then **flat**: the temporal VAE compresses the time axis, so adding frames to a window
+costs almost no extra VRAM. The only VRAM term that grows is the output tensor
+(~35 MB/frame at 4K). So **the GPU does not OOM at any practical window**: extrapolated 4K
+OOM is ~`bs>300` on the H200 (a >35-min single window) and ~`bs1200` on the B200 (a
+~2.5-hour window). "Run until OOM" is therefore not a useful continuity ceiling at these
+resolutions: **the real limit on window length is time (and pod RAM on small pods), not
+VRAM** (see section 8 for the pod-RAM coupling and the cgroup-not-`free` correction). 4K
+on the B200 was left at bs45 not because of a ceiling but because per-frame had saturated
+and further rows only add cost.
+
+### Measured results (fourth pass: RTX 5090, 32 GB, 1080p, the cheap-card calibration)
+
+The card a cost-conscious 1080p user actually rents (EU-RO-1, $0.99/h, stock High). At
+32 GB it is **below the 40 GB resident threshold, so the engine offloads DiT/VAE to CPU
+(`resident=False`)** and reloads them over PCIe each window: a genuinely different regime
+from the big cards, and the reason this needs its own numbers.
+
+| bs | 1 | 5 | 9 | 13 | 21 | 29 | 45 | 61 | 89 |
+|---|---|---|---|---|---|---|---|---|---|
+| per-frame (s) | 7.08 | 1.89 | 1.44 | 1.28 | 1.05 | 0.98 | **0.94** | 0.98 | OOM |
+| peak VRAM (GB) | 16.5 | 19.3 | 30.7 | 30.7 | 30.7 | 30.7 | 30.7 | 30.7 | - |
+
+Findings: (1) **bs1 = 7.08 s/frame** is the offload penalty (load the 16 GB DiT to GPU,
+run one frame, offload) - this IS the carried-over "single-image 7.6 s" number, now
+explained. (2) **Batching matters far more on a cheap card: 7.5x** (7.08 -> 0.94 s) vs
+~2x on a resident big card, because it amortizes the per-window DiT load. So the video
+path's temporal batching is what makes the 5090 viable at all. (3) **VRAM plateaus at
+30.7 GB hard against the 32 GB wall**, so the **continuity ceiling is bs61** (OOM at
+bs89) - a ~2 s window, vs the big cards' bs89+. (4) Pod RAM is only **92 GB / 85.7 GiB**
+(cgroup), so a 1-min 1080p load-all (~90 GB) would nearly fill it: streaming is
+mandatory, not optional, on this pod.
+
+**1080p cost ranking (1-hour 30 fps video = 108k frames, per-frame at each card's floor):**
+
+| Card | per-frame | GPU-hours | $/h | **cost/hr-of-video** |
+|---|---|---|---|---|
+| **RTX 5090** | 0.94 s | 28.2 | $0.99 | **~$28** (cheapest) |
+| PRO 6000 | 0.74 s | 22.2 | $2.09 | ~$46 |
+| H200 | ~0.47 s | 14.1 | $4.39 | ~$62 |
+| B200 | 0.35 s | 10.5 | $5.89 | ~$62 |
+
+The 5090 is **~40% the B200's cost and half the PRO 6000's** for 1080p, and its $0.99/h
+sits under the upscale price ceiling (`max_price_per_hour_upscale` $1.10), so it is the
+right **default for 1080p**: cheapest total, lowest hourly (least exposure on a dropped
+connection). The big cards win wall-clock time and longer windows, not cost. **1080p ->
+5090** is now confirmed.
+
+### Measured results (fifth pass: A100 80 GB PCIe, 1440p) - the cheap card LOSES here
+
+The card expected to be the cheap 1440p pick (EU-RO-1, $1.39/h). Resident (80 GB > 40 GB).
+
+| bs | 1 | 5 | 9 | 13 | 21 | 45 | 61 | 89 |
+|---|---|---|---|---|---|---|---|---|
+| per-frame (s) | 3.65 | 3.65 | 3.62 | 3.57 | 3.48 | 3.45 | 3.43 | **3.42** |
+| peak VRAM (GB) | 26 | 47 | 67.6 | 67.6 | 72.9 | 72.9 | 72.9 | 78.2 |
+
+The A100 is **Ampere**: at ~3.42 s/frame it is **~1.75x slower than the PRO 6000** (1.96 s)
+and batching barely helps (~7%, vs the 5090's 7.5x), because it is resident and purely
+compute-bound. No OOM (plateau ~73 GB inside 80 GB). The cost consequence is the
+**counterintuitive result worth measuring**:
+
+**1440p cost ranking (1-hour 30 fps video = 108k frames, per-frame at floor):**
+
+| Card | per-frame | GPU-hours | $/h | **cost/hr-of-video** |
+|---|---|---|---|---|
+| **PRO 6000** | 1.96 s | 58.8 | $2.09 | **~$123** (cheapest) |
+| A100 80 GB | 3.42 s | 102.6 | $1.39 | ~$143 |
+| H200 | 1.89 s | 56.7 | $4.39 | ~$249 |
+| B200 | 1.64 s | 49.2 | $5.89 | ~$290 |
+
+The A100's **lower hourly is more than eaten by its slower throughput**, so it costs
+*more* than the PRO 6000 and is **dominated** (slower AND pricier). So the 1440p pick is
+the **PRO 6000**, not the A100, refuting the "cheaper card = cheaper job" intuition: at a
+fixed job, $/frame = per-frame x $/h, and the PRO 6000's speed wins. **Price-ceiling
+implication:** the cheapest viable 1440p card ($2.09) is **above** the $1.10 upscale
+ceiling tuned for the 5090, so the Video Upscaler needs a **higher (per-target) price
+ceiling for 1440p/4K** than the image upscaler's 1080p-tuned one, or 1440p/4K refuse to
+auto-deploy.
+
+**Batch size is a continuity lever, not only a throughput knob (source-confirmed).**
+Within one `batch_size` window the frames are denoised *jointly* with shared temporal
+attention, so a window has no internal seam; consecutive windows advance by
+`step = batch_size - temporal_overlap` and the overlap frames are reprocessed in both
+and blended, softening the join. So a **larger window = fewer joins = longer
+continuously-coherent runs**. SeedVR2's own code agrees: `calculate_optimal_batch_params`
+returns `best_batch = largest 4n+1 <= total_frames` commented *"maximizes temporal
+stability"*, and the runtime logs *"Matching batch_size to shot length improves temporal
+coherence."* The ideal window is the **whole shot**; VRAM is the only reason to chunk it.
+This means the throughput knee (~bs9-13, where per-frame stops dropping) is **not** the
+quality operating point: since per-frame is flat past the knee, a bigger window costs ~the
+same total $ for a segment but yields fewer seams, so on a big-VRAM card the quality
+operating point is **the largest window VRAM allows at the target** (with a modest
+`temporal_overlap`), not bs13. Caveats: gains have diminishing returns (the DiT's trained
+temporal context) and a 1-minute segment (~1800 frames) never fits as one window anyway,
+so this is "bigger-is-smoother within the VRAM budget", and overlap trades a little
+throughput (reprocesses `overlap` frames per window) for the join blend. Not yet measured
+perceptually (benchmark ran `temporal_overlap=0` for clean throughput) -> see section 13.
+
+## 8. Other gotchas to honour
+
+- **Audio is dropped by the engine.** `FFMPEGVideoWriter` pipes only rawvideo
+  frames, so the upscaled output is **silent** until reassembly muxes the original
+  track back. Non-negotiable.
+- **Dead-man's switch vs. long segments.** A single segment is still hours of
+  compute, so the worker must **touch the heartbeat per internal `chunk_size`
+  iteration** (the streaming generator in `inference_cli` yields per chunk, an ideal
+  hook), or the 15-min idle timeout self-stops the pod mid-segment. Run with
+  `max_runtime=0` and rely on active-heartbeat idle, as the image path already does.
+- **Per-segment transaction must poll, not block.** A multi-hour segment cannot be
+  a single blocking HTTP request (the image engine's timeout is 600 s). Use
+  submit -> poll frames-done/total -> fetch result; this also feeds live
+  intra-segment progress to the UI for free.
+- **System RAM: stream, never load-all (the worker MUST set `chunk_size > 0`).**
+  **Measured** (`pod/ram_probe.py`, 600 frames @ 1080p): load-all (`chunk_size = 0`)
+  used **30.3 GB** of system RAM, while streaming (`chunk_size = 33`) stayed **flat at
+  0 GB frame-accumulation delta**. **Re-confirmed on the B200 (30.6 GB load-all vs 0.0 GB
+  streaming): host-side, card-independent.** Bonus: streaming was also **faster
+  end-to-end** there (272 s vs 431 s), because load-all defers the entire mp4 encode to
+  one ~3-min burst at the end while streaming encodes incrementally: so streaming wins on
+  both RAM and wall-clock, no tradeoff. SeedVR2's load-all path holds every output frame
+  through assembly as multiple **float32** copies (decode + LAB color-correction +
+  assembly), so it is **~50 MB/frame**, not the ~9 MB/frame a single fp16 buffer would
+  be. That extrapolates to **~90 GB for a 1-minute 1080p segment and ~360 GB at 4K** -
+  impossible on any pod (and the exact ceiling the author hit on a 64 GB / RTX 3090
+  box; it is independent of VRAM). Streaming writes each chunk to the encoder and
+  frees it, so RAM stays flat regardless of segment length. The worker must
+  **always stream**, `chunk_size` sized to the pod's RAM (`chunk_size >= batch_size`;
+  measured 33 was already flat). The **pod** does this assembly, not the local side
+  (local only stream-copies). Our 1-minute segments do **not** replace streaming
+  (a load-all minute already needs ~90 GB).
+  **4K per-frame measured (H200): ~253 MB/frame load-all** (15.2 GB / 60 frames), so a
+  1-minute 4K segment load-all is **~455 GB** (worse than the earlier ~360 GB estimate).
+  Streaming `chunk_size = 30` at 4K peaked **<8 GB** total RSS, confirming the bound holds
+  at 4K too.
+- **Window length vs pod RAM are coupled (the `chunk_size >= batch_size` rule).** Because
+  a chunk must contain whole windows ([inference_cli.py] rounds the chunk up to a multiple
+  of `batch_size`), a longer *coherent* window forces a larger streaming chunk, so the pod
+  must hold **>= batch_size** decoded frames during reassembly. Per-window RAM therefore
+  scales with `batch_size x frame_bytes` (~130 MB/frame held at 4K streaming, ~250 MB
+  worst case). The worker sets `chunk_size = batch_size` (minimum RAM for the chosen
+  window) and picks `batch_size = min(VRAM-fit, pod-RAM-fit)`. So the continuity lever
+  (section 7) is bounded by pod RAM at 4K, not only VRAM.
+- **Read the pod's cgroup RAM limit, NOT `free` / host RAM.** A RunPod pod is a container
+  on a shared host; `free` (and `nvidia-smi`-adjacent host probes) report the **whole
+  server**. Measured: a 1-GPU H200 pod's `free` showed **2015 GB** but its cgroup
+  (`/sys/fs/cgroup/memory[.v1 limit_in_bytes | .v2 max]`) and the RunPod listing both say
+  **251 GB / 234 GiB**, 24 vCPU (the host is 2 TB / 192 CPU). The kernel OOM-kills the
+  container at the **cgroup** limit regardless of host free RAM, so the worker's RAM
+  sizing and the cost estimator's "does this window fit" check must read the cgroup limit.
+  (This also means the remote-pod telemetry row, section 11 / `pod/worker.py /telemetry`,
+  must report cgroup RAM, not host RAM, or it overstates the pod by ~8x.)
+- **At 4K, which ceiling binds first is pod-specific.** On the 251 GB H200 the GPU's
+  output-tensor growth OOMs (~`bs>300`, a >35-min window) **before** RAM does (~bs900+),
+  and both are far past any practical window, so **time** is the real limit. On a cheaper
+  4K-capable pod with a smaller RAM slice, RAM can bind first. The estimator should warn
+  when a requested 4K window exceeds either the pod's VRAM or its cgroup RAM.
+- **Container disk.** A long 4K output is many GB; the pod `containerDiskInGb`
+  (default 30) must hold input + output, or write to the mounted volume.
+- **4K video is the practical ceiling problem.** `batch_size` VRAM at 4K forces a
+  tiny temporal window (weaker coherence) and/or a big expensive card, compounding
+  the cost. 1080p is the sane default for video; gate 4K behind an extra warning.
+
+## 9. Shared config (`config.json` -> new `video` section)
+
+No new config file. A new section alongside `upscale`, `tagging`, `runpod`, etc.
+The whole `runpod` section (pod lifecycle, GPU pickers, price ceilings,
+dead-man's-switch limits, SSH) is reused unchanged. Draft keys:
+
+```jsonc
+"video": {
+    "target": "1080p",              // 1080p | 1440p | 4K (own target, not upscale's)
+    "skip_cutoff_pct": 0,           // same meaning as upscale's skip-cutoff
+    "segment_seconds": 60,          // nominal segment length
+    "max_segment_seconds": 120,     // sparse-keyframe re-encode trigger (6.1)
+    "batch_size": 0,                // 0 = auto per (target x card) from benchmark
+    "temporal_overlap": 0,
+    "chunk_size": 0,                // 0 = engine default / auto
+    "color_correction": "lab",
+    "video_backend": "ffmpeg",      // pod-side output writer; ffmpeg enables 10-bit
+    "use_10bit": false,             // pod-side deliverable codec (x265 10-bit)
+    "normalize_cfr": true,          // -vsync cfr before segmenting (6.3)
+    "local_reencode_codec": "auto", // auto = nvenc(h265->h264) if available, else CPU (6.4)
+    "per_run_minute_cap": 0,        // 0 = no cap; installment control (section 5)
+    "per_run_cost_cap": 0.0,        // 0 = no cap
+    "cost_confirm_usd": 10.0        // hard confirmation above this estimate
+}
+```
+
+`defaults` gains a Video Upscaler source/output folder pair like the other tools.
+
+## 10. Shared database (`db/cache.db` -> new tables)
+
+No new database. New tables in the existing cache, mirroring the upscale
+eligibility/resume pattern (`upscale_roots` / `upscale_files`) so resume and the
+installment model work across runs:
+
+- **`video_roots`** (source folder -> scan metadata), like `upscale_roots`.
+- **`video_files`** (one row per source video: path, dimensions, fps, total
+  frames, duration, chosen target, status, output path). Drives the queue and the
+  "skip already-done / near-target" decision.
+- **`video_segments`** (one row per segment: parent video id, segment index, time
+  span, input frame count, status `pending|done|failed`, upscaled output path,
+  output frame count). This is what makes **segment-level resume** and the
+  per-run cap work: a re-run picks up the first `pending`/`failed` segment.
+
+Logs stay text files in `logs/`, not the DB, consistent with the rest of the app.
+
+## 11. Build pieces
+
+- **`scripts/batch_video_upscale.py`** runner sibling: walks the source tree,
+  mirrors to the output root, does the ffmpeg split/reassemble/mux, drives the
+  per-segment remote stream, manages the `video_*` resume tables, runs the
+  duration-drift check, sends notifications. No torch import (remote-only).
+- **Worker `--mode video`** (`pod/worker.py`): receives a segment, runs the
+  SeedVR2 CLI video path with the tuned settings, serves submit/poll/fetch, touches
+  the heartbeat per internal chunk. Sibling to the existing `full` / `tag` modes.
+- **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): same
+  create -> push -> start worker -> arm dead-man's switch -> stream -> teardown
+  lifecycle, with the video worker mode and the submit/poll protocol.
+- **GUI tab "Video Upscaler"** (`toolbox_gui.py`): the thumbnail/film-strip wall
+  does not map to video, so show a **per-video segment-progress + queue + the cost
+  estimator/gate** instead, plus the live remote telemetry row the upscale tab has.
+  Reuses the Settings Region/DC + GPU pickers.
+- **`ffmpeg` dependency (settled, 6.4):** `bootstrap.ps1` downloads a pinned,
+  nvenc-enabled ffmpeg in **both** install modes (Remote-only needs it too). All
+  container work (probe/split/normalize/re-encode/reassemble/mux) runs locally; the
+  pod stays SeedVR2-only. Local re-encode (only when a video needs it) uses nvenc if
+  a CUDA GPU is present, else a CPU fallback. Ship ffmpeg's GPL license.
+
+Reused unchanged from #1: pod lifecycle, network-volume + models, SSH/key
+injection, GraphQL deploy + GPU picker, per-task price ceiling + fallback chain,
+cost tracking, notifications, taskbar progress/flash.
+
+## 12. Phasing
+
+1. **Benchmark pass first** (section 7): real per-frame rates and good
+   `batch_size`/`overlap`/`segment_seconds` defaults per (target x card) on a pod,
+   before any UI. De-risks the cost estimator and the whole feature. **Harness
+   built: `pod/bench_video.py`** — loads the engine once and drives its video core
+   across a (target short-side x batch_size) grid, reporting per-frame time, peak
+   VRAM, and the OOM ceiling to a CSV (scp it next to `upscale_engine.py`, run with
+   the volume venv's python).
+2. **ffmpeg split/reassemble/mux + drift detection** locally (no pod): prove the
+   segment -> concat -> audio-mux -> drift-warn pipeline on already-upscaled or
+   passthrough segments.
+3. **Worker `--mode video` + submit/poll protocol + heartbeat-per-chunk.**
+4. **`batch_video_upscale.py`** wiring the `video_*` tables, per-segment streaming,
+   resume, and the per-run cap.
+5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress.
+
+**Reasonable v1 scope:** 1080p target only; fixed seed per video (6.2); plain
+`-c copy` splitting with the sparse-GOP re-encode fallback (6.1); CFR normalize +
+duration-drift detection/warning (6.3); file-level + segment-level resume; a
+per-run minute/$ cap on by default. Lift the cap, add 1440p/4K, and consider
+multi-pod parallelism and `prepend_frames` seam-blending once the cost UX and
+reassembly are proven.
+
+## 13. To verify before/while building
+
+- **DONE on the RTX PRO 6000** (96 GB): per-frame rates + batch_size/VRAM curve +
+  ceilings (see section 7 measured results). **Still needed: the same grid on the
+  cards users actually rent** (RTX 5090 32 GB, RTX PRO 4500 32 GB) for the real cost
+  calibration. A 32 GB card offloads DiT (resident=False), so its VRAM profile and
+  per-frame both differ from the PRO 6000; the cost estimator must use *those*
+  numbers, not the 96 GB ones.
+- **Batch-size continuity A/B (perceptual, not yet measured).** Source confirms a
+  larger `batch_size`/window improves temporal coherence (section 7 note), but the
+  throughput grid ran `temporal_overlap=0` and judged nothing visually. Before locking
+  the per-target defaults, render the same clip at a small window + overlap vs the
+  largest the card fits and compare seam visibility / flicker, to choose `batch_size`,
+  `temporal_overlap` and `segment_seconds` on quality, not just VRAM/throughput. This
+  also sets whether 4K justifies a 96 GB+ card for the *window* (continuity), not only
+  to fit at all.
+- **Pod RAM must come from the cgroup, not `free`/host (measured trap).** A RunPod pod
+  is a host-shared container: `free` reported 2015 GB on a 1-GPU H200 pod whose real cap
+  (cgroup + RunPod listing) is **251 GB / 234 GiB**, 24 vCPU. The worker's window/RAM
+  sizing and the estimator's fit check must read `/sys/fs/cgroup/memory.max` (v2) or
+  `memory/memory.limit_in_bytes` (v1). **Fix `pod/worker.py` `/telemetry`** if it reports
+  host RAM/CPU (it would overstate the pod ~8x and mislead the remote telemetry row).
+- **Per-target window ceiling = min(VRAM, cgroup-RAM, time).** 4K VRAM plateaus (~128 GB
+  H200 / ~135 GB B200, flat from ~bs9), so the GPU only OOMs at impractically large
+  windows; the binding limit is pod RAM on small pods (~130 MB/frame held streaming at 4K,
+  ~253 MB load-all) and otherwise wall-clock. Encode the per-target default `batch_size`
+  from the chosen card's VRAM plateau AND its cgroup RAM, and gate 4K windows behind a
+  RAM/time check rather than assuming VRAM is the limit.
+- **ffmpeg build (source chosen: gyan.dev `release-essentials`, GPLv3, includes
+  nvenc + libx264/libx265; latest verified 8.1.1 / 2026-05-04).** For
+  `bootstrap.ps1`: download the **`.zip`** (native `Expand-Archive`; the `.7z` is
+  ~3x smaller but needs a 7-Zip extractor the app doesn't ship) and verify the
+  published `.sha256` sidecar. Pin a version via the packages URL
+  (`builds/packages/ffmpeg-<ver>-essentials_build.zip`, retained one release back)
+  or read `builds/release-version` and fetch the moving
+  `builds/ffmpeg-release-essentials.zip`. Extract only **`ffmpeg.exe` + `ffprobe.exe`**
+  (skip `ffplay`) into an `APP_ROOT`-resolved tools dir; ship the build's `LICENSE`.
+- Confirm nvenc availability at runtime: NVIDIA GPU/driver present **and**
+  `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
+  libx265/libx264 fallback (6.4).

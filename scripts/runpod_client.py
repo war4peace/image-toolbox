@@ -334,6 +334,22 @@ def is_consumer_gpu(gpu_id):
     return "geforce" in (gpu_id or "").lower()
 
 
+# AMD Instinct accelerators (MI300X, MI250, MI325X…) sometimes appear in a data
+# center's catalog cheaper than comparable NVIDIA cards, but the whole pipeline is
+# CUDA-only: PyTorch is a CUDA build, SeedVR2 and the orientation CNN run on CUDA,
+# and telemetry shells out to nvidia-smi — none of which works on AMD's ROCm/HIP
+# stack. So an AMD card can never run a job; it must never reach the GPU pickers.
+_AMD_GPU_RE = re.compile(r"\b(amd|instinct|radeon|mi\d{2,3}x?)\b", re.IGNORECASE)
+
+
+def is_amd_gpu(gpu_id):
+    """True for AMD GPUs (Instinct MI-series, Radeon). The app is CUDA-only, so
+    these can't run any task — they're filtered out of the live GPU pickers
+    (`available_gpus`) before a user can pick one that would only fail at run
+    time."""
+    return bool(_AMD_GPU_RE.search(gpu_id or ""))
+
+
 _DEPLOY_MUTATION = """
 mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) { id machineId costPerHr }
@@ -685,6 +701,11 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
     — a card the account can't actually rent in this region never appears, so the
     UI can't offer a GPU that will only fail at create time.
 
+    AMD GPUs (Instinct MI-series, Radeon) are dropped here regardless of stock or
+    price: the pipeline is CUDA-only (see `is_amd_gpu`), so an AMD card could only
+    fail at run time. They're cheap enough to be tempting in some data centers, so
+    filtering them at the source keeps them out of every picker.
+
     `include_out_of_stock=True` keeps cards with no current stock (their `stock`
     is None) — for the Settings GPU *preference* lists, which should still offer a
     card that's only momentarily sold out. The live per-run pickers leave it False.
@@ -693,10 +714,14 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
                     timeout=timeout)
     out = []
     for g in data.get("gpuTypes") or []:
+        gid = g.get("id") or ""
+        name = g.get("displayName") or gid
         lp = g.get("lowestPrice") or {}
         stock = lp.get("stockStatus")
         price = lp.get("uninterruptablePrice")
         mem = g.get("memoryInGb") or 0
+        if is_amd_gpu(gid) or is_amd_gpu(name):       # CUDA-only app → never offer AMD
+            continue
         if not stock and not include_out_of_stock:   # out of stock here → skip
             continue
         if mem < min_memory_gb:
@@ -705,8 +730,8 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
         # (deploy_pod), which accepts the full catalog — so every in-stock card is
         # genuinely deployable, matching what the RunPod console offers.
         out.append({
-            "id":        g.get("id"),
-            "name":      g.get("displayName") or g.get("id"),
+            "id":        gid,
+            "name":      name,
             "memory_gb": mem,
             "price":     price,
             "stock":     stock,
