@@ -612,6 +612,31 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
   does not map to video, so show a **per-video segment-progress + queue + the cost
   estimator/gate** instead, plus the live remote telemetry row the upscale tab has.
   Reuses the Settings Region/DC + GPU pickers.
+- **Video comparison window** (GUI, phase 5): a floating, resizable
+  original-vs-upscaled **video** viewer, the video analogue of the image
+  `ComparisonWindow` (0.2.9). Same shape: one shared instance, geometry persisted
+  (`video_compare_geometry`), opened from the Video Upscaler tab's per-video
+  context menu / a **Compare** action on a completed video (there is no thumbnail
+  wall for video, so the entry point is the queue row, not a double-click on a
+  strip). Both streams draw aligned on one canvas split by a vertical **before/after
+  wipe** (left = source scaled up nearest-neighbour so its pixels line up with the
+  upscaled grid, right = upscaled), with **shared** zoom (wheel, pointer-centred) and
+  pan and a draggable divider, exactly like the image version, so the quality gain
+  is directly visible. Key decisions that keep it dependency-light and correct:
+    * **Align by TIMESTAMP, not frame index.** CFR-normalize can change the upscaled
+      frame count (4835 -> 4923, section 14), so frame-index pairing would slowly
+      mismatch; seeking both sides to the same time keeps the same content under the
+      wipe.
+    * **v1 is scrub + frame-step, not real-time playback** (a timeline slider +
+      prev/next-frame, decode-on-seek). For judging upscale *quality* a held frame
+      beats motion, and this mirrors how the image viewer decodes only when a gesture
+      settles. Real-time synchronised playback is a later add.
+    * **Decode frames on demand through the bundled ffmpeg**
+      (`ffmpeg -ss <t> -i <file> -frames:v 1` to a pipe -> Pillow), so the GUI needs
+      **no opencv and no new dependency** and reuses the same bundled-ffmpeg + Pillow
+      stack as the rest of the app. Decode only the visible slice of each side (the
+      upscaled side is the cost; the source is tiny), fast filter during gestures and
+      a crisp pass when they settle, as the image viewer does.
 - **`ffmpeg` dependency (settled, 6.4):** `bootstrap.ps1` downloads a pinned,
   nvenc-enabled ffmpeg in **both** install modes (Remote-only needs it too). All
   container work (probe/split/normalize/re-encode/reassemble/mux) runs locally; the
@@ -648,7 +673,11 @@ cost tracking, notifications, taskbar progress/flash.
    cleanly mid-video, a resume run picks up at the first unfinished SEGMENT off the
    reused split, recursion/mirroring works, and the round trip is frame-perfect
    (4835->4835) with drift OK. See section 14.
-5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress.
+5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress,
+   plus the **original-vs-upscaled video comparison window** (the video analogue of
+   the image `ComparisonWindow`; before/after wipe, shared zoom/pan, timestamp-aligned
+   scrub + frame-step, frames decoded on demand via the bundled ffmpeg — see the
+   build piece in section 11).
 
 **Reasonable v1 scope:** 1080p target only; fixed seed per video (6.2); plain
 `-c copy` splitting with the sparse-GOP re-encode fallback (6.1); CFR normalize +
