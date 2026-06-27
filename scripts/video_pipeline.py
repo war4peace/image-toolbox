@@ -344,6 +344,21 @@ def plan_split(info: VideoInfo, segment_seconds=60.0, max_segment_seconds=120.0,
                          f"VFR source (r={float(info.r_fps):.3f} != avg="
                          f"{float(info.avg_fps):.3f} fps): CFR-normalize",
                          segment_seconds, info.fps)
+    # Mistagged frame rate: a source can TAG a clean CFR (r == avg) yet hold a
+    # frame count that doesn't match `tagged_fps x duration` — an old AVI tags
+    # 30fps but holds 4835 frames over 164.1s = a REAL 29.46fps. Upscaling re-times
+    # it to the tagged fps (SeedVR2's writer trusts CAP_PROP_FPS), shortening the
+    # video and desyncing the muxed audio (measured on Pisici.AVI: a 2.9s
+    # progressive drift, the dangerous lip-sync case in 6.3). CFR-normalize pads
+    # the frames to a true CFR stream matching the duration, keeping A/V in sync.
+    # Needs COUNTED frames (probe(count=True)); the header count would hide it.
+    if info.duration and info.nb_frames and info.r_fps > 0:
+        eff = info.nb_frames / info.duration
+        if abs(eff - float(info.r_fps)) / float(info.r_fps) > 0.005:
+            return SplitPlan("reencode",
+                             f"tagged {float(info.r_fps):.3f}fps but real "
+                             f"{eff:.3f}fps (counted/duration): CFR-normalize",
+                             segment_seconds, info.fps)
     gap = max_keyframe_gap(info.path)
     if gap > max_segment_seconds:
         return SplitPlan("reencode",

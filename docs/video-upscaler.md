@@ -751,9 +751,35 @@ log glyph crashed Windows cp1252 stdout and masked the installment path — the
 runner now reconfigures stdout to UTF-8 `errors="replace"`; (2) the Discord/Telegram
 `fields` API wants list-of-dicts (`{"name","value"}`), not tuples.
 
+**Real-pod end-to-end PASSED (RTX 5090, EU-RO-1, 2026-06-27).** A full
+`Pisici.AVI -> 1080p` run on a rented 5090 ($0.99/h): worker came up in `video`
+mode (354 s incl. model load), 3 segments streamed (submit/poll/fetch), each a real
+SeedVR2 upscale (1778/1762/1295 frames at ~0.88-0.91 s/frame, matching the
+benchmark), the **heartbeat held across each ~27-min segment** (dead-man's switch
+never misfired), pod-reuse + worker version/mode reuse worked on the second
+connect (no reload), and the pod **terminated cleanly** at the end. Output:
+1440x1080, frame-perfect **4835 -> 4835** frames. ~72 min wall, ~$1.20.
+
+**The run found a real bug — and the drift detector caught it.** The output had a
+**2.9 s progressive A/V desync**. Cause: `Pisici.AVI` holds 4835 frames over a
+164.1 s container = a REAL **29.46 fps**, but the AVI *tags* 30 fps (r == avg ==
+30/1). SeedVR2's opencv writer trusts the tag and writes 30 fps -> 4835/30 =
+161.17 s video, while the original 164.1 s audio is muxed unchanged -> they drift
+2.9 s over the clip (the dangerous lip-sync case in 6.3). The phase-2 VFR check
+missed it because it compares r vs avg frame-rate (both tagged 30), never the
+COUNTED rate. **Fixed** (`plan_split`): also trigger CFR-normalize when
+`counted_frames / duration` disagrees with the tagged fps by >0.5 %. CFR-normalize
+pads 4835 -> 4923 frames = 164.2 s @ 30 fps, matching the audio: the desync drops
+from **2.9 s (progressive) to 0.11 s (near-constant)**, and the detector honestly
+notes the small residual (the CFR-rounding overshoot, output 164.20 s vs source
+164.10 s). Validated locally via the round-trip; on a pod the segments are now true
+30 fps CFR so SeedVR2 reproduces the same 164.2 s. **Possible future refinement:**
+CFR-normalize to the *effective* fps (29.46) for an exact-duration match instead of
+the ~0.1 s overshoot. The two other notes: the opencv backend writes **mpeg4**
+(`mp4v`), not h264 — switch to the ffmpeg backend (x264/x265) for a better
+deliverable once ffmpeg is confirmed on the pod; and the pod's worker re-runs the
+SeedVR2 video path with no code change from #1.
+
 **Still to build (phase 5):** the GUI "Video Upscaler" tab (cost estimator/gate +
 per-video segment progress, consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI
-events the runner already emits). **Still un-exercised against a real pod:** the
-actual SeedVR2 segment upscale + the worker heartbeat/dead-man's-switch under a
-multi-minute segment (the local proof uses a passthrough engine). A real-pod
-end-to-end pass is the first thing to do when wiring phase 5.
+events the runner already emits) and its `cost_confirm_usd` gate.
