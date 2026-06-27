@@ -258,6 +258,16 @@ by **local GPU capability, not video size**.
   `-c copy` concat + `-c copy` audio mux** with no re-encode of the result, so all
   segments share identical codec params (same worker settings) and concat stays
   lossless.
+- **Two `-c copy` exceptions found in phase 2 (refines the two bullets above):**
+  (a) **Audio may not fit mp4.** Old-camera audio codecs (measured: `Pisici.AVI`
+  carries `pcm_mulaw`) cannot `-c copy` into an mp4/mov container, so the **audio
+  alone** is re-encoded to AAC (the *video* still `-c copy`s — 6.4's real concern).
+  Detected by checking the source audio codec against an mp4-friendly set
+  (`aac/mp3/ac3/eac3/alac`). (b) **Re-encode must normalize pixel format.** When the
+  split DOES re-encode (VFR/sparse-GOP), NVENC rejects 4:2:2 input (measured:
+  `hevc_nvenc` 400s on the source's `yuvj422p` with "YUV422P not supported"), so the
+  re-encode forces `-pix_fmt yuv420p` (universal for x264/x265/nvenc; harmless, since
+  that intermediate is upscaled downstream by a detail-hallucinating model).
 
 ## 7. SeedVR2 video settings + benchmark prerequisite
 
@@ -605,7 +615,9 @@ cost tracking, notifications, taskbar progress/flash.
    the volume venv's python).
 2. **ffmpeg split/reassemble/mux + drift detection** locally (no pod): prove the
    segment -> concat -> audio-mux -> drift-warn pipeline on already-upscaled or
-   passthrough segments.
+   passthrough segments. **DONE — `scripts/video_pipeline.py`** (probe / plan /
+   split / concat / mux / drift, CLI passthrough round-trip proof). See section 14
+   for what the proof surfaced.
 3. **Worker `--mode video` + submit/poll protocol + heartbeat-per-chunk.**
 4. **`batch_video_upscale.py`** wiring the `video_*` tables, per-segment streaming,
    resume, and the per-run cap.
@@ -658,3 +670,45 @@ reassembly are proven.
 - Confirm nvenc availability at runtime: NVIDIA GPU/driver present **and**
   `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
   libx265/libx264 fallback (6.4).
+
+## 14. Phase 2 built: `scripts/video_pipeline.py` (local container pipeline)
+
+The phase-2 deliverable (section 12.2) is built and proven on the real motivating
+asset (`benchmark-videos/Pisici.AVI`, 320x240 mjpeg/AVI, pcm_mulaw audio). The
+module is **stdlib + a bundled ffmpeg/ffprobe, no torch, never touches the
+source**: `probe` / `count_frames` / `max_keyframe_gap` / `plan_split` /
+`pick_encoder` / `split` / `concat_segments` / `mux_audio` / `check_drift`, plus a
+CLI `passthrough_roundtrip` that splits then reassembles the *same* segments
+(identity = "upscaled") and verifies a lossless round trip. Phase 3 swaps the
+identity step for the real per-segment pod upscale; nothing else in the pipeline
+changes. `find_ffmpeg` resolves `$IMGTBX_FFMPEG_DIR` -> `APP_ROOT/ffmpeg/bin`
+(bootstrap target) -> PATH.
+
+**Proven:** copy-path round trip is **frame-perfect** (4835 -> 4835 frames,
+duration preserved) at both 60 s (3 segments) and 5 s (33 segments) granularity;
+the forced-re-encode path runs end to end; the drift detector both **stays quiet**
+on a clean copy and **fires** on a real timing change.
+
+**What the proof surfaced (each now handled in code + folded into 6.3/6.4):**
+
+- **The `nb_frames` stream HEADER is unreliable.** `Pisici.AVI` reports 4923 in
+  the header but holds **4835** actual frames (packet count == decoded count == 4835;
+  the 4923 is `30 fps x 164.1 s`, but the video stream is ~29.5 fps under an
+  audio-driven 164.1 s container duration). **Drift detection must compare COUNTED
+  frames, never the header** (`probe(count=True)` does one demux pass), or every such
+  file raises a false 88-frame alarm. This is the single most important phase-2
+  finding for correctness.
+- **Audio codec vs mp4** and **pixel format vs NVENC**: the two `-c copy`
+  exceptions now documented in 6.4 (audio -> AAC fallback; re-encode -> `yuv420p`).
+- **CFR normalize legitimately shifts duration**, and the detector correctly warns:
+  forcing this source to exactly 30 fps CFR padded 4835 -> 4923 frames (+0.098 s),
+  because its real frame count doesn't fill the nominal `fps x duration` grid. Per
+  6.3 the app **warns and keeps the result, never silently fixes** — working as
+  intended. (Implication for the runner: prefer the `-c copy` path whenever
+  possible; the re-encode path can nudge timing on sources whose own metadata is
+  internally inconsistent.)
+
+**Not yet built (phase 3+ picks up):** the worker `--mode video` submit/poll
+protocol, the `video_*` resume tables + `batch_video_upscale.py`, and the GUI tab.
+The per-segment frame-count assertion lives in `check_drift` already; the runner
+will call it per segment as results return.
