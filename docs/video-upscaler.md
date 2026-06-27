@@ -580,10 +580,14 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
 
 ## 11. Build pieces
 
-- **`scripts/batch_video_upscale.py`** runner sibling: walks the source tree,
-  mirrors to the output root, does the ffmpeg split/reassemble/mux, drives the
-  per-segment remote stream, manages the `video_*` resume tables, runs the
-  duration-drift check, sends notifications. No torch import (remote-only).
+- **`scripts/batch_video_upscale.py`** runner sibling: **BUILT (phase 4).** Walks
+  the source tree, mirrors to the output root, splits each video locally
+  (video_pipeline), streams each segment through the injected engine, reassembles
+  + mux + drift-checks, manages the `video_*` resume tables and the per-run
+  installment cap, sends notifications. No torch import (remote-only). The engine
+  is injected (`run_batch(engine, …)`) so the same orchestration runs against the
+  real `RemoteVideoEngine` or a built-in `PassthroughVideoEngine` (`--passthrough`,
+  no pod: stream-copies each segment) for testing the whole pipeline GPU-free.
 - **Worker `--mode video`** (`pod/worker.py`): **BUILT (phase 3).** Loads SeedVR2
   once (like `full`) and serves the async **submit / poll / fetch** trio
   (`POST /video/submit` -> `{id, total_frames}`; `GET /video/status?id=` ->
@@ -598,9 +602,12 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
   goes stale and the dead-man's switch reclaims the pod). Sibling to `full` / `tag`.
   Proven locally with a fake engine (full protocol + 409 + heartbeat + frame-count
   read) — see commit. **Still to wire (phase 4): the client half.**
-- **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): same
-  create -> push -> start worker -> arm dead-man's switch -> stream -> teardown
-  lifecycle, with the video worker mode and the submit/poll protocol.
+- **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): **DONE** by
+  extending `RemoteSession` with `mode="video"` (worker `--mode video`) — the same
+  create -> push -> start worker -> arm dead-man's switch -> teardown lifecycle,
+  handing back a **`RemoteVideoEngine`** (`scripts/remote_video_engine.py`) that
+  subclasses `RemoteUpscaleEngine` for the proven tunnel/health/telemetry/close and
+  adds `process_segment` (submit -> poll status -> fetch, with live `on_progress`).
 - **GUI tab "Video Upscaler"** (`toolbox_gui.py`): the thumbnail/film-strip wall
   does not map to video, so show a **per-video segment-progress + queue + the cost
   estimator/gate** instead, plus the live remote telemetry row the upscale tab has.
@@ -635,7 +642,12 @@ cost tracking, notifications, taskbar progress/flash.
    tee (finer than per-chunk + hang-detection), see section 11. Client half is
    phase 4.
 4. **`batch_video_upscale.py`** wiring the `video_*` tables, per-segment streaming,
-   resume, and the per-run cap.
+   resume, and the per-run cap. **DONE** — plus `RemoteVideoEngine`, `RemoteSession`
+   `mode="video"`, and the `db.py` `video_roots/video_files/video_segments` tables.
+   Proven end to end locally with `--passthrough` (no pod): installment cap stops
+   cleanly mid-video, a resume run picks up at the first unfinished SEGMENT off the
+   reused split, recursion/mirroring works, and the round trip is frame-perfect
+   (4835->4835) with drift OK. See section 14.
 5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress.
 
 **Reasonable v1 scope:** 1080p target only; fixed seed per video (6.2); plain
@@ -723,7 +735,25 @@ on a clean copy and **fires** on a real timing change.
   possible; the re-encode path can nudge timing on sources whose own metadata is
   internally inconsistent.)
 
-**Not yet built (phase 3+ picks up):** the worker `--mode video` submit/poll
-protocol, the `video_*` resume tables + `batch_video_upscale.py`, and the GUI tab.
-The per-segment frame-count assertion lives in `check_drift` already; the runner
-will call it per segment as results return.
+**Phase 4 built (the integration step):** `batch_video_upscale.py` ties the phase-2
+local ffmpeg pipeline to the phase-3 worker. New pieces:
+`scripts/remote_video_engine.py` (`RemoteVideoEngine.process_segment` = submit ->
+poll -> fetch), `remote_run.RemoteSession` `mode="video"`, and `db.py`
+`video_roots/video_files/video_segments` (resume at TWO granularities: a stopped
+run resumes at the first unfinished SEGMENT). The runner is engine-injected, so a
+built-in `PassthroughVideoEngine` (`--passthrough`) runs the whole orchestration
+with no pod. **Proven locally:** the per-run installment cap stops cleanly
+mid-video (not a failure); a resume run continues at the first pending segment off
+the *reused* split (no re-split, no re-upscale of done segments); recursion +
+output mirroring work; the round trip is frame-perfect (4835->4835) with drift OK;
+"already done" short-circuits. Two bugs the test caught and fixed: (1) a non-ASCII
+log glyph crashed Windows cp1252 stdout and masked the installment path — the
+runner now reconfigures stdout to UTF-8 `errors="replace"`; (2) the Discord/Telegram
+`fields` API wants list-of-dicts (`{"name","value"}`), not tuples.
+
+**Still to build (phase 5):** the GUI "Video Upscaler" tab (cost estimator/gate +
+per-video segment progress, consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI
+events the runner already emits). **Still un-exercised against a real pod:** the
+actual SeedVR2 segment upscale + the worker heartbeat/dead-man's-switch under a
+multi-minute segment (the local proof uses a passthrough engine). A real-pod
+end-to-end pass is the first thing to do when wiring phase 5.

@@ -105,6 +105,49 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     hash  TEXT
 );
 
+-- Video Upscaler (#2) resume + queue state, mirroring the upscale eligibility
+-- pattern but at two granularities (video, then segment) so a stopped run
+-- resumes at the first unfinished SEGMENT, not the first unfinished video — the
+-- installment model (docs/video-upscaler.md section 5). No GPU/torch here: the
+-- runner is pure orchestration + local ffmpeg.
+CREATE TABLE IF NOT EXISTS video_roots (
+    id          INTEGER PRIMARY KEY,
+    source_root TEXT NOT NULL UNIQUE,
+    output_root TEXT,
+    saved_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS video_files (
+    root_id      INTEGER NOT NULL REFERENCES video_roots(id) ON DELETE CASCADE,
+    rel_path     TEXT NOT NULL,
+    width        INTEGER,
+    height       INTEGER,
+    fps          REAL,
+    frames       INTEGER,          -- COUNTED frames (not the unreliable header), see 14
+    duration     REAL,
+    target       TEXT,             -- 1080p | 1440p | 4K chosen for this video
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending|splitting|streaming|done|failed|skipped
+    skip_reason  TEXT,
+    output_path  TEXT,
+    out_frames   INTEGER,          -- frames in the reassembled output (drift check)
+    updated_at   TEXT,
+    PRIMARY KEY (root_id, rel_path)
+);
+CREATE TABLE IF NOT EXISTS video_segments (
+    video_root_id INTEGER NOT NULL,
+    video_rel     TEXT NOT NULL,            -- the parent video's rel_path
+    seg_index     INTEGER NOT NULL,
+    in_frames     INTEGER,                  -- source frames in this segment
+    out_frames    INTEGER,                  -- upscaled frames returned by the worker
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|done|failed
+    seconds       REAL,                     -- worker process time for this segment
+    output_path   TEXT,                     -- the upscaled segment file (kept for reassembly)
+    updated_at    TEXT,
+    PRIMARY KEY (video_root_id, video_rel, seg_index),
+    FOREIGN KEY (video_root_id) REFERENCES video_roots(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_video_seg_parent
+    ON video_segments(video_root_id, video_rel);
+
 -- Per-user GPU timing for the remote-pod cost estimator (0.3.9). Cumulative
 -- images + processing seconds per (task, gpu_id), accumulated from finished
 -- remote runs, so a future run on the same card warm-starts its "$ / 100 images"
@@ -249,6 +292,90 @@ def find_tag_root(conn, source_root):
         if _norm(row["source_root"]) == target:
             return row
     return None
+
+
+# ─────────────────────────────────────────────
+#  VIDEO UPSCALER  (resume + queue, two granularities)
+# ─────────────────────────────────────────────
+
+def get_video_root_id(conn, source_root, output_root=None, create=True):
+    """Return the id of a video root (creating/updating it when create=True)."""
+    row = conn.execute("SELECT id FROM video_roots WHERE source_root = ?",
+                       (source_root,)).fetchone()
+    if row is not None:
+        if create and output_root is not None:
+            conn.execute("UPDATE video_roots SET output_root = ? WHERE id = ?",
+                         (output_root, row["id"]))
+        return row["id"]
+    if not create:
+        return None
+    cur = conn.execute(
+        "INSERT INTO video_roots (source_root, output_root, saved_at) VALUES (?, ?, ?)",
+        (source_root, output_root, datetime.datetime.now().isoformat()))
+    return cur.lastrowid
+
+
+def upsert_video_file(conn, root_id, rel_path, **fields):
+    """Insert or update a video_files row. `fields` may set any of: width, height,
+    fps, frames, duration, target, status, skip_reason, output_path, out_frames.
+    Always stamps updated_at. Commits."""
+    fields["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    cols = ["root_id", "rel_path"] + list(fields.keys())
+    existing = conn.execute(
+        "SELECT 1 FROM video_files WHERE root_id = ? AND rel_path = ?",
+        (root_id, rel_path)).fetchone()
+    if existing is None:
+        placeholders = ", ".join("?" for _ in cols)
+        conn.execute(f"INSERT INTO video_files ({', '.join(cols)}) VALUES ({placeholders})",
+                     [root_id, rel_path, *fields.values()])
+    else:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE video_files SET {sets} WHERE root_id = ? AND rel_path = ?",
+                     [*fields.values(), root_id, rel_path])
+    conn.commit()
+
+
+def get_video_file(conn, root_id, rel_path):
+    """Return the video_files Row for a source video, or None."""
+    return conn.execute(
+        "SELECT * FROM video_files WHERE root_id = ? AND rel_path = ?",
+        (root_id, rel_path)).fetchone()
+
+
+def upsert_video_segment(conn, root_id, video_rel, seg_index, **fields):
+    """Insert or update one video_segments row (in_frames, out_frames, status,
+    seconds, output_path). Stamps updated_at. Commits."""
+    fields["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    cols = ["video_root_id", "video_rel", "seg_index"] + list(fields.keys())
+    existing = conn.execute(
+        "SELECT 1 FROM video_segments WHERE video_root_id = ? AND video_rel = ? "
+        "AND seg_index = ?", (root_id, video_rel, seg_index)).fetchone()
+    if existing is None:
+        placeholders = ", ".join("?" for _ in cols)
+        conn.execute(f"INSERT INTO video_segments ({', '.join(cols)}) VALUES ({placeholders})",
+                     [root_id, video_rel, seg_index, *fields.values()])
+    else:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE video_segments SET {sets} WHERE video_root_id = ? AND "
+            "video_rel = ? AND seg_index = ?",
+            [*fields.values(), root_id, video_rel, seg_index])
+    conn.commit()
+
+
+def get_video_segments(conn, root_id, video_rel):
+    """All segment rows for a video, ordered by index."""
+    return conn.execute(
+        "SELECT * FROM video_segments WHERE video_root_id = ? AND video_rel = ? "
+        "ORDER BY seg_index", (root_id, video_rel)).fetchall()
+
+
+def clear_video_segments(conn, root_id, video_rel):
+    """Drop a video's segment rows (a fresh split supersedes the old plan)."""
+    conn.execute(
+        "DELETE FROM video_segments WHERE video_root_id = ? AND video_rel = ?",
+        (root_id, video_rel))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────

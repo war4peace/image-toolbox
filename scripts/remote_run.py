@@ -27,6 +27,7 @@ import subprocess
 import runpod_client as rp
 import ssh_setup
 from remote_upscale_engine import RemoteUpscaleEngine
+from remote_video_engine import RemoteVideoEngine
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
 HEARTBEAT = "/tmp/upscale_heartbeat"
@@ -45,15 +46,17 @@ class RemoteSession:
         """`attach` = (pod_id, host, ssh_port) to reuse a running pod instead of
         creating one (dev/validation). `on_event(msg)` is for progress lines.
 
-        `mode`: "upscale" (full worker: SeedVR2 + /upscale + /orient) or "tag"
+        `mode`: "upscale" (full worker: SeedVR2 + /upscale + /orient), "tag"
         (remote Tag & Rename — the worker loads only /orient so the VRAM is free
         for Ollama, which is also started on the pod and reached via a second
-        tunnel exposed as `self.ollama_url`)."""
+        tunnel exposed as `self.ollama_url`), or "video" (Video Upscaler #2 — the
+        worker loads SeedVR2 and serves /video/*, and start() hands back a
+        RemoteVideoEngine that streams one segment at a time)."""
         self.cfg = runpod_cfg
         self.upscale_cfg = upscale_cfg
         self.app_root = app_root
         self.mode = mode
-        self.worker_mode = "tag" if mode == "tag" else "full"
+        self.worker_mode = {"tag": "tag", "video": "video"}.get(mode, "full")
         self.ollama_url = None        # set in tag mode (local end of the tunnel)
         self._ollama_tunnel = None
         self.api_key = runpod_cfg.get("api_key", "")
@@ -168,12 +171,18 @@ class RemoteSession:
             self._start_ollama()
         self._arm_deadman()
         self._emit("Connecting to the worker …")
-        self.engine = RemoteUpscaleEngine(
+        engine_cls = RemoteVideoEngine if self.mode == "video" else RemoteUpscaleEngine
+        self.engine = engine_cls(
             self.host, self.ssh_port, self.key_path,
             worker_port=self.worker_port, known_hosts=self.known_hosts)
         if self.mode == "tag":
             self._open_ollama_tunnel()
             self._emit(f"Remote tagging ready (Ollama at {self.ollama_url}).")
+        elif self.mode == "video":
+            vram = (" (big-VRAM: DiT + VAE kept resident on the GPU)"
+                    if getattr(self.engine, "resident", False)
+                    else " (DiT/VAE CPU offload)")
+            self._emit(f"Remote video engine ready on {self.engine.device_name}.{vram}")
         else:
             vram = (" (big-VRAM: DiT + VAE kept resident on the GPU)"
                     if getattr(self.engine, "resident", False)
