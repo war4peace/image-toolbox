@@ -293,6 +293,55 @@ class UpscaleEngine:
             runner_cache=self._runner_cache,
         )
 
+    # ── Video entry point (Video Upscaler #2, phase 3) ───────────────────────
+
+    def process_video(self, src_path, dest_path, *, resolution, batch_size=13,
+                      chunk_size=0, temporal_overlap=0, seed=None,
+                      video_backend="opencv", use_10bit=False,
+                      load_cap=0, skip_first_frames=0, capture=False):
+        """
+        Upscale a whole video SEGMENT file to dest_path and return the number of
+        frames written. Drives the SAME SeedVR2 streaming path the benchmark and
+        RAM harnesses validated (`inference_cli.process_single_file`), reusing the
+        cached DiT/VAE so successive segments skip the model load.
+
+        The video-only knobs (no equivalent on the image path) come from the tuned
+        per-(target x card) defaults the runner picks; `chunk_size > 0` MUST be set
+        by the caller for any non-trivial segment so output frames stream out
+        instead of accumulating in RAM (docs/video-upscaler.md section 8). The
+        source segment is read-only; output is written to dest_path.
+
+        Unlike upscale(), this does NOT redirect stdout by default (`capture=False`)
+        so the pipeline's progress reaches the pod log live during a long segment;
+        the worker monitors the growing output file for liveness/heartbeat.
+        """
+        self.args.resolution        = int(resolution)
+        self.args.batch_size        = int(batch_size)
+        self.args.chunk_size        = int(chunk_size)
+        self.args.temporal_overlap  = int(temporal_overlap)
+        self.args.load_cap          = int(load_cap)
+        self.args.skip_first_frames = int(skip_first_frames)
+        self.args.output_format     = "mp4"
+        self.args.video_backend     = video_backend
+        self.args.use_10bit         = bool(use_10bit)
+        # One fixed seed per source video (6.2) when the caller supplies it; else a
+        # fresh draw. Capped at 2**31-1 for the same VAE-seed reason as upscale().
+        self.args.seed = int(seed) if seed is not None else random.randint(0, 2**31 - 1)
+
+        def _go():
+            return self._cli.process_single_file(
+                src_path, self.args, ["0"],
+                output_path=dest_path, runner_cache=self._runner_cache)
+
+        if not capture:
+            return _go()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                return _go()
+        finally:
+            self._drain_capture(buf)
+
     def close(self):
         """Release cached models and free VRAM/RAM."""
         self._runner_cache.clear()

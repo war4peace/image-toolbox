@@ -584,9 +584,20 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
   mirrors to the output root, does the ffmpeg split/reassemble/mux, drives the
   per-segment remote stream, manages the `video_*` resume tables, runs the
   duration-drift check, sends notifications. No torch import (remote-only).
-- **Worker `--mode video`** (`pod/worker.py`): receives a segment, runs the
-  SeedVR2 CLI video path with the tuned settings, serves submit/poll/fetch, touches
-  the heartbeat per internal chunk. Sibling to the existing `full` / `tag` modes.
+- **Worker `--mode video`** (`pod/worker.py`): **BUILT (phase 3).** Loads SeedVR2
+  once (like `full`) and serves the async **submit / poll / fetch** trio
+  (`POST /video/submit` -> `{id, total_frames}`; `GET /video/status?id=` ->
+  state/frames/bytes/elapsed; `GET /video/fetch?id=` -> upscaled mp4). One segment
+  at a time (a concurrent submit returns 409); GPU work holds `_GPU_LOCK`. The
+  per-segment upscale runs via the new **`UpscaleEngine.process_video`** (the same
+  `inference_cli.process_single_file` streaming path the benchmark/RAM harnesses
+  validated), reusing the cached DiT/VAE. **Heartbeat:** instead of literal
+  per-chunk touches, a `_HeartbeatTee` over the pipeline's tqdm output refreshes
+  the heartbeat on every line of progress — finer-grained than per-chunk AND it
+  doubles as hang-detection (a stuck GPU stops emitting progress, so the heartbeat
+  goes stale and the dead-man's switch reclaims the pod). Sibling to `full` / `tag`.
+  Proven locally with a fake engine (full protocol + 409 + heartbeat + frame-count
+  read) — see commit. **Still to wire (phase 4): the client half.**
 - **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): same
   create -> push -> start worker -> arm dead-man's switch -> stream -> teardown
   lifecycle, with the video worker mode and the submit/poll protocol.
@@ -619,6 +630,10 @@ cost tracking, notifications, taskbar progress/flash.
    split / concat / mux / drift, CLI passthrough round-trip proof). See section 14
    for what the proof surfaced.
 3. **Worker `--mode video` + submit/poll protocol + heartbeat-per-chunk.**
+   **DONE** — `pod/worker.py` (async submit/status/fetch, one segment at a time)
+   + `UpscaleEngine.process_video`. Heartbeat is progress-line-gated via a tqdm
+   tee (finer than per-chunk + hang-detection), see section 11. Client half is
+   phase 4.
 4. **`batch_video_upscale.py`** wiring the `video_*` tables, per-segment streaming,
    resume, and the per-run cap.
 5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress.

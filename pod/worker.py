@@ -26,14 +26,30 @@ Endpoints:
                                          remote-pod #1 option B — the CNN runs here so
                                          the local side needs no torch; it sends only a
                                          ~512px thumbnail, then rotates + uploads locally)
+
+  Video Upscaler (#2, phase 3) — a segment upscale takes minutes to hours, far
+  too long for one synchronous request, so it is async (submit / poll / fetch):
+    POST /video/submit?resolution=&batch_size=&chunk_size=&temporal_overlap=
+                       &seed=&video_backend=&use_10bit=&ext=.mkv
+                                      body = ONE segment's bytes
+                                      -> {"id":..., "total_frames":N}  (starts work)
+    GET  /video/status?id=ID          -> {state, total_frames, frames_written,
+                                          output_bytes, elapsed, seconds, error}
+    GET  /video/fetch?id=ID           -> upscaled mp4 bytes (409 until done)
+  The heartbeat is refreshed on every line of pipeline progress (a tee over the
+  SeedVR2 tqdm output), so a long segment that is genuinely working stays alive
+  while a HUNG GPU goes stale and the dead-man's switch can reclaim the pod.
 """
 import os
 import sys
 import json
 import time
+import uuid
+import shutil
 import argparse
 import tempfile
 import threading
+import contextlib
 import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -43,13 +59,19 @@ _HEARTBEAT = None
 _COUNT = 0
 _VERSION = ""           # worker-code version (hash of the pushed .py files); a
                         # reused pod reloads the worker when this stops matching
-_MODE = "full"          # "full" (SeedVR2 + /upscale) or "tag" (/orient only); a
-                        # reused pod also reloads when the requested mode differs
+_MODE = "full"          # "full" (SeedVR2 + /upscale), "tag" (/orient only), or
+                        # "video" (SeedVR2 + /video/*); a reused pod also reloads
+                        # when the requested mode differs
 # GPU work (upscale + the orient CNN) is serialised through this lock so a
 # /telemetry or /health request can still be answered WHILE an upscale runs
 # (the server is multi-threaded; those two endpoints never take the lock).
 _GPU_LOCK = threading.Lock()
 _PREV_CPU = None        # (idle, total) jiffies from the last /telemetry sample
+
+# The one active video job (segments are streamed one at a time, so the worker
+# never runs two at once). Guarded by _VIDEO_LOCK. None until the first submit.
+_VIDEO_JOB = None
+_VIDEO_LOCK = threading.Lock()
 
 
 def _touch(path):
@@ -172,6 +194,100 @@ def _sample_telemetry():
     }
 
 
+# ── video jobs (Video Upscaler #2, phase 3) ─────────────────────────────────
+
+def _count_video_frames(path):
+    """Frame count of a segment via OpenCV (already a SeedVR2 dependency). Best
+    effort: 0 on failure (status then reports total_frames=0, never blocks work)."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return max(0, n)
+    except Exception:
+        return 0
+
+
+class _HeartbeatTee:
+    """A stdout/stderr proxy that forwards to the real stream AND touches the
+    heartbeat on every non-blank write. Wrapping the SeedVR2 pipeline's tqdm
+    progress in this turns each per-batch redraw into a liveness signal, so the
+    dead-man's switch sees a working segment as alive yet a hung GPU (no progress
+    output) as idle and reclaims the pod."""
+
+    def __init__(self, real, job):
+        self._real = real
+        self._job = job
+
+    def write(self, s):
+        try:
+            self._real.write(s)
+        except Exception:
+            pass
+        if s and s.strip():
+            _touch(_HEARTBEAT)
+            self._job["last_output_t"] = time.time()
+        return len(s) if s else 0
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+
+def _run_video_job(job, params):
+    """Upscale one segment to job['output'] (its own thread). GPU work is
+    serialised through _GPU_LOCK; progress is teed to the heartbeat. Fail-safe:
+    any error lands in job['error'] and the worker keeps serving."""
+    global _COUNT
+    job["state"] = "running"
+    _touch(_HEARTBEAT)
+    tee = _HeartbeatTee(sys.stdout, job)
+    try:
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            with _GPU_LOCK:
+                t0 = time.time()
+                n = _ENGINE.process_video(
+                    job["input"], job["output"],
+                    resolution=params["resolution"],
+                    batch_size=params["batch_size"],
+                    chunk_size=params["chunk_size"],
+                    temporal_overlap=params["temporal_overlap"],
+                    seed=params["seed"],
+                    video_backend=params["video_backend"],
+                    use_10bit=params["use_10bit"])
+                dt = time.time() - t0
+        try:
+            out_bytes = os.path.getsize(job["output"])
+        except OSError:
+            out_bytes = 0
+        job["frames_written"] = n
+        job["output_bytes"] = out_bytes
+        job["seconds"] = dt
+        job["state"] = "done"
+        _COUNT += 1
+        _log(f"video job {job['id'][:8]} done: {n} frames in {dt:.1f}s "
+             f"-> {out_bytes}B (res={params['resolution']} bs={params['batch_size']} "
+             f"chunk={params['chunk_size']})")
+    except Exception as exc:                 # noqa: BLE001 — report, keep serving
+        job["state"] = "error"
+        job["error"] = str(exc)
+        _log(f"video job {job['id'][:8]} ERROR: {exc}")
+    finally:
+        _touch(_HEARTBEAT)
+
+
+def _cleanup_job(job):
+    """Remove a finished job's temp dir (input + output). Best effort."""
+    if not job:
+        return
+    d = job.get("dir")
+    if d and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):          # quiet the default per-request logging
         pass
@@ -200,6 +316,10 @@ class Handler(BaseHTTPRequestHandler):
             # Lock-free so it answers even while an upscale holds _GPU_LOCK.
             body = json.dumps(_sample_telemetry()).encode()
             self._send(200, body, "application/json")
+        elif path == "/video/status":
+            self._handle_video_status(parse_qs(urlparse(self.path).query))
+        elif path == "/video/fetch":
+            self._handle_video_fetch(parse_qs(urlparse(self.path).query))
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -207,6 +327,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/orient":
             self._handle_orient()
+            return
+        if parsed.path == "/video/submit":
+            self._handle_video_submit(parsed)
             return
         if parsed.path != "/upscale":
             self._send(404, b"not found", "text/plain")
@@ -305,6 +428,125 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
 
+    # ── video (submit / status / fetch) ──────────────────────────────────────
+
+    def _read_body(self):
+        """Read the request body (draining the connection even on an early
+        rejection, so HTTP keep-alive stays in sync)."""
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length > 0 else b""
+
+    def _handle_video_submit(self, parsed):
+        global _VIDEO_JOB
+        data = self._read_body()           # always drain first
+        if _ENGINE is None:
+            self._send(503, b"video engine not loaded (worker not in video mode)",
+                       "text/plain")
+            return
+        if not data:
+            self._send(400, b"empty body", "text/plain")
+            return
+        q = parse_qs(parsed.query)
+        try:
+            params = {
+                "resolution":       int(q.get("resolution", ["1080"])[0]),
+                "batch_size":       int(q.get("batch_size", ["13"])[0]),
+                "chunk_size":       int(q.get("chunk_size", ["0"])[0]),
+                "temporal_overlap": int(q.get("temporal_overlap", ["0"])[0]),
+                "seed":             int(q["seed"][0]) if q.get("seed") else None,
+                "video_backend":    q.get("video_backend", ["opencv"])[0],
+                "use_10bit":        q.get("use_10bit", ["0"])[0] in ("1", "true", "True"),
+            }
+        except ValueError as exc:
+            self._send(400, f"bad parameter: {exc}".encode(), "text/plain")
+            return
+        ext = q.get("ext", [".mkv"])[0]
+        if not ext.startswith("."):
+            ext = "." + ext
+
+        with _VIDEO_LOCK:
+            if _VIDEO_JOB is not None and _VIDEO_JOB["state"] in ("queued", "running"):
+                self._send(409, b"a video job is already running", "text/plain")
+                return
+            _cleanup_job(_VIDEO_JOB)       # reclaim the previous (fetched) job's dir
+            job_dir = tempfile.mkdtemp(prefix="vid_")
+            in_path = os.path.join(job_dir, "in" + ext)
+            with open(in_path, "wb") as f:
+                f.write(data)
+            job = {
+                "id": uuid.uuid4().hex,
+                "state": "queued",
+                "dir": job_dir,
+                "input": in_path,
+                "output": os.path.join(job_dir, "out.mp4"),
+                "total_frames": _count_video_frames(in_path),
+                "frames_written": None,
+                "output_bytes": 0,
+                "seconds": None,
+                "error": None,
+                "started": time.time(),
+                "last_output_t": time.time(),
+            }
+            _VIDEO_JOB = job
+            threading.Thread(target=_run_video_job, args=(job, params),
+                             daemon=True).start()
+        _log(f"video job {job['id'][:8]} accepted: {len(data)}B "
+             f"({job['total_frames']} frames) res={params['resolution']} "
+             f"bs={params['batch_size']} chunk={params['chunk_size']}")
+        body = json.dumps({"id": job["id"],
+                           "total_frames": job["total_frames"]}).encode()
+        self._send(200, body, "application/json")
+
+    def _handle_video_status(self, q):
+        job = _VIDEO_JOB
+        jid = (q.get("id") or [None])[0]
+        if job is None or job["id"] != jid:
+            self._send(404, json.dumps({"state": "unknown"}).encode(),
+                       "application/json")
+            return
+        # While running, report the growing output size as coarse progress.
+        out_bytes = job.get("output_bytes") or 0
+        if job["state"] == "running":
+            try:
+                out_bytes = os.path.getsize(job["output"])
+            except OSError:
+                out_bytes = 0
+        body = json.dumps({
+            "id":             job["id"],
+            "state":          job["state"],
+            "total_frames":   job["total_frames"],
+            "frames_written": job.get("frames_written"),
+            "output_bytes":   out_bytes,
+            "elapsed":        round(time.time() - job["started"], 1),
+            "seconds":        job.get("seconds"),
+            "error":          job.get("error"),
+        }).encode()
+        self._send(200, body, "application/json")
+
+    def _handle_video_fetch(self, q):
+        job = _VIDEO_JOB
+        jid = (q.get("id") or [None])[0]
+        if job is None or job["id"] != jid:
+            self._send(404, b"no such job", "text/plain")
+            return
+        if job["state"] == "error":
+            self._send(500, (job.get("error") or "error").encode(), "text/plain")
+            return
+        if job["state"] != "done":
+            self._send(409, job["state"].encode(), "text/plain")
+            return
+        try:
+            with open(job["output"], "rb") as f:
+                out = f.read()
+        except OSError as exc:
+            self._send(500, f"output unreadable: {exc}".encode(), "text/plain")
+            return
+        self._send(200, out, "video/mp4",
+                   {"X-Frames": str(job.get("frames_written") or 0),
+                    "X-Process-Time": f"{job.get('seconds') or 0:.3f}"})
+        _log(f"video job {job['id'][:8]} fetched: {len(out)}B")
+
+
 def _ctype_for(ext):
     return {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
             ".png": "image/png", ".webp": "image/webp"}.get(ext.lower(),
@@ -323,10 +565,11 @@ def main(argv=None):
     p.add_argument("--worker-version", default="",
                    help="code version reported by /health so a reused pod can "
                         "detect a stale worker and reload it")
-    p.add_argument("--mode", choices=("full", "tag"), default="full",
+    p.add_argument("--mode", choices=("full", "tag", "video"), default="full",
                    help="full = load SeedVR2 and serve /upscale + /orient; "
                         "tag = skip the SeedVR2 load and serve /orient only "
-                        "(remote Tag & Rename — leaves the VRAM for Ollama)")
+                        "(remote Tag & Rename — leaves the VRAM for Ollama); "
+                        "video = load SeedVR2 and serve /video/* (Video Upscaler)")
     args = p.parse_args(argv)
 
     _HEARTBEAT = args.heartbeat
@@ -341,10 +584,13 @@ def main(argv=None):
         _log("tag mode — SeedVR2 engine NOT loaded; serving /orient + /telemetry.")
         _touch(_HEARTBEAT)
     else:
+        # full and video both load SeedVR2 once; they differ only in which
+        # endpoints they serve (/upscale vs /video/*).
         from upscale_engine import UpscaleEngine
         with open(args.settings, encoding="utf-8") as f:
             settings = json.load(f)
-        _log(f"loading engine (repo={args.repo_dir} models={args.model_dir}) …")
+        _log(f"loading engine ({args.mode} mode, repo={args.repo_dir} "
+             f"models={args.model_dir}) …")
         t0 = time.time()
         _ENGINE = UpscaleEngine(args.repo_dir, args.model_dir, settings)
         _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name}")
