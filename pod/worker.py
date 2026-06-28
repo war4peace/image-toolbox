@@ -41,6 +41,7 @@ Endpoints:
   while a HUNG GPU goes stale and the dead-man's switch can reclaim the pod.
 """
 import os
+import re
 import sys
 import json
 import time
@@ -209,12 +210,22 @@ def _count_video_frames(path):
         return 0
 
 
+_NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
+
+
 class _HeartbeatTee:
     """A stdout/stderr proxy that forwards to the real stream AND touches the
     heartbeat on every non-blank write. Wrapping the SeedVR2 pipeline's tqdm
     progress in this turns each per-batch redraw into a liveness signal, so the
     dead-man's switch sees a working segment as alive yet a hung GPU (no progress
-    output) as idle and reclaims the pod."""
+    output) as idle and reclaims the pod.
+
+    It also opportunistically extracts WITHIN-SEGMENT frame progress for the GUI's
+    progress bar (15.8): any tqdm `n/total` whose total matches the segment's known
+    frame count is taken as frames_processed. CONSERVATIVE on purpose — if the
+    pipeline's bar counts something else (chunks/batches), nothing is reported and
+    the GUI falls back to a time-based bar. Purely additive and fail-safe: a parse
+    error can never affect the upscale."""
 
     def __init__(self, real, job):
         self._real = real
@@ -228,7 +239,21 @@ class _HeartbeatTee:
         if s and s.strip():
             _touch(_HEARTBEAT)
             self._job["last_output_t"] = time.time()
+            self._scan_progress(s)
         return len(s) if s else 0
+
+    def _scan_progress(self, s):
+        total = self._job.get("total_frames") or 0
+        if total <= 0:
+            return
+        try:
+            for m in _NT_RE.finditer(s):
+                n, tot = int(m.group(1)), int(m.group(2))
+                # Frame-scaled bar: denominator ~= the segment frame count.
+                if tot > 0 and abs(tot - total) <= max(2, int(total * 0.05)):
+                    self._job["frames_processed"] = min(n, total)
+        except Exception:
+            pass
 
     def flush(self):
         try:
@@ -481,6 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                 "output": os.path.join(job_dir, "out.mp4"),
                 "total_frames": _count_video_frames(in_path),
                 "frames_written": None,
+                "frames_processed": None,
                 "output_bytes": 0,
                 "seconds": None,
                 "error": None,
@@ -512,14 +538,15 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 out_bytes = 0
         body = json.dumps({
-            "id":             job["id"],
-            "state":          job["state"],
-            "total_frames":   job["total_frames"],
-            "frames_written": job.get("frames_written"),
-            "output_bytes":   out_bytes,
-            "elapsed":        round(time.time() - job["started"], 1),
-            "seconds":        job.get("seconds"),
-            "error":          job.get("error"),
+            "id":               job["id"],
+            "state":            job["state"],
+            "total_frames":     job["total_frames"],
+            "frames_written":   job.get("frames_written"),
+            "frames_processed": job.get("frames_processed"),
+            "output_bytes":     out_bytes,
+            "elapsed":          round(time.time() - job["started"], 1),
+            "seconds":          job.get("seconds"),
+            "error":            job.get("error"),
         }).encode()
         self._send(200, body, "application/json")
 
