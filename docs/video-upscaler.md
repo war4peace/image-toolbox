@@ -811,4 +811,159 @@ SeedVR2 video path with no code change from #1.
 
 **Still to build (phase 5):** the GUI "Video Upscaler" tab (cost estimator/gate +
 per-video segment progress, consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI
-events the runner already emits) and its `cost_confirm_usd` gate.
+events the runner already emits) and its `cost_confirm_usd` gate. The full UX spec
+is section 15.
+
+## 15. Phase 5: GUI "Video Upscaler" tab (UX spec)
+
+Settled with the user before building. The tab is the front end of the existing
+`batch_video_upscale.py` runner (launched as a subprocess, same stdin/stdout seam
+as the other tools); it adds no pipeline logic.
+
+### 15.1 Resolved decisions (the contract)
+
+- **Remote-only.** No local path; the tab is blocked with guidance until remote is
+  ready (15.3 step 1).
+- **A persistent, DB-backed QUEUE is the core object.** "Prepare" adds a
+  (source, target) job to the queue; Start processes the whole queue. The queue is
+  exactly the set of `video_outputs` rows not yet `done`, so it **survives app
+  restarts in full** (prepared-but-unstarted items too, not only partially-done
+  ones): select 10 videos, start, close the app, reopen, continue, with nothing to
+  re-select. This one mechanism gives the queue, restart-persistence, and
+  segment-level resume.
+- **One source can target multiple resolutions, but never in one action.** A clip
+  already done at 1080p can be re-added targeting 4K. Outputs are keyed by
+  (source, target); the output filename encodes the target.
+- **v1 runs ONE pod per Start, GPU chosen for the queue's most-demanding target.**
+  This is a deliberate FIRST-STEP simplification: a mixed 1080p+4K queue runs the
+  1080p items on the big-VRAM card too (costlier than a 5090 would be), for one
+  spin-up and simple orchestration. **v2:** group the queue by target and run a pod
+  per group (cheapest per-target card each) at the cost of multiple spin-ups.
+- **GPU list is sorted cheapest-total-cost-first** for the queue (15.7).
+- **Two-tier scanning (15.4): never deep-probe or hash on scan.** Fast ffprobe
+  metadata for the list + provisional eligibility; the expensive exact pass
+  (counted frames, keyframe gap) and the content hash happen at Prepare / upscale
+  time, only for the file being acted on.
+- **Confirm-before-rent** is a Settings checkbox (default ON); Start shows the
+  estimate and a louder warning above `cost_confirm_usd`.
+- **Output subfolder `__upscaled__`** (configurable `video.output_subdir`), matching
+  the image tab's baked-in GUI default and the `__Archive__` style.
+- **Deliverable codec lives in Settings**, not the main flow (a non-technical user
+  shouldn't have to care): the opencv backend writes mpeg4 today; an ffmpeg-backend
+  h264/h265 option belongs in Settings -> Video (14).
+- **Cell-specific double-click** in the list (15.5), so columns can grow their own
+  actions later (e.g. double-click a resolution cell to filter).
+
+### 15.2 Screen layout (top to bottom)
+
+1. **Remote-readiness strip:** one line, "Remote ready" or what's missing
+   (API key valid, SSH key present, network volume provisioned, region selected),
+   with a link to Settings.
+2. **Folder row:** Browse source folder + "Save upscaled to:" (auto-fills
+   `<source>\__upscaled__`, mirrored tree), like the image tab.
+3. **Scan list** (`ttk.Treeview`): columns = full path, resolution, duration
+   (hh:mm:ss), codec, framerate, upscaled filename(s), upscaled resolution(s),
+   status. Green path = has an upscaled counterpart. Double-click row = open in
+   default player; double-click an upscaled-filename cell = ComparisonWindow;
+   right-click = context menu. Sortable headers.
+4. **Source + target row:** "Source File" textbox (filled from the selected row),
+   a target combobox populated with that file's ELIGIBLE targets only, and
+   **Prepare** (adds the (file, target) job to the queue; disabled if that
+   (file, target) is already `done`).
+5. **Queue list** (`ttk.Treeview`): the jobs to run, reorderable (move up/down) and
+   removable. Persisted (15.1).
+6. **Estimate status line:** GPU combobox (recommended cards, cheapest-first) plus
+   read-outs for the WHOLE queue: estimated duration, estimated cost, total
+   segments, average cost/segment. Changing the GPU refreshes them.
+7. **Start Upscaling** + (during a run) a live progress view + **Stop**.
+
+### 15.3 The flow
+
+1. **Readiness.** Remote-only, so the strip gates everything; a missing piece links
+   to the relevant Settings field.
+2. **Pick a folder.** Output auto-fills to the mirrored `__upscaled__` tree.
+3. **Scan (fast).** Walk the tree, fast-probe each video (15.4), cache by
+   (path, mtime, size), show the list with provisional per-target eligibility.
+4. **Browse / inspect.** Double-click to play; green rows have an upscaled
+   counterpart; double-click the upscaled cell to compare.
+5. **Select + target + Prepare.** Selecting a row fills "Source File" and populates
+   the target combobox with eligible targets. Prepare runs the EXACT pass for that
+   (file, target) (counted frames, keyframe gap, segment plan, lazy content hash),
+   then adds the job to the queue. Already-done (file, target) -> Prepare disabled.
+6. **Build the queue.** Repeat 5 for as many files/targets as wanted; reorder/remove
+   in the Queue list. The estimate line sums the queue.
+7. **Pick the GPU.** The combobox lists cards deployable now in the volume's region
+   that meet the queue's max-target VRAM floor, cheapest-total-cost first; selecting
+   one refreshes the estimate.
+8. **Start.** Confirm-before-rent (if enabled) shows the estimate; then one pod is
+   rented and the queue streams. The live view shows the current video + segment
+   X/Y, ETA, accrued cost, the pod telemetry row, and Stop (finish current segment,
+   tear the pod down). Resume is automatic next Start (the queue is DB-backed).
+
+### 15.4 Scanning: two tiers
+
+- **Fast scan (every file, on folder open):** `ffprobe` stream metadata only
+  (resolution, codec, framerate, duration, HEADER frame count). No demux, no decode,
+  no hash. Cache the result in `video_files` keyed by (path, mtime, size) so an
+  unchanged re-scan is instant. Enough for the list + provisional eligibility.
+- **Exact pass (at Prepare, per acted-on file):** COUNTED frames (the header lies,
+  14), keyframe gap (segment planning / sparse-GOP re-encode, 6.1), and the source
+  content hash (lineage, lazily, only for files being upscaled). This is the data
+  the segment plan and the cost estimate actually need, computed only when needed.
+
+### 15.5 Eligibility
+
+Per target, eligible if the source SHORT side is meaningfully below the target short
+side, honouring the skip-cutoff: `min(w, h) < target_short * (1 - skip_cutoff/100)`
+(1080p -> 1080, 1440p -> 1440, 4K -> 2160). A 320x240 clip is eligible for all three;
+a 1920x1080 clip for 1440p/4K only; a >=4K clip for none (shown greyed, Prepare
+disabled, "already >= 4K"). The combobox offers only eligible targets.
+
+### 15.6 Schema (revises the phase-4 tables; cache.db is regenerable, nothing shipped)
+
+Normalised so source properties are stored once and per-target job/resume state is
+separate:
+
+- **`video_files`** (source, PK root_id+rel_path): width, height, vcodec, acodec,
+  fps, nb_frames (counted, filled at Prepare), duration, mtime, size (cache
+  validation), src_hash (lazy). Eligibility is derived on read.
+- **`video_outputs`** (per-target job, PK root_id+rel_path+target): status
+  (`queued|splitting|streaming|partial|done|failed|skipped`), output_path,
+  out_frames, queue_order (reorder; the queue = rows not `done`, ordered by it),
+  created_at/updated_at. THIS is the durable queue + resume state.
+- **`video_segments`** (PK root_id+rel_path+target+seg_index): in_frames, out_frames,
+  status, seconds, output_path. Segment-level resume picks up the first non-`done`.
+
+The phase-4 runner (which put target/output inline on `video_files` and keyed
+segments without target) is updated to this in phase 5.
+
+### 15.7 Cost estimator
+
+- **Rate table:** seconds/frame per (target, GPU), seeded from the benchmark
+  (section 7) and refined by the user's own history via `gpu_perf` with video task
+  keys (`video-1080p` etc.) the way the image estimator already self-improves.
+- **Per-target VRAM floor** (benchmark-derived, tunable): 1080p ~ a 32 GB offload
+  card (5090) and up; 1440p ~ >= 80 GB resident (plateau 71-77 GB); 4K ~ >= 80 GB to
+  fit at all (PRO 6000 bs5), big-VRAM (~140 GB) for a usable continuity window. The
+  GPU list is filtered to the queue's MAX target floor.
+- **Live availability:** `runpod_client.available_gpus(region, floor)` for cards
+  deployable now with price/stock, intersected with the rate table, sorted by
+  cheapest TOTAL queue cost.
+- **Spin-up counted once per Start:** pod boot + worker model load (measured
+  ~360 s worker-ready on a 5090) dominates short clips, so
+  `total = ($/h) * (spin_up + sum_over_queue(frames * s_per_frame)) / 3600`.
+  Per-video and per-segment read-outs are processing-only; the queue total adds the
+  single spin-up.
+
+### 15.8 Settings additions (Settings -> Video)
+
+`confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the
+deliverable codec/quality (opencv mpeg4 vs ffmpeg h264/h265), plus the existing
+`video` knobs (section 9). Region/DC + GPU pickers and the price ceilings are reused
+from Remote (#1).
+
+### 15.9 Deferred to v2 (documented, not built)
+
+Per-target pod grouping for mixed-target queues (15.1); the h264/h265 deliverable if
+not done in v1 (14); real-time synchronised playback in the comparison window (it is
+scrub + frame-step in v1, section 11).
