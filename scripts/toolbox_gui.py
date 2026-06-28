@@ -3509,6 +3509,15 @@ class _ScrollFrame(ttk.Frame):
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
 
+# Video deliverable codec choices (label -> video_backend, use_10bit). opencv is
+# SeedVR2's default writer (MPEG-4 / mp4v, most compatible); the ffmpeg backend
+# enables H.265 10-bit (docs/video-upscaler.md 6.4 / 14).
+_VIDEO_CODEC_OPTIONS = [
+    ("Standard — MPEG-4 (most compatible)", "opencv", False),
+    ("High quality — H.265 10-bit (ffmpeg)", "ffmpeg", True),
+]
+
+
 class SettingsTab(ttk.Frame):
     """Edit the settings that previously lived only in config.json."""
 
@@ -3743,6 +3752,31 @@ class SettingsTab(ttk.Frame):
             ttk.Label(sec, text=f"{_lbl(key)}:").grid(row=row, column=0, sticky="w", pady=3, padx=(0, 4))
             self._make_seedvr_control(sec, key, value).grid(row=row, column=1, sticky="w", pady=3)
             row += 1
+
+        # ── Video Upscaler (#2) ───────────────────────────────────────────────────
+        vid = CFG.get("video", {})
+        sec = self._section(body, "Video Upscaler")
+        sec.columnconfigure(1, weight=1)
+        ttk.Label(sec, text="Default target:").grid(row=0, column=0, sticky="w", pady=3)
+        self.video_target_var = tk.StringVar(value=vid.get("target", "1080p"))
+        ttk.Combobox(sec, textvariable=self.video_target_var, state="readonly",
+                     width=10, values=["1080p", "1440p", "4K"]).grid(
+            row=0, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="Output subfolder:").grid(row=1, column=0, sticky="w", pady=3)
+        self.video_outsub_var = tk.StringVar(value=vid.get("output_subdir", "__upscaled__"))
+        ttk.Entry(sec, textvariable=self.video_outsub_var, width=20).grid(
+            row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="Output quality:").grid(row=2, column=0, sticky="w", pady=3)
+        self.video_codec_var = tk.StringVar(value=self._video_codec_label(vid))
+        ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
+                     width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS]).grid(
+            row=2, column=1, sticky="w", padx=6, pady=3)
+        self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
+        ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
+                        variable=self.video_confirm_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
+                     "output subfolder mirrors the source tree (like Batch Upscaler).")
 
         # ── Notifications ───────────────────────────────────────────────────────
         # Settings live in the "notifications" config section; resolve_settings()
@@ -4074,6 +4108,32 @@ class SettingsTab(ttk.Frame):
         self.default_corig_var.set(defs.get("conciliate_original", ""))
         self.default_cproc_var.set(defs.get("conciliate_processed", ""))
 
+    def _video_codec_label(self, vid):
+        """The codec combobox label matching the saved video_backend/use_10bit."""
+        backend = vid.get("video_backend", "opencv")
+        ten = bool(vid.get("use_10bit", False))
+        for lbl, b, t in _VIDEO_CODEC_OPTIONS:
+            if b == backend and t == ten:
+                return lbl
+        return _VIDEO_CODEC_OPTIONS[0][0]
+
+    def _video_section(self):
+        """The proposed `video` config block from the form. Only the exposed keys
+        are set; config-only keys (segment_seconds, spin_up_seconds, …) are left
+        untouched by _save's per-section update()."""
+        backend, ten = _VIDEO_CODEC_OPTIONS[0][1], _VIDEO_CODEC_OPTIONS[0][2]
+        for lbl, b, t in _VIDEO_CODEC_OPTIONS:
+            if lbl == self.video_codec_var.get():
+                backend, ten = b, t
+                break
+        return {
+            "target":              self.video_target_var.get(),
+            "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
+            "video_backend":       backend,
+            "use_10bit":           ten,
+            "confirm_before_rent": bool(self.video_confirm_var.get()),
+        }
+
     def _collect(self):
         """Build the config sections the form currently describes, without
         touching CFG. Returns (sections, errors): `sections` maps section name →
@@ -4147,6 +4207,7 @@ class SettingsTab(ttk.Frame):
                 "straighten_min_confidence": min(1.0, max(0.5, conf)),
                 "max_image_px": max_px,
             },
+            "video": self._video_section(),
             "updates": {"auto_check": bool(self.auto_update_var.get())},
             "mqtt": self._mqtt_fields(),
             "notifications": {
@@ -4256,6 +4317,11 @@ class SettingsTab(ttk.Frame):
         self.tg_chat_var.set(notif.get("telegram_chat_id", ""))
         self.ntfy_server_var.set(notif.get("ntfy_server", "https://ntfy.sh"))
         self.ntfy_topic_var.set(notif.get("ntfy_topic", ""))
+        vid = CFG.get("video", {})
+        self.video_target_var.set(vid.get("target", "1080p"))
+        self.video_outsub_var.set(vid.get("output_subdir", "__upscaled__"))
+        self.video_codec_var.set(self._video_codec_label(vid))
+        self.video_confirm_var.set(bool(vid.get("confirm_before_rent", True)))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))
         self.mqtt_port_var.set(str(mqtt.get("port", 1883)))
