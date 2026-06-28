@@ -875,7 +875,9 @@ as the other tools); it adds no pipeline logic.
 6. **Estimate status line:** GPU combobox (recommended cards, cheapest-first) plus
    read-outs for the WHOLE queue: estimated duration, estimated cost, total
    segments, average cost/segment. Changing the GPU refreshes them.
-7. **Start Upscaling** + (during a run) a live progress view + **Stop**.
+7. **Start Upscaling** + (during a run) a live progress view + **Stop** (15.8):
+   a frames-based queue progress bar, current video/segment bars, ETA, accrued
+   cost, live s/frame vs estimate, and the pod telemetry row.
 
 ### 15.3 The flow
 
@@ -955,14 +957,51 @@ segments without target) is updated to this in phase 5.
   Per-video and per-segment read-outs are processing-only; the queue total adds the
   single spin-up.
 
-### 15.8 Settings additions (Settings -> Video)
+### 15.8 Progress feedback (the running view)
+
+Video upscaling is long (tens of minutes per segment), so the running view must
+show continuous, honest progress, not just "working". Progress is measured in
+**frames** (the natural, monotonic unit that correctly weights a long video over a
+short one), at three levels:
+
+- **Queue bar (primary):** `frames_done / total_queue_frames`, where the total is
+  the sum of every queued segment's `in_frames` (known after Prepare). Shown with a
+  %, an **ETA** (frames remaining x live s/frame) and **cost accrued** so far.
+- **Current video:** "name -- segment X / Y" plus a per-video frames bar.
+- **Current segment (the long wait):** a bar from frames processed WITHIN the
+  segment. This is the piece that matters most here: without it a 3-segment video's
+  bar sits still for ~27 min at a time.
+
+**Within-segment frames need a small worker addition.** Today `/video/status`
+returns `output_bytes` (a coarse liveness signal that already steps up per chunk).
+Add **`frames_processed`**: the worker's `_HeartbeatTee` already sees the SeedVR2
+tqdm progress, so it parses the latest `n/total` and exposes it (falling back to
+`output_bytes` if a line can't be parsed). `RemoteVideoEngine` forwards it on the
+`SEGMENT` event, already emitted every ~5 s poll, so the bar updates smoothly. The
+zero-worker-change fallback is a **time-based** within-segment bar
+(`elapsed / estimated_segment_seconds` from the rate): smooth but it drifts if the
+rate estimate is off, so `frames_processed` is preferred.
+
+**"Is it going well?"** Beyond the bar: show the **live seconds/frame next to the
+estimate** so the user sees it tracking (a large divergence is the signal something
+is wrong, the same idea as the image tool's degraded-GPU watchdog, #1), plus the
+pod telemetry row (GPU / VRAM / temp) and accrued-vs-estimated cost. ETA and cost
+both derive from the live s/frame (refined as the run proceeds) x frames remaining,
+so they self-correct instead of trusting only the up-front estimate.
+
+**Reuse the existing app chrome:** drive the Windows taskbar progress bar
+(`taskbar_progress.py`, ITaskbarList3) from the queue %, as the image batch does;
+flash the taskbar on completion (`App.flash_attention`); and send the
+queue-complete / error notification (`notifications`). All already in the app.
+
+### 15.9 Settings additions (Settings -> Video)
 
 `confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the
 deliverable codec/quality (opencv mpeg4 vs ffmpeg h264/h265), plus the existing
 `video` knobs (section 9). Region/DC + GPU pickers and the price ceilings are reused
 from Remote (#1).
 
-### 15.9 Deferred to v2 (documented, not built)
+### 15.10 Deferred to v2 (documented, not built)
 
 Per-target pod grouping for mixed-target queues (15.1); the h264/h265 deliverable if
 not done in v1 (14); real-time synchronised playback in the comparison window (it is
