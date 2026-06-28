@@ -6085,6 +6085,13 @@ class VideoTab(ttk.Frame):
         self._root_id = None
         self._src_root = None
         self._out_root = None
+        # Scan progress (incremental, off the UI thread).
+        self._scan_seq = 0
+        self._scanning = False
+        self._scan_q = None
+        self._scan_total = 0
+        self._scan_done = 0
+        self._scan_start = None
         # Run progress state (frames-based, 15.8).
         self._run_total = 0
         self._run_done = 0
@@ -6126,7 +6133,8 @@ class VideoTab(ttk.Frame):
         self.src_var = tk.StringVar()
         ttk.Entry(ff, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(ff, text="Browse…", command=self._browse_source).grid(row=0, column=2)
-        ttk.Button(ff, text="Scan", command=self._scan).grid(row=0, column=3, padx=(6, 0))
+        self.scan_btn = ttk.Button(ff, text="Scan", command=self._scan)
+        self.scan_btn.grid(row=0, column=3, padx=(6, 0))
         ttk.Label(ff, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.out_var = tk.StringVar()
         ttk.Entry(ff, textvariable=self.out_var).grid(row=1, column=1, columnspan=2,
@@ -6298,51 +6306,115 @@ class VideoTab(ttk.Frame):
         if not src or not os.path.isdir(src):
             messagebox.showwarning(APP_TITLE, "Choose a valid video folder first.")
             return
+        if self._scanning:
+            return
         if not self.out_var.get().strip():
             self.out_var.set(os.path.join(src, "__upscaled__"))
         self._src_root = os.path.abspath(src)
         self._out_root = os.path.abspath(self.out_var.get().strip())
         set_default_folder("video_source", self._src_root)
-        self.status_var.set("Scanning …")
         self.scan_tree.delete(*self.scan_tree.get_children())
         self._scan_rows.clear()
+        self.progress.set(0)
+        self._scanning = True
+        self._scan_total = self._scan_done = 0
+        self._scan_seq += 1
+        seq = self._scan_seq
+        self._scan_q = queue.Queue()
+        self.scan_btn.configure(state="disabled")
+        self.status_var.set("Listing files …")
+        self.console.feed(f"Scanning {self._src_root} …\n")
+        threading.Thread(target=lambda: self._scan_worker(seq), daemon=True).start()
+        self.after(120, lambda: self._scan_poll(seq))
 
-        def work():
-            import batch_video_upscale as bv
+    def _scan_worker(self, seq):
+        """Walk + probe each video off the UI thread, streaming results to the
+        poller via a queue so the list/progress fill in live. ffprobe is cached by
+        (mtime, size), so a re-scan of an unchanged tree races through."""
+        import batch_video_upscale as bv
+        try:
             conn = self._conn()
-            self._root_id = db_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
+            self._root_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
             cutoff = self._vcfg()["skip_cutoff_pct"]
-            rows = []
-            for abs_path, rel in bv.walk_videos(self._src_root):
-                r = bv.scan_file(conn, db_id, abs_path, rel)
+            files = bv.walk_videos(self._src_root)
+            self._scan_q.put(("total", len(files)))
+            for abs_path, rel in files:
+                if seq != self._scan_seq:
+                    return                       # a newer scan superseded this one
+                r = bv.scan_file(conn, self._root_id, abs_path, rel)
                 if r is None:
+                    self._scan_q.put(("skip", rel))
                     continue
                 elig = bv.eligible_targets(r["width"], r["height"], cutoff)
-                outs = bv.db.get_video_outputs_for(conn, db_id, rel)
-                rows.append((rel, abs_path, dict(r), elig,
-                             [(o["target"], o["status"], o["output_path"]) for o in outs]))
-            self.after(0, lambda: self._populate_scan(rows))
+                outs = [(o["target"], o["status"], o["output_path"])
+                        for o in bv.db.get_video_outputs_for(conn, self._root_id, rel)]
+                self._scan_q.put(("row", (rel, abs_path, dict(r), elig, outs)))
+            self._scan_q.put(("done", None))
+        except Exception as exc:                 # noqa: BLE001 (UI thread surfaces it)
+            self._scan_q.put(("error", str(exc)))
 
-        threading.Thread(target=work, daemon=True).start()
-
-    def _populate_scan(self, rows):
+    def _scan_poll(self, seq):
+        if seq != self._scan_seq:
+            return
         import video_estimate as ve
-        for rel, abs_path, r, elig, outs in rows:
-            res = f"{r['width']}x{r['height']}" if r["width"] else "?"
-            dur = ve.fmt_duration(r["duration"]) if r["duration"] else "?"
-            fps = f"{r['fps']:.2f}" if r["fps"] else "?"
-            done = [o for o in outs if o[1] == "done"]
-            up = ", ".join(t for t, _s, _p in done)
-            tags = ("haveup",) if done else ()
-            iid = self.scan_tree.insert(
-                "", "end", text=rel,
-                values=(res, dur, r["vcodec"] or "?", fps, up,
-                        ", ".join(t for t, _s, _p in done), ""),
-                tags=tags)
-            self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig,
-                                    "outs": outs}
-        self.status_var.set(f"Found {len(rows)} video(s). "
-                            f"{sum(1 for _ in self._scan_rows)} listed.")
+        drained = 0
+        while drained < 400:                     # cap per cycle: stay responsive on
+            try:                                 # a fast cached re-scan of a huge tree
+                kind, data = self._scan_q.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            if kind == "total":
+                self._scan_total = data
+                self._scan_start = time.time()
+                if data == 0:
+                    self.status_var.set("No videos found in this folder.")
+            elif kind == "row":
+                self._insert_scan_row(*data)
+                self._scan_done += 1
+                self.console.feed(f"  {data[0]}  ({data[2]['width']}×{data[2]['height']}, "
+                                  f"{data[2]['vcodec']})\n")
+            elif kind == "skip":
+                self._scan_done += 1
+                self.console.feed(f"  {data}  (unreadable — skipped)\n")
+            elif kind == "error":
+                self.status_var.set(f"Scan failed: {data}")
+                self._finish_scan()
+                return
+            elif kind == "done":
+                self._finish_scan()
+                return
+        if self._scan_total > 0:
+            self.progress.set(100.0 * self._scan_done / self._scan_total)
+            el = time.time() - (self._scan_start or time.time())
+            eta = (self._scan_total - self._scan_done) * (el / self._scan_done) \
+                if self._scan_done > 0 else None
+            tail = f" · ETA {ve.fmt_duration(eta)}" if eta else ""
+            self.status_var.set(f"Scanning {self._scan_done}/{self._scan_total}{tail}")
+        # If the cap was hit there is likely more waiting — poll again promptly.
+        self.after(1 if drained >= 400 else 120, lambda: self._scan_poll(seq))
+
+    def _insert_scan_row(self, rel, abs_path, r, elig, outs):
+        import video_estimate as ve
+        res = f"{r['width']}x{r['height']}" if r["width"] else "?"
+        dur = ve.fmt_duration(r["duration"]) if r["duration"] else "?"
+        fps = f"{r['fps']:.2f}" if r["fps"] else "?"
+        done = [o for o in outs if o[1] == "done"]
+        up = ", ".join(t for t, _s, _p in done)
+        iid = self.scan_tree.insert(
+            "", "end", text=rel,
+            values=(res, dur, r["vcodec"] or "?", fps, up, up, ""),
+            tags=("haveup",) if done else ())
+        self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig, "outs": outs}
+
+    def _finish_scan(self):
+        self._scanning = False
+        self.scan_btn.configure(state="normal")
+        n = len(self._scan_rows)
+        self.progress.set(100 if self._scan_total else 0)
+        self.status_var.set(f"Found {n} video(s)." if n
+                            else "No videos found in this folder.")
+        self.console.feed(f"Scan complete: {n} video(s).\n")
 
     def _done_targets(self, rel):
         """Targets already upscaled for `rel`, read LIVE from the DB (not the scan
