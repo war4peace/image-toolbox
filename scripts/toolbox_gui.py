@@ -6239,6 +6239,14 @@ class VideoTab(ttk.Frame):
             if d:
                 self.out_var.set(d)
 
+    def on_enter(self):
+        """Called when the tab is entered (not only at startup): re-check remote
+        readiness so a RunPod API key / SSH key / volume set after launch is seen,
+        and refresh the durable queue."""
+        self.restore_defaults_if_empty()
+        self._check_readiness()
+        self._load_queue()
+
     def _check_readiness(self):
         rpc = CFG.get("runpod", {})
 
@@ -7084,6 +7092,11 @@ class App(tk.Tk):
         # default, so a default set in Settings after startup takes effect.
         if isinstance(new_widget, ToolTab):
             new_widget.restore_defaults_if_empty()
+        elif new_widget is self.video_tab:
+            # Re-check remote readiness on entry, so an API key / SSH key / volume
+            # configured in the RunPod tab AFTER startup is picked up (not only the
+            # one-time check at launch), and refresh the durable queue.
+            self.video_tab.on_enter()
 
     def _confirm_unsaved(self, context, tab=None, name="Settings"):
         """Modal Save / Don't save / Cancel prompt for unsaved edits in a
