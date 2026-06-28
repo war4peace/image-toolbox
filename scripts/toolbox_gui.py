@@ -6916,9 +6916,9 @@ class App(tk.Tk):
         self.settings_tab   = SettingsTab(self.nb, self)
         self.runpod_tab     = RunPodTab(self.nb, self)
         self.nb.add(self.upscale_tab,    text="  Batch Upscaler  ")
-        self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
         self.nb.add(self.conciliate_tab, text="  Conciliation  ")
+        self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.add(self.runpod_tab,     text="  RunPod  ")
         # Bottom status bar with a right-aligned "Report an issue" link (Future
