@@ -31,6 +31,7 @@ Usage:
 import os
 import sys
 import json
+import math
 import time
 import shutil
 import hashlib
@@ -130,6 +131,7 @@ def resolve_video_cfg(cfg, overrides=None):
     v = dict(cfg.get("video", {}) or {})
     out = {
         "target":              v.get("target", "1080p"),
+        "output_subdir":       v.get("output_subdir", "__upscaled__"),
         "skip_cutoff_pct":     float(v.get("skip_cutoff_pct", 0) or 0),
         "segment_seconds":     float(v.get("segment_seconds", 60) or 60),
         "max_segment_seconds": float(v.get("max_segment_seconds", 120) or 120),
@@ -305,57 +307,136 @@ def _work_dirs(out_video):
     return os.path.join(root, "in"), os.path.join(root, "up"), root
 
 
-def process_one(engine, conn, root_id, src_abs, rel, out_root, vcfg, budget,
-                index, total):
-    """Process one source video. Returns ('done'|'skipped', processing_seconds).
-    Raises StopInstallment when a cap is hit mid-video (the rest stays pending)."""
-    target = vcfg["target"]
+# ─────────────────────────────────────────────
+#  SCAN + ELIGIBILITY + PREPARE  (shared with the GUI, in-process, no GPU)
+# ─────────────────────────────────────────────
+
+def eligible_targets(width, height, skip_cutoff_pct=0):
+    """Targets whose short side is meaningfully ABOVE the source short side
+    (15.5). A 320x240 clip -> all three; a 1920x1080 clip -> 1440p/4K; a >=4K clip
+    -> none. Honours the skip-cutoff so a 'barely below' source is not offered."""
+    short = min(width, height) if width and height else 0
+    if not short:
+        return []
+    return [t for t, res in TARGET_RES.items()
+            if short < res * (1 - skip_cutoff_pct / 100.0)]
+
+
+def _output_path(output_root, rel, target):
+    """Mirror the source tree under output_root, encoding the target in the name:
+    <output_root>/<rel_dir>/<base>_<target>.mp4 (15.1)."""
+    rel_dir = os.path.dirname(rel)
+    base = os.path.splitext(os.path.basename(rel))[0]
+    return os.path.join(output_root, rel_dir, f"{base}_{target}.mp4")
+
+
+def scan_file(conn, root_id, abs_path, rel):
+    """Fast scan one video into video_files (15.4): ffprobe METADATA only (no demux,
+    no hash), cached by (mtime, size) so an unchanged re-scan skips re-probing.
+    Returns the video_files Row (cached or freshly probed). Best-effort: None on a
+    probe failure (a corrupt/unreadable file)."""
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return None
+    if db.video_file_is_fresh(conn, root_id, rel, st.st_mtime, st.st_size):
+        return db.get_video_file(conn, root_id, rel)
+    try:
+        info = vp.probe(abs_path)                 # fast: metadata only, count=False
+    except Exception:
+        return None
+    db.upsert_video_file(conn, root_id, rel,
+                         width=info.width, height=info.height,
+                         vcodec=info.vcodec, acodec=info.acodec,
+                         fps=float(info.fps), duration=info.duration,
+                         mtime=round(st.st_mtime, 3), size=st.st_size)
+    return db.get_video_file(conn, root_id, rel)
+
+
+def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
+    """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
+    CLI: do the EXACT pass for this (file, target) (counted frames — the header
+    lies), then enqueue a video_outputs job. Returns a dict with nb_frames and an
+    approximate segment count for the estimate. Idempotent: re-preparing an
+    existing job leaves its queue position and any progress intact."""
+    abs_path = os.path.join(source_root, rel)
+    info = vp.probe(abs_path, count=True)         # exact frames for cost + drift
+    db.upsert_video_file(conn, root_id, rel,
+                         width=info.width, height=info.height,
+                         vcodec=info.vcodec, acodec=info.acodec,
+                         fps=float(info.fps), duration=info.duration,
+                         nb_frames=info.nb_frames)
+    existing = db.get_video_output(conn, root_id, rel, target)
+    if existing is None:
+        db.upsert_video_output(conn, root_id, rel, target, status="queued",
+                               output_path=_output_path(output_root, rel, target),
+                               queue_order=db.next_queue_order(conn, root_id))
+    seg_secs = vcfg["segment_seconds"]
+    approx_segments = max(1, math.ceil((info.duration or 0) / seg_secs)) if seg_secs else 1
+    return {"nb_frames": info.nb_frames, "duration": info.duration,
+            "segments": approx_segments,
+            "width": info.width, "height": info.height}
+
+
+def enqueue_folder(conn, root_id, source_root, output_root, target, vcfg):
+    """Headless CLI helper: scan the tree and Prepare every ELIGIBLE video to
+    `target` (the GUI does this per-file via prepare_job). Skips ineligible files
+    and (target) jobs already done."""
+    n = 0
+    for abs_path, rel in walk_videos(source_root):
+        row = scan_file(conn, root_id, abs_path, rel)
+        if row is None:
+            continue
+        if target not in eligible_targets(row["width"], row["height"],
+                                          vcfg["skip_cutoff_pct"]):
+            continue
+        done = db.get_video_output(conn, root_id, rel, target)
+        if done is not None and done["status"] == "done":
+            continue
+        prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg)
+        n += 1
+    return n
+
+
+# ─────────────────────────────────────────────
+#  PER-JOB PROCESSING (one queued (source, target))
+# ─────────────────────────────────────────────
+
+def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, total):
+    """Process one queued (source, target) job. Returns ('done', seconds). Raises
+    StopInstallment when a cap is hit mid-job (the rest stays pending, the job is
+    marked 'partial')."""
+    rel, target = job["rel_path"], job["target"]
     resolution = TARGET_RES.get(target, 1080)
-    info = vp.probe(src_abs, count=True)
-    gui_event("VIDEO", {"rel": rel, "index": index, "total": total,
+    src_abs = os.path.join(source_root, rel)
+    out_video = job["output_path"] or _output_path(
+        os.path.join(source_root, vcfg["output_subdir"]), rel, target)
+    info = vp.probe(src_abs, count=True)          # counted frames: CFR-mistag (14) + drift
+    gui_event("VIDEO", {"rel": rel, "target": target, "index": index, "total": total,
                         "width": info.width, "height": info.height,
-                        "frames": info.nb_frames, "target": target})
+                        "frames": info.nb_frames})
 
-    # Near-target skip (parity with the image path's skip-cutoff): if the short
-    # side already meets the target (within the cutoff), there is nothing to gain.
-    eff = min(info.width, info.height) if info.width and info.height else 0
-    threshold = resolution * (1 - vcfg["skip_cutoff_pct"] / 100.0)
-    if eff and eff >= threshold:
-        reason = f"short side {eff}px >= {target} target ({threshold:.0f}px)"
-        db.upsert_video_file(conn, root_id, rel, width=info.width, height=info.height,
-                             fps=float(info.fps), frames=info.nb_frames,
-                             duration=info.duration, target=target,
-                             status="skipped", skip_reason=reason)
-        log(f"[{index}/{total}] SKIP {rel} — {reason}")
-        gui_event("VRESULT", {"rel": rel, "outcome": "skip", "reason": reason})
-        return "skipped", 0.0
-
-    out_video = os.path.join(out_root, os.path.splitext(rel)[0] + ".mp4")
     os.makedirs(os.path.dirname(out_video), exist_ok=True)
     in_dir, up_dir, work_root = _work_dirs(out_video)
     os.makedirs(up_dir, exist_ok=True)
-
-    db.upsert_video_file(conn, root_id, rel, width=info.width, height=info.height,
-                         fps=float(info.fps), frames=info.nb_frames,
-                         duration=info.duration, target=target, status="splitting",
-                         output_path=out_video, skip_reason=None)
+    db.upsert_video_output(conn, root_id, rel, target, status="splitting",
+                           output_path=out_video, skip_reason=None)
 
     segs, mode = ensure_split(info, in_dir, vcfg)
     if not segs:
         raise vp.FFmpegError(f"split produced no segments for {rel}")
-    log(f"[{index}/{total}] {rel}: {info.width}x{info.height} {info.nb_frames}f "
-        f"-> {target}; {len(segs)} segment(s) ({mode})")
+    log(f"[{index}/{total}] {rel} -> {target}: {info.width}x{info.height} "
+        f"{info.nb_frames}f; {len(segs)} segment(s) ({mode})")
 
-    # (Re)align the DB segment plan with the split.
-    recorded = db.get_video_segments(conn, root_id, rel)
+    recorded = db.get_video_segments(conn, root_id, rel, target)
     if len(recorded) != len(segs):
-        db.clear_video_segments(conn, root_id, rel)
+        db.clear_video_segments(conn, root_id, rel, target)
         for s in segs:
-            db.upsert_video_segment(conn, root_id, rel, s.index,
+            db.upsert_video_segment(conn, root_id, rel, target, s.index,
                                     in_frames=s.frame_count, status="pending")
-        recorded = db.get_video_segments(conn, root_id, rel)
+        recorded = db.get_video_segments(conn, root_id, rel, target)
 
-    db.upsert_video_file(conn, root_id, rel, status="streaming")
+    db.upsert_video_output(conn, root_id, rel, target, status="streaming")
     batch = resolve_batch(vcfg, target)
     chunk = resolve_chunk(vcfg, batch)
     seed = per_video_seed(vcfg, rel)
@@ -363,24 +444,25 @@ def process_one(engine, conn, root_id, src_abs, rel, out_root, vcfg, budget,
 
     for s in segs:
         up_path = os.path.join(up_dir, f"seg_{s.index:05d}.mp4")
-        rec = recorded[s.index]
-        if rec["status"] == "done" and os.path.exists(up_path):
-            continue                       # segment-level resume
-        gui_event("SEGMENT", {"video_rel": rel, "seg_index": s.index,
-                              "total": len(segs), "state": "running"})
+        if recorded[s.index]["status"] == "done" and os.path.exists(up_path):
+            continue                              # segment-level resume
 
-        def _progress(st, _i=s.index):
-            gui_event("SEGMENT", {"video_rel": rel, "seg_index": _i,
-                                  "total": len(segs), "state": st.get("state"),
+        def _progress(st, _i=s.index, _tot=s.frame_count):
+            gui_event("SEGMENT", {"video_rel": rel, "target": target,
+                                  "seg_index": _i, "total": len(segs),
+                                  "state": st.get("state"),
+                                  "frames_processed": st.get("frames_processed"),
+                                  "seg_frames": _tot,
                                   "output_bytes": st.get("output_bytes")})
 
+        _progress({"state": "running"})
         n = engine.process_segment(
             s.path, up_path, resolution=resolution, batch_size=batch,
             chunk_size=chunk, temporal_overlap=vcfg["temporal_overlap"],
             seed=seed, video_backend=vcfg["video_backend"],
             use_10bit=vcfg["use_10bit"], on_progress=_progress)
         secs = getattr(engine, "last_segment_seconds", None)
-        db.upsert_video_segment(conn, root_id, rel, s.index, status="done",
+        db.upsert_video_segment(conn, root_id, rel, target, s.index, status="done",
                                 out_frames=n, output_path=up_path, seconds=secs)
         total_secs += secs or 0
         budget.add(secs)
@@ -388,9 +470,10 @@ def process_one(engine, conn, root_id, src_abs, rel, out_root, vcfg, budget,
             + (f" in {secs:.1f}s" if secs else ""))
 
         cap = budget.exceeded()
-        remaining = [r for r in db.get_video_segments(conn, root_id, rel)
+        remaining = [r for r in db.get_video_segments(conn, root_id, rel, target)
                      if r["status"] != "done"]
         if cap and remaining:
+            db.upsert_video_output(conn, root_id, rel, target, status="partial")
             log(f"  PAUSED: {cap}; stopping after this segment "
                 f"({len(remaining)} segment(s) left — resume to continue).")
             raise StopInstallment(cap)
@@ -402,16 +485,14 @@ def process_one(engine, conn, root_id, src_abs, rel, out_root, vcfg, budget,
     vp.mux_audio(concat_path, src_abs, out_video, log=lambda m: log("    " + m.strip()))
     out_info = vp.probe(out_video, count=True)
 
-    seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel)]
+    seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel, target)]
     reference = sum(s.frame_count for s in segs)   # SeedVR2 preserves per-segment frames (6.3)
     report = vp.check_drift(info, out_info, seg_out, reference_frames=reference)
-    db.upsert_video_file(conn, root_id, rel, status="done", output_path=out_video,
-                         out_frames=out_info.nb_frames)
+    db.upsert_video_output(conn, root_id, rel, target, status="done",
+                           output_path=out_video, out_frames=out_info.nb_frames)
     shutil.rmtree(work_root, ignore_errors=True)
-    # Tidy the shared work parent (<out>/.imgtbx_video) once it is empty, so a
-    # finished tree leaves nothing behind but the output videos.
     try:
-        os.rmdir(os.path.dirname(work_root))
+        os.rmdir(os.path.dirname(work_root))      # tidy the empty work parent
     except OSError:
         pass
 
@@ -420,53 +501,45 @@ def process_one(engine, conn, root_id, src_abs, rel, out_root, vcfg, budget,
             f"({out_info.nb_frames} frames)")
     else:
         log(f"[{index}/{total}] DONE (review) {rel}: " + "; ".join(report.warnings))
-    gui_event("VRESULT", {"rel": rel, "outcome": "ok", "output_path": out_video,
-                          "warnings": report.warnings})
+    gui_event("VRESULT", {"rel": rel, "target": target, "outcome": "ok",
+                          "output_path": out_video, "warnings": report.warnings})
     return "done", total_secs
 
 
 # ─────────────────────────────────────────────
-#  RUN
+#  RUN THE QUEUE
 # ─────────────────────────────────────────────
 
-def run_batch(src_root, out_root, vcfg, engine, conn, root_id,
-              notify_settings=None, cost_per_hr=None):
-    """Drive the whole queue against an injected engine. Returns a summary dict."""
-    videos = walk_videos(src_root)
-    gui_event("QUEUE", [rel for _a, rel in videos])
-    log(f"Found {len(videos)} video(s) under {src_root}; target {vcfg['target']}.")
-    budget = RunBudget(vcfg["per_run_minute_cap"], vcfg["per_run_cost_cap"], cost_per_hr)
+def run_queue(engine, conn, root_id, source_root, vcfg, budget,
+              notify_settings=None):
+    """Process the durable queue (video_outputs not yet done) for this root against
+    an injected engine. Returns a summary dict."""
+    jobs = db.get_video_queue(conn, root_id)
+    gui_event("QUEUE", [{"rel": j["rel_path"], "target": j["target"]} for j in jobs])
+    log(f"Queue: {len(jobs)} job(s) under {source_root}.")
 
-    done = skipped = failed = 0
+    done = failed = 0
     stopped = None
-    for i, (abs_path, rel) in enumerate(videos, 1):
-        existing = db.get_video_file(conn, root_id, rel)
-        if existing and existing["status"] == "done" and existing["output_path"] \
-                and os.path.exists(existing["output_path"]):
-            log(f"[{i}/{len(videos)}] already done: {rel}")
-            done += 1
-            continue
+    for i, job in enumerate(jobs, 1):
+        rel, target = job["rel_path"], job["target"]
         try:
-            outcome, _secs = process_one(engine, conn, root_id, abs_path, rel,
-                                         out_root, vcfg, budget, i, len(videos))
-            if outcome == "done":
-                done += 1
-            elif outcome == "skipped":
-                skipped += 1
+            process_job(engine, conn, root_id, source_root, job, vcfg, budget,
+                        i, len(jobs))
+            done += 1
         except StopInstallment as exc:
             stopped = str(exc)
             break
         except Exception as exc:                       # noqa: BLE001 — log, keep going
             failed += 1
-            db.upsert_video_file(conn, root_id, rel, status="failed",
-                                 skip_reason=str(exc)[:300])
-            log(f"[{i}/{len(videos)}] FAILED {rel}: {exc}")
-            gui_event("VRESULT", {"rel": rel, "outcome": "fail", "error": str(exc)[:300]})
+            db.upsert_video_output(conn, root_id, rel, target, status="failed",
+                                   skip_reason=str(exc)[:300])
+            log(f"[{i}/{len(jobs)}] FAILED {rel} -> {target}: {exc}")
+            gui_event("VRESULT", {"rel": rel, "target": target, "outcome": "fail",
+                                  "error": str(exc)[:300]})
 
-    summary = {"done": done, "skipped": skipped, "failed": failed,
-               "stopped": stopped, "total": len(videos)}
-    _notify_summary(notify_settings, summary, src_root)
-    log(f"Summary: {done} done, {skipped} skipped, {failed} failed"
+    summary = {"done": done, "failed": failed, "stopped": stopped, "total": len(jobs)}
+    _notify_summary(notify_settings, summary, source_root)
+    log(f"Summary: {done} done, {failed} failed of {len(jobs)}"
         + (f", stopped early ({stopped})" if stopped else "") + ".")
     return summary
 
@@ -481,8 +554,8 @@ def _notify_summary(notify_settings, summary, src_root):
             color, title = 0xF1C40F, "Video upscale paused (per-run cap)"
         else:
             color, title = 0x2ECC71, "Video upscale complete"
-        desc = (f"{summary['done']} done, {summary['skipped']} skipped, "
-                f"{summary['failed']} failed of {summary['total']}.")
+        desc = (f"{summary['done']} done, {summary['failed']} failed of "
+                f"{summary['total']} job(s).")
         if summary["stopped"]:
             desc += f"\n{summary['stopped']} — re-run to continue."
         notifications.notify(notify_settings, title, desc, color,
@@ -494,8 +567,12 @@ def _notify_summary(notify_settings, summary, src_root):
 def main(argv=None):
     p = argparse.ArgumentParser(description="Video Upscaler runner (RunPod-only).")
     p.add_argument("source", help="source folder (searched recursively)")
-    p.add_argument("output", nargs="?", help="output folder (default: <source>/_upscaled_video)")
-    p.add_argument("--target", choices=list(TARGET_RES), help="override the configured target")
+    p.add_argument("output", nargs="?",
+                   help="output folder (default: <source>/<video.output_subdir>)")
+    p.add_argument("--target", choices=list(TARGET_RES),
+                   help="headless: scan + enqueue every eligible video to this "
+                        "target before running. Omit to run the existing queue "
+                        "(the GUI populates it via Prepare).")
     p.add_argument("--passthrough", action="store_true",
                    help="no pod: stream-copy each segment locally (pipeline test only)")
     args = p.parse_args(argv)
@@ -504,19 +581,23 @@ def main(argv=None):
     if not os.path.isdir(src_root):
         print(f"ERROR: source folder not found: {src_root}")
         return 2
-    out_root = os.path.abspath(args.output) if args.output \
-        else os.path.join(src_root, "_upscaled_video")
 
     cfg = _load_config()
-    overrides = {"target": args.target} if args.target else None
-    vcfg = resolve_video_cfg(cfg, overrides)
+    vcfg = resolve_video_cfg(cfg)
     notify_settings = notifications.resolve_settings(cfg)
+    out_root = os.path.abspath(args.output) if args.output \
+        else os.path.join(src_root, vcfg["output_subdir"])
 
     conn = db.get_conn()
     root_id = db.get_video_root_id(conn, src_root, out_root)
 
+    # Headless: pre-populate the queue from the folder (the GUI does this per-file).
+    if args.target:
+        n = enqueue_folder(conn, root_id, src_root, out_root, args.target, vcfg)
+        log(f"Enqueued {n} eligible video(s) to {args.target}.")
+
+    budget = RunBudget(vcfg["per_run_minute_cap"], vcfg["per_run_cost_cap"])
     session = None
-    cost_per_hr = None
     if args.passthrough:
         log("Passthrough mode — no pod; segments are stream-copied locally.")
         engine = PassthroughVideoEngine()
@@ -525,11 +606,11 @@ def main(argv=None):
         session = RemoteSession(cfg.get("runpod", {}), cfg.get("upscale", {}),
                                 APP_ROOT, on_event=log, mode="video")
         engine = session.start()
-        cost_per_hr = session.cost_per_hr
+        budget.cost_per_hr = session.cost_per_hr
 
     try:
-        run_batch(src_root, out_root, vcfg, engine, conn, root_id,
-                  notify_settings=notify_settings, cost_per_hr=cost_per_hr)
+        run_queue(engine, conn, root_id, src_root, vcfg, budget,
+                  notify_settings=notify_settings)
     finally:
         if session is not None:
             session.close()
