@@ -105,48 +105,73 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     hash  TEXT
 );
 
--- Video Upscaler (#2) resume + queue state, mirroring the upscale eligibility
--- pattern but at two granularities (video, then segment) so a stopped run
--- resumes at the first unfinished SEGMENT, not the first unfinished video — the
--- installment model (docs/video-upscaler.md section 5). No GPU/torch here: the
--- runner is pure orchestration + local ffmpeg.
+-- Video Upscaler (#2) — normalised into three tables (docs/video-upscaler.md
+-- section 15.6): source PROPERTIES once (video_files), per-(source,target) JOB +
+-- queue state (video_outputs), and per-(source,target,segment) resume state
+-- (video_segments). The QUEUE is exactly the video_outputs rows not yet 'done',
+-- ordered by queue_order, so the queue survives app restarts and a stopped run
+-- resumes at the first unfinished SEGMENT (the installment model, section 5).
+-- No GPU/torch here: the runner is pure orchestration + local ffmpeg.
 CREATE TABLE IF NOT EXISTS video_roots (
     id          INTEGER PRIMARY KEY,
     source_root TEXT NOT NULL UNIQUE,
     output_root TEXT,
     saved_at    TEXT
 );
+-- Source properties (one row per source video). The cheap fast-scan fields
+-- (width/height/vcodec/acodec/fps/duration) are filled on folder scan and
+-- validated by (mtime, size) so an unchanged re-scan is free; nb_frames (COUNTED,
+-- the header lies — see 14) and src_hash (content lineage) are filled lazily at
+-- Prepare/upscale time, only for files actually acted on (section 15.4).
 CREATE TABLE IF NOT EXISTS video_files (
-    root_id      INTEGER NOT NULL REFERENCES video_roots(id) ON DELETE CASCADE,
-    rel_path     TEXT NOT NULL,
-    width        INTEGER,
-    height       INTEGER,
-    fps          REAL,
-    frames       INTEGER,          -- COUNTED frames (not the unreliable header), see 14
-    duration     REAL,
-    target       TEXT,             -- 1080p | 1440p | 4K chosen for this video
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending|splitting|streaming|done|failed|skipped
-    skip_reason  TEXT,
-    output_path  TEXT,
-    out_frames   INTEGER,          -- frames in the reassembled output (drift check)
-    updated_at   TEXT,
+    root_id    INTEGER NOT NULL REFERENCES video_roots(id) ON DELETE CASCADE,
+    rel_path   TEXT NOT NULL,
+    width      INTEGER,
+    height     INTEGER,
+    vcodec     TEXT,
+    acodec     TEXT,
+    fps        REAL,
+    nb_frames  INTEGER,           -- COUNTED frames, filled at Prepare (NULL = not yet)
+    duration   REAL,
+    mtime      REAL,              -- (mtime, size) validate the fast-scan cache
+    size       INTEGER,
+    src_hash   TEXT,              -- content hash, filled lazily at upscale time
+    updated_at TEXT,
     PRIMARY KEY (root_id, rel_path)
 );
+-- Per-(source, target) job. THIS is the durable queue + resume state: the queue
+-- is the rows with status not 'done', ordered by queue_order.
+CREATE TABLE IF NOT EXISTS video_outputs (
+    root_id     INTEGER NOT NULL REFERENCES video_roots(id) ON DELETE CASCADE,
+    rel_path    TEXT NOT NULL,
+    target      TEXT NOT NULL,    -- 1080p | 1440p | 4K
+    status      TEXT NOT NULL DEFAULT 'queued',  -- queued|splitting|streaming|partial|done|failed|skipped
+    skip_reason TEXT,
+    output_path TEXT,
+    out_frames  INTEGER,          -- frames in the reassembled output (drift check)
+    queue_order INTEGER,          -- user-orderable position in the queue
+    created_at  TEXT,
+    updated_at  TEXT,
+    PRIMARY KEY (root_id, rel_path, target)
+);
+CREATE INDEX IF NOT EXISTS idx_video_outputs_queue
+    ON video_outputs(root_id, queue_order);
 CREATE TABLE IF NOT EXISTS video_segments (
-    video_root_id INTEGER NOT NULL,
-    video_rel     TEXT NOT NULL,            -- the parent video's rel_path
-    seg_index     INTEGER NOT NULL,
-    in_frames     INTEGER,                  -- source frames in this segment
-    out_frames    INTEGER,                  -- upscaled frames returned by the worker
-    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|done|failed
-    seconds       REAL,                     -- worker process time for this segment
-    output_path   TEXT,                     -- the upscaled segment file (kept for reassembly)
-    updated_at    TEXT,
-    PRIMARY KEY (video_root_id, video_rel, seg_index),
-    FOREIGN KEY (video_root_id) REFERENCES video_roots(id) ON DELETE CASCADE
+    root_id    INTEGER NOT NULL,
+    rel_path   TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    seg_index  INTEGER NOT NULL,
+    in_frames  INTEGER,           -- source frames in this segment
+    out_frames INTEGER,           -- upscaled frames returned by the worker
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending|done|failed
+    seconds    REAL,              -- worker process time for this segment
+    output_path TEXT,             -- the upscaled segment file (kept for reassembly)
+    updated_at TEXT,
+    PRIMARY KEY (root_id, rel_path, target, seg_index),
+    FOREIGN KEY (root_id) REFERENCES video_roots(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_video_seg_parent
-    ON video_segments(video_root_id, video_rel);
+    ON video_segments(root_id, rel_path, target);
 
 -- Per-user GPU timing for the remote-pod cost estimator (0.3.9). Cumulative
 -- images + processing seconds per (task, gpu_id), accumulated from finished
@@ -180,6 +205,7 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _migrate_video_tables(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     if fresh:
@@ -189,6 +215,25 @@ def get_conn():
             print(f"  [db] Legacy cache import skipped due to error: {exc}")
     _conn = conn
     return conn
+
+
+def _migrate_video_tables(conn):
+    """Phase 5 normalised the video_* cache into three tables (15.6). If a DB still
+    carries the phase-4 shape (video_files with a 'target' column, no video_outputs),
+    drop the three video tables so the new SCHEMA recreates them. No real data is
+    lost: these are a regenerable resume cache, and only the experimental branch
+    ever wrote them. Runs once — after the drop, video_files has no 'target' column
+    so this is a no-op. Fail-safe."""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_files)")]
+        if cols and "target" in cols:
+            conn.executescript(
+                "DROP TABLE IF EXISTS video_segments;"
+                "DROP TABLE IF EXISTS video_outputs;"
+                "DROP TABLE IF EXISTS video_files;")
+            conn.commit()
+    except Exception:
+        pass
 
 
 def _norm(p):
@@ -315,24 +360,32 @@ def get_video_root_id(conn, source_root, output_root=None, create=True):
     return cur.lastrowid
 
 
-def upsert_video_file(conn, root_id, rel_path, **fields):
-    """Insert or update a video_files row. `fields` may set any of: width, height,
-    fps, frames, duration, target, status, skip_reason, output_path, out_frames.
-    Always stamps updated_at. Commits."""
+def _upsert(conn, table, key_cols, key_vals, fields):
+    """Generic insert-or-update helper for the video_* tables. Stamps updated_at,
+    commits. `key_cols`/`key_vals` are the primary-key columns/values; `fields` is
+    the dict of other columns to set."""
+    fields = dict(fields)
     fields["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    cols = ["root_id", "rel_path"] + list(fields.keys())
-    existing = conn.execute(
-        "SELECT 1 FROM video_files WHERE root_id = ? AND rel_path = ?",
-        (root_id, rel_path)).fetchone()
-    if existing is None:
-        placeholders = ", ".join("?" for _ in cols)
-        conn.execute(f"INSERT INTO video_files ({', '.join(cols)}) VALUES ({placeholders})",
-                     [root_id, rel_path, *fields.values()])
+    where = " AND ".join(f"{c} = ?" for c in key_cols)
+    exists = conn.execute(f"SELECT 1 FROM {table} WHERE {where}", key_vals).fetchone()
+    if exists is None:
+        cols = list(key_cols) + list(fields.keys())
+        ph = ", ".join("?" for _ in cols)
+        conn.execute(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({ph})",
+                     [*key_vals, *fields.values()])
     else:
         sets = ", ".join(f"{k} = ?" for k in fields)
-        conn.execute(f"UPDATE video_files SET {sets} WHERE root_id = ? AND rel_path = ?",
-                     [*fields.values(), root_id, rel_path])
+        conn.execute(f"UPDATE {table} SET {sets} WHERE {where}",
+                     [*fields.values(), *key_vals])
     conn.commit()
+
+
+# ── video_files (source properties) ──────────────────────────────────────────
+
+def upsert_video_file(conn, root_id, rel_path, **fields):
+    """Insert/update source properties (width, height, vcodec, acodec, fps,
+    nb_frames, duration, mtime, size, src_hash). Stamps updated_at, commits."""
+    _upsert(conn, "video_files", ("root_id", "rel_path"), (root_id, rel_path), fields)
 
 
 def get_video_file(conn, root_id, rel_path):
@@ -342,39 +395,102 @@ def get_video_file(conn, root_id, rel_path):
         (root_id, rel_path)).fetchone()
 
 
-def upsert_video_segment(conn, root_id, video_rel, seg_index, **fields):
-    """Insert or update one video_segments row (in_frames, out_frames, status,
-    seconds, output_path). Stamps updated_at. Commits."""
-    fields["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    cols = ["video_root_id", "video_rel", "seg_index"] + list(fields.keys())
-    existing = conn.execute(
-        "SELECT 1 FROM video_segments WHERE video_root_id = ? AND video_rel = ? "
-        "AND seg_index = ?", (root_id, video_rel, seg_index)).fetchone()
-    if existing is None:
-        placeholders = ", ".join("?" for _ in cols)
-        conn.execute(f"INSERT INTO video_segments ({', '.join(cols)}) VALUES ({placeholders})",
-                     [root_id, video_rel, seg_index, *fields.values()])
-    else:
-        sets = ", ".join(f"{k} = ?" for k in fields)
-        conn.execute(
-            f"UPDATE video_segments SET {sets} WHERE video_root_id = ? AND "
-            "video_rel = ? AND seg_index = ?",
-            [*fields.values(), root_id, video_rel, seg_index])
+def video_file_is_fresh(conn, root_id, rel_path, mtime, size):
+    """True if the cached fast-scan row matches the file's current (mtime, size),
+    so a re-scan can skip re-probing it (section 15.4)."""
+    row = conn.execute(
+        "SELECT mtime, size FROM video_files WHERE root_id = ? AND rel_path = ?",
+        (root_id, rel_path)).fetchone()
+    return bool(row and row["mtime"] == round(mtime, 3) and row["size"] == size)
+
+
+# ── video_outputs (the per-target job = the durable queue) ───────────────────
+
+def upsert_video_output(conn, root_id, rel_path, target, **fields):
+    """Insert/update one (source, target) job row (status, skip_reason,
+    output_path, out_frames, queue_order). Sets created_at on first insert."""
+    if conn.execute(
+            "SELECT 1 FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
+            (root_id, rel_path, target)).fetchone() is None:
+        fields.setdefault("created_at",
+                          datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    _upsert(conn, "video_outputs", ("root_id", "rel_path", "target"),
+            (root_id, rel_path, target), fields)
+
+
+def get_video_output(conn, root_id, rel_path, target):
+    """Return the (source, target) job Row, or None."""
+    return conn.execute(
+        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
+        (root_id, rel_path, target)).fetchone()
+
+
+def get_video_outputs_for(conn, root_id, rel_path):
+    """All target jobs for one source (so the list can show every upscaled
+    counterpart)."""
+    return conn.execute(
+        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? ORDER BY target",
+        (root_id, rel_path)).fetchall()
+
+
+def get_video_queue(conn, root_id):
+    """The queue: every job not yet 'done'/'skipped', in queue order. This IS the
+    durable, restart-surviving queue + resume set (section 15.1)."""
+    return conn.execute(
+        "SELECT * FROM video_outputs WHERE root_id = ? "
+        "AND status NOT IN ('done', 'skipped') "
+        "ORDER BY queue_order, rowid", (root_id,)).fetchall()
+
+
+def next_queue_order(conn, root_id):
+    """The next queue_order to append at the end of the queue."""
+    row = conn.execute(
+        "SELECT MAX(queue_order) AS m FROM video_outputs WHERE root_id = ?",
+        (root_id,)).fetchone()
+    return (row["m"] + 1) if row and row["m"] is not None else 0
+
+
+def set_queue_order(conn, root_id, rel_path, target, order):
+    """Reorder one queued job. Commits."""
+    conn.execute(
+        "UPDATE video_outputs SET queue_order = ? WHERE root_id = ? AND rel_path = ? "
+        "AND target = ?", (order, root_id, rel_path, target))
     conn.commit()
 
 
-def get_video_segments(conn, root_id, video_rel):
-    """All segment rows for a video, ordered by index."""
-    return conn.execute(
-        "SELECT * FROM video_segments WHERE video_root_id = ? AND video_rel = ? "
-        "ORDER BY seg_index", (root_id, video_rel)).fetchall()
-
-
-def clear_video_segments(conn, root_id, video_rel):
-    """Drop a video's segment rows (a fresh split supersedes the old plan)."""
+def delete_video_output(conn, root_id, rel_path, target):
+    """Remove a job from the queue (and its segment rows). Commits."""
     conn.execute(
-        "DELETE FROM video_segments WHERE video_root_id = ? AND video_rel = ?",
-        (root_id, video_rel))
+        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ?",
+        (root_id, rel_path, target))
+    conn.execute(
+        "DELETE FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
+        (root_id, rel_path, target))
+    conn.commit()
+
+
+# ── video_segments (per-target resume) ───────────────────────────────────────
+
+def upsert_video_segment(conn, root_id, rel_path, target, seg_index, **fields):
+    """Insert/update one segment row (in_frames, out_frames, status, seconds,
+    output_path). Stamps updated_at, commits."""
+    _upsert(conn, "video_segments",
+            ("root_id", "rel_path", "target", "seg_index"),
+            (root_id, rel_path, target, seg_index), fields)
+
+
+def get_video_segments(conn, root_id, rel_path, target):
+    """All segment rows for a (source, target) job, ordered by index."""
+    return conn.execute(
+        "SELECT * FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ? "
+        "ORDER BY seg_index", (root_id, rel_path, target)).fetchall()
+
+
+def clear_video_segments(conn, root_id, rel_path, target):
+    """Drop a job's segment rows (a fresh split supersedes the old plan). Commits."""
+    conn.execute(
+        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ?",
+        (root_id, rel_path, target))
     conn.commit()
 
 
