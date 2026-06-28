@@ -677,7 +677,12 @@ cost tracking, notifications, taskbar progress/flash.
    plus the **original-vs-upscaled video comparison window** (the video analogue of
    the image `ComparisonWindow`; before/after wipe, shared zoom/pan, timestamp-aligned
    scrub + frame-step, frames decoded on demand via the bundled ffmpeg — see the
-   build piece in section 11).
+   build piece in section 11). **DONE** — `VideoTab` + `VideoComparisonWindow` in
+   `toolbox_gui.py`, `video_estimate.py`, the worker's `frames_processed`, Settings
+   -> Video, and `db.get_conn(check_same_thread=False)` for the GUI's worker
+   threads. All logic tested headless (fake-app + temp-DB smoke tests); the
+   **live running view is still un-exercised against a real pod** (a GUI run is the
+   next validation).
 
 **Reasonable v1 scope:** 1080p target only; fixed seed per video (6.2); plain
 `-c copy` splitting with the sparse-GOP re-encode fallback (6.1); CFR normalize +
