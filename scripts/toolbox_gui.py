@@ -5730,8 +5730,8 @@ class UpdateDialog(tk.Toplevel):
             return
         # Refuse to self-update while a tool is mid-run — replacing files then
         # would be unsafe. (The tabs lock each other, so checking all is enough.)
-        busy = [t for t in (self.app.upscale_tab, self.app.tag_tab, self.app.conciliate_tab)
-                if t.running]
+        busy = [t for t in (self.app.upscale_tab, self.app.video_tab, self.app.tag_tab,
+                            self.app.conciliate_tab) if t.running]
         if busy:
             messagebox.showwarning(
                 APP_TITLE, "Please let the current task finish before updating.")
@@ -5802,6 +5802,823 @@ class UpdateDialog(tk.Toplevel):
 #  APP WINDOW
 # ─────────────────────────────────────────────
 
+class VideoTab(ttk.Frame):
+    """The Video Upscaler tab (#2, phase 5). RunPod-only. A two-list setup flow
+    (scan list -> Prepare -> a durable queue), a cheapest-first GPU picker with a
+    live cost estimate, and a frames-based running view. Standalone (not a ToolTab)
+    because its shape is very different from the image tabs; it reuses the runner's
+    GPU-free helpers (batch_video_upscale) and the cost estimator (video_estimate)
+    in-process, and drives the queue via the batch_video_upscale subprocess.
+    See docs/video-upscaler.md section 15."""
+
+    def __init__(self, notebook, app):
+        super().__init__(notebook, padding=(12, 10))
+        self.app = app
+        self.proc = None
+        self._queue_io = queue.Queue()
+        self._hold = ""
+        self._marker_buf = None
+        self.console = ConsoleBuffer()
+        self.tool_name = "Video Upscaler"
+        self.active_pod_id = None
+        self._gpu_choices = []
+        self._scan_rows = {}        # tree iid -> dict(rel, abs, width, height, ...)
+        self._root_id = None
+        self._src_root = None
+        self._out_root = None
+        # Run progress state (frames-based, 15.8).
+        self._run_total = 0
+        self._run_done = 0
+        self._cur_seg_frames = 0
+        self._cur_seg_done = 0
+        self._run_start = None
+        self._rate = None           # observed s/frame, refined from done segments
+        self._run_tick_job = None
+        self._build()
+        self.after(200, self._check_readiness)
+        self.after(300, self._load_queue)
+
+    # ── config / db ──────────────────────────────────────────────────────────
+
+    def _conn(self):
+        import db
+        return db.get_conn()
+
+    def _vcfg(self):
+        import batch_video_upscale as bv
+        return bv.resolve_video_cfg(CFG)
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def _build(self):
+        self.columnconfigure(0, weight=1)
+
+        # 1) Remote-readiness strip.
+        self.ready_var = tk.StringVar(value="Checking remote readiness …")
+        self.ready_lbl = tk.Label(self, textvariable=self.ready_var, anchor="w",
+                                  fg="#7f8a99", font=("Segoe UI", 9))
+        self.ready_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+        # 2) Source / output folders.
+        ff = ttk.Frame(self)
+        ff.grid(row=1, column=0, sticky="ew")
+        ff.columnconfigure(1, weight=1)
+        ttk.Label(ff, text="Video folder:").grid(row=0, column=0, sticky="w")
+        self.src_var = tk.StringVar()
+        ttk.Entry(ff, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(ff, text="Browse…", command=self._browse_source).grid(row=0, column=2)
+        ttk.Button(ff, text="Scan", command=self._scan).grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(ff, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.out_var = tk.StringVar()
+        ttk.Entry(ff, textvariable=self.out_var).grid(row=1, column=1, columnspan=2,
+                                                      sticky="ew", padx=6, pady=(4, 0))
+
+        # 3) Scan list.
+        sf = ttk.LabelFrame(self, text=" Videos in this folder ", padding=4)
+        sf.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        self.rowconfigure(2, weight=3)
+        sf.rowconfigure(0, weight=1)
+        sf.columnconfigure(0, weight=1)
+        cols = ("res", "dur", "codec", "fps", "up", "upres", "status")
+        self.scan_tree = ttk.Treeview(sf, columns=cols, show="tree headings", height=7)
+        self.scan_tree.heading("#0", text="File")
+        self.scan_tree.column("#0", width=240, stretch=True)
+        for c, txt, w in (("res", "Resolution", 90), ("dur", "Duration", 70),
+                          ("codec", "Codec", 70), ("fps", "FPS", 55),
+                          ("up", "Upscaled", 150), ("upres", "Up res", 80),
+                          ("status", "Status", 80)):
+            self.scan_tree.heading(c, text=txt)
+            self.scan_tree.column(c, width=w, stretch=False, anchor="w")
+        self.scan_tree.tag_configure("haveup", foreground="#2f6f3f")
+        self.scan_tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.scan_tree.configure(yscrollcommand=sb.set)
+        self.scan_tree.bind("<<TreeviewSelect>>", self._on_scan_select)
+        self.scan_tree.bind("<Double-1>", self._on_scan_double)
+        self.scan_tree.bind("<Button-3>", self._on_scan_right)
+
+        # 4) Source file + target + Prepare.
+        pf = ttk.Frame(self)
+        pf.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        pf.columnconfigure(1, weight=1)
+        ttk.Label(pf, text="Source file:").grid(row=0, column=0, sticky="w")
+        self.srcfile_var = tk.StringVar()
+        ttk.Entry(pf, textvariable=self.srcfile_var, state="readonly").grid(
+            row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(pf, text="Target:").grid(row=0, column=2)
+        self.target_var = tk.StringVar()
+        self.target_combo = ttk.Combobox(pf, textvariable=self.target_var,
+                                         state="readonly", width=8, values=[])
+        self.target_combo.grid(row=0, column=3, padx=4)
+        self.target_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_prepare_btn())
+        self.prepare_btn = ttk.Button(pf, text="Prepare ▾ add to queue",
+                                     command=self._prepare, state="disabled")
+        self.prepare_btn.grid(row=0, column=4, padx=(6, 0))
+
+        # 5) Queue list.
+        qf = ttk.LabelFrame(self, text=" Upscale queue ", padding=4)
+        qf.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        self.rowconfigure(4, weight=2)
+        qf.rowconfigure(0, weight=1)
+        qf.columnconfigure(0, weight=1)
+        qcols = ("target", "status", "frames", "segs")
+        self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
+        self.queue_tree.heading("#0", text="File")
+        self.queue_tree.column("#0", width=240, stretch=True)
+        for c, txt, w in (("target", "Target", 70), ("status", "Status", 90),
+                          ("frames", "Frames", 80), ("segs", "Segments", 80)):
+            self.queue_tree.heading(c, text=txt)
+            self.queue_tree.column(c, width=w, stretch=False, anchor="w")
+        self.queue_tree.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        qsb = ttk.Scrollbar(qf, orient="vertical", command=self.queue_tree.yview)
+        qsb.grid(row=0, column=1, rowspan=4, sticky="ns")
+        self.queue_tree.configure(yscrollcommand=qsb.set)
+        ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1)).grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1)).grid(row=1, column=2, padx=(4, 0))
+        ttk.Button(qf, text="Remove", command=self._queue_remove).grid(row=2, column=2, padx=(4, 0), pady=(4, 0))
+
+        # 6) GPU picker + estimate.
+        gf = ttk.Frame(self)
+        gf.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        gf.columnconfigure(5, weight=1)
+        ttk.Label(gf, text="GPU:").grid(row=0, column=0, sticky="w")
+        self.gpu_var = tk.StringVar()
+        self.gpu_combo = ttk.Combobox(gf, textvariable=self.gpu_var, state="readonly",
+                                     width=40, values=[])
+        self.gpu_combo.grid(row=0, column=1, padx=4)
+        self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_estimate())
+        ttk.Button(gf, text="↻", width=3, command=self._refresh_gpus).grid(row=0, column=2)
+        self.estimate_var = tk.StringVar(value="Add videos to the queue for an estimate.")
+        ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
+                  foreground="#2f6f3f").grid(row=0, column=5, sticky="ew", padx=(12, 0))
+
+        # 7) Start / Stop + progress + status.
+        af = ttk.Frame(self)
+        af.grid(row=6, column=0, sticky="ew", pady=(8, 0))
+        af.columnconfigure(2, weight=1)
+        self.start_btn = ttk.Button(af, text="Start Upscaling", command=self._start)
+        self.start_btn.grid(row=0, column=0)
+        self.stop_btn = ttk.Button(af, text="Stop", command=self._stop, state="disabled")
+        self.stop_btn.grid(row=0, column=1, padx=(6, 0))
+        self.progress = ProgressBar(af, width=200)
+        self.progress.grid(row=0, column=2, sticky="ew", padx=12)
+        ttk.Button(af, text="View log", command=self._view_log).grid(row=0, column=3)
+        self.status_var = tk.StringVar(value="Ready.")
+        tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
+                 font=("Consolas", 9)).grid(row=7, column=0, sticky="ew", pady=(4, 0))
+
+    # ── readiness ────────────────────────────────────────────────────────────
+
+    def restore_defaults_if_empty(self):
+        if not self.src_var.get():
+            d = get_default_folder("video_source")
+            if d:
+                self.src_var.set(d)
+        if not self.out_var.get():
+            d = get_default_folder("video_output")
+            if d:
+                self.out_var.set(d)
+
+    def _check_readiness(self):
+        rpc = CFG.get("runpod", {})
+
+        def work():
+            msg, ok = self._readiness_text(rpc)
+            self.after(0, lambda: self._set_ready(msg, ok))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _readiness_text(self, rpc):
+        if not rpc.get("api_key"):
+            return "Not ready: set a RunPod API key (RunPod tab).", False
+        try:
+            import ssh_setup
+            key = os.path.expandvars(rpc.get("ssh_key_path", "")) or ssh_setup.default_key_path()
+        except Exception:
+            key = os.path.expandvars(rpc.get("ssh_key_path", ""))
+        if not (key and os.path.exists(key)):
+            return "Not ready: no SSH key — use 'Set up SSH key' (Settings).", False
+        vol = (rpc.get("network_volume_id") or "").strip()
+        if not vol:
+            return "Not ready: no model network volume configured (Settings).", False
+        try:
+            import runpod_client as rp
+            region = rp.volume_region(rpc["api_key"], vol)
+        except Exception as exc:
+            return f"Not ready: could not reach RunPod ({exc}).", False
+        if not region:
+            return "Not ready: configured network volume not found.", False
+        return f"Remote ready — models in {region}.", True
+
+    def _set_ready(self, msg, ok):
+        self.ready_var.set(msg)
+        self.ready_lbl.configure(fg="#2f6f3f" if ok else "#b23b3b")
+        self._ready = ok
+
+    # ── browse / scan ────────────────────────────────────────────────────────
+
+    def _browse_source(self):
+        folder = filedialog.askdirectory(title="Choose the folder with videos to upscale")
+        if folder:
+            self.src_var.set(folder)
+            out = self.out_var.get().strip()
+            if not out or os.path.basename(out) == "__upscaled__":
+                self.out_var.set(os.path.join(folder, "__upscaled__"))
+
+    def _scan(self):
+        src = self.src_var.get().strip()
+        if not src or not os.path.isdir(src):
+            messagebox.showwarning(APP_TITLE, "Choose a valid video folder first.")
+            return
+        if not self.out_var.get().strip():
+            self.out_var.set(os.path.join(src, "__upscaled__"))
+        self._src_root = os.path.abspath(src)
+        self._out_root = os.path.abspath(self.out_var.get().strip())
+        set_default_folder("video_source", self._src_root)
+        self.status_var.set("Scanning …")
+        self.scan_tree.delete(*self.scan_tree.get_children())
+        self._scan_rows.clear()
+
+        def work():
+            import batch_video_upscale as bv
+            conn = self._conn()
+            self._root_id = db_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
+            cutoff = self._vcfg()["skip_cutoff_pct"]
+            rows = []
+            for abs_path, rel in bv.walk_videos(self._src_root):
+                r = bv.scan_file(conn, db_id, abs_path, rel)
+                if r is None:
+                    continue
+                elig = bv.eligible_targets(r["width"], r["height"], cutoff)
+                outs = bv.db.get_video_outputs_for(conn, db_id, rel)
+                rows.append((rel, abs_path, dict(r), elig,
+                             [(o["target"], o["status"], o["output_path"]) for o in outs]))
+            self.after(0, lambda: self._populate_scan(rows))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_scan(self, rows):
+        import video_estimate as ve
+        for rel, abs_path, r, elig, outs in rows:
+            res = f"{r['width']}x{r['height']}" if r["width"] else "?"
+            dur = ve.fmt_duration(r["duration"]) if r["duration"] else "?"
+            fps = f"{r['fps']:.2f}" if r["fps"] else "?"
+            done = [o for o in outs if o[1] == "done"]
+            up = ", ".join(t for t, _s, _p in done)
+            tags = ("haveup",) if done else ()
+            iid = self.scan_tree.insert(
+                "", "end", text=rel,
+                values=(res, dur, r["vcodec"] or "?", fps, up,
+                        ", ".join(t for t, _s, _p in done), ""),
+                tags=tags)
+            self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig,
+                                    "outs": outs}
+        self.status_var.set(f"Found {len(rows)} video(s). "
+                            f"{sum(1 for _ in self._scan_rows)} listed.")
+
+    def _done_targets(self, rel):
+        """Targets already upscaled for `rel`, read LIVE from the DB (not the scan
+        cache) so a job that finished after the scan still disables re-Prepare."""
+        if self._root_id is None:
+            return set()
+        import batch_video_upscale as bv
+        return {o["target"] for o in bv.db.get_video_outputs_for(self._conn(), self._root_id, rel)
+                if o["status"] == "done"}
+
+    def _on_scan_select(self, _e=None):
+        sel = self.scan_tree.selection()
+        if not sel:
+            return
+        row = self._scan_rows.get(sel[0])
+        if not row:
+            return
+        self.srcfile_var.set(row["abs"])
+        done_targets = self._done_targets(row["rel"])
+        self.target_combo.configure(values=row["elig"])
+        if row["elig"]:
+            # default to the first eligible target not already done
+            nxt = next((t for t in row["elig"] if t not in done_targets), row["elig"][0])
+            self.target_var.set(nxt)
+        else:
+            self.target_var.set("")
+        self._sync_prepare_btn()
+
+    def _sync_prepare_btn(self):
+        sel = self.scan_tree.selection()
+        row = self._scan_rows.get(sel[0]) if sel else None
+        target = self.target_var.get()
+        ok = bool(row and target)
+        if ok and target in self._done_targets(row["rel"]):
+            ok = False                           # already upscaled to this target (15.1 step 5)
+        self.prepare_btn.configure(state="normal" if ok else "disabled")
+
+    def _on_scan_double(self, event):
+        iid = self.scan_tree.identify_row(event.y)
+        if not iid:
+            return
+        row = self._scan_rows.get(iid)
+        if not row:
+            return
+        col = self.scan_tree.identify_column(event.x)
+        # Double-click the "Upscaled" cell (#5) -> compare; else open the source.
+        done = [o for o in row["outs"] if o[1] == "done"]
+        if col == "#5" and done:
+            self._open_compare(row["abs"], done[0][2])
+        else:
+            self._open_path(row["abs"])
+
+    def _on_scan_right(self, event):
+        iid = self.scan_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.scan_tree.selection_set(iid)
+        row = self._scan_rows.get(iid)
+        if not row:
+            return
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
+        m.add_command(label="Open source folder",
+                      command=lambda: self._open_folder(row["abs"]))
+        for t, s, p in row["outs"]:
+            if s == "done" and p:
+                m.add_command(label=f"Compare ({t})",
+                              command=lambda p=p: self._open_compare(row["abs"], p))
+                m.add_command(label=f"Open upscaled ({t})",
+                              command=lambda p=p: self._open_path(p))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _open_path(self, p):
+        try:
+            os.startfile(p)
+        except Exception as exc:                         # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Could not open:\n{p}\n{exc}")
+
+    def _open_folder(self, p):
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
+        except Exception:
+            self._open_path(os.path.dirname(p))
+
+    def _open_compare(self, src, up):
+        # Placeholder until the video ComparisonWindow lands (phase-5 build piece).
+        self._open_path(up)
+
+    # ── prepare / queue ──────────────────────────────────────────────────────
+
+    def _prepare(self):
+        sel = self.scan_tree.selection()
+        row = self._scan_rows.get(sel[0]) if sel else None
+        target = self.target_var.get()
+        if not row or not target:
+            return
+        self.prepare_btn.configure(state="disabled")
+        self.status_var.set(f"Preparing {os.path.basename(row['abs'])} → {target} …")
+
+        def work():
+            import batch_video_upscale as bv
+            try:
+                info = bv.prepare_job(self._conn(), self._root_id, self._src_root,
+                                      self._out_root, row["rel"], target, self._vcfg())
+            except Exception as exc:                     # noqa: BLE001
+                self.after(0, lambda e=exc: self.status_var.set(f"Prepare failed: {e}"))
+                return
+            self.after(0, lambda: self._after_prepare(row["rel"], target, info))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_prepare(self, rel, target, info):
+        self.status_var.set(f"Queued {os.path.basename(rel)} → {target} "
+                            f"({info['nb_frames']} frames, ~{info['segments']} segments).")
+        self._load_queue()
+        self._sync_prepare_btn()
+        self._update_estimate()
+
+    def _load_queue(self):
+        """Populate the queue list from the DB (survives restarts, 15.1)."""
+        import batch_video_upscale as bv
+        conn = self._conn()
+        if self._root_id is None:
+            src = self.src_var.get().strip()
+            if src and os.path.isdir(src):
+                self._src_root = os.path.abspath(src)
+                self._out_root = os.path.abspath(self.out_var.get().strip()
+                                                 or os.path.join(self._src_root, "__upscaled__"))
+                self._root_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
+            else:
+                return
+        self.queue_tree.delete(*self.queue_tree.get_children())
+        for j in bv.db.get_video_queue(conn, self._root_id):
+            vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
+            frames = (vf["nb_frames"] if vf else None) or "?"
+            segs = bv.db.get_video_segments(conn, self._root_id, j["rel_path"], j["target"])
+            done = sum(1 for s in segs if s["status"] == "done")
+            segtxt = f"{done}/{len(segs)}" if segs else "?"
+            self.queue_tree.insert("", "end",
+                                   text=j["rel_path"],
+                                   values=(j["target"], j["status"], frames, segtxt),
+                                   tags=(j["rel_path"], j["target"]))
+        self._refresh_scan_outputs()
+        self._update_estimate()
+
+    def _refresh_scan_outputs(self):
+        """Re-read each scan row's upscaled counterparts from the DB so the
+        'Upscaled' columns and the green tag stay current after a run (without a
+        full re-scan)."""
+        if self._root_id is None:
+            return
+        import batch_video_upscale as bv
+        conn = self._conn()
+        for iid, row in self._scan_rows.items():
+            outs = [(o["target"], o["status"], o["output_path"])
+                    for o in bv.db.get_video_outputs_for(conn, self._root_id, row["rel"])]
+            row["outs"] = outs
+            done = [o for o in outs if o[1] == "done"]
+            up = ", ".join(t for t, _s, _p in done)
+            vals = list(self.scan_tree.item(iid, "values"))
+            vals[4] = up           # Upscaled
+            vals[5] = up           # Up res (target == short side, shown as the target)
+            self.scan_tree.item(iid, values=vals, tags=("haveup",) if done else ())
+
+    def _selected_queue_job(self):
+        sel = self.queue_tree.selection()
+        if not sel:
+            return None
+        tags = self.queue_tree.item(sel[0], "tags")
+        return (tags[0], tags[1]) if len(tags) >= 2 else None
+
+    def _queue_remove(self):
+        job = self._selected_queue_job()
+        if not job:
+            return
+        import batch_video_upscale as bv
+        bv.db.delete_video_output(self._conn(), self._root_id, job[0], job[1])
+        self._load_queue()
+
+    def _queue_move(self, delta):
+        job = self._selected_queue_job()
+        if not job or self._root_id is None:
+            return
+        import batch_video_upscale as bv
+        conn = self._conn()
+        jobs = list(bv.db.get_video_queue(conn, self._root_id))
+        idx = next((i for i, j in enumerate(jobs)
+                    if j["rel_path"] == job[0] and j["target"] == job[1]), -1)
+        ni = idx + delta
+        if idx < 0 or ni < 0 or ni >= len(jobs):
+            return
+        # Swap queue_order with the neighbour, then renormalise positions.
+        order = [(j["rel_path"], j["target"]) for j in jobs]
+        order[idx], order[ni] = order[ni], order[idx]
+        for pos, (rel, tgt) in enumerate(order):
+            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos)
+        self._load_queue()
+        # Re-select the moved row.
+        for iid in self.queue_tree.get_children():
+            t = self.queue_tree.item(iid, "tags")
+            if len(t) >= 2 and t[0] == job[0] and t[1] == job[1]:
+                self.queue_tree.selection_set(iid)
+                break
+
+    # ── GPU picker + estimate ────────────────────────────────────────────────
+
+    def _refresh_gpus(self):
+        rpc = CFG.get("runpod", {})
+        if not rpc.get("api_key"):
+            self.gpu_var.set("(set a RunPod API key)")
+            return
+        self.gpu_var.set("loading GPUs …")
+        self.gpu_combo.configure(values=[])
+
+        def work():
+            try:
+                import batch_video_upscale as bv
+                import runpod_client as rp
+                import video_estimate as ve
+                key = rpc["api_key"]
+                vol = (rpc.get("network_volume_id") or "").strip()
+                dc = rp.volume_region(key, vol) if vol else None
+                floor = ve.max_target_floor(self._queue_jobs()) or 24
+                gpus = rp.available_gpus(key, dc, min_memory_gb=floor)
+                self.after(0, lambda: self._populate_gpus(gpus))
+            except Exception as exc:                     # noqa: BLE001
+                self.after(0, lambda e=exc: self.gpu_var.set(f"GPU list failed: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_gpus(self, gpus):
+        import video_estimate as ve
+        jobs = self._queue_jobs()
+        ranked = ve.recommend_gpus(gpus, jobs, self._spin_up(),
+                                   conn=self._conn()) if jobs else []
+        self._gpu_choices = ranked or gpus
+        labels = []
+        for g in self._gpu_choices:
+            price = f"${g['price']:.2f}/h" if g.get("price") is not None else "n/a"
+            est = g.get("estimate")
+            tail = f" → ${est['cost']:.2f}" if est else ""
+            labels.append(f"{g['name']} — {g['memory_gb']} GB — {price} ({g['stock']}){tail}")
+        self.gpu_combo.configure(values=labels)
+        if labels:
+            self.gpu_combo.current(0)
+        else:
+            self.gpu_var.set("no eligible GPU available right now")
+        self._update_estimate()
+
+    def _selected_gpu(self):
+        if not self._gpu_choices:
+            return None
+        i = self.gpu_combo.current()
+        return self._gpu_choices[i if 0 <= i < len(self._gpu_choices) else 0]
+
+    def _queue_jobs(self):
+        """The queue as estimator job dicts [{frames, target, segments}]."""
+        import batch_video_upscale as bv
+        if self._root_id is None:
+            return []
+        conn = self._conn()
+        jobs = []
+        for j in bv.db.get_video_queue(conn, self._root_id):
+            vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
+            frames = (vf["nb_frames"] if vf else 0) or 0
+            dur = (vf["duration"] if vf else 0) or 0
+            seg_secs = self._vcfg()["segment_seconds"]
+            import math as _m
+            segs = max(1, _m.ceil(dur / seg_secs)) if seg_secs else 1
+            jobs.append({"frames": frames, "target": j["target"], "segments": segs})
+        return jobs
+
+    def _spin_up(self):
+        return float(CFG.get("video", {}).get("spin_up_seconds", 360))
+
+    def _update_estimate(self):
+        import video_estimate as ve
+        jobs = self._queue_jobs()
+        if not jobs:
+            self.estimate_var.set("Add videos to the queue for an estimate.")
+            return
+        g = self._selected_gpu()
+        if not g:
+            self.estimate_var.set(f"{len(jobs)} job(s) queued — pick a GPU (↻).")
+            return
+        est = ve.estimate_queue(jobs, g.get("id") or g.get("name"), g.get("price"),
+                                self._spin_up(), conn=self._conn())
+        if not est:
+            self.estimate_var.set(f"{g['name']} can't serve every queued target.")
+            return
+        self.estimate_var.set(
+            f"{len(jobs)} job(s) · {ve.fmt_duration(est['duration_seconds'])} · "
+            f"${est['cost']:.2f} · {est['segments']} segments · "
+            f"${est['cost_per_segment']:.3f}/segment")
+
+    # ── start / stop / run ───────────────────────────────────────────────────
+
+    def _start(self):
+        if self.proc is not None:
+            return
+        if not getattr(self, "_ready", False):
+            messagebox.showwarning(APP_TITLE, self.ready_var.get())
+            return
+        jobs = self._queue_jobs()
+        if not jobs:
+            messagebox.showinfo(APP_TITLE, "The queue is empty. Prepare a video first.")
+            return
+        g = self._selected_gpu()
+        if not g:
+            messagebox.showwarning(APP_TITLE, "Pick a GPU (press ↻ to load the list).")
+            return
+        import video_estimate as ve
+        est = ve.estimate_queue(jobs, g.get("id") or g.get("name"), g.get("price"),
+                                self._spin_up(), conn=self._conn())
+        if CFG.get("video", {}).get("confirm_before_rent", True):
+            cost = f"${est['cost']:.2f}" if est else "?"
+            dur = ve.fmt_duration(est["duration_seconds"]) if est else "?"
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Rent {g['name']} (${g.get('price', 0):.2f}/h) and upscale "
+                    f"{len(jobs)} job(s)?\n\nEstimated: {dur}, {cost}.\n\n"
+                    "A billed pod is created and torn down when done."):
+                return
+        # GPU override (cheapest-first fallback chain from here down the list).
+        ids = [gg.get("id") for gg in self._gpu_choices[self.gpu_combo.current():]
+               if gg.get("id")]
+        env = {"IMGTBX_GPU_OVERRIDE": ",".join(ids)} if ids else None
+        self._begin_run(sum(j["frames"] for j in jobs))
+        self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
+
+    def _begin_run(self, total_frames):
+        self._run_total = total_frames
+        self._run_done = 0
+        self._cur_seg_frames = self._cur_seg_done = 0
+        self._run_start = time.time()
+        self._rate = None
+        self.progress.set(0)
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.status_var.set("Starting pod …")
+        self.console.clear()
+        self.app.taskbar_state("indeterminate")
+        if self._run_tick_job is None:
+            self._run_tick_job = self.after(1000, self._run_tick)
+
+    def _launch(self, script, args, extra_env=None):
+        cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, script)] + list(args)
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        if extra_env:
+            env.update(extra_env)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=APP_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW, env=env)
+        except Exception as exc:                         # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Could not start the runner:\n{exc}")
+            self._end_run()
+            return
+        self._hold = ""
+        self._marker_buf = None
+        threading.Thread(target=self._pump, daemon=True).start()
+        self.after(50, self._poll)
+
+    @property
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def send(self, line):
+        """Send a control line to the runner's stdin (App._on_close uses this)."""
+        if self.proc and self.proc.stdin:
+            try:
+                self.proc.stdin.write((line + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+
+    def terminate(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+    def _stop(self):
+        if self.running:
+            self.send("q")
+            self.status_var.set("Stopping after the current segment …")
+        self.stop_btn.configure(state="disabled")
+
+    def _pump(self):
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        stream = self.proc.stdout
+        while True:
+            chunk = stream.read1(4096)
+            if not chunk:
+                break
+            self._queue_io.put(decoder.decode(chunk))
+        self._queue_io.put(None)
+
+    def _poll(self):
+        finished = False
+        while True:
+            try:
+                item = self._queue_io.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                finished = True
+                break
+            self.console.feed(self._filter_markers(item))
+        if finished:
+            code = self.proc.wait() if self.proc else 0
+            self.proc = None
+            self.on_exit(code)
+        elif self.proc is not None:
+            self.after(50, self._poll)
+
+    def _filter_markers(self, text):
+        """Strip @@TBX@@KIND|payload lines and dispatch them; same parser shape as
+        ToolTab (markers can arrive mid-line from a background thread)."""
+        out = []
+        data = self._hold + text
+        self._hold = ""
+        pos, n = 0, len(data)
+        while pos < n:
+            if self._marker_buf is not None:
+                nl = data.find("\n", pos)
+                if nl < 0:
+                    self._marker_buf += data[pos:]
+                    pos = n
+                else:
+                    self._marker_buf += data[pos:nl]
+                    self._on_marker(self._marker_buf)
+                    self._marker_buf = None
+                    pos = nl + 1
+                continue
+            idx = data.find(GUI_MARKER, pos)
+            if idx < 0:
+                hold = ""
+                for k in range(len(GUI_MARKER) - 1, 0, -1):
+                    if data.endswith(GUI_MARKER[:k]):
+                        hold = GUI_MARKER[:k]
+                        break
+                out.append(data[pos:n - len(hold)] if hold else data[pos:])
+                self._hold = hold
+                pos = n
+            else:
+                out.append(data[pos:idx])
+                self._marker_buf = ""
+                pos = idx + len(GUI_MARKER)
+        return "".join(out)
+
+    def _on_marker(self, content):
+        kind, _, payload = content.strip().partition("|")
+        try:
+            data = json.loads(payload) if payload else None
+        except ValueError:
+            data = None
+        self._handle_event(kind, data, payload)
+
+    def _handle_event(self, kind, data, payload):
+        if kind == "POD":
+            self.active_pod_id = payload or None
+            self.app.notify_active_pods_changed()
+        elif kind == "VIDEO" and data:
+            self._cur_rel = data.get("rel")
+            self._cur_target = data.get("target")
+            self._cur_seg_frames = self._cur_seg_done = 0
+            self.status_var.set(f"Upscaling {os.path.basename(data.get('rel',''))} "
+                                f"→ {data.get('target')} "
+                                f"[{data.get('index')}/{data.get('total')}]")
+        elif kind == "SEGMENT" and data:
+            seg_frames = data.get("seg_frames") or 0
+            fp = data.get("frames_processed")
+            self._cur_seg_frames = seg_frames
+            if data.get("state") == "done":
+                self._run_done += seg_frames
+                self._cur_seg_done = 0
+            elif fp is not None:
+                self._cur_seg_done = min(fp, seg_frames)
+            self._update_progress()
+        elif kind == "VRESULT" and data:
+            self._load_queue()                           # done/failed leaves the queue
+        elif kind == "RTELEM" and data:
+            self.app.apply_remote_telemetry(self, data)
+
+    def _update_progress(self):
+        if self._run_total <= 0:
+            return
+        done = self._run_done + self._cur_seg_done
+        self.progress.set(100.0 * done / self._run_total)
+        self.app.taskbar_progress(done, self._run_total)
+
+    def _run_tick(self):
+        """1 s heartbeat during a run: refine the rate, smooth a time-based bar when
+        the worker isn't reporting frames_processed, and show ETA."""
+        if self.proc is None:
+            self._run_tick_job = None
+            return
+        elapsed = time.time() - (self._run_start or time.time())
+        done = self._run_done + self._cur_seg_done
+        if done > 0 and elapsed > 0:
+            self._rate = elapsed / done
+        if self._run_total > 0:
+            remaining = max(0, self._run_total - done)
+            eta = remaining * self._rate if self._rate else None
+            import video_estimate as ve
+            tail = f" · ETA {ve.fmt_duration(eta)}" if eta else ""
+            self.status_var.set(
+                getattr(self, "_cur_status", self.status_var.get()).split(" · ETA")[0] + tail)
+        self._run_tick_job = self.after(1000, self._run_tick)
+
+    def on_exit(self, code):
+        self._end_run()
+        self.app.taskbar_clear()
+        self.app.flash_attention()
+        self._load_queue()
+        self.status_var.set("Run finished." if code == 0 else f"Run exited (code {code}).")
+
+    def _end_run(self):
+        self.proc = None
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        if self._run_tick_job is not None:
+            self.after_cancel(self._run_tick_job)
+            self._run_tick_job = None
+
+    def _view_log(self):
+        self.app.show_log(self.console, f"{APP_TITLE} — Video Upscaler output")
+
+    def on_exit_app(self):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+
 class App(tk.Tk):
 
     def __init__(self):
@@ -5823,11 +6640,13 @@ class App(tk.Tk):
 
         self.nb = ttk.Notebook(self)
         self.upscale_tab    = UpscaleTab(self.nb, self)
+        self.video_tab      = VideoTab(self.nb, self)
         self.tag_tab        = TagTab(self.nb, self)
         self.conciliate_tab = ConciliateTab(self.nb, self)
         self.settings_tab   = SettingsTab(self.nb, self)
         self.runpod_tab     = RunPodTab(self.nb, self)
         self.nb.add(self.upscale_tab,    text="  Batch Upscaler  ")
+        self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
         self.nb.add(self.conciliate_tab, text="  Conciliation  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
@@ -6320,7 +7139,8 @@ class App(tk.Tk):
         def mark(label):
             marks.append((label, time.perf_counter() - t0))
 
-        busy = [t for t in (self.upscale_tab, self.tag_tab, self.conciliate_tab) if t.running]
+        busy = [t for t in (self.upscale_tab, self.video_tab, self.tag_tab,
+                            self.conciliate_tab) if t.running]
         if busy:
             if not messagebox.askyesno(
                     APP_TITLE, "A task is still running.\nStop it and close the app?"):

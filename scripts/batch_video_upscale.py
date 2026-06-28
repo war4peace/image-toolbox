@@ -37,6 +37,7 @@ import shutil
 import hashlib
 import datetime
 import argparse
+import threading
 
 try:
     import crash_logger
@@ -117,8 +118,25 @@ def _load_config():
 
 
 class StopInstallment(Exception):
-    """Raised to end a run cleanly when a per-run cap is reached; the rest stays
-    `pending` and resumes next run."""
+    """Raised to end a run cleanly when a per-run cap is reached OR the user pressed
+    Stop; the rest stays `pending`/`partial` and resumes next run."""
+
+
+# Set when the GUI sends "q" on stdin (Stop). Checked between segments so a Stop
+# finishes the current segment, then tears the pod down (15.3 step 8).
+_STOP = threading.Event()
+
+
+def _watch_stdin_for_stop():
+    """Background reader: a 'q'/'quit'/'stop' line on stdin requests a graceful
+    stop. Started in GUI mode only. Fail-safe (any error just ends the watcher)."""
+    try:
+        for line in sys.stdin:
+            if line.strip().lower() in ("q", "quit", "stop"):
+                _STOP.set()
+                break
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
@@ -469,7 +487,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
             + (f" in {secs:.1f}s" if secs else ""))
 
-        cap = budget.exceeded()
+        cap = budget.exceeded() or ("stopped by user" if _STOP.is_set() else None)
         remaining = [r for r in db.get_video_segments(conn, root_id, rel, target)
                      if r["status"] != "done"]
         if cap and remaining:
@@ -521,6 +539,9 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     done = failed = 0
     stopped = None
     for i, job in enumerate(jobs, 1):
+        if _STOP.is_set():
+            stopped = "stopped by user"
+            break
         rel, target = job["rel_path"], job["target"]
         try:
             process_job(engine, conn, root_id, source_root, job, vcfg, budget,
@@ -590,6 +611,10 @@ def main(argv=None):
 
     conn = db.get_conn()
     root_id = db.get_video_root_id(conn, src_root, out_root)
+
+    # GUI mode (stdin is a pipe): watch for a "q" Stop line.
+    if GUI_MODE:
+        threading.Thread(target=_watch_stdin_for_stop, daemon=True).start()
 
     # Headless: pre-populate the queue from the folder (the GUI does this per-file).
     if args.target:

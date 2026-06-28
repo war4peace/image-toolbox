@@ -201,7 +201,13 @@ def get_conn():
         return _conn
     os.makedirs(DB_DIR, exist_ok=True)
     fresh = not os.path.exists(DB_PATH)
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    # check_same_thread=False: the GUI (Video Upscaler tab) touches this one shared
+    # connection from short-lived worker threads (scan / prepare run off the UI
+    # thread). The app already serialises DB work in practice — the tools are
+    # separate single-threaded subprocesses and the GUI runs one background op at a
+    # time — and WAL keeps concurrent readers safe, so disabling the thread guard
+    # is safe here and avoids a per-thread connection.
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
