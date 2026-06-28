@@ -1158,6 +1158,199 @@ class ComparisonWindow(tk.Toplevel):
         self.destroy()
 
 
+class VideoComparisonWindow(ComparisonWindow):
+    """Original-vs-upscaled **video** comparison (Video Upscaler #2, phase 5). The
+    video analogue of ComparisonWindow: it reuses the parent's shared zoom / pan /
+    before-after-wipe rendering verbatim, and only swaps the image source — each
+    seek decodes a frame PAIR from the two videos through the bundled ffmpeg
+    (`-ss <t> -i <file> -frames:v 1` to a PNG pipe -> Pillow) and feeds them into
+    the same renderer.
+
+    v1 is **scrub + frame-step**, aligned by TIMESTAMP not frame index (the
+    upscaled frame count can differ after a CFR-normalize, section 14), so seeking
+    both sides to the same time keeps the same content under the wipe. Zoom/pan are
+    preserved across seeks; only opening a new pair resets the view. Decoding runs
+    off the UI thread. See docs/video-upscaler.md sections 11 / 15."""
+
+    def __init__(self, master, source, upscaled, app=None):
+        tk.Toplevel.__init__(self, master)
+        self._app = app
+        geo = app.settings.get("video_compare_geometry") if app is not None else None
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x680")
+        self.minsize(560, 380)
+        self._last_normal_geo = None
+        if app is not None and app.settings.get("video_compare_zoomed"):
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
+
+        bar = ttk.Frame(self, padding=(8, 4))
+        bar.pack(fill="x")
+        self._old_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._old_lbl.pack(side="left")
+        self._new_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._new_lbl.pack(side="right")
+
+        # Bottom transport: frame-step, a scrubber, and a time read-out.
+        tl = ttk.Frame(self, padding=(8, 4))
+        tl.pack(side="bottom", fill="x")
+        ttk.Button(tl, text="◀ frame", width=8,
+                   command=lambda: self._step(-1)).pack(side="left")
+        ttk.Button(tl, text="frame ▶", width=8,
+                   command=lambda: self._step(1)).pack(side="left", padx=(4, 8))
+        self.time_var = tk.StringVar(value="0:00.000 / 0:00.000")
+        ttk.Label(tl, textvariable=self.time_var, width=20,
+                  font=("Consolas", 9)).pack(side="left")
+        self.timeline = ttk.Scale(tl, from_=0.0, to=1.0, orient="horizontal",
+                                  command=self._on_scrub)
+        self.timeline.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, bg="#15181d")
+        self.canvas.pack(fill="both", expand=True)
+
+        # Shared view state (consumed by the inherited renderer).
+        self._old = self._new = None
+        self._zoom = 1.0
+        self._ox = self._oy = 0.0
+        self._wipe_frac = 0.5
+        self._inited = False
+        self._last_size = None
+        self._drag = None
+        self._photos = []
+        self._crisp_after = None
+        # Video state.
+        self._src_path = self._up_path = None
+        self._duration = 0.0
+        self._fps = 30.0
+        self._cur_t = 0.0
+        self._scrub_after = None
+        self._seek_seq = 0
+
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.bind("<Configure>", self._track_geometry, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.show_videos(source, upscaled)
+
+    def save_geometry(self):
+        if self._app is not None and self.winfo_exists():
+            try:
+                zoomed = (self.state() == "zoomed")
+            except tk.TclError:
+                zoomed = False
+            self._app.settings["video_compare_geometry"] = self._last_normal_geo or self.geometry()
+            self._app.settings["video_compare_zoomed"] = zoomed
+            save_settings(self._app.settings)
+
+    # ── public API (shared single instance) ──────────────────────────────────
+
+    def show_videos(self, source, upscaled):
+        """Point the window at a new (source, upscaled) pair and reset the view."""
+        import video_pipeline as vp
+        self._src_path, self._up_path = source, upscaled
+        try:
+            si, ui = vp.probe(source), vp.probe(upscaled)
+        except Exception:
+            si = ui = None
+        sdim = f"{si.width}×{si.height}" if si else "?"
+        udim = f"{ui.width}×{ui.height}" if ui else "?"
+        self._duration = max((si.duration if si else 0) or 0,
+                             (ui.duration if ui else 0) or 0) or 0.01
+        self._fps = float((ui.fps if ui else None) or (si.fps if si else None) or 30)
+        self._old_lbl.configure(text=f"Original:  {os.path.basename(source)}  ·  {sdim}")
+        self._new_lbl.configure(text=f"Upscaled:  {os.path.basename(upscaled)}  ·  {udim}")
+        self.title(f"{APP_TITLE} — Compare video — {os.path.basename(source)}")
+        self._zoom = 1.0
+        self._wipe_frac = 0.5
+        self._inited = False
+        self.timeline.configure(to=max(0.01, self._duration))
+        self.timeline.set(0.0)
+        self.lift()
+        self.focus_set()
+        self._seek(0.0)
+
+    # ── transport ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_t(t):
+        t = max(0.0, t)
+        m, s = divmod(t, 60)
+        return f"{int(m)}:{s:06.3f}"
+
+    def _update_time_label(self, t):
+        self.time_var.set(f"{self._fmt_t(t)} / {self._fmt_t(self._duration)}")
+
+    def _on_scrub(self, val):
+        try:
+            t = float(val)
+        except (TypeError, ValueError):
+            return
+        self._update_time_label(t)
+        # Debounce: decode only after the scrub settles (decoding is ~hundreds of
+        # ms per frame and we decode two), so dragging stays smooth.
+        if self._scrub_after is not None:
+            self.after_cancel(self._scrub_after)
+        self._scrub_after = self.after(160, lambda: self._seek(t))
+
+    def _step(self, frames):
+        t = max(0.0, min(self._duration, self._cur_t + frames / max(1e-6, self._fps)))
+        self.timeline.set(t)
+        self._seek(t)
+
+    def _seek(self, t):
+        """Decode the frame pair at time `t` off the UI thread, then render."""
+        self._cur_t = t
+        self._update_time_label(t)
+        src, up = self._src_path, self._up_path
+        if not src or not up:
+            return
+        self._seek_seq += 1
+        seq = self._seek_seq
+
+        def work():
+            o = self._decode_frame(src, t)
+            n = self._decode_frame(up, t)
+            self.after(0, lambda: self._apply_frames(seq, o, n))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_frames(self, seq, old_img, new_img):
+        if seq != self._seek_seq:        # a newer seek superseded this one
+            return
+        if new_img is not None:
+            self._new = new_img
+        if old_img is not None:
+            self._old = old_img
+        self._render()
+
+    def _decode_frame(self, path, t):
+        """One frame at time `t` via the bundled ffmpeg -> PIL (no new dependency).
+        Returns None on any failure (the renderer shows the placeholder)."""
+        import io
+        import video_pipeline as vp
+        from PIL import Image
+        try:
+            ffmpeg, _ = vp.find_ffmpeg()
+        except Exception:
+            return None
+        args = [ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-ss", f"{max(0.0, t):.3f}", "-i", path, "-frames:v", "1",
+                "-f", "image2pipe", "-vcodec", "png", "-"]
+        try:
+            cp = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=CREATE_NO_WINDOW)
+            if cp.returncode != 0 or not cp.stdout:
+                return None
+            return Image.open(io.BytesIO(cp.stdout)).convert("RGB")
+        except Exception:
+            return None
+
+
 # ─────────────────────────────────────────────
 #  TOOL TAB BASE  (subprocess plumbing)
 # ─────────────────────────────────────────────
@@ -6164,8 +6357,18 @@ class VideoTab(ttk.Frame):
             self._open_path(os.path.dirname(p))
 
     def _open_compare(self, src, up):
-        # Placeholder until the video ComparisonWindow lands (phase-5 build piece).
-        self._open_path(up)
+        """Open/reuse the shared original-vs-upscaled video comparison window."""
+        if not (up and os.path.exists(up)):
+            self._open_path(src)
+            return
+        win = getattr(self.app, "video_comparison_window", None)
+        if win is not None and win.winfo_exists():
+            win.show_videos(src, up)
+            win.deiconify()
+            win.lift()
+        else:
+            self.app.video_comparison_window = VideoComparisonWindow(
+                self.app, src, up, app=self.app)
 
     # ── prepare / queue ──────────────────────────────────────────────────────
 
@@ -6633,7 +6836,8 @@ class App(tk.Tk):
         self.settings = load_settings()
         self._last_normal_geo = None
         self.log_window = None          # single shared LogViewer for both tools
-        self.comparison_window = None   # single shared ComparisonWindow
+        self.comparison_window = None   # single shared ComparisonWindow (images)
+        self.video_comparison_window = None  # single shared VideoComparisonWindow
         self._migrate_default_folders()
         self._restore_geometry()
         self._install_picklist_wheel_guard()
@@ -7161,6 +7365,8 @@ class App(tk.Tk):
             self.log_window.save_geometry()
         if self.comparison_window is not None and self.comparison_window.winfo_exists():
             self.comparison_window.save_geometry()
+        if self.video_comparison_window is not None and self.video_comparison_window.winfo_exists():
+            self.video_comparison_window.save_geometry()
         mark("save-geometry")
         # Record last-used time and announce going offline before we exit.
         self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))
