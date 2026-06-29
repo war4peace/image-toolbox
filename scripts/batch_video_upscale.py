@@ -557,6 +557,19 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
             + (f" in {secs:.1f}s" if secs else ""))
 
+        # Self-calibrate future estimates: record this segment's real frames vs
+        # seconds against the GPU that actually ran it (IMGTBX_GPU_OVERRIDE, which
+        # the GUI also keys its estimate on), so the next run's ETA uses measured
+        # data instead of the static benchmark rate. Remote runs only (passthrough
+        # has no billed GPU id); fail-safe, never breaks a run.
+        gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+        if gpu_id and n and secs:
+            try:
+                import video_estimate as ve
+                ve.record_run(conn, gpu_id, target, n, secs)
+            except Exception:                          # noqa: BLE001 (best-effort)
+                pass
+
         cap = budget.exceeded() or ("stopped by user" if _STOP.is_set() else None)
         remaining = [r for r in db.get_video_segments(conn, root_id, rel, target)
                      if r["status"] != "done"]
