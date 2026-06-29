@@ -6968,16 +6968,22 @@ class VideoTab(ttk.Frame):
             state = data.get("state")
             self._cur_seg_frames = seg_frames
             if state == "running":
-                # Segment just started: anchor the time-based estimate to now and
-                # work out how long this segment should take on the chosen GPU.
-                self._seg_start = time.time()
-                self._seg_has_frames = False
-                self._cur_seg_done = 0
-                import video_estimate as ve
-                self._seg_expected = ve.estimate_job(
-                    seg_frames, self._cur_target, getattr(self, "_run_gpu", None),
-                    conn=self._conn(), src_w=getattr(self, "_cur_w", None),
-                    src_h=getattr(self, "_cur_h", None))
+                # "running" arrives on EVERY status poll (~5 s), not just once. Anchor
+                # the time-based estimate the FIRST time only (_seg_start is None),
+                # else each poll would reset the clock -> the bar sticks near 0 % and
+                # the elapsed counter loops back to 0 every poll.
+                if self._seg_start is None:
+                    self._seg_start = time.time()
+                    self._seg_has_frames = False
+                    self._cur_seg_done = 0
+                    import video_estimate as ve
+                    self._seg_expected = ve.estimate_job(
+                        seg_frames, self._cur_target, getattr(self, "_run_gpu", None),
+                        conn=self._conn(), src_w=getattr(self, "_cur_w", None),
+                        src_h=getattr(self, "_cur_h", None))
+                if fp is not None:               # real within-segment frames, if any
+                    self._cur_seg_done = min(fp, seg_frames)
+                    self._seg_has_frames = True  # real data overrides the clock
             elif state == "done":
                 self._run_done += seg_frames
                 self._cur_seg_done = 0

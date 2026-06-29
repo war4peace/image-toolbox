@@ -563,11 +563,20 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     batch = resolve_batch(vcfg, target)
     chunk = resolve_chunk(vcfg, batch)
     seed = per_video_seed(vcfg, rel)
+    # SeedVR2 SILENTLY resets temporal_overlap >= batch_size to 0 (seams come back).
+    # That bites when the global overlap exceeds a small per-target auto batch (4K's
+    # auto batch is 5). Clamp to batch-1 so a high overlap blends the most it can
+    # instead of disabling itself.
+    overlap = vcfg["temporal_overlap"]
+    if overlap >= batch:
+        overlap = max(0, batch - 1)
+        log(f"    (temporal_overlap {vcfg['temporal_overlap']} >= batch_size {batch}; "
+            f"clamped to {overlap} so it isn't silently disabled)")
     # The effective (resolved) SeedVR2 settings for THIS job, so a per-job failure
     # can be reproduced from the log alone (batch/chunk are target-dependent; seed
     # is per-video).
     log(f"    SeedVR2: short-side {resolution}px, batch_size {batch}, "
-        f"chunk_size {chunk}, temporal_overlap {vcfg['temporal_overlap']}, "
+        f"chunk_size {chunk}, temporal_overlap {overlap}, "
         f"seed {seed}, backend {vcfg['video_backend']}, "
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'}")
     total_secs = 0.0
@@ -588,7 +597,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         _progress({"state": "running"})
         n = engine.process_segment(
             s.path, up_path, resolution=resolution, batch_size=batch,
-            chunk_size=chunk, temporal_overlap=vcfg["temporal_overlap"],
+            chunk_size=chunk, temporal_overlap=overlap,
             seed=seed, video_backend=vcfg["video_backend"],
             use_10bit=vcfg["use_10bit"], on_progress=_progress)
         secs = getattr(engine, "last_segment_seconds", None)
