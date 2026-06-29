@@ -287,18 +287,15 @@ otherwise-deployable in-stock hosts (an A100 PCIe @ 12.4–12.7 in EU-RO-1 runs
 cu128 fine, yet the floor refused it with "no instances available" while the
 console showed the card available) — so the deploy omits the floor for them,
 matching the website deploy that works;
-(2) a **per-task price ceiling**
-(`runpod.max_price_per_hour_upscale` default **$1.10/h**,
-`runpod.max_price_per_hour_tag` default **$0.50/h**, Settings → Remote)
-caps the *automatic* fallback chain so a sold-out cheap card can't silently
-escalate to a $1.49+ A100 — the user's own explicit pick is never capped (and the
-confirm flags it when it's above the ceiling). The cap is **split by task**
-(0.3.4, benchmark-driven): tagging runs fine on $0.24 cards so its cap stays low,
-but the cheapest viable *upscale* card is ~$0.74 — a single $0.50 cap left
-upscaling with **no** fallback at all — so the upscale cap is higher (covers the
-RTX 5090 value pick, still blocks an A100/B200). Each tab sets its own ceiling via
-`_gpu_price_key`/`_gpu_price_default` in `_fallback_ceiling`; the pre-0.3.4 single
-`max_price_per_hour` key is deprecated (ignored, dropped on next Settings save). If nothing meets the VRAM floor the
+(2) **no GPU-type substitution** (0.4.0): a run deploys **only the card the user
+picked**, never a cheaper/pricier substitute. The old automatic fallback chain (and
+its per-task price ceilings `runpod.max_price_per_hour_upscale` /
+`max_price_per_hour_tag`, plus `_fallback_ceiling` and the Settings → Remote
+spinners) are **removed** because silent type-switching surprised the user during
+benchmarking. If the picked card is sold out at deploy time the run fails cleanly
+and the status line points the user to press the picker's ↻ to refresh stock and
+re-pick. `_selected_gpu_chain` now returns just `[picked_id]`; the three deprecated
+price keys are dropped from `config.json` on the next Settings save. If nothing meets the VRAM floor the
 run is refused up-front with a clear message instead of spinning a doomed pod, and
 a failed run now surfaces the real cause on the status line (pointing at "View
 log") rather than the old "see the messages above" (there were none — the clean

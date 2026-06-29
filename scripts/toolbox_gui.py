@@ -1726,25 +1726,6 @@ class ToolTab(ttk.Frame):
         except Exception:                       # noqa: BLE001 (best-effort)
             pass
 
-    def _fallback_ceiling(self):
-        """Max $/h an AUTOMATIC fallback GPU may cost. 0 / unset = no cap. Stops a
-        sold-out cheap card from silently escalating the chain to an expensive one.
-        The user's own explicit pick is never capped.
-
-        The ceiling is PER TASK (benchmarks, 2026-06): tagging runs fine on $0.24
-        cards so its cap stays low ($0.50), but the cheapest viable *upscale* card
-        is ~$0.74 — a single $0.50 cap left upscaling with no fallback at all — so
-        the upscale cap defaults to $1.10 (covers the RTX 5090 sweet spot, still
-        blocks a runaway A100/B200). Each tab sets `_gpu_price_key`/`_gpu_price_default`.
-        The pre-0.3.4 single `max_price_per_hour` key is deprecated and ignored."""
-        key     = getattr(self, "_gpu_price_key", "max_price_per_hour_tag")
-        default = getattr(self, "_gpu_price_default", 0.50)
-        try:
-            raw = CFG.get("runpod", {}).get(key)
-            return float((raw if raw is not None else default) or 0)
-        except (TypeError, ValueError):
-            return default
-
     def _selected_gpu_chain(self):
         """The picked GPU id as a single-element list. We NEVER substitute a
         different GPU TYPE without the user's consent (their preference): if the
@@ -1781,7 +1762,7 @@ class ToolTab(ttk.Frame):
         if self.console.find_last(
                 r"no instances currently available|Pod failed to deploy on any of"
                 r"|Gave up creating a pod"):
-            return ("Couldn't start a remote pod — no matching GPU was available "
+            return ("Couldn't start a remote pod: no matching GPU was available "
                     "just now. Re-check the GPU picker (↻), try another region, or "
                     "open 'View log' for details.")
         # Otherwise echo the script's own ERROR / '-> detail' line if there is one.
@@ -2774,11 +2755,6 @@ class UpscaleTab(ToolTab):
         self._gpu_min_vram = 32
         self._gpu_pref_key = "gpu_type_id"
         self._bench_task   = "upscale"   # $/100 readout: upscale benchmark rows
-        # Upscale fallback ceiling: the cheapest viable 32 GB card is ~$0.74, so a
-        # $0.50 cap would leave upscaling with no automatic fallback (see
-        # _fallback_ceiling). $1.10 covers the RTX 5090 value pick, blocks A100/B200.
-        self._gpu_price_key     = "max_price_per_hour_upscale"
-        self._gpu_price_default = 1.10
         self._paused      = False
         self._processing  = False    # True once the per-image phase started
         self._cancelled   = False    # user cancelled a preparation phase
@@ -3145,10 +3121,6 @@ class TagTab(ToolTab):
         self._gpu_min_vram = 16
         self._gpu_pref_key = "tag_gpu_type_id"
         self._bench_task   = "tag"       # $/100 readout: tag benchmark rows
-        # Tag fallback ceiling: tagging runs fine on $0.24–0.39 cards, so a low cap
-        # keeps a sold-out cheap card from escalating to a pricey one.
-        self._gpu_price_key     = "max_price_per_hour_tag"
-        self._gpu_price_default = 0.50
         self.scope_var  = tk.StringVar(value=UNDO_SCOPES[0][0])
         self._mode      = "tag"          # "tag" | "undo" — for the exit message
         self._build()
@@ -4231,7 +4203,9 @@ class SettingsTab(ttk.Frame):
             if name == "mqtt":
                 target.pop("enabled", None)   # MQTT is now gated by host being set
             if name == "runpod":
-                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
+                target.pop("max_price_per_hour", None)          # 0.3.4: split per task
+                target.pop("max_price_per_hour_upscale", None)  # 0.4.0: no auto-fallback
+                target.pop("max_price_per_hour_tag", None)      # GPU is never substituted
             if name == "upscale":
                 target.pop("discord_webhook_url", None)  # 0.3.8: moved to notifications
             target.update(values)
@@ -4399,33 +4373,6 @@ class RunPodTab(ttk.Frame):
         self.runpod_ssh_status = ttk.Label(keyrow, text="", foreground="#666")
         self.runpod_ssh_status.pack(side="left", padx=(8, 0))
         self._refresh_ssh_status()
-
-        # Cost guardrail — the automatic-fallback price ceiling, split PER TASK:
-        # tagging runs on $0.24 cards (cap stays low), but the cheapest viable
-        # upscale card is ~$0.74, so a shared $0.50 cap left upscaling with no
-        # fallback — see _fallback_ceiling. Both on one inline row.
-        price = ttk.Frame(sec)
-        price.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
-        ttk.Label(price, text="Max fallback: upscale").grid(row=0, column=0, sticky="e")
-        self.runpod_maxprice_up_var = tk.StringVar(
-            value=str(rp.get("max_price_per_hour_upscale", 1.10)))
-        up_spin = ttk.Spinbox(price, from_=0.0, to=100.0, increment=0.10, width=7,
-                              format="%.2f", textvariable=self.runpod_maxprice_up_var)
-        up_spin.grid(row=0, column=1, sticky="w", padx=(4, 0))
-        ttk.Label(price, text="tag:").grid(row=0, column=2, sticky="e", padx=(10, 0))
-        self.runpod_maxprice_tag_var = tk.StringVar(
-            value=str(rp.get("max_price_per_hour_tag", 0.50)))
-        tag_spin = ttk.Spinbox(price, from_=0.0, to=100.0, increment=0.10, width=7,
-                               format="%.2f", textvariable=self.runpod_maxprice_tag_var)
-        tag_spin.grid(row=0, column=3, sticky="w", padx=(4, 0))
-        for _sp, _kind, _cap in ((up_spin, "Upscaling", "$0.74+"),
-                                 (tag_spin, "Tag & Rename", "$0.24+")):
-            Tooltip(_sp,
-                    f"Cost guardrail for {_kind} (USD/h). When your picked GPU is "
-                    "sold out, only cheaper in-stock GPUs at or below this hourly "
-                    "price are tried automatically — so a run can't silently "
-                    f"escalate to an expensive card ({_kind} cards start at {_cap}). "
-                    "Your own explicit pick is never capped. 0 = no limit.")
 
         # Region + data center (FIRST, so the Refresh next to it clearly drives the
         # GPU lists and volume below). A model volume is region-locked and can only
@@ -4685,7 +4632,9 @@ class RunPodTab(ttk.Frame):
         for name, values in sections.items():
             target = CFG.setdefault(name, {})
             if name == "runpod":
-                target.pop("max_price_per_hour", None)   # 0.3.4: split per task
+                target.pop("max_price_per_hour", None)          # 0.3.4: split per task
+                target.pop("max_price_per_hour_upscale", None)  # 0.4.0: no auto-fallback
+                target.pop("max_price_per_hour_tag", None)      # GPU is never substituted
             target.update(values)
         if save_config():
             self._baseline = self._snapshot()
@@ -4719,8 +4668,6 @@ class RunPodTab(ttk.Frame):
         """Discard unsaved edits: reset every runpod field to the values in CFG."""
         rp = CFG.get("runpod", {})
         self.runpod_key_var.set(rp.get("api_key", ""))
-        self.runpod_maxprice_up_var.set(str(rp.get("max_price_per_hour_upscale", 1.10)))
-        self.runpod_maxprice_tag_var.set(str(rp.get("max_price_per_hour_tag", 0.50)))
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_provrun_var.set(str(rp.get("provision_max_runtime_minutes", 60)))
@@ -4759,8 +4706,6 @@ class RunPodTab(ttk.Frame):
         dc_id = self._selected_dc_id()
         return {
             "api_key":              self.runpod_key_var.get().strip(),
-            "max_price_per_hour_upscale": _num(self.runpod_maxprice_up_var, 1.10, float),
-            "max_price_per_hour_tag":     _num(self.runpod_maxprice_tag_var, 0.50, float),
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "provision_max_runtime_minutes": _num(self.runpod_provrun_var, 60, int),
@@ -6302,6 +6247,7 @@ class VideoTab(ttk.Frame):
         self.progress.set(0)
         self._scanning = True
         self._scan_total = self._scan_done = 0
+        self._scan_skipped = []          # rels ffprobe could not read
         self._scan_seq += 1
         seq = self._scan_seq
         self._scan_q = queue.Queue()
@@ -6360,7 +6306,8 @@ class VideoTab(ttk.Frame):
                                   f"{data[2]['vcodec']})\n")
             elif kind == "skip":
                 self._scan_done += 1
-                self.console.feed(f"  {data}  (unreadable — skipped)\n")
+                self._scan_skipped.append(data)
+                self.console.feed(f"  {data}  (unreadable, skipped)\n")
             elif kind == "error":
                 self.status_var.set(f"Scan failed: {data}")
                 self._finish_scan()
@@ -6395,10 +6342,18 @@ class VideoTab(ttk.Frame):
         self._scanning = False
         self.scan_btn.configure(state="normal")
         n = len(self._scan_rows)
+        skipped = getattr(self, "_scan_skipped", [])
         self.progress.set(100 if self._scan_total else 0)
-        self.status_var.set(f"Found {n} video(s)." if n
+        tail = f", {len(skipped)} unreadable (skipped)" if skipped else ""
+        self.status_var.set(f"Found {n} video(s){tail}." if n
                             else "No videos found in this folder.")
-        self.console.feed(f"Scan complete: {n} video(s).\n")
+        if skipped:
+            self.console.feed(f"Scan complete: {n} video(s), "
+                              f"{len(skipped)} unreadable and skipped:\n")
+            for rel in skipped:
+                self.console.feed(f"  {rel}\n")
+        else:
+            self.console.feed(f"Scan complete: {n} video(s).\n")
 
     def _done_targets(self, rel):
         """Targets already upscaled for `rel`, read LIVE from the DB (not the scan
@@ -6943,7 +6898,7 @@ class VideoTab(ttk.Frame):
             # A common cause is the picked GPU selling out between picker-refresh
             # and Start (we never substitute a different card). Point the user at
             # the manual re-pick rather than guessing for them.
-            self.status_var.set("Run failed — see View log. If the GPU is no longer "
+            self.status_var.set("Run failed (see View log). If the GPU is no longer "
                                 "available, press ↻ to refresh the list and pick another.")
 
     def _end_run(self):

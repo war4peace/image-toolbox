@@ -412,10 +412,10 @@ mandatory, not optional, on this pod.
 | H200 | ~0.47 s | 14.1 | $4.39 | ~$62 |
 | B200 | 0.35 s | 10.5 | $5.89 | ~$62 |
 
-The 5090 is **~40% the B200's cost and half the PRO 6000's** for 1080p, and its $0.99/h
-sits under the upscale price ceiling (`max_price_per_hour_upscale` $1.10), so it is the
-right **default for 1080p**: cheapest total, lowest hourly (least exposure on a dropped
-connection). The big cards win wall-clock time and longer windows, not cost. **1080p ->
+The 5090 is **~40% the B200's cost and half the PRO 6000's** for 1080p, and at $0.99/h
+it is also the lowest hourly of the four, so it is the right **default for 1080p**:
+cheapest total, least exposure on a dropped connection. The big cards win wall-clock
+time and longer windows, not cost. **1080p ->
 5090** is now confirmed.
 
 ### Measured results (fifth pass: A100 80 GB PCIe, 1440p) - the cheap card LOSES here
