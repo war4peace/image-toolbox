@@ -6248,6 +6248,8 @@ class VideoTab(ttk.Frame):
         self._scanning = True
         self._scan_total = self._scan_done = 0
         self._scan_skipped = []          # rels ffprobe could not read
+        self._scan_res = {}              # "WxH" -> count, for the summary breakdown
+        self._scan_listing = 0           # files found so far during the tree walk
         self._scan_seq += 1
         seq = self._scan_seq
         self._scan_q = queue.Queue()
@@ -6260,13 +6262,24 @@ class VideoTab(ttk.Frame):
     def _scan_worker(self, seq):
         """Walk + probe each video off the UI thread, streaming results to the
         poller via a queue so the list/progress fill in live. ffprobe is cached by
-        (mtime, size), so a re-scan of an unchanged tree races through."""
+        (mtime, size), so a re-scan of an unchanged tree races through.
+
+        Walking a large tree on a network drive can take many seconds, so we
+        iterate the walk lazily and stream a running 'found N' count while it runs
+        (otherwise the first feedback is the long-delayed total)."""
         import batch_video_upscale as bv
         try:
             conn = self._conn()
             self._root_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
             cutoff = self._vcfg()["skip_cutoff_pct"]
-            files = bv.walk_videos(self._src_root)
+            files = []
+            for abs_path, rel in bv.iter_videos(self._src_root):
+                if seq != self._scan_seq:
+                    return
+                files.append((abs_path, rel))
+                if len(files) % 25 == 0:
+                    self._scan_q.put(("listing", len(files)))
+            files.sort(key=lambda t: t[1].lower())
             self._scan_q.put(("total", len(files)))
             for abs_path, rel in files:
                 if seq != self._scan_seq:
@@ -6294,15 +6307,22 @@ class VideoTab(ttk.Frame):
             except queue.Empty:
                 break
             drained += 1
-            if kind == "total":
+            if kind == "listing":
+                self._scan_listing = data
+                self.status_var.set(f"Listing files … {data} found")
+            elif kind == "total":
                 self._scan_total = data
                 self._scan_start = time.time()
+                self.console.feed(f"Found {data} video file(s); reading properties …\n")
                 if data == 0:
                     self.status_var.set("No videos found in this folder.")
             elif kind == "row":
                 self._insert_scan_row(*data)
                 self._scan_done += 1
-                self.console.feed(f"  {data[0]}  ({data[2]['width']}×{data[2]['height']}, "
+                w, h = data[2]["width"], data[2]["height"]
+                key = f"{w}×{h}" if w and h else "unknown"
+                self._scan_res[key] = self._scan_res.get(key, 0) + 1
+                self.console.feed(f"  {data[0]}  ({w}×{h}, "
                                   f"{data[2]['vcodec']})\n")
             elif kind == "skip":
                 self._scan_done += 1
@@ -6343,17 +6363,28 @@ class VideoTab(ttk.Frame):
         self.scan_btn.configure(state="normal")
         n = len(self._scan_rows)
         skipped = getattr(self, "_scan_skipped", [])
+        res = getattr(self, "_scan_res", {})
         self.progress.set(100 if self._scan_total else 0)
         tail = f", {len(skipped)} unreadable (skipped)" if skipped else ""
         self.status_var.set(f"Found {n} video(s){tail}." if n
                             else "No videos found in this folder.")
+        # A clearly delimited summary block (find-able after the long per-file run):
+        # totals, then a count grouped by resolution, then the skipped files.
+        bar = "=" * 56
+        self.console.feed(f"\n{bar}\n")
+        self.console.feed("Scan summary\n")
+        self.console.feed(f"  Videos ready to queue: {n}\n")
         if skipped:
-            self.console.feed(f"Scan complete: {n} video(s), "
-                              f"{len(skipped)} unreadable and skipped:\n")
+            self.console.feed(f"  Unreadable (skipped):  {len(skipped)}\n")
+        if res:
+            self.console.feed("  By resolution:\n")
+            for key, cnt in sorted(res.items(), key=lambda kv: (-kv[1], kv[0])):
+                self.console.feed(f"     {key:<13}{cnt}\n")
+        if skipped:
+            self.console.feed("  Unreadable files:\n")
             for rel in skipped:
-                self.console.feed(f"  {rel}\n")
-        else:
-            self.console.feed(f"Scan complete: {n} video(s).\n")
+                self.console.feed(f"     {rel}\n")
+        self.console.feed(f"{bar}\n")
 
     def _done_targets(self, rel):
         """Targets already upscaled for `rel`, read LIVE from the DB (not the scan
