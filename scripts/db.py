@@ -357,12 +357,14 @@ def get_video_root_id(conn, source_root, output_root=None, create=True):
         if create and output_root is not None:
             conn.execute("UPDATE video_roots SET output_root = ? WHERE id = ?",
                          (output_root, row["id"]))
-        return row["id"]
-    if not create:
+            conn.commit()       # don't leave a write txn open: the runner calls this
+        return row["id"]        # then blocks for minutes in session.start(), which
+    if not create:              # would hold the WAL write lock and stall the GUI
         return None
     cur = conn.execute(
         "INSERT INTO video_roots (source_root, output_root, saved_at) VALUES (?, ?, ?)",
         (source_root, output_root, datetime.datetime.now().isoformat()))
+    conn.commit()
     return cur.lastrowid
 
 
@@ -437,6 +439,14 @@ def get_video_outputs_for(conn, root_id, rel_path):
     return conn.execute(
         "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? ORDER BY target",
         (root_id, rel_path)).fetchall()
+
+
+def get_video_outputs_all(conn, root_id):
+    """Every output job for a root in ONE query, so the GUI can refresh a large
+    scan list without a query per file (which froze the UI thread)."""
+    return conn.execute(
+        "SELECT rel_path, target, status, output_path FROM video_outputs "
+        "WHERE root_id = ?", (root_id,)).fetchall()
 
 
 def get_video_queue(conn, root_id):

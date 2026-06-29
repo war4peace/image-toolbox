@@ -6574,16 +6574,21 @@ class VideoTab(ttk.Frame):
         self._update_estimate()
 
     def _refresh_scan_outputs(self):
-        """Re-read each scan row's upscaled counterparts from the DB so the
-        'Upscaled' columns and the green tag stay current after a run (without a
-        full re-scan)."""
-        if self._root_id is None:
+        """Re-read the scan rows' upscaled counterparts so the 'Upscaled' columns
+        and the green tag stay current after a run (without a full re-scan). Uses a
+        SINGLE query for the whole root, not one per file — a per-row query froze
+        the UI thread on a large tree (1000+ files)."""
+        if self._root_id is None or not self._scan_rows:
             return
         import batch_video_upscale as bv
-        conn = self._conn()
+        by_rel = {}
+        for o in bv.db.get_video_outputs_all(self._conn(), self._root_id):
+            by_rel.setdefault(o["rel_path"], []).append(
+                (o["target"], o["status"], o["output_path"]))
         for iid, row in self._scan_rows.items():
-            outs = [(o["target"], o["status"], o["output_path"])
-                    for o in bv.db.get_video_outputs_for(conn, self._root_id, row["rel"])]
+            outs = by_rel.get(row["rel"], [])
+            if outs == row.get("outs"):
+                continue                      # unchanged — skip the tree write
             row["outs"] = outs
             done = [o for o in outs if o[1] == "done"]
             up = ", ".join(t for t, _s, _p in done)
