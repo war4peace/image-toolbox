@@ -679,6 +679,8 @@ class Handler(BaseHTTPRequestHandler):
             "error":            job.get("error"),
             "resolved_batch":   job.get("resolved_batch"),
             "resolved_overlap": job.get("resolved_overlap"),
+            "resolved_attention": getattr(getattr(_ENGINE, "args", None),
+                                          "attention_mode", None),
         }).encode()
         self._send(200, body, "application/json")
 

@@ -616,7 +616,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             if rb and not _resolved_logged[0]:       # the pod reported its auto choices
                 _resolved_logged[0] = True
                 log(f"    (pod resolved: batch_size {rb}, "
-                    f"temporal_overlap {st.get('resolved_overlap')})")
+                    f"temporal_overlap {st.get('resolved_overlap')}, "
+                    f"attention {st.get('resolved_attention') or '?'})")
             gui_event("SEGMENT", {"video_rel": rel, "target": target,
                                   "seg_index": _i, "total": len(segs),
                                   "state": st.get("state"),
