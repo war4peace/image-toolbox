@@ -3436,8 +3436,13 @@ _SEEDVR_LABELS = {
 }
 
 # Suggested values for the free-text enum fields (editable — type anything).
+# These MUST match SeedVR2's argparse choices (inference_cli.py --attention_mode):
+# the old short names "flash_attn"/"sage" are rejected now. sageattn_* and flash_attn_*
+# need their package on the pod (the worker logs a SageAttention/Flash/Triton check);
+# sageattn_3 is the Blackwell-tuned build, sdpa is the always-available fallback.
 _SEEDVR_CHOICES = {
-    "attention_mode":   ["sdpa", "flash_attn", "sage"],
+    "attention_mode":   ["sdpa", "sageattn_3", "sageattn_2",
+                         "flash_attn_3", "flash_attn_2"],
 }
 
 
