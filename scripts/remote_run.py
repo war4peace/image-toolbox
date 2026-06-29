@@ -374,8 +374,16 @@ class RemoteSession:
             "cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /workspace/ffmpeg/ && "
             "chmod +x /workspace/ffmpeg/ffmpeg /workspace/ffmpeg/ffprobe; "
             "rm -rf /tmp/ff.txz /tmp/ffmpeg-*-amd64-static; fi; "
+            "rm -f /root/worker.pid; "
             f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
-            f"for i in $(seq 1 120); do curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; sleep 5; done; "
+            # Poll /health, but bail the moment the worker PROCESS dies (e.g. a CUDA
+            # crash at model load) instead of polling the full 10 min on a dead pod.
+            # Only trip on a written-then-dead pid (a missing pid = not booted yet).
+            f"for i in $(seq 1 120); do "
+            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; "
+            "PID=$(cat /root/worker.pid 2>/dev/null); "
+            "if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then echo WORKER_DIED; break; fi; "
+            "sleep 5; done; "
             f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
             "{ echo WORKER_FAILED; tail -n 20 /root/worker.log; exit 1; }")
         res = self._ssh(launch, check=False, timeout=900)
