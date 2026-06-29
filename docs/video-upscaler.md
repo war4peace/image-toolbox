@@ -1035,6 +1035,24 @@ guess**):
    `video_estimate.record_run`) so the up-front estimate self-corrects over time, and
    note the **Workstation vs Server** editions of a card can differ enough to matter.
 
+**Aspect ratio / output megapixels (FIXED 0.4.0).** A second, separate cause of the
+under-estimate: the benchmark `RATES` were all measured on a **4:3** clip
+(`Pisici.AVI`, 320x240), so each target's output frame is 4:3 (1440p = 1920x1440 =
+2.76 MP). SeedVR2's cost scales with **output pixels**, and the target is the SHORT
+side, so a **16:9** video at "1440p" is 2560x1440 = **3.69 MP, ~33 % more per frame**
+than the 4:3 benchmark, at every target. The estimator keyed only on the target
+label, so it under-predicted widescreen by ~33 % regardless of GPU or self-calibration.
+Note the *input* resolution barely matters: cost follows output size, which the aspect
+ratio (not the source being small) sets. Fixed by normalising the rate to **seconds
+per output-megapixel** (`video_estimate.seconds_per_mp`, `output_megapixels`,
+`BENCH_OUT_MP`) and multiplying by each video's real output dimensions, so any aspect
+ratio estimates correctly from the one 4:3 benchmark. `record_run` now accumulates in
+**output megapixels** (task `video-mp-<target>`), so self-calibration is aspect-
+independent too. Remaining: the static `RATES` are still 4:3-*measured* (just
+converted, not re-measured on a 16:9 clip), which is fine because the conversion is
+exact for the dominant DiT cost; re-measure only if VAE encode (which does scale with
+input size) turns out to matter at the margin.
+
 ### 15.9 Settings additions (Settings -> Video)
 
 `confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the

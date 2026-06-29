@@ -26,11 +26,26 @@ import math
 
 # Seconds/frame per (target, GPU model), warm, from the benchmark (section 7).
 # Keyed by a model token; map_gpu() resolves a RunPod gpuTypeId/name to one.
+#
+# IMPORTANT: these were measured on a **4:3** test clip (Pisici.AVI, 320x240), so
+# each target's output frame is 4:3 (1080p = 1440x1080, 1440p = 1920x1440, 4K =
+# 2880x2160). SeedVR2's cost scales with OUTPUT pixels, so a 16:9 video at the same
+# target label is ~33 % more pixels per frame and costs ~33 % more. The estimator
+# therefore converts these to **seconds per output-megapixel** (rate / BENCH_OUT_MP)
+# and multiplies by each video's real output size, so any aspect ratio estimates
+# correctly from this one 4:3 benchmark.
 RATES = {
     "1080p": {"RTX 5090": 0.94, "RTX PRO 6000": 0.74, "H200": 0.47, "B200": 0.35},
     "1440p": {"RTX PRO 6000": 1.96, "A100 80GB": 3.42, "H200": 1.90, "B200": 1.64},
     "4K":    {"RTX PRO 6000": 6.63, "H200": 7.20, "B200": 6.40},
 }
+
+# Target -> output SHORT side (px). Mirrors batch_video_upscale.TARGET_RES.
+SHORT_SIDE = {"1080p": 1080, "1440p": 1440, "4K": 2160}
+
+# Output megapixels of the 4:3 benchmark clip per target (the denominator that turns
+# a benchmark s/frame into s/MP). 1440x1080, 1920x1440, 2880x2160.
+BENCH_OUT_MP = {"1080p": 1.5552, "1440p": 2.7648, "4K": 6.2208}
 
 # Minimum VRAM (GB) for a target. 1080p needs ~31 GB (5090 offload peak measured
 # 30.7); 1440p plateaus 71-77 GB; 4K needs ~80 GB to fit a small window and a
@@ -63,43 +78,78 @@ def map_gpu(gpu_id_or_name):
     return None
 
 
-def rate_for(gpu_id, target, conn=None):
-    """Seconds/frame for (gpu, target). Prefers the user's OWN measured history
-    (db.gpu_perf, task `video-<target>`) once there is enough of it, else the
-    benchmark table, else None (an un-benchmarked card we can't estimate)."""
+def output_dims(src_w, src_h, target):
+    """The output (w, h) SeedVR2 produces for a source upscaled to `target`: the
+    SHORT side is pinned to the target, the long side follows the source aspect.
+    None if the source dimensions are unknown/invalid."""
+    ss = SHORT_SIDE.get(target)
+    short = min(src_w or 0, src_h or 0)
+    if not ss or short <= 0:
+        return None
+    scale = ss / short
+    return (round(src_w * scale), round(src_h * scale))
+
+
+def output_megapixels(src_w, src_h, target):
+    """Output megapixels per frame for a (source, target) upscale. Falls back to
+    the 4:3 BENCH_OUT_MP when the source size is unknown, so callers that lack
+    dimensions keep the old benchmark-aspect behaviour."""
+    d = output_dims(src_w, src_h, target)
+    if d:
+        return d[0] * d[1] / 1_000_000.0
+    return BENCH_OUT_MP.get(target)
+
+
+def seconds_per_mp(gpu_id, target, conn=None):
+    """Seconds per OUTPUT megapixel for (gpu, target). Prefers the user's OWN
+    measured history (db.gpu_perf, task `video-mp-<target>`, recorded in MP) once
+    there is enough, else the benchmark rate converted from s/frame via the 4:3
+    BENCH_OUT_MP, else None (an un-benchmarked card we can't estimate)."""
     if conn is not None:
         try:
             import db
-            per_100 = db.get_gpu_perf(conn, f"video-{target}", gpu_id, min_images=300)
+            per_100 = db.get_gpu_perf(conn, f"video-mp-{target}", gpu_id, min_images=300)
             if per_100:
                 return per_100 / 100.0          # gpu_perf stores seconds / 100 units
         except Exception:
             pass
     model = map_gpu(gpu_id)
-    return RATES.get(target, {}).get(model) if model else None
+    rate = RATES.get(target, {}).get(model) if model else None
+    bench_mp = BENCH_OUT_MP.get(target)
+    if rate is None or not bench_mp:
+        return None
+    return rate / bench_mp
 
 
-def record_run(conn, gpu_id, target, frames, seconds):
+def record_run(conn, gpu_id, target, out_megapixels, seconds):
     """Accumulate a finished video run's timing so future estimates self-improve
-    (reuses db.gpu_perf with a `video-<target>` task key). Best-effort."""
+    (db.gpu_perf, task `video-mp-<target>`). The unit is OUTPUT MEGAPIXELS, not
+    frames, so the learned rate is aspect-independent. Best-effort."""
     try:
         import db
-        db.record_gpu_perf(conn, f"video-{target}", gpu_id, frames, seconds,
-                           min_images=300)
+        db.record_gpu_perf(conn, f"video-mp-{target}", gpu_id, out_megapixels,
+                           seconds, min_images=300)
     except Exception:
         pass
 
 
-def estimate_job(frames, target, gpu_id, conn=None):
+def estimate_job(frames, target, gpu_id, conn=None, src_w=None, src_h=None):
     """Processing seconds for one (frames, target) job on a GPU, or None if the
-    card has no rate for that target."""
-    r = rate_for(gpu_id, target, conn)
-    return None if r is None else frames * r
+    card has no rate for that target. Cost scales with OUTPUT megapixels, so pass
+    the source `src_w`/`src_h` for an aspect-correct estimate; without them it
+    assumes the 4:3 benchmark aspect (the old behaviour)."""
+    spm = seconds_per_mp(gpu_id, target, conn)
+    mp_per_frame = output_megapixels(src_w, src_h, target)
+    if spm is None or mp_per_frame is None:
+        return None
+    return frames * mp_per_frame * spm
 
 
 def estimate_queue(jobs, gpu_id, price_per_hour, spin_up_seconds=DEFAULT_SPIN_UP_SECONDS,
                    conn=None):
-    """Estimate the whole queue on one GPU. `jobs` = [{frames, target, segments}].
+    """Estimate the whole queue on one GPU. `jobs` = [{frames, target, segments,
+    width, height}]. width/height are the source size (optional); when present the
+    estimate is aspect-correct (output megapixels), else it assumes 4:3.
     Returns a dict, or None if the GPU can't serve every target in the queue.
 
     Spin-up is counted ONCE (one pod for the queue). Cost uses the live price."""
@@ -107,7 +157,8 @@ def estimate_queue(jobs, gpu_id, price_per_hour, spin_up_seconds=DEFAULT_SPIN_UP
     total_frames = 0
     total_segments = 0
     for j in jobs:
-        secs = estimate_job(j.get("frames") or 0, j["target"], gpu_id, conn)
+        secs = estimate_job(j.get("frames") or 0, j["target"], gpu_id, conn,
+                            src_w=j.get("width"), src_h=j.get("height"))
         if secs is None:
             return None                          # card can't do one of the targets
         total_proc += secs

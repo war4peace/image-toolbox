@@ -583,16 +583,17 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
             + (f" in {secs:.1f}s" if secs else ""))
 
-        # Self-calibrate future estimates: record this segment's real frames vs
-        # seconds against the GPU that actually ran it (IMGTBX_GPU_OVERRIDE, which
-        # the GUI also keys its estimate on), so the next run's ETA uses measured
-        # data instead of the static benchmark rate. Remote runs only (passthrough
-        # has no billed GPU id); fail-safe, never breaks a run.
+        # Self-calibrate future estimates: record this segment's real OUTPUT
+        # megapixels vs seconds against the GPU that ran it (IMGTBX_GPU_OVERRIDE,
+        # the same key the GUI estimate uses). Megapixels, not frames, so the
+        # learned rate is aspect-independent (a 16:9 video costs more per frame than
+        # the 4:3 benchmark). Remote runs only; fail-safe, never breaks a run.
         gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
         if gpu_id and n and secs:
             try:
                 import video_estimate as ve
-                ve.record_run(conn, gpu_id, target, n, secs)
+                out_mp = n * ve.output_megapixels(info.width, info.height, target)
+                ve.record_run(conn, gpu_id, target, out_mp, secs)
             except Exception:                          # noqa: BLE001 (best-effort)
                 pass
 

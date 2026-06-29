@@ -6685,7 +6685,9 @@ class VideoTab(ttk.Frame):
         return self._gpu_choices[i if 0 <= i < len(self._gpu_choices) else 0]
 
     def _queue_jobs(self):
-        """The queue as estimator job dicts [{frames, target, segments}]."""
+        """The queue as estimator job dicts [{frames, target, segments, width,
+        height}]. width/height are the source size so the estimate is aspect-correct
+        (cost scales with output megapixels, not frame count)."""
         import batch_video_upscale as bv
         if self._root_id is None:
             return []
@@ -6698,7 +6700,9 @@ class VideoTab(ttk.Frame):
             seg_secs = self._vcfg()["segment_seconds"]
             import math as _m
             segs = max(1, _m.ceil(dur / seg_secs)) if seg_secs else 1
-            jobs.append({"frames": frames, "target": j["target"], "segments": segs})
+            jobs.append({"frames": frames, "target": j["target"], "segments": segs,
+                         "width": (vf["width"] if vf else None),
+                         "height": (vf["height"] if vf else None)})
         return jobs
 
     def _spin_up(self):
@@ -6908,6 +6912,8 @@ class VideoTab(ttk.Frame):
         elif kind == "VIDEO" and data:
             self._cur_rel = data.get("rel")
             self._cur_target = data.get("target")
+            self._cur_w = data.get("width")          # source size, for the
+            self._cur_h = data.get("height")         # aspect-correct time estimate
             self._cur_seg_frames = self._cur_seg_done = 0
             self._cur_status = (f"Upscaling {os.path.basename(data.get('rel',''))} "
                                 f"→ {data.get('target')} "
@@ -6927,7 +6933,8 @@ class VideoTab(ttk.Frame):
                 import video_estimate as ve
                 self._seg_expected = ve.estimate_job(
                     seg_frames, self._cur_target, getattr(self, "_run_gpu", None),
-                    conn=self._conn())
+                    conn=self._conn(), src_w=getattr(self, "_cur_w", None),
+                    src_h=getattr(self, "_cur_h", None))
             elif state == "done":
                 self._run_done += seg_frames
                 self._cur_seg_done = 0
