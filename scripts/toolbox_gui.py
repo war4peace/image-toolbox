@@ -6756,6 +6756,7 @@ class VideoTab(ttk.Frame):
         # run fails with a clear message and the user refreshes (↻) and picks
         # another card themselves.
         env = {"IMGTBX_GPU_OVERRIDE": g["id"]} if g.get("id") else None
+        self._run_gpu = g.get("id") or g.get("name")     # for the time-based estimate
         self._begin_run(sum(j["frames"] for j in jobs))
         self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
 
@@ -6765,6 +6766,14 @@ class VideoTab(ttk.Frame):
         self._cur_seg_frames = self._cur_seg_done = 0
         self._run_start = time.time()
         self._rate = None
+        # Time-based fallback state: the worker often can't report within-segment
+        # frame progress (SeedVR2's bar counts batches, not frames), so we estimate
+        # the running segment's progress from elapsed-vs-expected time until (and
+        # unless) real frame counts arrive. See _run_tick.
+        self._seg_start = None        # when the current segment began processing
+        self._seg_expected = None     # estimated seconds for the current segment
+        self._seg_has_frames = False  # worker reported real frames_processed for it
+        self._cur_status = ""         # base status line the tick appends ETA to
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -6899,18 +6908,33 @@ class VideoTab(ttk.Frame):
             self._cur_rel = data.get("rel")
             self._cur_target = data.get("target")
             self._cur_seg_frames = self._cur_seg_done = 0
-            self.status_var.set(f"Upscaling {os.path.basename(data.get('rel',''))} "
+            self._cur_status = (f"Upscaling {os.path.basename(data.get('rel',''))} "
                                 f"→ {data.get('target')} "
                                 f"[{data.get('index')}/{data.get('total')}]")
+            self.status_var.set(self._cur_status)
         elif kind == "SEGMENT" and data:
             seg_frames = data.get("seg_frames") or 0
             fp = data.get("frames_processed")
+            state = data.get("state")
             self._cur_seg_frames = seg_frames
-            if data.get("state") == "done":
+            if state == "running":
+                # Segment just started: anchor the time-based estimate to now and
+                # work out how long this segment should take on the chosen GPU.
+                self._seg_start = time.time()
+                self._seg_has_frames = False
+                self._cur_seg_done = 0
+                import video_estimate as ve
+                self._seg_expected = ve.estimate_job(
+                    seg_frames, self._cur_target, getattr(self, "_run_gpu", None),
+                    conn=self._conn())
+            elif state == "done":
                 self._run_done += seg_frames
                 self._cur_seg_done = 0
+                self._seg_start = None
+                self._seg_has_frames = False
             elif fp is not None:
                 self._cur_seg_done = min(fp, seg_frames)
+                self._seg_has_frames = True      # real data: it overrides the clock
             self._update_progress()
         elif kind == "VRESULT" and data:
             self._load_queue()                           # done/failed leaves the queue
@@ -6925,22 +6949,38 @@ class VideoTab(ttk.Frame):
         self.app.taskbar_progress(done, self._run_total)
 
     def _run_tick(self):
-        """1 s heartbeat during a run: refine the rate, smooth a time-based bar when
-        the worker isn't reporting frames_processed, and show ETA."""
+        """1 s heartbeat during a run. The worker usually can't report within-segment
+        frame progress (SeedVR2's bar counts batches, not frames), so while a segment
+        is running we ADVANCE THE BAR from elapsed-vs-expected time, capped just below
+        100 %, and show an ETA. Real frame counts, when they arrive, take over via
+        _update_progress and we only refresh the ETA here. With no benchmark for the
+        card we can't estimate, so we show an elapsed counter to prove it is alive."""
         if self.proc is None:
             self._run_tick_job = None
             return
+        import video_estimate as ve
         elapsed = time.time() - (self._run_start or time.time())
-        done = self._run_done + self._cur_seg_done
-        if done > 0 and elapsed > 0:
-            self._rate = elapsed / done
-        if self._run_total > 0:
-            remaining = max(0, self._run_total - done)
-            eta = remaining * self._rate if self._rate else None
-            import video_estimate as ve
-            tail = f" · ETA {ve.fmt_duration(eta)}" if eta else ""
-            self.status_var.set(
-                getattr(self, "_cur_status", self.status_var.get()).split(" · ETA")[0] + tail)
+        done_now = self._run_done + self._cur_seg_done
+        if done_now > 0 and elapsed > 0:
+            self._rate = elapsed / done_now           # real seconds/frame for ETA
+        base = getattr(self, "_cur_status", "") or ""
+        tail = ""
+        running = self._seg_start is not None and not self._seg_has_frames
+        if running and self._seg_expected and self._run_total > 0:
+            frac = min(0.97, (time.time() - self._seg_start) / self._seg_expected)
+            done_est = self._run_done + frac * self._cur_seg_frames
+            self.progress.set(100.0 * done_est / self._run_total)
+            self.app.taskbar_progress(int(done_est), max(1, self._run_total))
+            per_frame = self._seg_expected / self._cur_seg_frames if self._cur_seg_frames else 0
+            if per_frame:
+                tail = f" · ETA {ve.fmt_duration((self._run_total - done_est) * per_frame)}"
+        elif running:
+            # No benchmark for this card: prove liveness with an elapsed counter.
+            tail = f" · running {ve.fmt_duration(time.time() - self._seg_start)}"
+        elif self._rate and self._run_total > 0:
+            tail = f" · ETA {ve.fmt_duration((self._run_total - done_now) * self._rate)}"
+        if base:
+            self.status_var.set(base + tail)
         self._run_tick_job = self.after(1000, self._run_tick)
 
     def on_exit(self, code):
