@@ -7162,6 +7162,10 @@ class VideoTab(ttk.Frame):
             # every poll (~5 s), which read as a 0 % flicker.
             if state == "done" or self._seg_has_frames:
                 self._update_progress()
+        elif kind == "VTOTAL" and data is not None:
+            # The runner re-reads the live queue each job and sends the current total
+            # frame count, so the progress denominator tracks mid-run queue edits.
+            self._run_total = int(data)
         elif kind == "VRESULT" and data:
             self._load_queue()                           # done/failed leaves the queue
         elif kind == "RTELEM" and data:

@@ -711,25 +711,49 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
 #  RUN THE QUEUE
 # ─────────────────────────────────────────────
 
+def _job_frames(conn, root_id, rel):
+    """Counted source frames for a job's video (0 if not yet probed)."""
+    vf = db.get_video_file(conn, root_id, rel)
+    return (vf["nb_frames"] if vf and vf["nb_frames"] else 0) or 0
+
+
 def run_queue(engine, conn, root_id, source_root, vcfg, budget,
               notify_settings=None):
     """Process the durable queue (video_outputs not yet done) for this root against
-    an injected engine. Returns a summary dict."""
-    jobs = db.get_video_queue(conn, root_id)
-    gui_event("QUEUE", [{"rel": j["rel_path"], "target": j["target"]} for j in jobs])
-    log(f"Queue: {len(jobs)} job(s) under {source_root}.")
+    an injected engine. Returns a summary dict.
+
+    The LIVE DB queue is re-read before every job, so removing / reordering / adding a
+    job in the GUI mid-run takes effect (the shared cache.db is the source of truth):
+    a job the user removes after Start is no longer processed, and a reorder changes
+    what runs next. Jobs already attempted this run are skipped so a 'failed' one is
+    not retried in a loop."""
+    initial = db.get_video_queue(conn, root_id)
+    gui_event("QUEUE", [{"rel": j["rel_path"], "target": j["target"]} for j in initial])
+    log(f"Queue: {len(initial)} job(s) under {source_root}.")
 
     done = failed = 0
+    done_frames = 0
     stopped = None
-    for i, job in enumerate(jobs, 1):
-        if _STOP.is_set():
-            stopped = "stopped by user"
+    attempted = set()                  # (rel, target) tried this run
+    while not _STOP.is_set():
+        pending = [j for j in db.get_video_queue(conn, root_id)
+                   if (j["rel_path"], j["target"]) not in attempted]
+        # Keep the GUI's progress denominator honest as the live queue changes.
+        live_total = done_frames + sum(_job_frames(conn, root_id, j["rel_path"])
+                                       for j in pending)
+        gui_event("VTOTAL", live_total)
+        if not pending:
             break
+        job = pending[0]
         rel, target = job["rel_path"], job["target"]
+        attempted.add((rel, target))
+        idx = done + failed + 1
+        total = idx + len(pending) - 1
         try:
             process_job(engine, conn, root_id, source_root, job, vcfg, budget,
-                        i, len(jobs))
+                        idx, total)
             done += 1
+            done_frames += _job_frames(conn, root_id, rel)
         except StopInstallment as exc:
             stopped = str(exc)
             break
@@ -737,13 +761,16 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
             failed += 1
             db.upsert_video_output(conn, root_id, rel, target, status="failed",
                                    skip_reason=str(exc)[:300])
-            log(f"[{i}/{len(jobs)}] FAILED {rel} -> {target}: {exc}")
+            log(f"[{idx}/{total}] FAILED {rel} -> {target}: {exc}")
             gui_event("VRESULT", {"rel": rel, "target": target, "outcome": "fail",
                                   "error": str(exc)[:300]})
+    if _STOP.is_set() and stopped is None:
+        stopped = "stopped by user"
 
-    summary = {"done": done, "failed": failed, "stopped": stopped, "total": len(jobs)}
+    summary = {"done": done, "failed": failed, "stopped": stopped,
+               "total": done + failed}
     _notify_summary(notify_settings, summary, source_root)
-    log(f"Summary: {done} done, {failed} failed of {len(jobs)}"
+    log(f"Summary: {done} done, {failed} failed of {done + failed}"
         + (f", stopped early ({stopped})" if stopped else "") + ".")
     return summary
 
