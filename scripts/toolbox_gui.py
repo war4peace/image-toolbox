@@ -6174,6 +6174,13 @@ class VideoTab(ttk.Frame):
         tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
                  font=("Consolas", 9)).grid(row=7, column=0, sticky="ew", pady=(4, 0))
 
+        # 8) Remote-pod telemetry (CPU/RAM/GPU). Created hidden; App.apply_remote_
+        # telemetry reveals it on the first RTELEM sample of a run and _end_run
+        # hides it again, so it only shows while a pod is actually streaming.
+        self.remote_telemetry_row = TelemetryRow(self, prefix="Remote pod")
+        self.remote_telemetry_row.grid(row=8, column=0, sticky="ew", pady=(2, 0))
+        self.remote_telemetry_row.grid_remove()
+
     # ── readiness ────────────────────────────────────────────────────────────
 
     def restore_defaults_if_empty(self):
@@ -6957,6 +6964,9 @@ class VideoTab(ttk.Frame):
         if self._run_tick_job is not None:
             self.after_cancel(self._run_tick_job)
             self._run_tick_job = None
+        # The remote-pod telemetry row only makes sense during a remote run.
+        if self.remote_telemetry_row.winfo_manager():
+            self.remote_telemetry_row.grid_remove()
 
     def _view_log(self):
         self.app.show_log(self.console, f"{APP_TITLE} — Video Upscaler output")

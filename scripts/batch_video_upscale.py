@@ -102,10 +102,31 @@ def gui_event(kind, payload):
       VIDEO|<json>     – the video now being processed (rel, index, total, segments)
       SEGMENT|<json>   – per-segment progress (video_rel, seg_index, total, state)
       VRESULT|<json>   – [rel, "ok"|"fail"|"skip", output_path, warnings?]
+      RTELEM|<json>    – a remote-pod telemetry sample (cpu/ram/gpu)
     """
     if GUI_MODE:
         sys.stdout.write(f"{GUI_MARKER}{kind}|{json.dumps(payload)}\n")
         sys.stdout.flush()
+
+
+def _start_remote_telemetry(engine, stop, interval=10.0):
+    """Poll the pod's telemetry and stream it to the GUI as RTELEM events so the
+    Video Upscaler tab can show a dedicated 'remote pod' readout row (mirrors
+    batch_upscale's sampler). The worker answers /telemetry lock-free, so this
+    keeps reporting while a segment is being upscaled. Daemon thread, best-effort:
+    a failed sample is just skipped, and `stop` ends it cleanly at teardown."""
+    def _loop():
+        while not stop.is_set():
+            stop.wait(interval)
+            if stop.is_set():
+                break
+            try:
+                sample = engine.telemetry()
+            except Exception:                       # noqa: BLE001 (best-effort)
+                sample = None
+            if sample:
+                gui_event("RTELEM", sample)
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 def _load_config():
@@ -632,6 +653,7 @@ def main(argv=None):
 
     budget = RunBudget(vcfg["per_run_minute_cap"], vcfg["per_run_cost_cap"])
     session = None
+    tele_stop = threading.Event()
     if args.passthrough:
         log("Passthrough mode — no pod; segments are stream-copied locally.")
         engine = PassthroughVideoEngine()
@@ -641,11 +663,14 @@ def main(argv=None):
                                 APP_ROOT, on_event=log, mode="video")
         engine = session.start()
         budget.cost_per_hr = session.cost_per_hr
+        # Stream the pod's CPU/RAM/GPU to the GUI's remote-telemetry row.
+        _start_remote_telemetry(engine, tele_stop)
 
     try:
         run_queue(engine, conn, root_id, src_root, vcfg, budget,
                   notify_settings=notify_settings)
     finally:
+        tele_stop.set()
         if session is not None:
             session.close()
         else:
