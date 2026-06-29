@@ -138,6 +138,29 @@ done
 echo "---- pulling $OLLAMA_MODEL to $OLLAMA_MODELS_DIR ----"
 ollama pull "$OLLAMA_MODEL"
 
+# 5. ffmpeg (static) to the volume ---------------------------------------------
+# The Video Upscaler's default H.265 10-bit writer shells out to `ffmpeg` on the
+# pod. Cache a static build (with libx264/libx265) on the volume so every disposable
+# pod has it without apt. remote_run also resolves it at launch (system ffmpeg wins;
+# else this cache; else a one-off fetch), so this just makes the first run fast.
+FFMPEG_DIR="$VOL/ffmpeg"
+if [ -x "$FFMPEG_DIR/ffmpeg" ]; then
+  echo "---- ffmpeg already cached ----"
+else
+  echo "---- caching static ffmpeg to $FFMPEG_DIR ----"
+  mkdir -p "$FFMPEG_DIR"
+  cd /tmp
+  curl -fSL -o ffmpeg.txz \
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+  rm -rf /tmp/ffmpeg_extract && mkdir -p /tmp/ffmpeg_extract
+  tar -xJf ffmpeg.txz -C /tmp/ffmpeg_extract
+  cp /tmp/ffmpeg_extract/ffmpeg-*-amd64-static/ffmpeg \
+     /tmp/ffmpeg_extract/ffmpeg-*-amd64-static/ffprobe "$FFMPEG_DIR/"
+  chmod +x "$FFMPEG_DIR/ffmpeg" "$FFMPEG_DIR/ffprobe"
+  rm -rf ffmpeg.txz /tmp/ffmpeg_extract
+  "$FFMPEG_DIR/ffmpeg" -hide_banner -version | head -1 || true
+fi
+
 echo "================ provisioning complete ================"
 echo "Volume contents:"
-du -sh "$SEEDVR2_DIR" "$VENV" "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR" 2>/dev/null || true
+du -sh "$SEEDVR2_DIR" "$VENV" "$SEEDVR2_MODELS" "$OLLAMA_MODELS_DIR" "$FFMPEG_DIR" 2>/dev/null || true

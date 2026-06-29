@@ -342,13 +342,26 @@ class RemoteSession:
         # weights (cached by provision.sh) are found without re-downloading.
         inner = (
             "echo $$ > /root/worker.pid; "
-            "exec env TORCH_HOME=/workspace/models/torch "
+            # PATH carries the volume-cached ffmpeg so the worker's H.265 10-bit
+            # writer (FFMPEGVideoWriter calls a bare `ffmpeg`) resolves it; a system
+            # ffmpeg in /usr/bin still wins if the image ships one.
+            "exec env TORCH_HOME=/workspace/models/torch PATH=/workspace/ffmpeg:$PATH "
             "/workspace/venv/bin/python /root/worker.py "
             "--repo-dir /workspace/seedvr2 --model-dir /workspace/models/seedvr2 "
             f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT} "
             f"--worker-version {self.worker_version} --mode {self.worker_mode}")
         launch = (
             "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
+            # Guarantee ffmpeg for the H.265 10-bit writer: a system one is fine,
+            # else the volume cache (provision.sh), else fetch a static build to the
+            # volume once (best-effort; the worker fails loudly if it's truly absent).
+            "if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /workspace/ffmpeg/ffmpeg ]; then "
+            "echo 'caching static ffmpeg to the volume...'; mkdir -p /workspace/ffmpeg; "
+            "curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz "
+            "-o /tmp/ff.txz && tar -xJf /tmp/ff.txz -C /tmp && "
+            "cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /workspace/ffmpeg/ && "
+            "chmod +x /workspace/ffmpeg/ffmpeg /workspace/ffmpeg/ffprobe; "
+            "rm -rf /tmp/ff.txz /tmp/ffmpeg-*-amd64-static; fi; "
             f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
             f"for i in $(seq 1 120); do curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; sleep 5; done; "
             f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "

@@ -4072,8 +4072,8 @@ class SettingsTab(ttk.Frame):
 
     def _video_codec_label(self, vid):
         """The codec combobox label matching the saved video_backend/use_10bit."""
-        backend = vid.get("video_backend", "opencv")
-        ten = bool(vid.get("use_10bit", False))
+        backend = vid.get("video_backend", "ffmpeg")        # H.265 10-bit default
+        ten = bool(vid.get("use_10bit", True))
         for lbl, b, t in _VIDEO_CODEC_OPTIONS:
             if b == backend and t == ten:
                 return lbl

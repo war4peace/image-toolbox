@@ -1085,13 +1085,18 @@ the finished bytes `shutil.move`d to the output path (a plain copy, safe on any 
 single-segment job also skips the concat demuxer entirely (mux straight from the lone
 segment).
 
-**Still open: the deliverable codec is mpeg4 (opencv backend).** The opencv
-`video_backend` writes segments (and therefore the `-c copy` deliverable) as cv2 `mp4v`
-= MPEG-4 Part 2, a low-quality 1990s codec that re-compresses the upscale and that
-Windows Explorer often can't read metadata for. The proper fix is to ship ffmpeg on the
-pod (`pod/provision.sh`) and default `video_backend` to `ffmpeg` (x264 CRF 12, or x265
-for 10-bit, via `FFMPEGVideoWriter`). Deferred: it changes pod provisioning, so confirm
-before doing it.
+**Deliverable codec defaulted to H.265 10-bit (FIXED).** The opencv `video_backend`
+wrote segments (and the `-c copy` deliverable) as cv2 `mp4v` = MPEG-4 Part 2, a
+low-quality 1990s codec that re-compresses the upscale and that Windows Explorer often
+can't read metadata for. The default is now the **ffmpeg backend with H.265 10-bit**
+(`FFMPEGVideoWriter`, libx265 CRF 12, yuv420p10le - less gradient banding), set in
+`resolve_video_cfg` (`video_backend="ffmpeg"`, `use_10bit=True`) and pre-selected in the
+Settings codec picker. Pick "Standard - MPEG-4" to fall back to opencv. The pod is
+guaranteed ffmpeg three ways: `pod/provision.sh` caches a static build (libx264/libx265)
+to `/workspace/ffmpeg`, `remote_run` adds that to the worker's PATH, and the worker
+launch fetches it once if a volume predates this (a system ffmpeg in the image wins over
+all of them). Re-provision an existing volume to cache ffmpeg ahead of the first run.
+Local reassembly (`-c copy` concat + audio mux) handles x265 10-bit mp4 unchanged.
 
 ### 15.9 Settings additions (Settings -> Video)
 

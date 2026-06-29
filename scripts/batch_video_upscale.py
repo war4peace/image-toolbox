@@ -230,12 +230,14 @@ def resolve_video_cfg(cfg, overrides=None):
                                 if v.get("temporal_overlap") is not None
                                 else DEFAULT_TEMPORAL_OVERLAP),
         "chunk_size":          int(v.get("chunk_size", 0) or 0),
-        # opencv (SeedVR2 default, x264) unless 10-bit is asked for, which needs
-        # the ffmpeg backend (x265 10-bit). Defaulting to opencv avoids a pod-side
-        # "ffmpeg not in PATH" failure on a minimal image (deviates from the draft
-        # §9 default deliberately; revisit once provision.sh ships ffmpeg on the pod).
-        "video_backend":       v.get("video_backend", "opencv"),
-        "use_10bit":           bool(v.get("use_10bit", False)),
+        # Default to the ffmpeg backend with H.265 10-bit: opencv's writer emits
+        # mp4v (MPEG-4 Part 2), a low-quality codec that re-compresses the upscale
+        # and that Windows can't always read. ffmpeg/x265-10bit keeps the detail and
+        # cuts gradient banding. The pod is guaranteed ffmpeg by remote_run (volume
+        # cache + launch-time fallback) and provision.sh. Pick "Standard — MPEG-4" in
+        # Settings to fall back to opencv.
+        "video_backend":       v.get("video_backend", "ffmpeg"),
+        "use_10bit":           bool(v.get("use_10bit", True)),
         "seed":                v.get("seed"),               # None = per-video stable seed
         "per_run_minute_cap":  float(v.get("per_run_minute_cap", 0) or 0),
         "per_run_cost_cap":    float(v.get("per_run_cost_cap", 0) or 0),
