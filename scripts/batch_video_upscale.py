@@ -89,10 +89,53 @@ def _ts():
     return datetime.datetime.now().strftime("%H:%M:%S")
 
 
+_LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
+
+
+def _open_log(source_root):
+    """Open (append) a persistent run log keyed by source root, so every session
+    for the same folder accumulates in one file: logs/video_<12-char hash>.log.
+    Mirrors batch_upscale's Logger. Best-effort: a logging failure never stops a
+    run (the GUI console still shows everything)."""
+    global _LOG_FH
+    try:
+        digest = hashlib.sha256(source_root.encode("utf-8")).hexdigest()[:12]
+        log_dir = os.path.join(APP_ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        _LOG_FH = open(os.path.join(log_dir, f"video_{digest}.log"),
+                       "a", encoding="utf-8", buffering=1)
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+        _LOG_FH.write(f"\n{'=' * 64}\nSession started: {stamp}\n"
+                      f"Source: {source_root}\n{'=' * 64}\n")
+    except Exception:                              # noqa: BLE001 (logging is optional)
+        _LOG_FH = None
+
+
+def _close_log():
+    global _LOG_FH
+    if _LOG_FH is not None:
+        try:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+            _LOG_FH.write(f"Session ended: {stamp}\n")
+            _LOG_FH.close()
+        except Exception:                          # noqa: BLE001
+            pass
+        _LOG_FH = None
+
+
 def log(msg):
-    """Human-readable, timestamped progress to stdout (the GUI log pane / console)."""
+    """Human-readable, timestamped progress to stdout (the GUI log pane / console)
+    and, when a run log is open, to logs/video_<hash>.log for later troubleshooting.
+    The file line carries a full date+time so the on-disk log reconstructs timing;
+    stdout stays HH:MM:SS (the GUI window adds its own per-line stamp)."""
     sys.stdout.write(f"{_ts()} | {msg}\n")
     sys.stdout.flush()
+    if _LOG_FH is not None:
+        try:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+            _LOG_FH.write(f"{stamp} | {msg}\n")
+        except Exception:                          # noqa: BLE001
+            pass
 
 
 def gui_event(kind, payload):
@@ -632,6 +675,7 @@ def main(argv=None):
     if not os.path.isdir(src_root):
         print(f"ERROR: source folder not found: {src_root}")
         return 2
+    _open_log(src_root)               # persist this run to logs/video_<hash>.log
 
     cfg = _load_config()
     vcfg = resolve_video_cfg(cfg)
@@ -653,28 +697,30 @@ def main(argv=None):
 
     budget = RunBudget(vcfg["per_run_minute_cap"], vcfg["per_run_cost_cap"])
     session = None
+    engine = None
     tele_stop = threading.Event()
-    if args.passthrough:
-        log("Passthrough mode — no pod; segments are stream-copied locally.")
-        engine = PassthroughVideoEngine()
-    else:
-        from remote_run import RemoteSession
-        session = RemoteSession(cfg.get("runpod", {}), cfg.get("upscale", {}),
-                                APP_ROOT, on_event=log, mode="video")
-        engine = session.start()
-        budget.cost_per_hr = session.cost_per_hr
-        # Stream the pod's CPU/RAM/GPU to the GUI's remote-telemetry row.
-        _start_remote_telemetry(engine, tele_stop)
-
     try:
+        if args.passthrough:
+            log("Passthrough mode — no pod; segments are stream-copied locally.")
+            engine = PassthroughVideoEngine()
+        else:
+            from remote_run import RemoteSession
+            session = RemoteSession(cfg.get("runpod", {}), cfg.get("upscale", {}),
+                                    APP_ROOT, on_event=log, mode="video")
+            engine = session.start()
+            budget.cost_per_hr = session.cost_per_hr
+            # Stream the pod's CPU/RAM/GPU to the GUI's remote-telemetry row.
+            _start_remote_telemetry(engine, tele_stop)
+
         run_queue(engine, conn, root_id, src_root, vcfg, budget,
                   notify_settings=notify_settings)
     finally:
         tele_stop.set()
         if session is not None:
             session.close()
-        else:
+        elif engine is not None:
             engine.close()
+        _close_log()
     return 0
 
 
