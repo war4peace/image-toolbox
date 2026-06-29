@@ -235,6 +235,25 @@ def resolve_video_cfg(cfg, overrides=None):
     return out
 
 
+def log_video_settings(vcfg):
+    """Echo the SeedVR2 / pipeline settings this run uses, to the log window and
+    file, so a run (especially a failed one) records exactly what it was given.
+    0/None knobs are shown as 'auto'/'per-video' (their effective value is resolved
+    per job and logged there too)."""
+    batch = vcfg.get("batch_size", 0) or 0
+    chunk = vcfg.get("chunk_size", 0) or 0
+    seed = vcfg.get("seed")
+    log("Run settings (SeedVR2 / pipeline):")
+    log(f"    default target {vcfg['target']}, skip-cutoff {vcfg['skip_cutoff_pct']:.0f}%, "
+        f"segments ~{vcfg['segment_seconds']:.0f}s (max {vcfg['max_segment_seconds']:.0f}s)")
+    log(f"    batch_size {batch or 'auto'}, chunk_size {chunk or 'auto'}, "
+        f"temporal_overlap {vcfg['temporal_overlap']}, "
+        f"seed {seed if seed is not None else 'per-video'}")
+    log(f"    backend {vcfg['video_backend']}, "
+        f"10-bit {'on' if vcfg['use_10bit'] else 'off'}, "
+        f"output subdir '{vcfg['output_subdir']}'")
+
+
 def resolve_batch(vcfg, target):
     b = int(vcfg.get("batch_size", 0) or 0)
     return b if b > 0 else DEFAULT_BATCH.get(target, 13)
@@ -528,6 +547,13 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     batch = resolve_batch(vcfg, target)
     chunk = resolve_chunk(vcfg, batch)
     seed = per_video_seed(vcfg, rel)
+    # The effective (resolved) SeedVR2 settings for THIS job, so a per-job failure
+    # can be reproduced from the log alone (batch/chunk are target-dependent; seed
+    # is per-video).
+    log(f"    SeedVR2: short-side {resolution}px, batch_size {batch}, "
+        f"chunk_size {chunk}, temporal_overlap {vcfg['temporal_overlap']}, "
+        f"seed {seed}, backend {vcfg['video_backend']}, "
+        f"10-bit {'on' if vcfg['use_10bit'] else 'off'}")
     total_secs = 0.0
 
     for s in segs:
@@ -692,6 +718,7 @@ def main(argv=None):
     notify_settings = notifications.resolve_settings(cfg)
     out_root = os.path.abspath(args.output) if args.output \
         else os.path.join(src_root, vcfg["output_subdir"])
+    log_video_settings(vcfg)          # record the run's settings up front
 
     conn = db.get_conn()
     root_id = db.get_video_root_id(conn, src_root, out_root)
