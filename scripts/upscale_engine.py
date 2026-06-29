@@ -129,6 +129,31 @@ class UpscaleEngine:
             pass
         return "cpu", False
 
+    def _resolve_attention(self, mode):
+        """Resolve attention_mode 'auto' to the FASTEST backend actually installed on
+        this GPU (SeedVR2's compatibility flags), so the user never has to know which
+        kernel their card supports: sageattn_3 (Blackwell) > sageattn_2 > flash_attn_3
+        > flash_attn_2 > sdpa. A non-'auto' value is honoured as-is. Fail-safe: any
+        import problem falls back to the always-available sdpa."""
+        if (mode or "auto").lower() != "auto":
+            return mode
+        try:
+            from src.optimization import compatibility as compat
+            if getattr(compat, "SAGE_ATTN_3_AVAILABLE", False):
+                pick = "sageattn_3"
+            elif getattr(compat, "SAGE_ATTN_2_AVAILABLE", False):
+                pick = "sageattn_2"
+            elif getattr(compat, "FLASH_ATTN_3_AVAILABLE", False):
+                pick = "flash_attn_3"
+            elif getattr(compat, "FLASH_ATTN_2_AVAILABLE", False):
+                pick = "flash_attn_2"
+            else:
+                pick = "sdpa"
+        except Exception:
+            pick = "sdpa"
+        print(f"🧠 Attention mode auto -> {pick}", flush=True)
+        return pick
+
     def _build_args(self, settings):
         """
         Build the full argument namespace through the CLI's own parser so we
@@ -146,7 +171,7 @@ class UpscaleEngine:
             "--max_resolution",    str(settings.get("max_resolution", 3840)),
             "--batch_size",        "1",                      # single image per call
             "--color_correction",  settings.get("color_correction", "lab"),
-            "--attention_mode",    settings.get("attention_mode", "sdpa"),
+            "--attention_mode",    self._resolve_attention(settings.get("attention_mode", "auto")),
             # Keep models in memory across images. On a small GPU they park in
             # system RAM; on a big-VRAM card they stay resident on the GPU.
             "--cache_dit", "--cache_vae",

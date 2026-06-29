@@ -72,14 +72,11 @@ TARGET_RES = {"1080p": 1080, "1440p": 1440, "4K": 2160}
 # Per-target default temporal window (benchmark sweet spot; section 7). 4K's VRAM
 # plateau allows more but per-frame is flat past bs9, so a moderate window stands.
 DEFAULT_BATCH = {"1080p": 13, "1440p": 13, "4K": 5}
-# Frames blended between consecutive temporal batches. With 0, SeedVR2 denoises each
-# batch independently and hard-concatenates them, so a visible "break" shows every
-# batch_size frames (~3x/second at 30fps with bs13). A non-zero overlap makes the
-# stride batch_size - overlap and blends the seam away. 3 matches SeedVR2's own
-# examples; cost rises by ~ overlap/(batch-overlap). SeedVR2 clamps overlap >= batch
-# back to 0. Override per run with video.temporal_overlap (0 disables, restoring the
-# old hard-cut behaviour).
-DEFAULT_TEMPORAL_OVERLAP = 3
+# Temporal overlap = frames blended between consecutive batches so a boundary doesn't
+# show as a "break". -1 = AUTO (the pod scales it to ~1/6 of the resolved batch). An
+# explicit >=0 overrides (0 = a deliberate hard cut). SeedVR2 silently resets an
+# overlap >= batch back to 0, so the pod clamps it to batch-1.
+AUTO_TEMPORAL_OVERLAP = -1
 
 WORK_DIRNAME = ".imgtbx_video"        # per-output-tree work area for segments
 
@@ -224,12 +221,14 @@ def resolve_video_cfg(cfg, overrides=None):
         "skip_cutoff_pct":     float(v.get("skip_cutoff_pct", 0) or 0),
         "segment_seconds":     float(v.get("segment_seconds", 60) or 60),
         "max_segment_seconds": float(v.get("max_segment_seconds", 120) or 120),
+        # 0 = AUTO: the pod sizes the batch from its real VRAM + the output
+        # resolution (no global value to misapply across targets). >0 overrides.
         "batch_size":          int(v.get("batch_size", 0) or 0),
-        # Default to a non-zero overlap so batch boundaries don't show as seams; an
-        # explicit config 0 still disables it (preserve a deliberate hard-cut).
+        # -1 = AUTO: the pod scales the overlap to the batch. >=0 overrides (0 = a
+        # deliberate hard cut). The pod clamps overlap >= batch so it never disables.
         "temporal_overlap":    (int(v["temporal_overlap"])
                                 if v.get("temporal_overlap") is not None
-                                else DEFAULT_TEMPORAL_OVERLAP),
+                                else AUTO_TEMPORAL_OVERLAP),
         "chunk_size":          int(v.get("chunk_size", 0) or 0),
         # Default to the ffmpeg backend with H.265 10-bit: opencv's writer emits
         # mp4v (MPEG-4 Part 2), a low-quality codec that re-compresses the upscale
@@ -560,25 +559,21 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         recorded = db.get_video_segments(conn, root_id, rel, target)
 
     db.upsert_video_output(conn, root_id, rel, target, status="streaming")
-    batch = resolve_batch(vcfg, target)
-    chunk = resolve_chunk(vcfg, batch)
+    # AUTO (batch 0 / overlap -1 / chunk 0) is resolved ON THE POD from its real VRAM
+    # and the output resolution; an explicit value overrides. We pass the sentinels
+    # through and log what the pod chose when it reports back (see _progress).
+    batch = int(vcfg.get("batch_size", 0) or 0)        # 0 = auto
+    overlap = int(vcfg["temporal_overlap"])            # -1 = auto
+    chunk = resolve_chunk(vcfg, batch) if batch > 0 else 0
     seed = per_video_seed(vcfg, rel)
-    # SeedVR2 SILENTLY resets temporal_overlap >= batch_size to 0 (seams come back).
-    # That bites when the global overlap exceeds a small per-target auto batch (4K's
-    # auto batch is 5). Clamp to batch-1 so a high overlap blends the most it can
-    # instead of disabling itself.
-    overlap = vcfg["temporal_overlap"]
-    if overlap >= batch:
-        overlap = max(0, batch - 1)
-        log(f"    (temporal_overlap {vcfg['temporal_overlap']} >= batch_size {batch}; "
-            f"clamped to {overlap} so it isn't silently disabled)")
-    # The effective (resolved) SeedVR2 settings for THIS job, so a per-job failure
-    # can be reproduced from the log alone (batch/chunk are target-dependent; seed
-    # is per-video).
-    log(f"    SeedVR2: short-side {resolution}px, batch_size {batch}, "
-        f"chunk_size {chunk}, temporal_overlap {overlap}, "
+    log(f"    SeedVR2: short-side {resolution}px, "
+        f"batch_size {batch if batch > 0 else 'auto'}, "
+        f"chunk_size {chunk if chunk > 0 else 'auto'}, "
+        f"temporal_overlap {overlap if overlap >= 0 else 'auto'}, "
         f"seed {seed}, backend {vcfg['video_backend']}, "
-        f"10-bit {'on' if vcfg['use_10bit'] else 'off'}")
+        f"10-bit {'on' if vcfg['use_10bit'] else 'off'} "
+        f"(auto values resolved on the pod)")
+    _resolved_logged = [False]
     total_secs = 0.0
 
     for s in segs:
@@ -587,6 +582,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             continue                              # segment-level resume
 
         def _progress(st, _i=s.index, _tot=s.frame_count):
+            rb = st.get("resolved_batch")
+            if rb and not _resolved_logged[0]:       # the pod reported its auto choices
+                _resolved_logged[0] = True
+                log(f"    (pod resolved: batch_size {rb}, "
+                    f"temporal_overlap {st.get('resolved_overlap')})")
             gui_event("SEGMENT", {"video_rel": rel, "target": target,
                                   "seg_index": _i, "total": len(segs),
                                   "state": st.get("state"),

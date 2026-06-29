@@ -3441,12 +3441,13 @@ _SEEDVR_LABELS = {
 }
 
 # Suggested values for the free-text enum fields (editable — type anything).
-# These MUST match SeedVR2's argparse choices (inference_cli.py --attention_mode):
-# the old short names "flash_attn"/"sage" are rejected now. sageattn_* and flash_attn_*
-# need their package on the pod (the worker logs a SageAttention/Flash/Triton check);
-# sageattn_3 is the Blackwell-tuned build, sdpa is the always-available fallback.
+# "auto" (recommended) lets the engine pick the FASTEST backend the GPU actually has
+# (sageattn_3 > sageattn_2 > flash_attn_* > sdpa) so the user needn't know their card.
+# The explicit names MUST match SeedVR2's argparse choices (inference_cli.py
+# --attention_mode); the old short "flash_attn"/"sage" are rejected. sageattn_3 is the
+# Blackwell build; sdpa is the always-available fallback.
 _SEEDVR_CHOICES = {
-    "attention_mode":   ["sdpa", "sageattn_3", "sageattn_2",
+    "attention_mode":   ["auto", "sdpa", "sageattn_3", "sageattn_2",
                          "flash_attn_3", "flash_attn_2"],
 }
 
@@ -3741,36 +3742,36 @@ class SettingsTab(ttk.Frame):
         ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
                      width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS]).grid(
             row=2, column=1, sticky="w", padx=6, pady=3)
-        # Batch size = the temporal window SeedVR2 denoises at once. Bigger = better
-        # temporal coherence + fewer seam boundaries + faster per frame, but more
-        # VRAM. Must be 4n+1; "auto" (0) = the per-target default (1080p/1440p 13,
-        # 4K 5). The picklist only offers valid 4n+1 values so an invalid window
-        # can't be typed.
-        ttk.Label(sec, text="Batch size (window):").grid(row=3, column=0, sticky="w", pady=3)
+        # ── Advanced (leave on Auto) ──────────────────────────────────────────────
+        # Batch (temporal window) and overlap default to Auto: the pod sizes them from
+        # its real VRAM + the output resolution, so a user never has to learn SeedVR2's
+        # knobs. These are overrides for power users; a wrong value self-corrects on the
+        # pod (OOM auto-recovery). The picklists only offer valid 4n+1 / in-range values.
+        ttk.Label(sec, text="Advanced (leave on Auto):", foreground="#888").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(sec, text="Batch size (window):").grid(row=4, column=0, sticky="w", pady=3)
         _bs = int(vid.get("batch_size", 0) or 0)
-        self.video_batch_var = tk.StringVar(value=("auto" if _bs <= 0 else str(_bs)))
-        _batch_choices = ["auto"] + [str(4 * n + 1) for n in range(1, 12)]   # 5,9,…,45
+        self.video_batch_var = tk.StringVar(value=("Auto" if _bs <= 0 else str(_bs)))
+        _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 12)]   # 5,9,…,45
         bs_cb = ttk.Combobox(sec, textvariable=self.video_batch_var, state="readonly",
                              width=10, values=_batch_choices)
-        bs_cb.grid(row=3, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(bs_cb, "Frames SeedVR2 processes together (must be 4n+1). Larger = "
-                       "smoother motion, fewer batch seams, faster per frame, but more "
-                       "VRAM. 'auto' = 13 (1080p/1440p) or 5 (4K). A 96 GB card handles "
-                       "33+ at 1440p.")
-        # Temporal overlap = frames blended between consecutive batches so a boundary
-        # doesn't show as a break. 0 = the old hard-cut. Must be < batch size.
-        ttk.Label(sec, text="Temporal overlap:").grid(row=4, column=0, sticky="w", pady=3)
-        self.video_overlap_var = tk.StringVar(value=str(int(vid.get("temporal_overlap", 3))))
+        bs_cb.grid(row=4, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(bs_cb, "Frames SeedVR2 processes together (4n+1). Auto = the largest the "
+                       "pod's VRAM safely allows for the target (more = smoother motion, "
+                       "fewer seams). Leave on Auto unless you know what you're doing.")
+        ttk.Label(sec, text="Temporal overlap:").grid(row=5, column=0, sticky="w", pady=3)
+        _ov = int(vid.get("temporal_overlap", -1))
+        self.video_overlap_var = tk.StringVar(value=("Auto" if _ov < 0 else str(_ov)))
         ov_cb = ttk.Combobox(sec, textvariable=self.video_overlap_var, state="readonly",
-                             width=10, values=[str(n) for n in range(0, 9)])
-        ov_cb.grid(row=4, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(ov_cb, "Frames blended between batches to hide the seam (must be < batch "
-                       "size). 0 = hard cut (visible break every batch). 3 is a good "
-                       "default; higher = smoother but a bit more compute.")
+                             width=10, values=["Auto"] + [str(n) for n in range(0, 13)])
+        ov_cb.grid(row=5, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(ov_cb, "Frames blended between batches to hide the seam. Auto scales it to "
+                       "the window (~1/6). 0 = hard cut (visible break every batch); higher "
+                       "= smoother but a bit more compute. The pod caps it below the batch.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
                      "output subfolder mirrors the source tree (like Batch Upscaler).")
 
@@ -4125,14 +4126,16 @@ class SettingsTab(ttk.Frame):
                 backend, ten = b, t
                 break
         bs = self.video_batch_var.get()
-        batch = 0 if bs == "auto" else int(bs)
+        batch = 0 if bs.lower() == "auto" else int(bs)      # 0 = auto (pod sizes it)
+        ov = self.video_overlap_var.get()
+        overlap = -1 if ov.lower() == "auto" else int(ov)   # -1 = auto (scaled to batch)
         return {
             "target":              self.video_target_var.get(),
             "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
             "video_backend":       backend,
             "use_10bit":           ten,
             "batch_size":          batch,
-            "temporal_overlap":    int(self.video_overlap_var.get()),
+            "temporal_overlap":    overlap,
             "confirm_before_rent": bool(self.video_confirm_var.get()),
         }
 
@@ -4330,8 +4333,9 @@ class SettingsTab(ttk.Frame):
         self.video_outsub_var.set(vid.get("output_subdir", "__upscaled__"))
         self.video_codec_var.set(self._video_codec_label(vid))
         _vbs = int(vid.get("batch_size", 0) or 0)
-        self.video_batch_var.set("auto" if _vbs <= 0 else str(_vbs))
-        self.video_overlap_var.set(str(int(vid.get("temporal_overlap", 3))))
+        self.video_batch_var.set("Auto" if _vbs <= 0 else str(_vbs))
+        _vov = int(vid.get("temporal_overlap", -1))
+        self.video_overlap_var.set("Auto" if _vov < 0 else str(_vov))
         self.video_confirm_var.set(bool(vid.get("confirm_before_rent", True)))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))

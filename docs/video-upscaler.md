@@ -1098,6 +1098,38 @@ launch fetches it once if a volume predates this (a system ffmpeg in the image w
 all of them). Re-provision an existing volume to cache ffmpeg ahead of the first run.
 Local reassembly (`-c copy` concat + audio mux) handles x265 10-bit mp4 unchanged.
 
+#### Auto-tuning: the user picks target + GPU, the pod picks the rest (0.4.0)
+
+Goal: a user (and often the dev) shouldn't have to learn SeedVR2's knobs. `batch_size`,
+`temporal_overlap`, `chunk_size` and `attention_mode` all default to **Auto** and are
+resolved **on the pod**, the only place that knows the card's real VRAM.
+
+- **batch_size (window)** — `pod/worker._auto_batch(out_w, out_h, vram_gb, resident)`
+  inverts a fitted VRAM model `vram ~= out_megapixels * (A + B*batch)` (A=11.69,
+  B=0.2746, from measured anchors: PRO 6000 96 GB 4K-4:3 bs5=81 GB; B200 180 GB 4K-16:9
+  bs33=172 GB; the 1440p ~75 GB plateau checks out) to the largest 4n+1 that fits
+  `vram * 0.80`, capped at 33 (continuity flattens past there; throughput past ~9) and
+  floored at 5. Picks ~5 at 4K on 96 GB, ~17 at 4K on a B200, 33 at 1440p on 96 GB.
+- **temporal_overlap** — `_auto_overlap(batch)` = ~1/6 of the window, clamped `[2,
+  batch-1]` (SeedVR2 silently resets overlap >= batch to 0).
+- **chunk_size** — ~90 frames rounded to whole batches (RAM-bound, no quality effect).
+- **attention_mode** — `UpscaleEngine._resolve_attention("auto")` reads SeedVR2's
+  `compatibility.SAGE_ATTN_*_AVAILABLE` / `FLASH_ATTN_*_AVAILABLE` flags and picks the
+  fastest installed kernel (sageattn_3 > sageattn_2 > flash_attn_3 > flash_attn_2 >
+  sdpa). Applies to the image upscaler too.
+
+**OOM auto-recovery is what makes Auto trustworthy** (`_run_video_job`): a CUDA OOM
+retries the segment at the next-smaller 4n+1 (down to the floor, `empty_cache` between),
+so an optimistic guess self-corrects on the pod (a reload, not a redeploy) instead of
+failing the run. It also defuses the degraded-GPU/OOM failure mode for video.
+
+The runner passes the AUTO sentinels through (`batch_size 0`, `temporal_overlap -1`,
+`chunk_size 0`); the worker reports the resolved values in `/video/status`
+(`resolved_batch`/`resolved_overlap`) and the runner logs them once ("pod resolved:
+…"). Settings → Video shows batch/overlap under an **"Advanced (leave on Auto)"** group;
+explicit values still override (a power-user escape hatch), and an explicit overlap is
+clamped below the batch on the pod.
+
 ### 15.9 Settings additions (Settings -> Video)
 
 `confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the

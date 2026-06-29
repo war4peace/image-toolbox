@@ -210,6 +210,67 @@ def _count_video_frames(path):
         return 0
 
 
+def _video_dims(path):
+    """(width, height) of a segment via OpenCV. (0, 0) on failure."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return max(0, w), max(0, h)
+    except Exception:
+        return 0, 0
+
+
+def _vram_total_gb():
+    """Total VRAM (GB) of GPU 0, or 0.0 if it can't be read."""
+    try:
+        import torch
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def _to_4n1(x):
+    """Largest valid SeedVR2 batch (4n+1: 1,5,9,…) that is <= x."""
+    if x < 5:
+        return 1
+    n = (int(x) - 1) // 4
+    return 4 * n + 1
+
+
+# Auto-tuner constants. VRAM_USED ~= out_megapixels * (A + B * batch) for a RESIDENT
+# 7B-fp16 run, fitted to measured anchors (RTX PRO 6000 96 GB: 4K 4:3 bs5 = 81 GB;
+# B200 180 GB: 4K 16:9 bs33 = 172 GB). The 1440p plateau (~75 GB at bs33 16:9) checks
+# out. Errs a touch high so the SAFETY margin + OOM auto-recovery cover the rest.
+_VRAM_A, _VRAM_B = 11.69, 0.2746
+_VRAM_SAFETY = 0.80          # use at most this fraction of the card before OOM-recovery
+_BATCH_CAP = 33              # continuity gains flatten past here; throughput is flat past ~9
+_BATCH_FLOOR = 5             # below this a temporal window barely helps
+
+
+def _auto_batch(out_w, out_h, vram_gb, resident):
+    """Pick the largest safe temporal window (4n+1) for an output of out_w x out_h on
+    a card with vram_gb. Bigger = better continuity + fewer seams (throughput is flat
+    past ~9), so we take the most the VRAM budget allows, capped where continuity
+    stops improving. OOM auto-recovery backstops an optimistic guess. Returns a 4n+1
+    in [_BATCH_FLOOR, _BATCH_CAP]; a safe 13 if dims/VRAM are unknown."""
+    mp = (out_w * out_h) / 1_000_000.0
+    if mp <= 0 or vram_gb <= 0:
+        return 13
+    budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
+    raw = (budget / mp - _VRAM_A) / _VRAM_B        # invert the VRAM model for batch
+    return max(_BATCH_FLOOR, min(_BATCH_CAP, _to_4n1(raw)))
+
+
+def _auto_overlap(batch):
+    """Frames blended between batches, scaled to the window (~1/6 of it) so seams stay
+    hidden at any batch size. Clamped to [2, batch-1] (SeedVR2 silently disables an
+    overlap >= batch)."""
+    return max(2, min(batch - 1, round(batch / 6)))
+
+
 _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
 
 
@@ -262,28 +323,95 @@ class _HeartbeatTee:
             pass
 
 
+def _is_oom(exc):
+    """True if `exc` is a CUDA out-of-memory error (the case OOM-recovery retries)."""
+    s = str(exc).lower()
+    return ("out of memory" in s or "cuda oom" in s
+            or exc.__class__.__name__ == "OutOfMemoryError")
+
+
+def _empty_cuda_cache():
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def _resolve_auto_params(job, params):
+    """Fill in batch_size / temporal_overlap when the caller asked for AUTO
+    (batch_size <= 0, temporal_overlap < 0): pick the window from the segment's
+    OUTPUT size and this card's real VRAM, and scale the overlap to it. An explicit
+    value from the caller is left untouched (the Advanced override)."""
+    if params["batch_size"] <= 0:
+        in_w, in_h = _video_dims(job["input"])
+        short = min(in_w, in_h) if in_w and in_h else 0
+        scale = (params["resolution"] / short) if short else 1.0
+        out_w, out_h = round(in_w * scale), round(in_h * scale)
+        resident = bool(getattr(_ENGINE, "resident", False))
+        params["batch_size"] = _auto_batch(out_w, out_h, _vram_total_gb(), resident)
+        job["auto_batch"] = True
+        _log(f"auto batch -> {params['batch_size']} (out {out_w}x{out_h}, "
+             f"vram {_vram_total_gb():.0f}GB, resident={resident})")
+    if params["chunk_size"] <= 0:
+        # Stream in ~90-frame chunks rounded to a whole number of batches (RAM-bound,
+        # no quality effect); MUST be > 0 so frames stream out instead of ballooning.
+        b = max(1, params["batch_size"])
+        params["chunk_size"] = b * max(1, round(90 / b))
+    if params["temporal_overlap"] < 0:
+        params["temporal_overlap"] = _auto_overlap(params["batch_size"])
+        _log(f"auto temporal_overlap -> {params['temporal_overlap']}")
+    # SeedVR2 silently resets overlap >= batch to 0; clamp so it never disables.
+    if params["temporal_overlap"] >= params["batch_size"]:
+        params["temporal_overlap"] = max(0, params["batch_size"] - 1)
+    job["resolved_batch"] = params["batch_size"]
+    job["resolved_overlap"] = params["temporal_overlap"]
+
+
 def _run_video_job(job, params):
     """Upscale one segment to job['output'] (its own thread). GPU work is
     serialised through _GPU_LOCK; progress is teed to the heartbeat. Fail-safe:
-    any error lands in job['error'] and the worker keeps serving."""
+    any error lands in job['error'] and the worker keeps serving.
+
+    Auto-tunes batch/overlap when asked (AUTO sentinels), and on a CUDA OOM RETRIES
+    the segment with a smaller window (down to the floor) so an optimistic guess
+    self-corrects on the pod instead of failing the whole run."""
     global _COUNT
     job["state"] = "running"
     _touch(_HEARTBEAT)
     tee = _HeartbeatTee(sys.stdout, job)
+    _resolve_auto_params(job, params)
     try:
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             with _GPU_LOCK:
-                t0 = time.time()
-                n = _ENGINE.process_video(
-                    job["input"], job["output"],
-                    resolution=params["resolution"],
-                    batch_size=params["batch_size"],
-                    chunk_size=params["chunk_size"],
-                    temporal_overlap=params["temporal_overlap"],
-                    seed=params["seed"],
-                    video_backend=params["video_backend"],
-                    use_10bit=params["use_10bit"])
-                dt = time.time() - t0
+                n = dt = None
+                while True:
+                    t0 = time.time()
+                    try:
+                        n = _ENGINE.process_video(
+                            job["input"], job["output"],
+                            resolution=params["resolution"],
+                            batch_size=params["batch_size"],
+                            chunk_size=params["chunk_size"],
+                            temporal_overlap=params["temporal_overlap"],
+                            seed=params["seed"],
+                            video_backend=params["video_backend"],
+                            use_10bit=params["use_10bit"])
+                        dt = time.time() - t0
+                        break
+                    except Exception as exc:           # noqa: BLE001
+                        if not _is_oom(exc) or params["batch_size"] <= _BATCH_FLOOR:
+                            raise
+                        smaller = _to_4n1(params["batch_size"] - 1)
+                        _empty_cuda_cache()
+                        _log(f"video job {job['id'][:8]} OOM at batch "
+                             f"{params['batch_size']}; retrying at {smaller}")
+                        params["batch_size"] = smaller
+                        params["temporal_overlap"] = min(
+                            params["temporal_overlap"], max(0, smaller - 1))
+                        job["resolved_batch"] = smaller
+                        job["resolved_overlap"] = params["temporal_overlap"]
         try:
             out_bytes = os.path.getsize(job["output"])
         except OSError:
@@ -295,7 +423,7 @@ def _run_video_job(job, params):
         _COUNT += 1
         _log(f"video job {job['id'][:8]} done: {n} frames in {dt:.1f}s "
              f"-> {out_bytes}B (res={params['resolution']} bs={params['batch_size']} "
-             f"chunk={params['chunk_size']})")
+             f"chunk={params['chunk_size']} overlap={params['temporal_overlap']})")
     except Exception as exc:                 # noqa: BLE001 — report, keep serving
         job["state"] = "error"
         job["error"] = str(exc)
@@ -475,9 +603,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             params = {
                 "resolution":       int(q.get("resolution", ["1080"])[0]),
-                "batch_size":       int(q.get("batch_size", ["13"])[0]),
+                # 0 = AUTO: the worker sizes the batch from the card's VRAM + the
+                # output resolution. -1 overlap = AUTO (scaled to the batch).
+                "batch_size":       int(q.get("batch_size", ["0"])[0]),
                 "chunk_size":       int(q.get("chunk_size", ["0"])[0]),
-                "temporal_overlap": int(q.get("temporal_overlap", ["0"])[0]),
+                "temporal_overlap": int(q.get("temporal_overlap", ["-1"])[0]),
                 "seed":             int(q["seed"][0]) if q.get("seed") else None,
                 "video_backend":    q.get("video_backend", ["opencv"])[0],
                 "use_10bit":        q.get("use_10bit", ["0"])[0] in ("1", "true", "True"),
@@ -547,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
             "elapsed":          round(time.time() - job["started"], 1),
             "seconds":          job.get("seconds"),
             "error":            job.get("error"),
+            "resolved_batch":   job.get("resolved_batch"),
+            "resolved_overlap": job.get("resolved_overlap"),
         }).encode()
         self._send(200, body, "application/json")
 
