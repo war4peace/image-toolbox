@@ -33,6 +33,18 @@ DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
 HEARTBEAT = "/tmp/upscale_heartbeat"
 
 
+def _is_transient_gpu_error(text):
+    """True if a worker-startup failure is a transient RunPod GPU-allocation problem
+    (the rented host handed us a GPU that is busy/unavailable), not a code or config
+    fault. These clear on a retry with a fresh pod, so the caller can advise that."""
+    t = (text or "").lower()
+    return ("cudaerrordevicesunavailable" in t
+            or "busy or unavailable" in t
+            or "is/are busy" in t
+            or "no cuda-capable device" in t
+            or "all cuda-capable devices are busy" in t)
+
+
 def _ssh_base(key, port, known_hosts):
     return ["-i", key, "-p", str(port),
             "-o", "StrictHostKeyChecking=no",
@@ -368,8 +380,16 @@ class RemoteSession:
             "{ echo WORKER_FAILED; tail -n 20 /root/worker.log; exit 1; }")
         res = self._ssh(launch, check=False, timeout=900)
         if "WORKER_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
-            raise rp.RunPodError(
-                "Worker failed to become ready:\n" + (res.stdout + res.stderr)[-800:])
+            tail = (res.stdout + res.stderr)[-800:]
+            if _is_transient_gpu_error(tail):
+                raise rp.RunPodError(
+                    "The rented pod's GPU was busy or unavailable during model load "
+                    "(CUDA cudaErrorDevicesUnavailable). That is a bad GPU allocation "
+                    "on RunPod's side, not your run or the 4K target. The pod was "
+                    "terminated. Press Start to retry: a fresh pod usually lands on a "
+                    "healthy GPU (or pick a different card with the picker's refresh).\n\n"
+                    + tail)
+            raise rp.RunPodError("Worker failed to become ready:\n" + tail)
 
     def _start_ollama(self):
         """Start `ollama serve` on the pod (remote Tag & Rename), serving the

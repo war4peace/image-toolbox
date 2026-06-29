@@ -38,6 +38,7 @@ import hashlib
 import tempfile
 import datetime
 import argparse
+import traceback
 import threading
 
 try:
@@ -785,6 +786,14 @@ def main(argv=None):
 
         run_queue(engine, conn, root_id, src_root, vcfg, budget,
                   notify_settings=notify_settings)
+    except Exception as exc:                       # noqa: BLE001
+        # Surface a clean, actionable one-liner instead of a raw traceback (a
+        # transient pod-GPU failure is the common case and is not a code bug); keep
+        # the full detail below it for debugging.
+        log("")
+        log(f"Run failed: {exc}")
+        log(traceback.format_exc())
+        return 1
     finally:
         tele_stop.set()
         if session is not None:
