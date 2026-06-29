@@ -85,10 +85,6 @@ def _gui_mode():
 GUI_MODE = _gui_mode()
 
 
-def _ts():
-    return datetime.datetime.now().strftime("%H:%M:%S")
-
-
 _LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
 
 
@@ -124,11 +120,12 @@ def _close_log():
 
 
 def log(msg):
-    """Human-readable, timestamped progress to stdout (the GUI log pane / console)
-    and, when a run log is open, to logs/video_<hash>.log for later troubleshooting.
-    The file line carries a full date+time so the on-disk log reconstructs timing;
-    stdout stays HH:MM:SS (the GUI window adds its own per-line stamp)."""
-    sys.stdout.write(f"{_ts()} | {msg}\n")
+    """Human-readable progress to stdout (the GUI log pane / console) and, when a
+    run log is open, to logs/video_<hash>.log for later troubleshooting. stdout is
+    CLEAN (no timestamp): the GUI window adds its own '[HH:MM:SS]' per line, so
+    stamping here too would double it. The file line carries a full date+time so
+    the on-disk log reconstructs timing on its own."""
+    sys.stdout.write(f"{msg}\n")
     sys.stdout.flush()
     if _LOG_FH is not None:
         try:
