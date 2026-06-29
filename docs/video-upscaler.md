@@ -999,6 +999,42 @@ so they self-correct instead of trusting only the up-front estimate.
 flash the taskbar on completion (`App.flash_attention`); and send the
 queue-complete / error notification (`notifications`). All already in the app.
 
+#### Required improvement: the shipped bar is a time-based estimate, not frame-accurate (0.4.0)
+
+**Status: shipped as a fallback, NOT good enough; a real fix is still required.**
+In practice the worker's `frames_processed` almost never arrives: `_HeartbeatTee`
+only accepts a tqdm `n/total` whose denominator matches the segment frame count, but
+SeedVR2's bar counts **batches/chunks, not frames**, so the conservative match never
+fires. The running view therefore relies on the **time-based** within-segment bar
+(`elapsed / estimated_segment_seconds` from the rate table), capped at 97 % until the
+segment's real `done` event.
+
+This is honest about being an estimate, but it is **not reliable enough for a billed
+pod**, because the rate table is optimistic and the estimate can be badly low. Live
+example (2026-06-29, RTX PRO 6000 Blackwell **Workstation** Edition, 1440p, 760-frame
+segment): up-front estimate **30:50**, but the run overshot it by **8+ minutes and was
+still going**, so the bar sat **pinned at 97 % with the ETA exhausted (0:00)**. A
+non-technical user reads "stuck at 97 %, past the ETA, on a pod I am paying for" as a
+hung run and interrupts it, wasting the spend, the exact failure this view exists to
+prevent.
+
+Two things are needed (**validate against real worker output on a live pod, do not
+guess**):
+
+1. **Real within-segment frame progress (the proper fix).** Inspect SeedVR2's actual
+   tqdm/stdout on a running pod and map its true unit (batches/chunks, accounting for
+   `batch_size` / `chunk_size` / `temporal_overlap`) to frames in
+   `_HeartbeatTee._scan_progress`, so `frames_processed` is reported reliably. A
+   monotonic frame count is truthful regardless of rate-estimate error and removes the
+   dependence on the estimate entirely.
+2. **Make the time-based fallback degrade gracefully past the estimate.** When elapsed
+   exceeds the estimate, do **not** freeze at 97 % with a 0:00 ETA. Keep proving the
+   run is alive (continue an elapsed/"running NN:NN" counter, and say "running longer
+   than estimated, the pod is still working" instead of showing a stalled bar). Also
+   recalibrate the rate table from `db.gpu_perf` as runs finish (already recorded via
+   `video_estimate.record_run`) so the up-front estimate self-corrects over time, and
+   note the **Workstation vs Server** editions of a card can differ enough to matter.
+
 ### 15.9 Settings additions (Settings -> Video)
 
 `confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the
