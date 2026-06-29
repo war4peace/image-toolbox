@@ -1092,6 +1092,11 @@ class ComparisonWindow(tk.Toplevel):
         from PIL import Image
 
         self._crisp_after = None
+        # A redraw can be queued (off-thread decode's after(0), or the deferred
+        # crisp pass) and then fire AFTER the window is closed and its canvas
+        # destroyed -> "invalid command name …!canvas". Bail if the canvas is gone.
+        if not self.canvas.winfo_exists():
+            return
         self.canvas.delete("all")
         self._photos = []
         cw, ch = self._size()
