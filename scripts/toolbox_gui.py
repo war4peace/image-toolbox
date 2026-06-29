@@ -1746,11 +1746,13 @@ class ToolTab(ttk.Frame):
             return default
 
     def _selected_gpu_chain(self):
-        """The picked GPU id followed by the other in-stock ids (cheapest-first,
-        capped at the fallback price ceiling) as a fallback chain, or None when
-        nothing was loaded (then the run uses the configured default + curated
-        chain). Empty list = loaded but none available, a hard stop for the
-        caller."""
+        """The picked GPU id as a single-element list. We NEVER substitute a
+        different GPU TYPE without the user's consent (their preference): if the
+        pick is unavailable at start, the run stops and the user refreshes (↻) and
+        re-picks. None when nothing was loaded (the run then uses the configured
+        default). Empty list = loaded but none available, a hard stop for the
+        caller. (Kept the "_chain" name + return shape so the call sites and the
+        IMGTBX_GPU_OVERRIDE join are unchanged.)"""
         if not self._gpu_loaded:
             return None
         if not self._gpu_choices:
@@ -1758,35 +1760,17 @@ class ToolTab(ttk.Frame):
         idx = self.gpu_combo.current()
         if idx < 0 or idx >= len(self._gpu_choices):
             idx = 0
-        chosen = self._gpu_choices[idx]["id"]
-        ceiling = self._fallback_ceiling()
-        chain = [chosen]
-        for g in self._gpu_choices:
-            if g["id"] == chosen:
-                continue
-            price = g.get("price")
-            if ceiling and price is not None and price > ceiling:
-                continue            # too pricey to fall back to automatically
-            chain.append(g["id"])
-        return chain
+        return [self._gpu_choices[idx]["id"]]
 
     def _gpu_confirm_note(self, gpu_chain):
         """A short line for the 'run on a billed pod?' confirm: the chosen GPU and
-        price, plus whether a capped cheaper fallback exists."""
+        price. No fallback line — only the selected card is used."""
         if not gpu_chain:
             return ""
         g = self._gpu_choices[max(0, self.gpu_combo.current())]
         price = g.get("price")
         price_str = f" (~${price:.2f}/h)" if price is not None else ""
-        note = f"\n\nGPU: {g['name']} — {g['memory_gb']} GB{price_str}."
-        ceiling = self._fallback_ceiling()
-        if ceiling and price is not None and price > ceiling:
-            note += (f"\n⚠ Above your ${ceiling:.2f}/h fallback ceiling (Settings) — "
-                     f"this is your explicit pick, so it's used anyway.")
-        elif ceiling and len(gpu_chain) > 1:
-            note += (f"\nIf it's unavailable, a cheaper in-stock GPU "
-                     f"(≤ ${ceiling:.2f}/h) is tried automatically.")
-        return note
+        return f"\n\nGPU: {g['name']}, {g['memory_gb']} GB{price_str}."
 
     def _failure_status(self, code):
         """A meaningful one-line status for a non-zero exit. The clean output goes
