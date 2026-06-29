@@ -6806,11 +6806,13 @@ class VideoTab(ttk.Frame):
             return (self.queue_tree.set(iid, col) or "").lower()
         return key
 
-    def _on_queue_double(self, _event):
-        """Double-click a queued video to run the queue (it's processed as a unit, in
-        order). No-op while a run is already going."""
-        if str(self.start_btn["state"]) != "disabled":
-            self._start()
+    def _on_queue_double(self, event):
+        """Double-click a queued video to open the source file in the default player
+        (same as the scan list)."""
+        iid = self.queue_tree.identify_row(event.y)
+        row = self._queue_rows.get(iid) if iid else None
+        if row:
+            self._open_path(row["abs"])
 
     def _on_queue_right(self, event):
         iid = self.queue_tree.identify_row(event.y)
