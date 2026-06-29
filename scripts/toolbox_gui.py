@@ -6756,10 +6756,11 @@ class VideoTab(ttk.Frame):
                     f"{len(jobs)} job(s)?\n\nEstimated: {dur}, {cost}.\n\n"
                     "A billed pod is created and torn down when done."):
                 return
-        # GPU override (cheapest-first fallback chain from here down the list).
-        ids = [gg.get("id") for gg in self._gpu_choices[self.gpu_combo.current():]
-               if gg.get("id")]
-        env = {"IMGTBX_GPU_OVERRIDE": ",".join(ids)} if ids else None
+        # Pass ONLY the selected GPU — never silently fall back to a different GPU
+        # TYPE. If it can't be deployed (sold out / unavailable by start time), the
+        # run fails with a clear message and the user refreshes (↻) and picks
+        # another card themselves.
+        env = {"IMGTBX_GPU_OVERRIDE": g["id"]} if g.get("id") else None
         self._begin_run(sum(j["frames"] for j in jobs))
         self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
 
@@ -6952,7 +6953,14 @@ class VideoTab(ttk.Frame):
         self.app.taskbar_clear()
         self.app.flash_attention()
         self._load_queue()
-        self.status_var.set("Run finished." if code == 0 else f"Run exited (code {code}).")
+        if code == 0:
+            self.status_var.set("Run finished.")
+        else:
+            # A common cause is the picked GPU selling out between picker-refresh
+            # and Start (we never substitute a different card). Point the user at
+            # the manual re-pick rather than guessing for them.
+            self.status_var.set("Run failed — see View log. If the GPU is no longer "
+                                "available, press ↻ to refresh the list and pick another.")
 
     def _end_run(self):
         self.proc = None
