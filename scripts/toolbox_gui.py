@@ -3503,12 +3503,16 @@ class SettingsTab(ttk.Frame):
         self.default_tag_var = tk.StringVar(value=defs.get("tag_folder", ""))
         self.default_corig_var = tk.StringVar(value=defs.get("conciliate_original", ""))
         self.default_cproc_var = tk.StringVar(value=defs.get("conciliate_processed", ""))
+        self.default_vsrc_var = tk.StringVar(value=defs.get("video_source", ""))
+        self.default_vout_var = tk.StringVar(value=defs.get("video_output", ""))
         for r, (text, var) in enumerate((
                 ("Batch Upscaler — Photo folder:",  self.default_src_var),
                 ("Batch Upscaler — Output folder:", self.default_out_var),
                 ("Tag & Rename — Photo folder:",    self.default_tag_var),
                 ("Conciliation — Original folder:",  self.default_corig_var),
-                ("Conciliation — Processed folder:", self.default_cproc_var))):
+                ("Conciliation — Processed folder:", self.default_cproc_var),
+                ("Video Upscaler — Video folder:",   self.default_vsrc_var),
+                ("Video Upscaler — Output folder:",  self.default_vout_var))):
             ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
             ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
             ttk.Button(sec, text="Browse…",
@@ -4063,6 +4067,8 @@ class SettingsTab(ttk.Frame):
         self.default_tag_var.set(defs.get("tag_folder", ""))
         self.default_corig_var.set(defs.get("conciliate_original", ""))
         self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.default_vsrc_var.set(defs.get("video_source", ""))
+        self.default_vout_var.set(defs.get("video_output", ""))
 
     def _video_codec_label(self, vid):
         """The codec combobox label matching the saved video_backend/use_10bit."""
@@ -4157,6 +4163,8 @@ class SettingsTab(ttk.Frame):
                 "tag_folder":     self.default_tag_var.get().strip(),
                 "conciliate_original":  self.default_corig_var.get().strip(),
                 "conciliate_processed": self.default_cproc_var.get().strip(),
+                "video_source":  self.default_vsrc_var.get().strip(),
+                "video_output":  self.default_vout_var.get().strip(),
             },
             "tagging": {
                 "auto_straighten": bool(self.straighten_var.get()),
@@ -4257,6 +4265,8 @@ class SettingsTab(ttk.Frame):
         self.default_tag_var.set(defs.get("tag_folder", ""))
         self.default_corig_var.set(defs.get("conciliate_original", ""))
         self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.default_vsrc_var.set(defs.get("video_source", ""))
+        self.default_vout_var.set(defs.get("video_output", ""))
         self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
         self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
         self.straighten_var.set(bool(tag.get("auto_straighten", True)))
@@ -6170,11 +6180,11 @@ class VideoTab(ttk.Frame):
         if not self.src_var.get():
             d = get_default_folder("video_source")
             if d:
-                self.src_var.set(d)
+                self.src_var.set(os.path.normpath(d))
         if not self.out_var.get():
             d = get_default_folder("video_output")
             if d:
-                self.out_var.set(d)
+                self.out_var.set(os.path.normpath(d))
 
     def on_enter(self):
         """Called when the tab is entered (not only at startup): re-check remote
@@ -6225,6 +6235,9 @@ class VideoTab(ttk.Frame):
     def _browse_source(self):
         folder = filedialog.askdirectory(title="Choose the folder with videos to upscale")
         if folder:
+            # askdirectory returns forward slashes on Windows; normpath gives the
+            # native backslash form so both fields read consistently (no X:/a\b mix).
+            folder = os.path.normpath(folder)
             self.src_var.set(folder)
             out = self.out_var.get().strip()
             if not out or os.path.basename(out) == "__upscaled__":
@@ -6241,7 +6254,12 @@ class VideoTab(ttk.Frame):
             self.out_var.set(os.path.join(src, "__upscaled__"))
         self._src_root = os.path.abspath(src)
         self._out_root = os.path.abspath(self.out_var.get().strip())
+        # Reflect the canonical (backslash) form back into the fields, and remember
+        # BOTH folders so a relaunch restores them together (output used to be lost).
+        self.src_var.set(self._src_root)
+        self.out_var.set(self._out_root)
         set_default_folder("video_source", self._src_root)
+        set_default_folder("video_output", self._out_root)
         self.scan_tree.delete(*self.scan_tree.get_children())
         self._scan_rows.clear()
         self.progress.set(0)
