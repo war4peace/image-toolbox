@@ -386,6 +386,11 @@ def _run_video_job(job, params):
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             with _GPU_LOCK:
                 n = dt = None
+                try:                              # measure the real working set
+                    import torch
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
                 while True:
                     t0 = time.time()
                     try:
@@ -416,6 +421,13 @@ def _run_video_job(job, params):
             out_bytes = os.path.getsize(job["output"])
         except OSError:
             out_bytes = 0
+        try:                                  # ground-truth VRAM: working set vs the
+            import torch                       # caching-allocator pool nvidia-smi shows
+            gb = 1024 ** 3
+            job["peak_alloc_gb"] = round(torch.cuda.max_memory_allocated() / gb, 1)
+            job["peak_reserved_gb"] = round(torch.cuda.max_memory_reserved() / gb, 1)
+        except Exception:
+            pass
         job["frames_written"] = n
         job["output_bytes"] = out_bytes
         job["seconds"] = dt
@@ -423,7 +435,9 @@ def _run_video_job(job, params):
         _COUNT += 1
         _log(f"video job {job['id'][:8]} done: {n} frames in {dt:.1f}s "
              f"-> {out_bytes}B (res={params['resolution']} bs={params['batch_size']} "
-             f"chunk={params['chunk_size']} overlap={params['temporal_overlap']})")
+             f"chunk={params['chunk_size']} overlap={params['temporal_overlap']} "
+             f"peakVRAM={job.get('peak_alloc_gb')}GB alloc/"
+             f"{job.get('peak_reserved_gb')}GB reserved)")
     except Exception as exc:                 # noqa: BLE001 — report, keep serving
         job["state"] = "error"
         job["error"] = str(exc)
@@ -681,6 +695,8 @@ class Handler(BaseHTTPRequestHandler):
             "resolved_overlap": job.get("resolved_overlap"),
             "resolved_attention": getattr(getattr(_ENGINE, "args", None),
                                           "attention_mode", None),
+            "peak_alloc_gb":    job.get("peak_alloc_gb"),
+            "peak_reserved_gb": job.get("peak_reserved_gb"),
         }).encode()
         self._send(200, body, "application/json")
 

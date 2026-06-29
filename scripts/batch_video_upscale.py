@@ -604,6 +604,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'} "
         f"(auto values resolved on the pod)")
     _resolved_logged = [False]
+    _peak_logged = [False]
     total_secs = 0.0
 
     for s in segs:
@@ -618,6 +619,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 log(f"    (pod resolved: batch_size {rb}, "
                     f"temporal_overlap {st.get('resolved_overlap')}, "
                     f"attention {st.get('resolved_attention') or '?'})")
+            pa = st.get("peak_alloc_gb")
+            if pa is not None and not _peak_logged[0]:
+                _peak_logged[0] = True
+                log(f"    (pod peak VRAM: {pa} GB working set, "
+                    f"{st.get('peak_reserved_gb')} GB reserved/pooled)")
             gui_event("SEGMENT", {"video_rel": rel, "target": target,
                                   "seg_index": _i, "total": len(segs),
                                   "state": st.get("state"),
