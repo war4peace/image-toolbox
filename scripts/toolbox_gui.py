@@ -6134,14 +6134,22 @@ class VideoTab(ttk.Frame):
         sf.columnconfigure(0, weight=1)
         cols = ("res", "dur", "codec", "fps", "up", "upres", "status")
         self.scan_tree = ttk.Treeview(sf, columns=cols, show="tree headings", height=7)
-        self.scan_tree.heading("#0", text="File")
+        self._scan_sort = {}             # sort direction state for the scan headers
+        _scan_titles = {"#0": "File"}
         self.scan_tree.column("#0", width=240, stretch=True)
         for c, txt, w in (("res", "Resolution", 90), ("dur", "Duration", 70),
                           ("codec", "Codec", 70), ("fps", "FPS", 55),
                           ("up", "Upscaled", 150), ("upres", "Up res", 80),
                           ("status", "Status", 80)):
-            self.scan_tree.heading(c, text=txt)
+            _scan_titles[c] = txt
             self.scan_tree.column(c, width=w, stretch=False, anchor="w")
+        self._scan_sort["_titles"] = _scan_titles
+        # Click a header (incl. File/#0) to sort by that column (toggles asc/desc).
+        for c, txt in _scan_titles.items():
+            self.scan_tree.heading(
+                c, text=txt,
+                command=lambda c=c: self._sort_tree(
+                    self.scan_tree, c, self._scan_sort_key(c), self._scan_sort))
         self.scan_tree.tag_configure("haveup", foreground="#2f6f3f")
         self.scan_tree.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
@@ -6175,18 +6183,30 @@ class VideoTab(ttk.Frame):
         self.rowconfigure(4, weight=2)
         qf.rowconfigure(0, weight=1)
         qf.columnconfigure(0, weight=1)
-        qcols = ("target", "status", "frames", "segs")
+        qcols = ("target", "status", "res", "dur", "codec", "fps", "frames", "segs")
         self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
-        self.queue_tree.heading("#0", text="File")
-        self.queue_tree.column("#0", width=240, stretch=True)
-        for c, txt, w in (("target", "Target", 70), ("status", "Status", 90),
-                          ("frames", "Frames", 80), ("segs", "Segments", 80)):
-            self.queue_tree.heading(c, text=txt)
+        self._queue_sort = {}
+        self._queue_rows = {}            # iid -> {rel, target, props} for sort/actions
+        _q_titles = {"#0": "File"}
+        self.queue_tree.column("#0", width=200, stretch=True)
+        for c, txt, w in (("target", "Target", 60), ("status", "Status", 80),
+                          ("res", "Resolution", 90), ("dur", "Duration", 70),
+                          ("codec", "Codec", 60), ("fps", "FPS", 50),
+                          ("frames", "Frames", 70), ("segs", "Segments", 70)):
+            _q_titles[c] = txt
             self.queue_tree.column(c, width=w, stretch=False, anchor="w")
+        self._queue_sort["_titles"] = _q_titles
+        for c, txt in _q_titles.items():
+            self.queue_tree.heading(
+                c, text=txt,
+                command=lambda c=c: self._sort_tree(
+                    self.queue_tree, c, self._queue_sort_key(c), self._queue_sort))
         self.queue_tree.grid(row=0, column=0, rowspan=4, sticky="nsew")
         qsb = ttk.Scrollbar(qf, orient="vertical", command=self.queue_tree.yview)
         qsb.grid(row=0, column=1, rowspan=4, sticky="ns")
         self.queue_tree.configure(yscrollcommand=qsb.set)
+        self.queue_tree.bind("<Double-1>", self._on_queue_double)
+        self.queue_tree.bind("<Button-3>", self._on_queue_right)
         ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1)).grid(row=0, column=2, padx=(4, 0))
         ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1)).grid(row=1, column=2, padx=(4, 0))
         ttk.Button(qf, text="Remove", command=self._queue_remove).grid(row=2, column=2, padx=(4, 0), pady=(4, 0))
@@ -6428,6 +6448,46 @@ class VideoTab(ttk.Frame):
         # If the cap was hit there is likely more waiting — poll again promptly.
         self.after(1 if drained >= 400 else 120, lambda: self._scan_poll(seq))
 
+    def _sort_tree(self, tree, col, keyfunc, state):
+        """View-sort a Treeview by `col` (toggling asc/desc), keying each row through
+        `keyfunc(iid)`. Header-only: it reorders the displayed rows, not any underlying
+        queue order. `state` is a per-tree dict remembering the current direction."""
+        reverse = not state.get(col, True)          # first click = ascending
+        rows = [(keyfunc(iid), iid) for iid in tree.get_children("")]
+        try:
+            rows.sort(key=lambda t: t[0], reverse=reverse)
+        except TypeError:                                # mixed types -> compare as str
+            rows.sort(key=lambda t: str(t[0]), reverse=reverse)
+        for i, (_k, iid) in enumerate(rows):
+            tree.move(iid, "", i)
+        titles = state.get("_titles", {})
+        for k in list(state.keys()):                     # reset directions, keep titles
+            if k != "_titles":
+                del state[k]
+        state[col] = reverse
+        for c, base in titles.items():
+            arrow = (" ▲" if not reverse else " ▼") if c == col else ""
+            tree.heading(c, text=base + arrow)
+
+    def _scan_sort_key(self, col):
+        """Sort key for a scan row, by the UNDERLYING property (not the display text),
+        so Resolution/Duration/FPS sort numerically."""
+        def key(iid):
+            row = self._scan_rows.get(iid) or {}
+            r = row.get("r") or {}
+            if col == "#0":
+                return (row.get("rel") or "").lower()
+            if col == "res":
+                return (r.get("width") or 0) * (r.get("height") or 0)
+            if col == "dur":
+                return r.get("duration") or 0.0
+            if col == "fps":
+                return r.get("fps") or 0.0
+            if col == "codec":
+                return (r.get("vcodec") or "").lower()
+            return (self.scan_tree.set(iid, col) or "").lower()
+        return key
+
     def _insert_scan_row(self, rel, abs_path, r, elig, outs):
         import video_estimate as ve
         res = f"{r['width']}x{r['height']}" if r["width"] else "?"
@@ -6439,7 +6499,8 @@ class VideoTab(ttk.Frame):
             "", "end", text=rel,
             values=(res, dur, r["vcodec"] or "?", fps, up, up, ""),
             tags=("haveup",) if done else ())
-        self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig, "outs": outs}
+        self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig,
+                                "outs": outs, "r": dict(r)}
 
     def _finish_scan(self):
         self._scanning = False
@@ -6619,17 +6680,32 @@ class VideoTab(ttk.Frame):
                 self._root_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
             else:
                 return
+        import video_estimate as ve
         self.queue_tree.delete(*self.queue_tree.get_children())
+        self._queue_rows = {}
         for j in bv.db.get_video_queue(conn, self._root_id):
             vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
             frames = (vf["nb_frames"] if vf else None) or "?"
             segs = bv.db.get_video_segments(conn, self._root_id, j["rel_path"], j["target"])
             done = sum(1 for s in segs if s["status"] == "done")
             segtxt = f"{done}/{len(segs)}" if segs else "?"
-            self.queue_tree.insert("", "end",
-                                   text=j["rel_path"],
-                                   values=(j["target"], j["status"], frames, segtxt),
-                                   tags=(j["rel_path"], j["target"]))
+            w = vf["width"] if vf else 0
+            h = vf["height"] if vf else 0
+            res = f"{w}x{h}" if w else "?"
+            dur = ve.fmt_duration(vf["duration"]) if (vf and vf["duration"]) else "?"
+            codec = (vf["vcodec"] if vf else None) or "?"
+            fps = f"{vf['fps']:.2f}" if (vf and vf["fps"]) else "?"
+            abs_path = os.path.join(self._src_root, j["rel_path"]) if self._src_root else j["rel_path"]
+            iid = self.queue_tree.insert(
+                "", "end", text=j["rel_path"],
+                values=(j["target"], j["status"], res, dur, codec, fps, frames, segtxt),
+                tags=(j["rel_path"], j["target"]))
+            self._queue_rows[iid] = {
+                "rel": j["rel_path"], "target": j["target"], "abs": abs_path,
+                "w": w or 0, "h": h or 0,
+                "duration": (vf["duration"] if vf else 0) or 0.0,
+                "fps": (vf["fps"] if vf else 0) or 0.0,
+                "codec": codec}
         self._refresh_scan_outputs()
         self._update_estimate()
 
@@ -6696,6 +6772,71 @@ class VideoTab(ttk.Frame):
             if len(t) >= 2 and t[0] == job[0] and t[1] == job[1]:
                 self.queue_tree.selection_set(iid)
                 break
+
+    def _queue_move_to_top(self, row):
+        """Send the job to the front of the queue (it runs first)."""
+        if self._root_id is None:
+            return
+        import batch_video_upscale as bv
+        conn = self._conn()
+        jobs = [(j["rel_path"], j["target"]) for j in bv.db.get_video_queue(conn, self._root_id)]
+        key = (row["rel"], row["target"])
+        if key not in jobs:
+            return
+        jobs.remove(key)
+        jobs.insert(0, key)
+        for pos, (rel, tgt) in enumerate(jobs):
+            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos)
+        self._load_queue()
+
+    def _queue_sort_key(self, col):
+        """Sort key for a queue row, by the underlying property where numeric."""
+        def key(iid):
+            row = self._queue_rows.get(iid) or {}
+            if col == "#0":
+                return (row.get("rel") or "").lower()
+            if col == "res":
+                return (row.get("w") or 0) * (row.get("h") or 0)
+            if col == "dur":
+                return row.get("duration") or 0.0
+            if col == "fps":
+                return row.get("fps") or 0.0
+            if col == "codec":
+                return (row.get("codec") or "").lower()
+            return (self.queue_tree.set(iid, col) or "").lower()
+        return key
+
+    def _on_queue_double(self, _event):
+        """Double-click a queued video to run the queue (it's processed as a unit, in
+        order). No-op while a run is already going."""
+        if str(self.start_btn["state"]) != "disabled":
+            self._start()
+
+    def _on_queue_right(self, event):
+        iid = self.queue_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.queue_tree.selection_set(iid)
+        row = self._queue_rows.get(iid)
+        if not row:
+            return
+        running = str(self.start_btn["state"]) == "disabled"
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Start upscaling", command=self._start,
+                      state="disabled" if running else "normal")
+        m.add_separator()
+        m.add_command(label="Move to top", command=lambda: self._queue_move_to_top(row))
+        m.add_command(label="Move up", command=lambda: self._queue_move(-1))
+        m.add_command(label="Move down", command=lambda: self._queue_move(1))
+        m.add_command(label="Remove from queue", command=self._queue_remove)
+        m.add_separator()
+        m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
+        m.add_command(label="Open source folder",
+                      command=lambda: self._open_folder(row["abs"]))
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
 
     # ── GPU picker + estimate ────────────────────────────────────────────────
 
@@ -7013,7 +7154,12 @@ class VideoTab(ttk.Frame):
             elif fp is not None:
                 self._cur_seg_done = min(fp, seg_frames)
                 self._seg_has_frames = True      # real data: it overrides the clock
-            self._update_progress()
+            # Only repaint the bar from REAL frame counts (or on 'done'). While a
+            # segment runs without frame reports, _run_tick owns the bar (time-based);
+            # repainting here would snap it back to the completed-segment fraction
+            # every poll (~5 s), which read as a 0 % flicker.
+            if state == "done" or self._seg_has_frames:
+                self._update_progress()
         elif kind == "VRESULT" and data:
             self._load_queue()                           # done/failed leaves the queue
         elif kind == "RTELEM" and data:
