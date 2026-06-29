@@ -6519,8 +6519,10 @@ class VideoTab(ttk.Frame):
         target = self.target_var.get()
         if not row or not target:
             return
+        # No status-bar chatter for queue edits: the queue list is the source of
+        # truth and shows the add/remove directly. Only a failure (below) is worth
+        # surfacing, since it has no other on-screen home.
         self.prepare_btn.configure(state="disabled")
-        self.status_var.set(f"Preparing {os.path.basename(row['abs'])} → {target} …")
 
         def work():
             import batch_video_upscale as bv
@@ -6535,8 +6537,7 @@ class VideoTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _after_prepare(self, rel, target, info):
-        self.status_var.set(f"Queued {os.path.basename(rel)} → {target} "
-                            f"({info['nb_frames']} frames, ~{info['segments']} segments).")
+        # The new row appearing in the queue list is the feedback; no status line.
         self._load_queue()
         self._sync_prepare_btn()
         self._update_estimate()
