@@ -136,6 +136,8 @@ CREATE TABLE IF NOT EXISTS video_files (
     mtime      REAL,              -- (mtime, size) validate the fast-scan cache
     size       INTEGER,
     src_hash   TEXT,              -- content hash, filled lazily at upscale time
+    probe_version INTEGER,        -- bumped when probe() semantics change (e.g. rotation
+                                  -- -> display dims); a mismatch forces a re-probe
     updated_at TEXT,
     PRIMARY KEY (root_id, rel_path)
 );
@@ -213,6 +215,7 @@ def get_conn():
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate_video_tables(conn)
     conn.executescript(SCHEMA)
+    _ensure_video_columns(conn)
     conn.commit()
     if fresh:
         try:
@@ -238,6 +241,17 @@ def _migrate_video_tables(conn):
                 "DROP TABLE IF EXISTS video_outputs;"
                 "DROP TABLE IF EXISTS video_files;")
             conn.commit()
+    except Exception:
+        pass
+
+
+def _ensure_video_columns(conn):
+    """Add columns introduced after a DB already had video_files (CREATE IF NOT EXISTS
+    won't alter an existing table). Fail-safe; runs every open, cheap."""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_files)")]
+        if cols and "probe_version" not in cols:
+            conn.execute("ALTER TABLE video_files ADD COLUMN probe_version INTEGER")
     except Exception:
         pass
 
@@ -403,13 +417,21 @@ def get_video_file(conn, root_id, rel_path):
         (root_id, rel_path)).fetchone()
 
 
+# Bump when probe() changes what dims/properties it reports, so a re-scan re-probes
+# cached rows. 2 = rotation-aware display dimensions (portrait phone clips).
+VIDEO_PROBE_VERSION = 2
+
+
 def video_file_is_fresh(conn, root_id, rel_path, mtime, size):
-    """True if the cached fast-scan row matches the file's current (mtime, size),
-    so a re-scan can skip re-probing it (section 15.4)."""
+    """True if the cached fast-scan row matches the file's current (mtime, size) AND
+    was probed by the current probe version, so a re-scan can skip re-probing it
+    (section 15.4). A probe_version bump (e.g. rotation-aware dims) re-probes once."""
     row = conn.execute(
-        "SELECT mtime, size FROM video_files WHERE root_id = ? AND rel_path = ?",
+        "SELECT mtime, size, probe_version FROM video_files "
+        "WHERE root_id = ? AND rel_path = ?",
         (root_id, rel_path)).fetchone()
-    return bool(row and row["mtime"] == round(mtime, 3) and row["size"] == size)
+    return bool(row and row["mtime"] == round(mtime, 3) and row["size"] == size
+                and row["probe_version"] == VIDEO_PROBE_VERSION)
 
 
 # ── video_outputs (the per-target job = the durable queue) ───────────────────

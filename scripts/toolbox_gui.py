@@ -6322,6 +6322,7 @@ class VideoTab(ttk.Frame):
         self._scan_skipped = []          # rels ffprobe could not read
         self._scan_res = {}              # "WxH" -> count, for the summary breakdown
         self._scan_listing = 0           # files found so far during the tree walk
+        self._scan_removed = []          # (rel, target) outputs reconciled off disk
         self._scan_seq += 1
         seq = self._scan_seq
         self._scan_q = queue.Queue()
@@ -6344,6 +6345,11 @@ class VideoTab(ttk.Frame):
             conn = self._conn()
             self._root_id = bv.db.get_video_root_id(conn, self._src_root, self._out_root)
             cutoff = self._vcfg()["skip_cutoff_pct"]
+            # Drop DB records for upscaled outputs the user deleted off disk, so the
+            # scan reflects what's actually there (and they can be re-queued).
+            removed = bv.reconcile_video_outputs(conn, self._root_id)
+            if removed:
+                self._scan_q.put(("reconciled", removed))
             files = []
             for abs_path, rel in bv.iter_videos(self._src_root):
                 if seq != self._scan_seq:
@@ -6379,7 +6385,12 @@ class VideoTab(ttk.Frame):
             except queue.Empty:
                 break
             drained += 1
-            if kind == "listing":
+            if kind == "reconciled":
+                self._scan_removed = data
+                for rel, tgt in data:
+                    self.console.feed(f"  removed (deleted off disk): {rel} → {tgt}\n")
+                self._load_queue()       # the removed jobs leave any queue view
+            elif kind == "listing":
                 self._scan_listing = data
                 self.status_var.set(f"Listing files … {data} found")
             elif kind == "total":
@@ -6436,8 +6447,10 @@ class VideoTab(ttk.Frame):
         n = len(self._scan_rows)
         skipped = getattr(self, "_scan_skipped", [])
         res = getattr(self, "_scan_res", {})
+        removed = getattr(self, "_scan_removed", [])
         self.progress.set(100 if self._scan_total else 0)
         tail = f", {len(skipped)} unreadable (skipped)" if skipped else ""
+        tail += f", {len(removed)} stale removed" if removed else ""
         self.status_var.set(f"Found {n} video(s){tail}." if n
                             else "No videos found in this folder.")
         # A clearly delimited summary block (find-able after the long per-file run):
@@ -6448,6 +6461,10 @@ class VideoTab(ttk.Frame):
         self.console.feed(f"  Videos ready to queue: {n}\n")
         if skipped:
             self.console.feed(f"  Unreadable (skipped):  {len(skipped)}\n")
+        if removed:
+            self.console.feed(f"  Upscaled removed (deleted off disk): {len(removed)}\n")
+            for rel, tgt in removed:
+                self.console.feed(f"     {rel} → {tgt}\n")
         if res:
             self.console.feed("  By resolution:\n")
             for key, cnt in sorted(res.items(), key=lambda kv: (-kv[1], kv[0])):

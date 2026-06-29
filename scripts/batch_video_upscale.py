@@ -477,8 +477,25 @@ def scan_file(conn, root_id, abs_path, rel):
                          width=info.width, height=info.height,
                          vcodec=info.vcodec, acodec=info.acodec,
                          fps=float(info.fps), duration=info.duration,
-                         mtime=round(st.st_mtime, 3), size=st.st_size)
+                         mtime=round(st.st_mtime, 3), size=st.st_size,
+                         probe_version=db.VIDEO_PROBE_VERSION)
     return db.get_video_file(conn, root_id, rel)
+
+
+def reconcile_video_outputs(conn, root_id):
+    """Drop DB records for upscaled outputs the user DELETED off disk: a 'done' job
+    whose output file is gone is removed (with its segment rows), so it no longer shows
+    as upscaled and can be re-prepared/re-queued. Only 'done' jobs are checked (others
+    have no final file yet). Returns the [(rel, target), …] removed. Best-effort."""
+    removed = []
+    for o in db.get_video_outputs_all(conn, root_id):
+        if o["status"] != "done":
+            continue
+        path = o["output_path"]
+        if not path or not os.path.exists(path):
+            db.delete_video_output(conn, root_id, o["rel_path"], o["target"])
+            removed.append((o["rel_path"], o["target"]))
+    return removed
 
 
 def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
@@ -493,7 +510,8 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
                          width=info.width, height=info.height,
                          vcodec=info.vcodec, acodec=info.acodec,
                          fps=float(info.fps), duration=info.duration,
-                         nb_frames=info.nb_frames)
+                         nb_frames=info.nb_frames,
+                         probe_version=db.VIDEO_PROBE_VERSION)
     existing = db.get_video_output(conn, root_id, rel, target)
     if existing is None:
         db.upsert_video_output(conn, root_id, rel, target, status="queued",
