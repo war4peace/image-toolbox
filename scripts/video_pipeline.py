@@ -168,6 +168,30 @@ class VideoInfo:
         return self.r_fps if self.r_fps and self.r_fps > 0 else self.avg_fps
 
 
+def _stream_rotation(v) -> int:
+    """Displayed rotation of a video stream in degrees (0/90/180/270), from the
+    Display Matrix side data (newer ffmpeg) or the legacy `rotate` tag. Normalised to
+    [0, 360); negative (e.g. -90 -> 270) handled. 0 on anything unparseable."""
+    rot = None
+    for sd in v.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                rot = float(sd["rotation"])
+            except (TypeError, ValueError):
+                rot = None
+            break
+    if rot is None:
+        tag = (v.get("tags") or {}).get("rotate")
+        if tag is not None:
+            try:
+                rot = float(tag)
+            except (TypeError, ValueError):
+                rot = None
+    if rot is None:
+        return 0
+    return int(round(rot)) % 360
+
+
 def _parse_fraction(value) -> Fraction:
     """Parse ffprobe's 'num/den' rate strings; 0/0 and junk -> Fraction(0)."""
     try:
@@ -225,10 +249,21 @@ def probe(path, count=False) -> VideoInfo:
     if r_fps > 0 and avg_fps > 0:
         is_vfr = abs(float(r_fps) - float(avg_fps)) / float(r_fps) > 0.005
 
+    # Report the DISPLAYED size. Phone clips store a landscape frame (e.g. 1280x720)
+    # plus a 90/270 Display Matrix rotation, so players AND OpenCV show portrait
+    # (720x1280). The coded width/height would make a vertical 4K clip come out
+    # 2160x3840 instead of 1215x2160; swap them when the rotation is a quarter turn so
+    # eligibility, the SeedVR2 short-side target, and the cost estimate all use the
+    # size the pod actually decodes.
+    width = int(v.get("width") or 0)
+    height = int(v.get("height") or 0)
+    if _stream_rotation(v) in (90, 270):
+        width, height = height, width
+
     return VideoInfo(
         path=path,
-        width=int(v.get("width") or 0),
-        height=int(v.get("height") or 0),
+        width=width,
+        height=height,
         r_fps=r_fps,
         avg_fps=avg_fps,
         nb_frames=nb_frames,
