@@ -264,11 +264,17 @@ def _auto_batch(out_w, out_h, vram_gb, resident):
     return max(_BATCH_FLOOR, min(_BATCH_CAP, _to_4n1(raw)))
 
 
+_MIN_OVERLAP = 6                 # measured: 3 left a visible seam, 6 was undetectable
+
+
 def _auto_overlap(batch):
-    """Frames blended between batches, scaled to the window (~1/6 of it) so seams stay
-    hidden at any batch size. Clamped to [2, batch-1] (SeedVR2 silently disables an
-    overlap >= batch)."""
-    return max(2, min(batch - 1, round(batch / 6)))
+    """Frames blended between batches to HIDE the seam. This is a quality floor, not a
+    cost knob: too little (3) ruins the result, so never go below _MIN_OVERLAP (6),
+    growing ~batch/6 for very large windows, clamped below the batch. With a big batch
+    the fixed overlap is cheap (low redundancy); a tiny VRAM-forced batch pays more for
+    it, which is the right trade (quality over a hair of cost). Use a big-VRAM card so
+    the batch can be large and the overlap is nearly free."""
+    return min(batch - 1, max(_MIN_OVERLAP, round(batch / 6)))
 
 
 _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs

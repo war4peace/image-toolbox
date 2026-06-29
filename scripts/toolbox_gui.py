@@ -3765,9 +3765,10 @@ class SettingsTab(ttk.Frame):
         ov_cb = ttk.Combobox(sec, textvariable=self.video_overlap_var, state="readonly",
                              width=10, values=["Auto"] + [str(n) for n in range(0, 13)])
         ov_cb.grid(row=5, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(ov_cb, "Frames blended between batches to hide the seam. Auto scales it to "
-                       "the window (~1/6). 0 = hard cut (visible break every batch); higher "
-                       "= smoother but a bit more compute. The pod caps it below the batch.")
+        Tooltip(ov_cb, "Frames blended between batches to hide the seam (a quality floor, "
+                       "not a cost knob: 3 left a visible break, 6 was undetectable). Auto "
+                       "uses at least 6, more for large windows. 0 = hard cut. The pod caps "
+                       "it below the batch.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
