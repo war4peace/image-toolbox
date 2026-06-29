@@ -35,6 +35,7 @@ import math
 import time
 import shutil
 import hashlib
+import tempfile
 import datetime
 import argparse
 import threading
@@ -70,6 +71,14 @@ TARGET_RES = {"1080p": 1080, "1440p": 1440, "4K": 2160}
 # Per-target default temporal window (benchmark sweet spot; section 7). 4K's VRAM
 # plateau allows more but per-frame is flat past bs9, so a moderate window stands.
 DEFAULT_BATCH = {"1080p": 13, "1440p": 13, "4K": 5}
+# Frames blended between consecutive temporal batches. With 0, SeedVR2 denoises each
+# batch independently and hard-concatenates them, so a visible "break" shows every
+# batch_size frames (~3x/second at 30fps with bs13). A non-zero overlap makes the
+# stride batch_size - overlap and blends the seam away. 3 matches SeedVR2's own
+# examples; cost rises by ~ overlap/(batch-overlap). SeedVR2 clamps overlap >= batch
+# back to 0. Override per run with video.temporal_overlap (0 disables, restoring the
+# old hard-cut behaviour).
+DEFAULT_TEMPORAL_OVERLAP = 3
 
 WORK_DIRNAME = ".imgtbx_video"        # per-output-tree work area for segments
 
@@ -215,7 +224,11 @@ def resolve_video_cfg(cfg, overrides=None):
         "segment_seconds":     float(v.get("segment_seconds", 60) or 60),
         "max_segment_seconds": float(v.get("max_segment_seconds", 120) or 120),
         "batch_size":          int(v.get("batch_size", 0) or 0),
-        "temporal_overlap":    int(v.get("temporal_overlap", 0) or 0),
+        # Default to a non-zero overlap so batch boundaries don't show as seams; an
+        # explicit config 0 still disables it (preserve a deliberate hard-cut).
+        "temporal_overlap":    (int(v["temporal_overlap"])
+                                if v.get("temporal_overlap") is not None
+                                else DEFAULT_TEMPORAL_OVERLAP),
         "chunk_size":          int(v.get("chunk_size", 0) or 0),
         # opencv (SeedVR2 default, x264) unless 10-bit is asked for, which needs
         # the ffmpeg backend (x265 10-bit). Defaulting to opencv avoids a pod-side
@@ -606,11 +619,29 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 f"({len(remaining)} segment(s) left — resume to continue).")
             raise StopInstallment(cap)
 
-    # All segments done -> reassemble locally (concat + audio mux) and drift-check.
+    # All segments done -> reassemble (concat if >1 segment + audio mux) and
+    # drift-check. The mp4 WRITES are staged on LOCAL disk, never straight onto the
+    # (possibly network) output drive: finalizing an mp4 needs a seek-back to write
+    # the moov atom, which an SMB share can leave unwritten -> an unplayable "no
+    # codec" file (the segment fetch is a plain sequential write, so segments survive
+    # but the reassembled file doesn't). We build the final locally, verify it
+    # decodes, then move the finished bytes across (a plain copy, safe on any drive).
     up_paths = [os.path.join(up_dir, f"seg_{s.index:05d}.mp4") for s in segs]
-    concat_path = os.path.join(work_root, "concat.mp4")
-    vp.concat_segments(up_paths, concat_path)
-    vp.mux_audio(concat_path, src_abs, out_video, log=lambda m: log("    " + m.strip()))
+    stage = tempfile.mkdtemp(prefix="imgtbx_video_reasm_")
+    try:
+        if len(up_paths) == 1:
+            joined = up_paths[0]                  # one segment: concat is a no-op
+        else:
+            joined = os.path.join(stage, "concat.mp4")
+            vp.concat_segments(up_paths, joined)
+        staged_out = os.path.join(stage, "final" + (os.path.splitext(out_video)[1] or ".mp4"))
+        vp.mux_audio(joined, src_abs, staged_out, log=lambda m: log("    " + m.strip()))
+        stage_info = vp.probe(staged_out, count=True)
+        if not stage_info.nb_frames:              # fail loudly, never ship a dud
+            raise vp.FFmpegError(f"reassembled output has no decodable frames: {rel}")
+        shutil.move(staged_out, out_video)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
     out_info = vp.probe(out_video, count=True)
 
     seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel, target)]

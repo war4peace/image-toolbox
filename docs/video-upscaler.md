@@ -1053,6 +1053,46 @@ converted, not re-measured on a 16:9 clip), which is fine because the conversion
 exact for the dominant DiT cost; re-measure only if VAE encode (which does scale with
 input size) turns out to matter at the margin.
 
+**Estimate was 3x optimistic on real footage (observed 0.4.0).** A first real run
+(1080p -> 1440p, 760 frames, RTX PRO 6000 Workstation) took 5824 s = 7.66 s/frame =
+~2.08 s/output-MP, vs the benchmark's 0.71 s/MP: the benchmark `RATES` were taken on a
+tiny 320x240 synthetic clip and are simply too fast for real 1080p sources. This is not
+a bug (self-calibration `record_run` stored the real timing, so the next 1440p estimate
+on that card uses ~2.08), but the static table should be treated as a floor, not a
+prediction, until a few real runs season `gpu_perf`. Enabling `temporal_overlap` (below)
+also adds ~`overlap/(batch-overlap)` to the time, which self-calibration then absorbs.
+
+#### Quality fixes from the first real run (0.4.0)
+
+**Seams every `batch_size` frames = `temporal_overlap` defaulted to 0 (FIXED).** SeedVR2
+denoises video in temporal batches of `batch_size`; with `temporal_overlap=0` each batch
+is independent and hard-concatenated, so a visible "break" shows every `batch_size`
+frames (with bs13 at 30 fps, ~3x/second - exactly what the first run produced). The
+overlap was never set (not in config, not in the GUI), so it was 0 on every run.
+`batch` steps by `batch_size - overlap` and the overlap region is blended
+(`seedvr2/.../generation_phases.py:271, 973-995`). Fixed by defaulting
+`video.temporal_overlap` to `DEFAULT_TEMPORAL_OVERLAP = 3` in
+`batch_video_upscale.resolve_video_cfg` (an explicit config 0 still disables it).
+SeedVR2 clamps `overlap >= batch` back to 0.
+
+**Reassembled file unplayable on a network output drive (FIXED).** The first run wrote
+to a mapped SMB drive (X:). Finalizing an mp4 needs a seek-back to write the `moov`
+atom; over SMB that seek can be lost, leaving an unplayable "no codec shown" file - even
+though the per-segment files (written by a plain sequential pod->local fetch, no seek)
+play fine. Fixed in `process_job`: the concat + audio-mux now stage their mp4 writes in
+a **local** temp dir, the result is probed (`nb_frames > 0` or raise), and only then are
+the finished bytes `shutil.move`d to the output path (a plain copy, safe on any drive). A
+single-segment job also skips the concat demuxer entirely (mux straight from the lone
+segment).
+
+**Still open: the deliverable codec is mpeg4 (opencv backend).** The opencv
+`video_backend` writes segments (and therefore the `-c copy` deliverable) as cv2 `mp4v`
+= MPEG-4 Part 2, a low-quality 1990s codec that re-compresses the upscale and that
+Windows Explorer often can't read metadata for. The proper fix is to ship ffmpeg on the
+pod (`pod/provision.sh`) and default `video_backend` to `ffmpeg` (x264 CRF 12, or x265
+for 10-bit, via `FFMPEGVideoWriter`). Deferred: it changes pod provisioning, so confirm
+before doing it.
+
 ### 15.9 Settings additions (Settings -> Video)
 
 `confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the
