@@ -43,6 +43,12 @@ RATES = {
 # Target -> output SHORT side (px). Mirrors batch_video_upscale.TARGET_RES.
 SHORT_SIDE = {"1080p": 1080, "1440p": 1440, "4K": 2160}
 
+# Each target is a LANDSCAPE box the output must fit INSIDE: max width OR max height
+# (so a 4K clip plays 1:1 on a 3840x2160 screen). A portrait clip is therefore capped
+# by its HEIGHT, not by pinning its short side to the target (which pushed a vertical
+# clip to 3840 tall at "4K" = 2x the height and ~3x the pixels). 16:9 boxes.
+TARGET_BOX = {"1080p": (1920, 1080), "1440p": (2560, 1440), "4K": (3840, 2160)}
+
 # Output megapixels of the 4:3 benchmark clip per target (the denominator that turns
 # a benchmark s/frame into s/MP). 1440x1080, 1920x1440, 2880x2160.
 BENCH_OUT_MP = {"1080p": 1.5552, "1440p": 2.7648, "4K": 6.2208}
@@ -78,16 +84,33 @@ def map_gpu(gpu_id_or_name):
     return None
 
 
-def output_dims(src_w, src_h, target):
-    """The output (w, h) SeedVR2 produces for a source upscaled to `target`: the
-    SHORT side is pinned to the target, the long side follows the source aspect.
-    None if the source dimensions are unknown/invalid."""
-    ss = SHORT_SIDE.get(target)
-    short = min(src_w or 0, src_h or 0)
-    if not ss or short <= 0:
+def fit_scale(src_w, src_h, target):
+    """The scale that fits a (src_w x src_h) frame INSIDE the target's landscape box
+    (preserving aspect): min(box_w/w, box_h/h). >1 = an upscale, <1 = a downscale.
+    None if the dims or target are unknown."""
+    box = TARGET_BOX.get(target)
+    if not box or not src_w or not src_h:
         return None
-    scale = ss / short
-    return (round(src_w * scale), round(src_h * scale))
+    return min(box[0] / src_w, box[1] / src_h)
+
+
+def output_dims(src_w, src_h, target):
+    """The output (w, h) for a source upscaled to `target`: scaled to FIT the target
+    box (so a portrait clip is capped by height, a landscape one by width/height).
+    None if the source dimensions are unknown/invalid."""
+    s = fit_scale(src_w, src_h, target)
+    if s is None:
+        return None
+    return (round(src_w * s), round(src_h * s))
+
+
+def fit_short_side(src_w, src_h, target):
+    """The SeedVR2 `--resolution` (output SHORT side) that makes the output fit the
+    target box at the source aspect: the short side of output_dims. None if unknown.
+    For landscape this is the target height (e.g. 2160); for a portrait clip it is
+    smaller (the long side is what hits the box's height cap)."""
+    d = output_dims(src_w, src_h, target)
+    return min(d) if d else None
 
 
 def output_megapixels(src_w, src_h, target):

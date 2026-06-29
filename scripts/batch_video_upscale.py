@@ -434,14 +434,20 @@ def _work_dirs(out_video):
 # ─────────────────────────────────────────────
 
 def eligible_targets(width, height, skip_cutoff_pct=0):
-    """Targets whose short side is meaningfully ABOVE the source short side
-    (15.5). A 320x240 clip -> all three; a 1920x1080 clip -> 1440p/4K; a >=4K clip
-    -> none. Honours the skip-cutoff so a 'barely below' source is not offered."""
-    short = min(width, height) if width and height else 0
-    if not short:
+    """Targets whose landscape box the source must be UPSCALED to fill (15.5). Uses
+    the box-fit scale (max width OR max height), so orientation is handled: a portrait
+    1080x1920 clip is eligible for 4K (-> 1215x2160) but NOT 1440p (that would DOWNSCALE
+    its 1920 height to 1440). A 320x240 clip -> all three; a >=4K-filling clip -> none.
+    The skip-cutoff drops a 'barely below' source (needs < cutoff% upscaling)."""
+    if not width or not height:
         return []
-    return [t for t, res in TARGET_RES.items()
-            if short < res * (1 - skip_cutoff_pct / 100.0)]
+    import video_estimate as ve
+    out = []
+    for t in TARGET_RES:
+        s = ve.fit_scale(width, height, t)
+        if s is not None and s > 1.0 + skip_cutoff_pct / 100.0:
+            out.append(t)
+    return out
 
 
 def _output_path(output_root, rel, target):
@@ -529,11 +535,17 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     StopInstallment when a cap is hit mid-job (the rest stays pending, the job is
     marked 'partial')."""
     rel, target = job["rel_path"], job["target"]
-    resolution = TARGET_RES.get(target, 1080)
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
         os.path.join(source_root, vcfg["output_subdir"]), rel, target)
     info = vp.probe(src_abs, count=True)          # counted frames: CFR-mistag (14) + drift
+    # SeedVR2's --resolution is the output SHORT side. Compute it so the output FITS
+    # the target's landscape box (max width OR max height) at the source aspect: for a
+    # portrait clip the long side (height) hits the box cap, so the short side is < the
+    # target (a vertical 4K clip is 1215x2160, NOT 2160x3840). Falls back to the target
+    # short side if dims are unreadable.
+    import video_estimate as ve
+    resolution = ve.fit_short_side(info.width, info.height, target) or TARGET_RES.get(target, 1080)
     gui_event("VIDEO", {"rel": rel, "target": target, "index": index, "total": total,
                         "width": info.width, "height": info.height,
                         "frames": info.nb_frames})
