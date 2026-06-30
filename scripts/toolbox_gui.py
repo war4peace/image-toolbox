@@ -3065,9 +3065,9 @@ class UpscaleTab(ToolTab):
         self._paused = False
         self.pause_btn.configure(text="Pause")
         self.eta_var.set("—")
-        # The remote-pod telemetry row only makes sense during a remote run.
-        if self.remote_telemetry_row.winfo_manager():
-            self.remote_telemetry_row.grid_remove()
+        # The remote-pod telemetry row only makes sense during a remote run; hide it and
+        # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.
+        self.app.clear_remote_telemetry(self)
         # Surface the run's tally line (e.g. "65 processed, 850 already done,
         # 5 corrupted, …") on the top status row, above the closing message.
         self._final_top = self.console.find_last(r"\(\d+ processed")
@@ -7310,9 +7310,9 @@ class VideoTab(ttk.Frame):
         if self._run_tick_job is not None:
             self.after_cancel(self._run_tick_job)
             self._run_tick_job = None
-        # The remote-pod telemetry row only makes sense during a remote run.
-        if self.remote_telemetry_row.winfo_manager():
-            self.remote_telemetry_row.grid_remove()
+        # The remote-pod telemetry row only makes sense during a remote run; hide it and
+        # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.
+        self.app.clear_remote_telemetry(self)
 
     def _view_log(self):
         self.app.show_log(self.console, f"{APP_TITLE} — Video Upscaler output")
@@ -7828,6 +7828,26 @@ class App(tk.Tk):
             values[mqtt_publisher.SYS_REMOTE_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
         if values:
             self.mqtt_publish(values)
+
+    def clear_remote_telemetry(self, tab):
+        """Run ended / pod gone: hide the tab's remote-pod telemetry row and zero the
+        retained MQTT system/remote/* topics, so a terminated pod doesn't leave stale
+        non-zero CPU/RAM/VRAM/temp readings showing in Home Assistant."""
+        row = getattr(tab, "remote_telemetry_row", None)
+        if row is not None:
+            try:
+                if row.winfo_manager():
+                    row.grid_remove()
+            except Exception:
+                pass
+        self.mqtt_publish({
+            mqtt_publisher.SYS_REMOTE_CPU_TOPIC:            "0",
+            mqtt_publisher.SYS_REMOTE_RAM_TOPIC:            "0",
+            mqtt_publisher.SYS_REMOTE_RAM_TOTAL_TOPIC:      "0",
+            mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOPIC:       "0",
+            mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOTAL_TOPIC: "0",
+            mqtt_publisher.SYS_REMOTE_GPU_TEMP_TOPIC:       "0",
+        })
 
     def show_update_dialog(self, info):
         """Open (or focus) the single update dialog for the given UpdateInfo."""
