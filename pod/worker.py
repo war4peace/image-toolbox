@@ -269,20 +269,29 @@ def _fit_batch_to_frames(batch, frames, overlap):
     return _to_4n1_ceil(even_step + max(0, overlap)), overlap
 
 
-# Auto-tuner constants. WORKING_SET ~= FIXED + out_megapixels * (A + B*batch + C*batch^2)
-# for a RESIDENT 7B-fp16 run. FIXED is the resolution-independent floor (resident weights
-# + buffers, ~16 GB). The batch cost is SUPER-LINEAR: temporal attention grows ~O(batch^2),
-# so a plain linear fit (used briefly) under-predicted badly at large windows — it put
-# 1440p bs437 at ~119 GB when the real run hit ~171 GB (96% of a B200) and THRASHED the
-# allocator. The quadratic C term fixes that. Fitted to four B200 anchors (working set,
-# except bs437 = the observed 96% reserved/thrash point):
-#   4K bs33 = 152.9,  1440p bs33 = 77.0,  1440p bs121 = 86.1,  1440p bs437 = 171.0 GB.
-# SAFETY 0.80 sits below the proven-clean 4K bs33 (152.9 GB = 85%) and well above where
-# bs437 thrashed (96%), leaving ~20% free for the allocator to breathe. The model is used
-# both to size the AUTO batch AND to CLAMP an explicit pick that would exceed the budget
-# (see _max_vram_batch / _resolve_auto_params); OOM-recovery backstops any remaining miss.
-_VRAM_FIXED = 16.3           # resident weights + fixed buffers, independent of resolution
-_VRAM_A, _VRAM_B, _VRAM_C = 15.98, 0.01096, 0.000111
+# Auto-tuner constants. WORKING_SET ~= FIXED + out_megapixels * (A + B*batch + C*batch^2).
+# FIXED is the resolution-independent floor (resident weights + buffers). The batch cost is
+# SUPER-LINEAR: temporal attention grows ~O(batch^2), so a plain linear fit (used briefly)
+# under-predicted badly at large windows — it put 7B 1440p bs437 at ~119 GB when the real
+# run hit ~171 GB (96% of a B200) and THRASHED the allocator. The quadratic C term fixes that.
+#
+# The coefficients differ a LOT by MODEL family — 7B fp16 carries far heavier weights and
+# activations than the quantised 3B-Q8 — so they are kept as per-model PROFILES and selected
+# by dit_model. Using the 7B numbers for 3B over-predicted ~1.85x and crushed the batch to the
+# floor (an A100 1440p 3B run clamped to bs5); using none let 3B THRASH (bs153 1440p hit ~79 GB
+# / 99% on an 80 GB A100). A per-model profile is the fix.
+#   7B: fit on four B200 7B-fp16 anchors (working set, bs437 = the 96% reserved/thrash point):
+#       4K bs33 = 152.9,  1440p bs33 = 77.0,  1440p bs121 = 86.1,  1440p bs437 = 171.0 GB.
+#   3B: fit on 3B-Q8 anchors — 1440p portrait 1.17 MP bs153 = 33.0 GB (clean peak); landscape
+#       3.69 MP bs9 ~41 GB (live) and bs153 ~79 GB (thrash on 80 GB). PROVISIONAL: refine with
+#       more clean peak-working-set lines. 3B fp16 is a touch heavier but close enough to share.
+# SAFETY 0.80 leaves ~20% free for the allocator to breathe (7B 4K bs33 ran clean at 85%, and
+# bs437 thrashed at 96%). The model sizes the AUTO batch AND clamps a too-big explicit pick;
+# OOM-recovery backstops any remaining miss.
+_VRAM_PROFILES = {       # model family -> (FIXED, A, B, C)
+    "7b": (16.3, 15.98, 0.01096, 0.000111),
+    "3b": (12.6, 7.15,  0.060,   0.000047),
+}
 _VRAM_SAFETY = 0.80          # max working-set fraction of the card (allocator thrashes near 1.0)
 _BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknown content on
                              # any card. Bigger windows add temporal consistency (SeedVR2's
@@ -291,35 +300,31 @@ _BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknow
 _BATCH_FLOOR = 5             # below this a temporal window barely helps
 
 
-def _ws_gb(mp, batch):
-    """Predicted working set (GB) for an output of `mp` megapixels at `batch` frames."""
-    return _VRAM_FIXED + mp * (_VRAM_A + _VRAM_B * batch + _VRAM_C * batch * batch)
+def _vram_profile(model):
+    """The (FIXED, A, B, C) VRAM coefficients for a dit_model. Matches the 3B family (incl.
+    GGUF quants) by name; the 7B family and any UNKNOWN model fall back to the heavier 7B
+    profile, which over-estimates safely rather than risking a thrash."""
+    return _VRAM_PROFILES["3b"] if "3b" in (model or "").lower() else _VRAM_PROFILES["7b"]
 
 
-def _vram_model_calibrated(model):
-    """The VRAM coefficients above are fit to 7B fp16. ONLY that family may be
-    predictively clamped: for any other model (e.g. 3B / a GGUF quant) the prediction
-    badly OVER-estimates (measured 3B-Q8 at 1440p used ~41 GB where the 7B model
-    predicted ~75 GB), which would crush the batch to the floor. For an uncalibrated
-    model we don't clamp at all and let the user's explicit pick stand, with OOM
-    auto-recovery as the backstop (same philosophy as not silently substituting GPUs).
-    Unknown/blank model -> assume the calibrated 7B default."""
-    m = (model or "").lower()
-    return (not m) or ("7b" in m)
+def _ws_gb(mp, batch, model=None):
+    """Predicted working set (GB) for an output of `mp` megapixels at `batch` frames, using
+    the VRAM profile for `model`."""
+    f, a, b, c = _vram_profile(model)
+    return f + mp * (a + b * batch + c * batch * batch)
 
 
 def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
-    """Largest 4n+1 batch whose predicted working set fits the SAFETY budget for this
-    card + output size. Returns a big sentinel when dims/VRAM are unknown OR the model
-    is not VRAM-calibrated (can't trust a prediction -> don't clamp; OOM-recovery
-    backstops). This is the VRAM ceiling, separate from the continuity cap _BATCH_CAP."""
+    """Largest 4n+1 batch whose predicted working set (for this card + output + MODEL) fits
+    the SAFETY budget. Returns a big sentinel when dims/VRAM are unknown (can't measure ->
+    don't clamp; OOM-recovery backstops). The VRAM ceiling, separate from _BATCH_CAP."""
     mp = (out_w * out_h) / 1_000_000.0
-    if mp <= 0 or vram_gb <= 0 or not _vram_model_calibrated(model):
+    if mp <= 0 or vram_gb <= 0:
         return 997
     budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
     best, b = _BATCH_FLOOR, _BATCH_FLOOR
     while b <= 997:
-        if _ws_gb(mp, b) <= budget:
+        if _ws_gb(mp, b, model) <= budget:
             best = b
             b += 4
         else:
@@ -483,7 +488,7 @@ def _resolve_auto_params(job, params):
              f"vram {vram:.0f}GB, vmax {vmax}, resident={resident}, model={model})")
     elif params["batch_size"] > vmax:
         _log(f"batch {params['batch_size']} exceeds the VRAM budget (out {out_w}x{out_h}, "
-             f"vram {vram:.0f}GB) -> clamped to {vmax} (~{_ws_gb((out_w*out_h)/1e6, vmax):.0f}GB "
+             f"vram {vram:.0f}GB) -> clamped to {vmax} (~{_ws_gb((out_w*out_h)/1e6, vmax, model):.0f}GB "
              f"working set); avoids the near-full allocator thrash.")
         params["batch_size"] = vmax
     if params["temporal_overlap"] < 0:
