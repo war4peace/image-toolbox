@@ -413,14 +413,13 @@ class _HeartbeatTee:
                 if frames > 0:
                     self._job["live_spf"] = round((now - self._last_bt) / frames, 2)
             tc = int(self._job.get("total_chunks") or 1)
-            if mtot > 0 and tc > 0:
-                # TODO(progress, single-batch): when the whole clip is ONE batch (mtot==1,
-                # tc==1) this is 1/1 = 100% the instant the batch STARTS, then that batch
-                # runs for the entire clip with no finer signal, so the GUI bar pins at
-                # 100% / ETA 0:00 for the whole run. Multi-batch/multi-chunk runs are fine.
-                # Fix later: for a single batch, fall back to the time-based estimate, or
-                # mine the per-batch denoise-step tqdm (the sampler bar) for sub-batch
-                # progress. Keep it fail-safe.
+            # A SINGLE batch over a single chunk (mtot==1, tc==1) has no within-run signal:
+            # "Upscaling batch 1/1" means the whole-clip batch STARTED, not finished, and
+            # SeedVR2 is a 1-step sampler so there's nothing finer to mine. Reporting it
+            # would pin the bar at 100% for the whole run, so we leave frames_processed
+            # unset and let the GUI's time-based estimate drive the bar. Multi-batch or
+            # multi-chunk runs do report — their N/M (scoped to the chunk) is real progress.
+            if mtot > 1 or tc > 1:
                 frac = min(1.0, (self._chunks_done + n / mtot) / tc)
                 self._job["frames_processed"] = min(total, int(round(frac * total)))
             self._last_bn, self._last_bt = n, now
