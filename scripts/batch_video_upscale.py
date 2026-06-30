@@ -190,8 +190,19 @@ class StopInstallment(Exception):
     Stop; the rest stays `pending`/`partial` and resumes next run."""
 
 
-# Set when the GUI sends "q" on stdin (Stop). Checked between segments so a Stop
-# finishes the current segment, then tears the pod down (15.3 step 8).
+# Mid-segment Stop signal raised by the remote engine's poll loop. Imported guarded so
+# the headless / passthrough paths still load without the remote stack; the fallback
+# never matches a real stop (only the remote engine raises the real class).
+try:
+    from remote_video_engine import RemoteVideoStopped as _RemoteVideoStopped
+except Exception:                                  # pragma: no cover
+    class _RemoteVideoStopped(Exception):
+        pass
+
+
+# Set when the GUI sends "q" on stdin (Stop). Now checked DURING a segment too (the
+# remote engine polls _STOP.is_set), so Stop aborts a long segment within a poll
+# interval and tears the pod down, instead of waiting for the whole segment.
 _STOP = threading.Event()
 
 
@@ -241,6 +252,14 @@ def resolve_video_cfg(cfg, overrides=None):
         "seed":                v.get("seed"),               # None = per-video stable seed
         "per_run_minute_cap":  float(v.get("per_run_minute_cap", 0) or 0),
         "per_run_cost_cap":    float(v.get("per_run_cost_cap", 0) or 0),
+        # SeedVR2 quality/speed knobs the pod applies (video path only). compile:
+        # torch.compile the DiT+VAE (20-40% faster after the first segment pays a
+        # one-time compile cost; safe because our segments share one fixed shape).
+        # uniform_batch_size: pad the ragged final batch so it can't flicker.
+        # input_noise_scale: >0 counters 4K over-smoothing (default 0 = off).
+        "compile":             bool(v.get("compile", True)),
+        "uniform_batch_size":  bool(v.get("uniform_batch_size", True)),
+        "input_noise_scale":   float(v.get("input_noise_scale", 0.0) or 0.0),
     }
     if out["use_10bit"]:
         out["video_backend"] = "ffmpeg"
@@ -267,6 +286,10 @@ def log_video_settings(vcfg):
     log(f"    backend {vcfg['video_backend']}, "
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'}, "
         f"output subdir '{vcfg['output_subdir']}'")
+    noise = float(vcfg.get("input_noise_scale", 0.0) or 0.0)
+    log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
+        f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
+        f"input noise {noise if noise > 0 else 'off'}")
 
 
 def resolve_batch(vcfg, target):
@@ -396,7 +419,7 @@ class PassthroughVideoEngine:
     def process_segment(self, src_path, dest_path, *, resolution, batch_size,
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
-                        poll_interval=0, on_progress=None):
+                        poll_interval=0, on_progress=None, should_stop=None):
         ffmpeg, _ = vp.find_ffmpeg()
         t0 = time.time()
         # mjpeg/h264 -> mp4 with -c copy keeps it lossless and fast; the real
@@ -594,7 +617,10 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # through and log what the pod chose when it reports back (see _progress).
     batch = int(vcfg.get("batch_size", 0) or 0)        # 0 = auto
     overlap = int(vcfg["temporal_overlap"])            # -1 = auto
-    chunk = resolve_chunk(vcfg, batch) if batch > 0 else 0
+    # Defer chunk to the pod: it knows the segment's real frame count and the final
+    # (frame-fitted) batch, so it sizes chunks to give whole-clip single passes / even
+    # batches without a ragged tail. See worker _resolve_auto_params / _fit_batch_to_frames.
+    chunk = 0
     seed = per_video_seed(vcfg, rel)
     log(f"    SeedVR2: short-side {resolution}px, "
         f"batch_size {batch if batch > 0 else 'auto'}, "
@@ -616,9 +642,16 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             rb = st.get("resolved_batch")
             if rb and not _resolved_logged[0]:       # the pod reported its auto choices
                 _resolved_logged[0] = True
+                _noise = st.get("input_noise")
+                _chunk = st.get("resolved_chunk") or 0
+                _nb = -(-_tot // _chunk) if _chunk else 0    # ~batches over this segment
+                _btxt = f", ~{_nb} batch(es) over {_tot}f" if _nb else ""
                 log(f"    (pod resolved: batch_size {rb}, "
-                    f"temporal_overlap {st.get('resolved_overlap')}, "
-                    f"attention {st.get('resolved_attention') or '?'})")
+                    f"temporal_overlap {st.get('resolved_overlap')}{_btxt}, "
+                    f"attention {st.get('resolved_attention') or '?'}, "
+                    f"compile {'on' if st.get('compile_dit') else 'off'}, "
+                    f"uniform {'on' if st.get('uniform_batch') else 'off'}, "
+                    f"noise {_noise if _noise else 'off'})")
             pa = st.get("peak_alloc_gb")
             if pa is not None and not _peak_logged[0]:
                 _peak_logged[0] = True
@@ -629,6 +662,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                                   "state": st.get("state"),
                                   "frames_processed": st.get("frames_processed"),
                                   "seg_frames": _tot,
+                                  "live_spf": st.get("live_spf"),
                                   "output_bytes": st.get("output_bytes")})
 
         _progress({"state": "running"})
@@ -636,7 +670,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             s.path, up_path, resolution=resolution, batch_size=batch,
             chunk_size=chunk, temporal_overlap=overlap,
             seed=seed, video_backend=vcfg["video_backend"],
-            use_10bit=vcfg["use_10bit"], on_progress=_progress)
+            use_10bit=vcfg["use_10bit"], on_progress=_progress,
+            should_stop=_STOP.is_set)        # responsive Stop: abort the poll mid-segment
         secs = getattr(engine, "last_segment_seconds", None)
         db.upsert_video_segment(conn, root_id, rel, target, s.index, status="done",
                                 out_frames=n, output_path=up_path, seconds=secs)
@@ -764,6 +799,12 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         except StopInstallment as exc:
             stopped = str(exc)
             break
+        except _RemoteVideoStopped:                    # responsive Stop, mid-segment
+            db.upsert_video_output(conn, root_id, rel, target, status="partial")
+            log(f"[{idx}/{total}] STOPPED {rel} -> {target} "
+                f"(aborted mid-segment; pod will be torn down).")
+            stopped = "stopped by user"
+            break
         except Exception as exc:                       # noqa: BLE001 — log, keep going
             failed += 1
             db.upsert_video_output(conn, root_id, rel, target, status="failed",
@@ -850,7 +891,17 @@ def main(argv=None):
             engine = PassthroughVideoEngine()
         else:
             from remote_run import RemoteSession
-            session = RemoteSession(cfg.get("runpod", {}), cfg.get("upscale", {}),
+            # The pod's SeedVR2 engine reads the image upscale config; overlay the
+            # video-only quality/speed knobs so they apply on the video pod without
+            # changing the Batch Upscaler's behaviour. Engine flag names (see
+            # upscale_engine._build_args): compile_dit/compile_vae, uniform_batch_size,
+            # input_noise_scale.
+            worker_cfg = dict(cfg.get("upscale", {}))
+            worker_cfg["compile_dit"]        = vcfg["compile"]
+            worker_cfg["compile_vae"]        = vcfg["compile"]
+            worker_cfg["uniform_batch_size"] = vcfg["uniform_batch_size"]
+            worker_cfg["input_noise_scale"]  = vcfg["input_noise_scale"]
+            session = RemoteSession(cfg.get("runpod", {}), worker_cfg,
                                     APP_ROOT, on_event=log, mode="video")
             engine = session.start()
             budget.cost_per_hr = session.cost_per_hr

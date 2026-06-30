@@ -240,28 +240,89 @@ def _to_4n1(x):
     return 4 * n + 1
 
 
-# Auto-tuner constants. VRAM_USED ~= out_megapixels * (A + B * batch) for a RESIDENT
-# 7B-fp16 run, fitted to measured anchors (RTX PRO 6000 96 GB: 4K 4:3 bs5 = 81 GB;
-# B200 180 GB: 4K 16:9 bs33 = 172 GB). The 1440p plateau (~75 GB at bs33 16:9) checks
-# out. Errs a touch high so the SAFETY margin + OOM auto-recovery cover the rest.
-_VRAM_A, _VRAM_B = 11.69, 0.2746
-_VRAM_SAFETY = 0.80          # use at most this fraction of the card before OOM-recovery
-_BATCH_CAP = 33              # continuity gains flatten past here; throughput is flat past ~9
+def _to_4n1_ceil(x):
+    """Smallest valid SeedVR2 batch (4n+1: 1,5,9,…) that is >= x."""
+    n = max(0, (int(x) + 2) // 4)        # ceil((x-1)/4)
+    return 4 * n + 1
+
+
+def _fit_batch_to_frames(batch, frames, overlap):
+    """Snap a requested batch to the segment's actual frame count so we never waste
+    compute or leave a tiny ragged final batch. Two cases:
+
+      * batch covers the whole segment (batch >= frames): collapse to ONE batch — the
+        nearest 4n+1 >= frames, with overlap 0 (a single pass has no seam to blend, and
+        no neighbour to overlap). This is the "whole shot in one batch" the user wants.
+      * otherwise: split the segment into N EVEN batches, where N is the fewest the
+        requested batch allows (N = ceil(frames / stride)); the new batch is the even
+        stride + overlap, rounded UP to a 4n+1 so N batches still cover the segment.
+        e.g. 1205 frames @ requested 501 -> 3 even batches (~409), not 501+501+203.
+
+    Only ever shrinks the batch, so VRAM is never increased. Returns (batch, overlap)."""
+    if batch <= 0 or frames <= 0:
+        return batch, overlap            # auto / unknown: leave for the caller to size
+    if batch >= frames:
+        return _to_4n1_ceil(frames), 0   # whole segment in a single batch
+    step = max(1, batch - max(0, overlap))
+    n = max(1, -(-frames // step))       # ceil: fewest batches at this requested window
+    even_step = -(-frames // n)          # ceil: even stride across N batches
+    return _to_4n1_ceil(even_step + max(0, overlap)), overlap
+
+
+# Auto-tuner constants. WORKING_SET ~= FIXED + out_megapixels * (A + B*batch + C*batch^2)
+# for a RESIDENT 7B-fp16 run. FIXED is the resolution-independent floor (resident weights
+# + buffers, ~16 GB). The batch cost is SUPER-LINEAR: temporal attention grows ~O(batch^2),
+# so a plain linear fit (used briefly) under-predicted badly at large windows — it put
+# 1440p bs437 at ~119 GB when the real run hit ~171 GB (96% of a B200) and THRASHED the
+# allocator. The quadratic C term fixes that. Fitted to four B200 anchors (working set,
+# except bs437 = the observed 96% reserved/thrash point):
+#   4K bs33 = 152.9,  1440p bs33 = 77.0,  1440p bs121 = 86.1,  1440p bs437 = 171.0 GB.
+# SAFETY 0.80 sits below the proven-clean 4K bs33 (152.9 GB = 85%) and well above where
+# bs437 thrashed (96%), leaving ~20% free for the allocator to breathe. The model is used
+# both to size the AUTO batch AND to CLAMP an explicit pick that would exceed the budget
+# (see _max_vram_batch / _resolve_auto_params); OOM-recovery backstops any remaining miss.
+_VRAM_FIXED = 16.3           # resident weights + fixed buffers, independent of resolution
+_VRAM_A, _VRAM_B, _VRAM_C = 15.98, 0.01096, 0.000111
+_VRAM_SAFETY = 0.80          # max working-set fraction of the card (allocator thrashes near 1.0)
+_BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknown content on
+                             # any card. Bigger windows add temporal consistency (SeedVR2's
+                             # ideal is batch = shot length); a manual override can go far
+                             # higher (the GUI offers up to 501), VRAM-clamped to what fits.
 _BATCH_FLOOR = 5             # below this a temporal window barely helps
+
+
+def _ws_gb(mp, batch):
+    """Predicted working set (GB) for an output of `mp` megapixels at `batch` frames."""
+    return _VRAM_FIXED + mp * (_VRAM_A + _VRAM_B * batch + _VRAM_C * batch * batch)
+
+
+def _max_vram_batch(out_w, out_h, vram_gb, resident):
+    """Largest 4n+1 batch whose predicted working set fits the SAFETY budget for this
+    card + output size. Returns a big sentinel when dims/VRAM are unknown (can't measure
+    -> don't clamp; OOM-recovery backstops). This is the VRAM ceiling, separate from the
+    continuity cap _BATCH_CAP."""
+    mp = (out_w * out_h) / 1_000_000.0
+    if mp <= 0 or vram_gb <= 0:
+        return 997
+    budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
+    best, b = _BATCH_FLOOR, _BATCH_FLOOR
+    while b <= 997:
+        if _ws_gb(mp, b) <= budget:
+            best = b
+            b += 4
+        else:
+            break
+    return best
 
 
 def _auto_batch(out_w, out_h, vram_gb, resident):
     """Pick the largest safe temporal window (4n+1) for an output of out_w x out_h on
-    a card with vram_gb. Bigger = better continuity + fewer seams (throughput is flat
-    past ~9), so we take the most the VRAM budget allows, capped where continuity
-    stops improving. OOM auto-recovery backstops an optimistic guess. Returns a 4n+1
-    in [_BATCH_FLOOR, _BATCH_CAP]; a safe 13 if dims/VRAM are unknown."""
-    mp = (out_w * out_h) / 1_000_000.0
-    if mp <= 0 or vram_gb <= 0:
+    a card with vram_gb: the most the VRAM budget allows, capped at _BATCH_CAP where
+    continuity gains flatten. OOM auto-recovery backstops an optimistic guess. Returns a
+    safe 13 if dims/VRAM are unknown."""
+    if (out_w * out_h) <= 0 or vram_gb <= 0:
         return 13
-    budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
-    raw = (budget / mp - _VRAM_A) / _VRAM_B        # invert the VRAM model for batch
-    return max(_BATCH_FLOOR, min(_BATCH_CAP, _to_4n1(raw)))
+    return max(_BATCH_FLOOR, min(_BATCH_CAP, _max_vram_batch(out_w, out_h, vram_gb, resident)))
 
 
 _MIN_OVERLAP = 6                 # measured: 3 left a visible seam, 6 was undetectable
@@ -278,6 +339,7 @@ def _auto_overlap(batch):
 
 
 _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
+_UPSCALE_BATCH_RE = re.compile(r"Upscaling batch\s+(\d+)\s*/\s*(\d+)")  # DiT phase, per batch
 
 
 class _HeartbeatTee:
@@ -297,6 +359,9 @@ class _HeartbeatTee:
     def __init__(self, real, job):
         self._real = real
         self._job = job
+        self._last_bn = 0          # last DiT batch index seen (for live s/frame timing)
+        self._last_bt = None       # wall-clock when that batch line arrived
+        self._chunks_done = 0      # streaming chunks whose DiT phase has finished
 
     def write(self, s):
         try:
@@ -319,6 +384,46 @@ class _HeartbeatTee:
                 # Frame-scaled bar: denominator ~= the segment frame count.
                 if tot > 0 and abs(tot - total) <= max(2, int(total * 0.05)):
                     self._job["frames_processed"] = min(n, total)
+        except Exception:
+            pass
+        # The DiT phase prints "Upscaling batch N/M" per batch (force=True), where M is
+        # the batch count of the CURRENT streaming chunk (it restarts each chunk). It's
+        # the dominant, compile-affected phase, so we mine those lines for (a) a frame
+        # bar and (b) a LIVE seconds/frame. The bar must stay MONOTONIC across chunks:
+        # N/M alone restarts 0->100% every chunk, so we scope it to this chunk's slice
+        # of the run -> (chunks_done + N/M) / total_chunks. The live s/frame is the gap
+        # between consecutive in-chunk batches / the frames each contributes
+        # (stride = batch - overlap); the first batch carries the one-time torch.compile
+        # cost, so its number is high then drops — the warm-up the user wants to watch.
+        # Fail-safe: any parse miss just leaves the old time-based bar.
+        try:
+            bm = _UPSCALE_BATCH_RE.search(s)
+            if not bm:
+                return
+            n, mtot = int(bm.group(1)), int(bm.group(2))
+            now = time.time()
+            reset = n <= self._last_bn        # index went backwards -> a new chunk began
+            if reset:
+                self._chunks_done += 1
+            batch = int(self._job.get("resolved_batch") or 0)
+            overlap = int(self._job.get("resolved_overlap") or 0)
+            stride = max(1, batch - overlap) if batch else 1
+            if not reset and self._last_bt is not None and n > self._last_bn:
+                frames = (n - self._last_bn) * stride
+                if frames > 0:
+                    self._job["live_spf"] = round((now - self._last_bt) / frames, 2)
+            tc = int(self._job.get("total_chunks") or 1)
+            if mtot > 0 and tc > 0:
+                # TODO(progress, single-batch): when the whole clip is ONE batch (mtot==1,
+                # tc==1) this is 1/1 = 100% the instant the batch STARTS, then that batch
+                # runs for the entire clip with no finer signal, so the GUI bar pins at
+                # 100% / ETA 0:00 for the whole run. Multi-batch/multi-chunk runs are fine.
+                # Fix later: for a single batch, fall back to the time-based estimate, or
+                # mine the per-batch denoise-step tqdm (the sampler bar) for sub-batch
+                # progress. Keep it fail-safe.
+                frac = min(1.0, (self._chunks_done + n / mtot) / tc)
+                self._job["frames_processed"] = min(total, int(round(frac * total)))
+            self._last_bn, self._last_bt = n, now
         except Exception:
             pass
 
@@ -346,33 +451,64 @@ def _empty_cuda_cache():
 
 
 def _resolve_auto_params(job, params):
-    """Fill in batch_size / temporal_overlap when the caller asked for AUTO
-    (batch_size <= 0, temporal_overlap < 0): pick the window from the segment's
-    OUTPUT size and this card's real VRAM, and scale the overlap to it. An explicit
-    value from the caller is left untouched (the Advanced override)."""
+    """Fill in batch_size / temporal_overlap. AUTO batch (<=0) is sized from the
+    segment's OUTPUT size and this card's real VRAM. An EXPLICIT (Advanced override)
+    batch is honoured but VRAM-CLAMPED: a pick whose predicted working set exceeds the
+    SAFETY budget is reduced to the largest that fits, so a too-big manual value can't
+    drive the card to the thrash zone (what bs437 did). Overlap is scaled to the batch."""
+    in_w, in_h = _video_dims(job["input"])
+    short = min(in_w, in_h) if in_w and in_h else 0
+    scale = (params["resolution"] / short) if short else 1.0
+    out_w, out_h = round(in_w * scale), round(in_h * scale)
+    resident = bool(getattr(_ENGINE, "resident", False))
+    vram = _vram_total_gb()
+    vmax = _max_vram_batch(out_w, out_h, vram, resident)   # VRAM ceiling for this card+output
     if params["batch_size"] <= 0:
-        in_w, in_h = _video_dims(job["input"])
-        short = min(in_w, in_h) if in_w and in_h else 0
-        scale = (params["resolution"] / short) if short else 1.0
-        out_w, out_h = round(in_w * scale), round(in_h * scale)
-        resident = bool(getattr(_ENGINE, "resident", False))
-        params["batch_size"] = _auto_batch(out_w, out_h, _vram_total_gb(), resident)
+        params["batch_size"] = _auto_batch(out_w, out_h, vram, resident)
         job["auto_batch"] = True
         _log(f"auto batch -> {params['batch_size']} (out {out_w}x{out_h}, "
-             f"vram {_vram_total_gb():.0f}GB, resident={resident})")
-    if params["chunk_size"] <= 0:
-        # Stream in ~90-frame chunks rounded to a whole number of batches (RAM-bound,
-        # no quality effect); MUST be > 0 so frames stream out instead of ballooning.
-        b = max(1, params["batch_size"])
-        params["chunk_size"] = b * max(1, round(90 / b))
+             f"vram {vram:.0f}GB, vmax {vmax}, resident={resident})")
+    elif params["batch_size"] > vmax:
+        _log(f"batch {params['batch_size']} exceeds the VRAM budget (out {out_w}x{out_h}, "
+             f"vram {vram:.0f}GB) -> clamped to {vmax} (~{_ws_gb((out_w*out_h)/1e6, vmax):.0f}GB "
+             f"working set); avoids the near-full allocator thrash.")
+        params["batch_size"] = vmax
     if params["temporal_overlap"] < 0:
         params["temporal_overlap"] = _auto_overlap(params["batch_size"])
         _log(f"auto temporal_overlap -> {params['temporal_overlap']}")
+    # Fit the batch to the segment's real frame count: a window >= the clip collapses to
+    # one seam-free pass; a window the clip exceeds is evened out so there's no tiny
+    # ragged final batch. Only ever shrinks the batch (VRAM never rises). Applies to both
+    # auto and explicit (Advanced override) batches.
+    frames = int(job.get("total_frames") or 0)
+    fb, fo = _fit_batch_to_frames(params["batch_size"], frames, params["temporal_overlap"])
+    if (fb, fo) != (params["batch_size"], params["temporal_overlap"]):
+        _log(f"fit batch to {frames} frames: batch {params['batch_size']} -> {fb}, "
+             f"overlap {params['temporal_overlap']} -> {fo}")
+        params["batch_size"], params["temporal_overlap"] = fb, fo
+    if params["chunk_size"] <= 0:
+        # Size streaming chunks (RAM-bound; MUST be > 0 so frames stream out). The whole
+        # clip in one batch -> one chunk; a big window -> one batch per chunk (so the even
+        # split holds, since each chunk prepends `overlap` context); otherwise the default
+        # ~90-frame chunks (several small batches per chunk, no quality effect).
+        b, o = params["batch_size"], params["temporal_overlap"]
+        if frames and b >= frames:
+            params["chunk_size"] = b
+        elif b > 89:
+            params["chunk_size"] = max(1, b - o)
+        else:
+            params["chunk_size"] = b * max(1, round(90 / b))
     # SeedVR2 silently resets overlap >= batch to 0; clamp so it never disables.
     if params["temporal_overlap"] >= params["batch_size"]:
         params["temporal_overlap"] = max(0, params["batch_size"] - 1)
     job["resolved_batch"] = params["batch_size"]
     job["resolved_overlap"] = params["temporal_overlap"]
+    job["resolved_chunk"] = params["chunk_size"]
+    if frames:
+        nb = -(-frames // max(1, params["chunk_size"]))
+        _log(f"resolved window: batch {params['batch_size']}, overlap "
+             f"{params['temporal_overlap']}, chunk {params['chunk_size']} -> "
+             f"~{nb} batch(es) over {frames} frames")
 
 
 def _run_video_job(job, params):
@@ -388,6 +524,12 @@ def _run_video_job(job, params):
     _touch(_HEARTBEAT)
     tee = _HeartbeatTee(sys.stdout, job)
     _resolve_auto_params(job, params)
+    # How many streaming chunks the engine will read (ceil of frames / chunk). The
+    # progress parser needs this because the per-chunk DiT bar restarts at each chunk,
+    # so a frame count is only monotonic when scoped to (this chunk of total_chunks).
+    ch = int(params.get("chunk_size") or 0)
+    tf = int(job.get("total_frames") or 0)
+    job["total_chunks"] = ((tf + ch - 1) // ch) if (ch > 0 and tf > ch) else 1
     try:
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             with _GPU_LOCK:
@@ -699,8 +841,13 @@ class Handler(BaseHTTPRequestHandler):
             "error":            job.get("error"),
             "resolved_batch":   job.get("resolved_batch"),
             "resolved_overlap": job.get("resolved_overlap"),
+            "resolved_chunk":   job.get("resolved_chunk"),
             "resolved_attention": getattr(getattr(_ENGINE, "args", None),
                                           "attention_mode", None),
+            "compile_dit":      getattr(getattr(_ENGINE, "args", None), "compile_dit", None),
+            "uniform_batch":    getattr(getattr(_ENGINE, "args", None), "uniform_batch_size", None),
+            "input_noise":      getattr(getattr(_ENGINE, "args", None), "input_noise_scale", None),
+            "live_spf":         job.get("live_spf"),
             "peak_alloc_gb":    job.get("peak_alloc_gb"),
             "peak_reserved_gb": job.get("peak_reserved_gb"),
         }).encode()

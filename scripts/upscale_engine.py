@@ -192,6 +192,22 @@ class UpscaleEngine:
         if settings.get("decode_tiled", False):
             argv += ["--vae_decode_tiled",
                      "--vae_decode_tile_size", str(settings.get("decode_tile_size", 1024))]
+        # Video-path quality/speed knobs (set only on the Video Upscaler's pod, so
+        # the image path is unaffected). torch.compile: a one-time compile cost on
+        # the first segment, then 20-40% faster DiT every segment after — worth it
+        # because our segments share one fixed shape (uniform_batch_size keeps it
+        # constant, so it never recompiles). uniform_batch_size pads the ragged
+        # final batch so it can't flicker. input_noise_scale (>0) counters 4K
+        # over-smoothing. All default off on the image path (keys absent there).
+        if settings.get("compile_dit"):
+            argv += ["--compile_dit"]
+        if settings.get("compile_vae"):
+            argv += ["--compile_vae"]
+        if settings.get("uniform_batch_size"):
+            argv += ["--uniform_batch_size"]
+        noise = float(settings.get("input_noise_scale", 0.0) or 0.0)
+        if noise > 0:
+            argv += ["--input_noise_scale", str(noise)]
 
         saved_argv = sys.argv
         sys.argv = argv

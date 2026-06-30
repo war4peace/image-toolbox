@@ -31,6 +31,14 @@ class RemoteVideoError(Exception):
     pass
 
 
+class RemoteVideoStopped(RemoteVideoError):
+    """Raised when the caller's should_stop() asks to abort while polling a segment,
+    so a Stop tears the (disposable) pod down within a poll interval instead of waiting
+    for a long segment to finish on its own. There is no on-pod 'abort batch' message —
+    killing the pod is the abort, which the runner's teardown (session.close) does."""
+    pass
+
+
 class RemoteVideoEngine(RemoteUpscaleEngine):
     """Stream video segments to a pod worker in `video` mode over an ssh -L
     tunnel. Reuses RemoteUpscaleEngine for the tunnel/health/telemetry/close."""
@@ -50,13 +58,15 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
     def process_segment(self, src_path, dest_path, *, resolution, batch_size,
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
-                        poll_interval=5, on_progress=None):
+                        poll_interval=5, on_progress=None, should_stop=None):
         """Upscale one segment file on the pod and write the result to dest_path
         atomically. Returns the number of frames the worker wrote. Raises
         RemoteVideoError on a worker error, a lost job, or a dropped tunnel.
 
         `on_progress(status_dict)` (optional) is called after each status poll so
-        the caller can surface live segment progress."""
+        the caller can surface live segment progress. `should_stop` (optional) is a
+        predicate polled each iteration; when it returns True the wait aborts with
+        RemoteVideoStopped so a Stop is responsive even mid-segment."""
         with open(src_path, "rb") as f:
             data = f.read()
         ext = os.path.splitext(src_path)[1] or ".mkv"
@@ -64,7 +74,7 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         self.last_segment_seconds = None
         job_id = self._submit(data, ext, resolution, batch_size, chunk_size,
                               temporal_overlap, seed, video_backend, use_10bit)
-        frames = self._await(job_id, poll_interval, on_progress)
+        frames = self._await(job_id, poll_interval, on_progress, should_stop)
         out = self._fetch(job_id)
 
         ext_out = ".mp4"
@@ -108,13 +118,17 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
             raise RemoteVideoError(f"worker returned no job id: {info}")
         return job_id
 
-    def _await(self, job_id, poll_interval, on_progress):
+    def _await(self, job_id, poll_interval, on_progress, should_stop=None):
         """Poll /video/status until the job leaves the running state. A handful of
         consecutive poll failures (a brief tunnel hiccup) are tolerated; a sustained
-        outage or a job the worker no longer knows about raises."""
+        outage or a job the worker no longer knows about raises. A `should_stop` that
+        turns True aborts the wait with RemoteVideoStopped (the run then tears the pod
+        down) instead of blocking until a long segment finishes."""
         url = self._url(f"/video/status?id={job_id}")
         misses = 0
         while True:
+            if should_stop and should_stop():
+                raise RemoteVideoStopped("stopped by user")
             try:
                 with urllib.request.urlopen(url, timeout=self.STATUS_TIMEOUT) as resp:
                     st = json.loads(resp.read().decode("utf-8", "replace"))

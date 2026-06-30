@@ -3752,13 +3752,16 @@ class SettingsTab(ttk.Frame):
         ttk.Label(sec, text="Batch size (window):").grid(row=4, column=0, sticky="w", pady=3)
         _bs = int(vid.get("batch_size", 0) or 0)
         self.video_batch_var = tk.StringVar(value=("Auto" if _bs <= 0 else str(_bs)))
-        _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 12)]   # 5,9,…,45
+        _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 126)]   # 5,9,…,501
         bs_cb = ttk.Combobox(sec, textvariable=self.video_batch_var, state="readonly",
                              width=10, values=_batch_choices)
         bs_cb.grid(row=4, column=1, sticky="w", padx=6, pady=3)
         Tooltip(bs_cb, "Frames SeedVR2 processes together (4n+1). Auto = the largest the "
                        "pod's VRAM safely allows for the target (more = smoother motion, "
-                       "fewer seams). Leave on Auto unless you know what you're doing.")
+                       "fewer seams). Big values past ~33 mostly cut overlap redundancy, not "
+                       "boost quality, and need a big card (4K caps near 33 on 180 GB; bigger "
+                       "fits only at 1440p/1080p). A too-large pick self-corrects via the pod's "
+                       "OOM-recovery. Leave on Auto unless you're benchmarking.")
         ttk.Label(sec, text="Temporal overlap:").grid(row=5, column=0, sticky="w", pady=3)
         _ov = int(vid.get("temporal_overlap", -1))
         self.video_overlap_var = tk.StringVar(value=("Auto" if _ov < 0 else str(_ov)))
@@ -3769,10 +3772,33 @@ class SettingsTab(ttk.Frame):
                        "not a cost knob: 3 left a visible break, 6 was undetectable). Auto "
                        "uses at least 6, more for large windows. 0 = hard cut. The pod caps "
                        "it below the batch.")
+        self.video_compile_var = tk.BooleanVar(value=bool(vid.get("compile", True)))
+        cmp_cb = ttk.Checkbutton(sec, text="Speed up with torch.compile (recommended)",
+                                 variable=self.video_compile_var)
+        cmp_cb.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        Tooltip(cmp_cb, "Compiles the SeedVR2 model the first time the pod runs a segment "
+                        "(that one segment is slower), then every later segment is 20-40% "
+                        "faster. A big win on long videos. Turn off only if a run fails at "
+                        "compile.")
+        self.video_uniform_var = tk.BooleanVar(value=bool(vid.get("uniform_batch_size", True)))
+        uni_cb = ttk.Checkbutton(sec, text="Uniform batch size (cleaner seams)",
+                                 variable=self.video_uniform_var)
+        uni_cb.grid(row=7, column=0, columnspan=2, sticky="w")
+        Tooltip(uni_cb, "Pads the last (ragged) batch so it matches the rest, preventing a "
+                        "flicker at the end of each chunk. Tiny extra compute, recommended on.")
+        ttk.Label(sec, text="4K input noise:").grid(row=8, column=0, sticky="w", pady=3)
+        _ns = float(vid.get("input_noise_scale", 0.0) or 0.0)
+        self.video_noise_var = tk.StringVar(value=("Off" if _ns <= 0 else f"{_ns:g}"))
+        ns_cb = ttk.Combobox(sec, textvariable=self.video_noise_var, state="readonly",
+                             width=10, values=["Off", "0.02", "0.03", "0.05"])
+        ns_cb.grid(row=8, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(ns_cb, "Injects a little noise into the input to counter the soft, "
+                       "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
+                       "try 0.02 if your 4K output looks plasticky.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
                      "output subfolder mirrors the source tree (like Batch Upscaler).")
 
@@ -4130,6 +4156,8 @@ class SettingsTab(ttk.Frame):
         batch = 0 if bs.lower() == "auto" else int(bs)      # 0 = auto (pod sizes it)
         ov = self.video_overlap_var.get()
         overlap = -1 if ov.lower() == "auto" else int(ov)   # -1 = auto (scaled to batch)
+        ns = self.video_noise_var.get()
+        noise = 0.0 if ns.lower() in ("off", "") else float(ns)
         return {
             "target":              self.video_target_var.get(),
             "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
@@ -4137,6 +4165,9 @@ class SettingsTab(ttk.Frame):
             "use_10bit":           ten,
             "batch_size":          batch,
             "temporal_overlap":    overlap,
+            "compile":             bool(self.video_compile_var.get()),
+            "uniform_batch_size":  bool(self.video_uniform_var.get()),
+            "input_noise_scale":   noise,
             "confirm_before_rent": bool(self.video_confirm_var.get()),
         }
 
@@ -4337,6 +4368,10 @@ class SettingsTab(ttk.Frame):
         self.video_batch_var.set("Auto" if _vbs <= 0 else str(_vbs))
         _vov = int(vid.get("temporal_overlap", -1))
         self.video_overlap_var.set("Auto" if _vov < 0 else str(_vov))
+        self.video_compile_var.set(bool(vid.get("compile", True)))
+        self.video_uniform_var.set(bool(vid.get("uniform_batch_size", True)))
+        _vns = float(vid.get("input_noise_scale", 0.0) or 0.0)
+        self.video_noise_var.set("Off" if _vns <= 0 else f"{_vns:g}")
         self.video_confirm_var.set(bool(vid.get("confirm_before_rent", True)))
         self.auto_update_var.set(update_auto_check_enabled())
         self.mqtt_host_var.set(mqtt.get("host", ""))
@@ -6987,6 +7022,7 @@ class VideoTab(ttk.Frame):
         self._seg_expected = None     # estimated seconds for the current segment
         self._seg_has_frames = False  # worker reported real frames_processed for it
         self._cur_status = ""         # base status line the tick appends ETA to
+        self._live_spf = None         # live seconds/frame the pod measures per DiT batch
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -7039,7 +7075,7 @@ class VideoTab(ttk.Frame):
     def _stop(self):
         if self.running:
             self.send("q")
-            self.status_var.set("Stopping after the current segment …")
+            self.status_var.set("Stopping (aborting the segment, tearing down the pod) …")
         self.stop_btn.configure(state="disabled")
 
     def _pump(self):
@@ -7132,6 +7168,7 @@ class VideoTab(ttk.Frame):
             fp = data.get("frames_processed")
             state = data.get("state")
             self._cur_seg_frames = seg_frames
+            self._live_spf = data.get("live_spf")   # pod's measured s/frame (DiT phase)
             if state == "running":
                 # "running" arrives on EVERY status poll (~5 s), not just once. Anchor
                 # the time-based estimate the FIRST time only (_seg_start is None),
@@ -7154,6 +7191,7 @@ class VideoTab(ttk.Frame):
                 self._cur_seg_done = 0
                 self._seg_start = None
                 self._seg_has_frames = False
+                self._live_spf = None
             elif fp is not None:
                 self._cur_seg_done = min(fp, seg_frames)
                 self._seg_has_frames = True      # real data: it overrides the clock
@@ -7210,6 +7248,11 @@ class VideoTab(ttk.Frame):
             tail = f" · running {ve.fmt_duration(time.time() - self._seg_start)}"
         elif self._rate and self._run_total > 0:
             tail = f" · ETA {ve.fmt_duration((self._run_total - done_now) * self._rate)}"
+        # The pod measures real seconds/frame per DiT batch (first batch is high while
+        # torch.compile warms up, then it drops): show it live so a benchmarking run
+        # isn't flying blind on an estimate. See worker _HeartbeatTee / SEGMENT events.
+        if self._live_spf:
+            tail += f" · {self._live_spf:.1f} s/frame (live)"
         if base:
             self.status_var.set(base + tail)
         self._run_tick_job = self.after(1000, self._run_tick)
