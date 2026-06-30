@@ -3484,6 +3484,16 @@ _VIDEO_CODEC_OPTIONS = [
     ("High quality — H.265 10-bit (ffmpeg)", "ffmpeg", True),
 ]
 
+# Video model choices (label -> dit_model filename). The pod auto-downloads the chosen
+# weights to the network volume on first use (no reprovision). 7B fp16 is the quality
+# default; 3B-Q8 is smaller and frees VRAM for bigger temporal windows.
+_VIDEO_MODEL_OPTIONS = [
+    ("7B FP16 (best detail, default)",        "seedvr2_ema_7b_fp16.safetensors"),
+    ("7B FP16 Sharp (stylized/crisper)",      "seedvr2_ema_7b_sharp_fp16.safetensors"),
+    ("3B Q8 (smaller, more VRAM headroom)",   "seedvr2_ema_3b-Q8_0.gguf"),
+    ("3B FP16 (small, full precision)",       "seedvr2_ema_3b_fp16.safetensors"),
+]
+
 
 class SettingsTab(ttk.Frame):
     """Edit the settings that previously lived only in config.json."""
@@ -3742,32 +3752,42 @@ class SettingsTab(ttk.Frame):
         ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
                      width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS]).grid(
             row=2, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="Model:").grid(row=3, column=0, sticky="w", pady=3)
+        self.video_model_var = tk.StringVar(value=self._video_model_label(vid))
+        model_cb = ttk.Combobox(sec, textvariable=self.video_model_var, state="readonly",
+                                width=34, values=[lbl for lbl, _f in _VIDEO_MODEL_OPTIONS])
+        model_cb.grid(row=3, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(model_cb, "SeedVR2 weights the pod loads (video only; the Batch Upscaler "
+                          "keeps its own). 7B FP16 = best detail. 3B Q8 = smaller, frees "
+                          "VRAM for bigger windows. The pod downloads the chosen file to "
+                          "the volume on first use (one-time), so switching needs no "
+                          "reprovision; that first run is slower while it downloads.")
         # ── Advanced (leave on Auto) ──────────────────────────────────────────────
         # Batch (temporal window) and overlap default to Auto: the pod sizes them from
         # its real VRAM + the output resolution, so a user never has to learn SeedVR2's
         # knobs. These are overrides for power users; a wrong value self-corrects on the
         # pod (OOM auto-recovery). The picklists only offer valid 4n+1 / in-range values.
         ttk.Label(sec, text="Advanced (leave on Auto):", foreground="#888").grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(sec, text="Batch size (window):").grid(row=4, column=0, sticky="w", pady=3)
+            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(sec, text="Batch size (window):").grid(row=5, column=0, sticky="w", pady=3)
         _bs = int(vid.get("batch_size", 0) or 0)
         self.video_batch_var = tk.StringVar(value=("Auto" if _bs <= 0 else str(_bs)))
         _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 126)]   # 5,9,…,501
         bs_cb = ttk.Combobox(sec, textvariable=self.video_batch_var, state="readonly",
                              width=10, values=_batch_choices)
-        bs_cb.grid(row=4, column=1, sticky="w", padx=6, pady=3)
+        bs_cb.grid(row=5, column=1, sticky="w", padx=6, pady=3)
         Tooltip(bs_cb, "Frames SeedVR2 processes together (4n+1). Auto = the largest the "
                        "pod's VRAM safely allows for the target (more = smoother motion, "
                        "fewer seams). Big values past ~33 mostly cut overlap redundancy, not "
                        "boost quality, and need a big card (4K caps near 33 on 180 GB; bigger "
                        "fits only at 1440p/1080p). A too-large pick self-corrects via the pod's "
                        "OOM-recovery. Leave on Auto unless you're benchmarking.")
-        ttk.Label(sec, text="Temporal overlap:").grid(row=5, column=0, sticky="w", pady=3)
+        ttk.Label(sec, text="Temporal overlap:").grid(row=6, column=0, sticky="w", pady=3)
         _ov = int(vid.get("temporal_overlap", -1))
         self.video_overlap_var = tk.StringVar(value=("Auto" if _ov < 0 else str(_ov)))
         ov_cb = ttk.Combobox(sec, textvariable=self.video_overlap_var, state="readonly",
                              width=10, values=["Auto"] + [str(n) for n in range(0, 13)])
-        ov_cb.grid(row=5, column=1, sticky="w", padx=6, pady=3)
+        ov_cb.grid(row=6, column=1, sticky="w", padx=6, pady=3)
         Tooltip(ov_cb, "Frames blended between batches to hide the seam (a quality floor, "
                        "not a cost knob: 3 left a visible break, 6 was undetectable). Auto "
                        "uses at least 6, more for large windows. 0 = hard cut. The pod caps "
@@ -3775,7 +3795,7 @@ class SettingsTab(ttk.Frame):
         self.video_compile_var = tk.BooleanVar(value=bool(vid.get("compile", True)))
         cmp_cb = ttk.Checkbutton(sec, text="Speed up with torch.compile (recommended)",
                                  variable=self.video_compile_var)
-        cmp_cb.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        cmp_cb.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(cmp_cb, "Compiles the SeedVR2 model the first time the pod runs a segment "
                         "(that one segment is slower), then every later segment is 20-40% "
                         "faster. A big win on long videos. Turn off only if a run fails at "
@@ -3783,22 +3803,22 @@ class SettingsTab(ttk.Frame):
         self.video_uniform_var = tk.BooleanVar(value=bool(vid.get("uniform_batch_size", True)))
         uni_cb = ttk.Checkbutton(sec, text="Uniform batch size (cleaner seams)",
                                  variable=self.video_uniform_var)
-        uni_cb.grid(row=7, column=0, columnspan=2, sticky="w")
+        uni_cb.grid(row=8, column=0, columnspan=2, sticky="w")
         Tooltip(uni_cb, "Pads the last (ragged) batch so it matches the rest, preventing a "
                         "flicker at the end of each chunk. Tiny extra compute, recommended on.")
-        ttk.Label(sec, text="4K input noise:").grid(row=8, column=0, sticky="w", pady=3)
+        ttk.Label(sec, text="4K input noise:").grid(row=9, column=0, sticky="w", pady=3)
         _ns = float(vid.get("input_noise_scale", 0.0) or 0.0)
         self.video_noise_var = tk.StringVar(value=("Off" if _ns <= 0 else f"{_ns:g}"))
         ns_cb = ttk.Combobox(sec, textvariable=self.video_noise_var, state="readonly",
                              width=10, values=["Off", "0.02", "0.03", "0.05"])
-        ns_cb.grid(row=8, column=1, sticky="w", padx=6, pady=3)
+        ns_cb.grid(row=9, column=1, sticky="w", padx=6, pady=3)
         Tooltip(ns_cb, "Injects a little noise into the input to counter the soft, "
                        "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
                        "try 0.02 if your 4K output looks plasticky.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
                      "output subfolder mirrors the source tree (like Batch Upscaler).")
 
@@ -4143,6 +4163,14 @@ class SettingsTab(ttk.Frame):
                 return lbl
         return _VIDEO_CODEC_OPTIONS[0][0]
 
+    def _video_model_label(self, vid):
+        """The model combobox label matching the saved dit_model filename."""
+        model = vid.get("dit_model", "seedvr2_ema_7b_fp16.safetensors")
+        for lbl, fname in _VIDEO_MODEL_OPTIONS:
+            if fname == model:
+                return lbl
+        return _VIDEO_MODEL_OPTIONS[0][0]
+
     def _video_section(self):
         """The proposed `video` config block from the form. Only the exposed keys
         are set; config-only keys (segment_seconds, spin_up_seconds, …) are left
@@ -4158,11 +4186,14 @@ class SettingsTab(ttk.Frame):
         overlap = -1 if ov.lower() == "auto" else int(ov)   # -1 = auto (scaled to batch)
         ns = self.video_noise_var.get()
         noise = 0.0 if ns.lower() in ("off", "") else float(ns)
+        model = next((f for lbl, f in _VIDEO_MODEL_OPTIONS
+                      if lbl == self.video_model_var.get()), _VIDEO_MODEL_OPTIONS[0][1])
         return {
             "target":              self.video_target_var.get(),
             "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
             "video_backend":       backend,
             "use_10bit":           ten,
+            "dit_model":           model,
             "batch_size":          batch,
             "temporal_overlap":    overlap,
             "compile":             bool(self.video_compile_var.get()),
@@ -4364,6 +4395,7 @@ class SettingsTab(ttk.Frame):
         self.video_target_var.set(vid.get("target", "1080p"))
         self.video_outsub_var.set(vid.get("output_subdir", "__upscaled__"))
         self.video_codec_var.set(self._video_codec_label(vid))
+        self.video_model_var.set(self._video_model_label(vid))
         _vbs = int(vid.get("batch_size", 0) or 0)
         self.video_batch_var.set("Auto" if _vbs <= 0 else str(_vbs))
         _vov = int(vid.get("temporal_overlap", -1))

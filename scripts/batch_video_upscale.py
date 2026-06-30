@@ -260,6 +260,12 @@ def resolve_video_cfg(cfg, overrides=None):
         "compile":             bool(v.get("compile", True)),
         "uniform_batch_size":  bool(v.get("uniform_batch_size", True)),
         "input_noise_scale":   float(v.get("input_noise_scale", 0.0) or 0.0),
+        # SeedVR2 weights the pod loads (video path only; the Batch Upscaler keeps its
+        # own). 7B fp16 = best detail (default); 3B-Q8 = smaller + more VRAM headroom for
+        # bigger windows. The pod auto-downloads the file to the volume on first use, so
+        # switching needs no reprovision. NOTE: the VRAM auto-batch model is 7B-calibrated;
+        # 3B uses far less, so on 3B the auto/clamp is conservative (safe, not optimal).
+        "dit_model":           v.get("dit_model", "seedvr2_ema_7b_fp16.safetensors"),
     }
     if out["use_10bit"]:
         out["video_backend"] = "ffmpeg"
@@ -287,6 +293,7 @@ def log_video_settings(vcfg):
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'}, "
         f"output subdir '{vcfg['output_subdir']}'")
     noise = float(vcfg.get("input_noise_scale", 0.0) or 0.0)
+    log(f"    model {vcfg.get('dit_model', 'seedvr2_ema_7b_fp16.safetensors')}")
     log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
         f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
         f"input noise {noise if noise > 0 else 'off'}")
@@ -901,6 +908,7 @@ def main(argv=None):
             worker_cfg["compile_vae"]        = vcfg["compile"]
             worker_cfg["uniform_batch_size"] = vcfg["uniform_batch_size"]
             worker_cfg["input_noise_scale"]  = vcfg["input_noise_scale"]
+            worker_cfg["dit_model"]          = vcfg["dit_model"]
             session = RemoteSession(cfg.get("runpod", {}), worker_cfg,
                                     APP_ROOT, on_event=log, mode="video")
             engine = session.start()
