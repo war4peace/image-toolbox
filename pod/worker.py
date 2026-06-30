@@ -363,6 +363,11 @@ def _auto_overlap(batch):
 
 
 _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
+# DiT/VAE phase lines (all force-printed by SeedVR2 with a leading icon). We TRACE the
+# real cadence of these to the job so a run reveals the true progress signal instead of us
+# guessing at the per-chunk batch count (the live s/frame + frame bar were built on an
+# UNVALIDATED assumption about it). Diagnostic only — fail-safe, bounded, never affects the run.
+_PHASE_RE = re.compile(r"(Encoding|Upscaling|Decoding) batch\s+(\d+)\s*/\s*(\d+)")
 _UPSCALE_BATCH_RE = re.compile(r"Upscaling batch\s+(\d+)\s*/\s*(\d+)")  # DiT phase, per batch
 
 
@@ -399,6 +404,19 @@ class _HeartbeatTee:
         return len(s) if s else 0
 
     def _scan_progress(self, s):
+        # Diagnostic trace (fail-safe, bounded): record the real cadence of the phase lines
+        # so a run shows us the true progress signal. Captures the first time each distinct
+        # "<phase> N/M" appears plus a running count, surfaced via /video/status.
+        try:
+            pm = _PHASE_RE.search(s)
+            if pm:
+                trace = self._job.setdefault("phase_trace", [])
+                tag = f"{pm.group(1)[0]}{pm.group(2)}/{pm.group(3)}"   # e.g. U3/4, D1/2
+                if len(trace) < 80 and (not trace or trace[-1] != tag):
+                    trace.append(tag)
+                self._job["phase_count"] = self._job.get("phase_count", 0) + 1
+        except Exception:
+            pass
         total = self._job.get("total_frames") or 0
         if total <= 0:
             return
@@ -885,6 +903,8 @@ class Handler(BaseHTTPRequestHandler):
             "live_spf":         job.get("live_spf"),
             "peak_alloc_gb":    job.get("peak_alloc_gb"),
             "peak_reserved_gb": job.get("peak_reserved_gb"),
+            "phase_trace":      job.get("phase_trace"),     # diagnostic: real phase cadence
+            "phase_count":      job.get("phase_count"),
         }).encode()
         self._send(200, body, "application/json")
 

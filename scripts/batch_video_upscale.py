@@ -638,6 +638,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         f"(auto values resolved on the pod)")
     _resolved_logged = [False]
     _peak_logged = [False]
+    _trace_logged = [False]
     total_secs = 0.0
 
     for s in segs:
@@ -675,6 +676,14 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 _peak_logged[0] = True
                 log(f"    (pod peak VRAM: {pa} GB working set, "
                     f"{st.get('peak_reserved_gb')} GB reserved/pooled)")
+            # Diagnostic (temporary): the real per-phase cadence, so we can fix the
+            # live s/frame + progress bar from ground truth instead of guesswork.
+            _tr = st.get("phase_trace")
+            if _tr and not _trace_logged[0] and (
+                    st.get("state") == "done" or len(_tr) >= 16):
+                _trace_logged[0] = True
+                log(f"    (pod phase trace [{st.get('phase_count')} lines]: "
+                    f"{' '.join(_tr[:60])})")
             gui_event("SEGMENT", {"video_rel": rel, "target": target,
                                   "seg_index": _i, "total": len(segs),
                                   "state": st.get("state"),
