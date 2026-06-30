@@ -650,8 +650,19 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             if rb and not _resolved_logged[0]:       # the pod reported its auto choices
                 _resolved_logged[0] = True
                 _noise = st.get("input_noise")
-                _chunk = st.get("resolved_chunk") or 0
-                _nb = -(-_tot // _chunk) if _chunk else 0    # ~batches over this segment
+                # Real model passes over this segment, NOT streaming chunks: a window
+                # advances by stride = batch - overlap new frames each pass (>= the clip
+                # is one pass). The old frames/chunk_size reported chunks and badly
+                # undercounted a small batch (e.g. batch 9/overlap 6 read as ~5).
+                _rb = int(rb or 0)
+                _ov = int(st.get("resolved_overlap") or 0)
+                _stride = max(1, _rb - _ov)
+                if not _tot:
+                    _nb = 0
+                elif _rb and _rb >= _tot:
+                    _nb = 1
+                else:
+                    _nb = max(1, -(-(_tot - _ov) // _stride))
                 _btxt = f", ~{_nb} batch(es) over {_tot}f" if _nb else ""
                 log(f"    (pod resolved: batch_size {rb}, "
                     f"temporal_overlap {st.get('resolved_overlap')}{_btxt}, "

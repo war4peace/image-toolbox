@@ -296,13 +296,25 @@ def _ws_gb(mp, batch):
     return _VRAM_FIXED + mp * (_VRAM_A + _VRAM_B * batch + _VRAM_C * batch * batch)
 
 
-def _max_vram_batch(out_w, out_h, vram_gb, resident):
+def _vram_model_calibrated(model):
+    """The VRAM coefficients above are fit to 7B fp16. ONLY that family may be
+    predictively clamped: for any other model (e.g. 3B / a GGUF quant) the prediction
+    badly OVER-estimates (measured 3B-Q8 at 1440p used ~41 GB where the 7B model
+    predicted ~75 GB), which would crush the batch to the floor. For an uncalibrated
+    model we don't clamp at all and let the user's explicit pick stand, with OOM
+    auto-recovery as the backstop (same philosophy as not silently substituting GPUs).
+    Unknown/blank model -> assume the calibrated 7B default."""
+    m = (model or "").lower()
+    return (not m) or ("7b" in m)
+
+
+def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
     """Largest 4n+1 batch whose predicted working set fits the SAFETY budget for this
-    card + output size. Returns a big sentinel when dims/VRAM are unknown (can't measure
-    -> don't clamp; OOM-recovery backstops). This is the VRAM ceiling, separate from the
-    continuity cap _BATCH_CAP."""
+    card + output size. Returns a big sentinel when dims/VRAM are unknown OR the model
+    is not VRAM-calibrated (can't trust a prediction -> don't clamp; OOM-recovery
+    backstops). This is the VRAM ceiling, separate from the continuity cap _BATCH_CAP."""
     mp = (out_w * out_h) / 1_000_000.0
-    if mp <= 0 or vram_gb <= 0:
+    if mp <= 0 or vram_gb <= 0 or not _vram_model_calibrated(model):
         return 997
     budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
     best, b = _BATCH_FLOOR, _BATCH_FLOOR
@@ -315,14 +327,15 @@ def _max_vram_batch(out_w, out_h, vram_gb, resident):
     return best
 
 
-def _auto_batch(out_w, out_h, vram_gb, resident):
+def _auto_batch(out_w, out_h, vram_gb, resident, model=None):
     """Pick the largest safe temporal window (4n+1) for an output of out_w x out_h on
     a card with vram_gb: the most the VRAM budget allows, capped at _BATCH_CAP where
     continuity gains flatten. OOM auto-recovery backstops an optimistic guess. Returns a
     safe 13 if dims/VRAM are unknown."""
     if (out_w * out_h) <= 0 or vram_gb <= 0:
         return 13
-    return max(_BATCH_FLOOR, min(_BATCH_CAP, _max_vram_batch(out_w, out_h, vram_gb, resident)))
+    return max(_BATCH_FLOOR,
+               min(_BATCH_CAP, _max_vram_batch(out_w, out_h, vram_gb, resident, model)))
 
 
 _MIN_OVERLAP = 6                 # measured: 3 left a visible seam, 6 was undetectable
@@ -460,13 +473,14 @@ def _resolve_auto_params(job, params):
     scale = (params["resolution"] / short) if short else 1.0
     out_w, out_h = round(in_w * scale), round(in_h * scale)
     resident = bool(getattr(_ENGINE, "resident", False))
+    model = getattr(getattr(_ENGINE, "args", None), "dit_model", "") or ""
     vram = _vram_total_gb()
-    vmax = _max_vram_batch(out_w, out_h, vram, resident)   # VRAM ceiling for this card+output
+    vmax = _max_vram_batch(out_w, out_h, vram, resident, model)  # VRAM ceiling for this card+output+model
     if params["batch_size"] <= 0:
-        params["batch_size"] = _auto_batch(out_w, out_h, vram, resident)
+        params["batch_size"] = _auto_batch(out_w, out_h, vram, resident, model)
         job["auto_batch"] = True
         _log(f"auto batch -> {params['batch_size']} (out {out_w}x{out_h}, "
-             f"vram {vram:.0f}GB, vmax {vmax}, resident={resident})")
+             f"vram {vram:.0f}GB, vmax {vmax}, resident={resident}, model={model})")
     elif params["batch_size"] > vmax:
         _log(f"batch {params['batch_size']} exceeds the VRAM budget (out {out_w}x{out_h}, "
              f"vram {vram:.0f}GB) -> clamped to {vmax} (~{_ws_gb((out_w*out_h)/1e6, vmax):.0f}GB "
@@ -475,6 +489,13 @@ def _resolve_auto_params(job, params):
     if params["temporal_overlap"] < 0:
         params["temporal_overlap"] = _auto_overlap(params["batch_size"])
         _log(f"auto temporal_overlap -> {params['temporal_overlap']}")
+    # Overlap MUST stay below the batch: SeedVR2 silently resets overlap>=batch to 0,
+    # and (worse) an overlap >= batch corrupts the frame-fit's stride math below
+    # (step collapses to 1, inflating the window). A VRAM-forced small batch with a
+    # bigger explicit overlap is exactly how that happened. Clamp BEFORE the fit.
+    if params["temporal_overlap"] >= params["batch_size"]:
+        params["temporal_overlap"] = max(0, params["batch_size"] - 1)
+        _log(f"overlap >= batch -> clamped to {params['temporal_overlap']}")
     # Fit the batch to the segment's real frame count: a window >= the clip collapses to
     # one seam-free pass; a window the clip exceeds is evened out so there's no tiny
     # ragged final batch. Only ever shrinks the batch (VRAM never rises). Applies to both
@@ -504,9 +525,13 @@ def _resolve_auto_params(job, params):
     job["resolved_overlap"] = params["temporal_overlap"]
     job["resolved_chunk"] = params["chunk_size"]
     if frames:
-        nb = -(-frames // max(1, params["chunk_size"]))
-        _log(f"resolved window: batch {params['batch_size']}, overlap "
-             f"{params['temporal_overlap']}, chunk {params['chunk_size']} -> "
+        # Real model passes, NOT chunks: a window advances by stride = batch - overlap
+        # new frames per pass (a window >= the clip is a single pass). The old count
+        # (frames / chunk_size) reported chunks, badly undercounting a small batch.
+        b, o = params["batch_size"], params["temporal_overlap"]
+        stride = max(1, b - o)
+        nb = 1 if b >= frames else max(1, -(-(frames - o) // stride))
+        _log(f"resolved window: batch {b}, overlap {o}, chunk {params['chunk_size']} -> "
              f"~{nb} batch(es) over {frames} frames")
 
 
