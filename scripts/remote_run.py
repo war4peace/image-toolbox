@@ -46,10 +46,18 @@ def _is_transient_gpu_error(text):
 
 
 def _ssh_base(key, port, known_hosts):
+    # ServerAlive* sends a protocol keepalive every 30s: a long, SILENT command
+    # (the worker-readiness loop waits minutes producing no output; a streaming
+    # segment runs minutes-to-hours) otherwise looks idle to RunPod's SSH proxy,
+    # which drops the channel and blanks the result. With the server alive the
+    # probes are answered so the connection persists; CountMax 40 only gives up
+    # after ~20 min of a truly unresponsive host.
     return ["-i", key, "-p", str(port),
             "-o", "StrictHostKeyChecking=no",
             "-o", f"UserKnownHostsFile={known_hosts}",
-            "-o", "ConnectTimeout=20"]
+            "-o", "ConnectTimeout=20",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=40"]
 
 
 class RemoteSession:
@@ -387,17 +395,37 @@ class RemoteSession:
             # Poll /health, but bail the moment the worker PROCESS dies (e.g. a CUDA
             # crash at model load) instead of polling the full 10 min on a dead pod.
             # Only trip on a written-then-dead pid (a missing pid = not booted yet).
-            f"for i in $(seq 1 120); do "
+            # 180 x 5s = 15 min: an UNCACHED model (first use of a new dit_model)
+            # must DOWNLOAD then load before /health answers, which can outrun a
+            # 10-min window; a dead worker still short-circuits via WORKER_DIED, so
+            # the longer ceiling only costs time when it is genuinely still loading.
+            # The periodic echo gives the channel real traffic (belt-and-suspenders
+            # with ServerAlive) so the silent wait can't be proxy-dropped.
+            f"for i in $(seq 1 180); do "
             f"curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; "
             "PID=$(cat /root/worker.pid 2>/dev/null); "
             "if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then echo WORKER_DIED; break; fi; "
+            "[ $((i % 12)) -eq 0 ] && echo \"worker-wait $((i * 5))s ...\"; "
             "sleep 5; done; "
             f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
-            "{ echo WORKER_FAILED; tail -n 20 /root/worker.log; exit 1; }")
-        res = self._ssh(launch, check=False, timeout=900)
+            "{ echo WORKER_FAILED; tail -n 40 /root/worker.log; exit 1; }")
+        res = self._ssh(launch, check=False, timeout=1080)
         out = self._ssh_output(res)
         if "WORKER_FAILED" in out or res.returncode != 0:
-            tail = out[-800:]
+            tail = out[-1200:]
+            # The launch connection can still drop during a long first-load,
+            # blanking its captured output; pull the worker log over a FRESH
+            # connection (the pod is up until teardown) so a failure is never
+            # diagnosed blind.
+            if "Traceback" not in tail and "WORKER_" not in tail:
+                try:
+                    log = self._ssh("tail -n 60 /root/worker.log 2>/dev/null",
+                                    check=False, timeout=60)
+                    extra = self._ssh_output(log).strip()
+                    if extra:
+                        tail = (tail + "\n--- worker.log ---\n" + extra)[-2000:]
+                except Exception:                        # noqa: BLE001
+                    pass
             if _is_transient_gpu_error(tail):
                 raise rp.RunPodError(
                     "The rented pod's GPU was busy or unavailable during model load "
