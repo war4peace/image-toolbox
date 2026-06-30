@@ -6191,8 +6191,10 @@ class VideoTab(ttk.Frame):
         self.scan_btn.grid(row=0, column=3, padx=(6, 0))
         ttk.Label(ff, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.out_var = tk.StringVar()
-        ttk.Entry(ff, textvariable=self.out_var).grid(row=1, column=1, columnspan=2,
-                                                      sticky="ew", padx=6, pady=(4, 0))
+        ttk.Entry(ff, textvariable=self.out_var).grid(row=1, column=1, sticky="ew",
+                                                      padx=6, pady=(4, 0))
+        ttk.Button(ff, text="Browse…", command=self._browse_output).grid(
+            row=1, column=2, pady=(4, 0))
 
         # 3) Scan list.
         sf = ttk.LabelFrame(self, text=" Videos in this folder ", padding=4)
@@ -6384,6 +6386,11 @@ class VideoTab(ttk.Frame):
             out = self.out_var.get().strip()
             if not out or os.path.basename(out) == "__upscaled__":
                 self.out_var.set(os.path.join(folder, "__upscaled__"))
+
+    def _browse_output(self):
+        folder = filedialog.askdirectory(title="Choose where to save the upscaled videos")
+        if folder:
+            self.out_var.set(os.path.normpath(folder))
 
     def _scan(self):
         src = self.src_var.get().strip()
