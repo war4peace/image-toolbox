@@ -122,6 +122,14 @@ class RemoteSession:
         return subprocess.run(args, check=check, timeout=timeout,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
 
+    @staticmethod
+    def _ssh_output(res):
+        """Combined stdout+stderr of an _ssh result, guarding against either being
+        None. capture_output normally yields strings, but a connection that drops
+        mid-run can leave a stream uncaptured (None); concatenating None used to crash
+        the error handler with a TypeError, masking the real worker.log tail."""
+        return (res.stdout or "") + (res.stderr or "")
+
     def _scp(self, local, remote):
         args = ["scp", "-i", self.key_path, "-P", str(self.ssh_port),
                 "-o", "StrictHostKeyChecking=no",
@@ -387,8 +395,9 @@ class RemoteSession:
             f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
             "{ echo WORKER_FAILED; tail -n 20 /root/worker.log; exit 1; }")
         res = self._ssh(launch, check=False, timeout=900)
-        if "WORKER_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
-            tail = (res.stdout + res.stderr)[-800:]
+        out = self._ssh_output(res)
+        if "WORKER_FAILED" in out or res.returncode != 0:
+            tail = out[-800:]
             if _is_transient_gpu_error(tail):
                 raise rp.RunPodError(
                     "The rented pod's GPU was busy or unavailable during model load "
@@ -425,9 +434,10 @@ class RemoteSession:
             "for i in $(seq 1 90); do curl -sf localhost:11434/api/version >/dev/null 2>&1 && break; sleep 2; done; "
             "curl -sf localhost:11434/api/version >/dev/null 2>&1 || { echo OLLAMA_FAILED; tail -n 20 /root/ollama.log; exit 1; }")
         res = self._ssh(launch, check=False, timeout=600)
-        if "OLLAMA_FAILED" in (res.stdout + res.stderr) or res.returncode != 0:
+        out = self._ssh_output(res)
+        if "OLLAMA_FAILED" in out or res.returncode != 0:
             raise rp.RunPodError(
-                "Ollama failed to start on the pod:\n" + (res.stdout + res.stderr)[-800:])
+                "Ollama failed to start on the pod:\n" + out[-800:])
 
     def _open_ollama_tunnel(self):
         """Open an ssh -L tunnel to the pod's Ollama (11434) and set
