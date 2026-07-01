@@ -290,13 +290,17 @@ def _fit_batch_to_frames(batch, frames, overlap):
 #       when it really hit 78.1 (98% / thrash on an 80 GB A100). Refit linear. NB: bs117/1440p
 #       on 80 GB is ABOVE safe headroom (it thrashed and ran ~60% slower per MP than a healthy
 #       run); the clamp now caps an 80 GB card at ~bs73 (~79%). Extrapolation beyond bs~150 is
-#       unverified (no data there). 3B fp16 is a touch heavier but close enough to share.
+#       unverified (no data there).
+#   3b_fp16: the UNQUANTISED 3B carries ~3 GB more resident weight than the Q8 GGUF (measured
+#       3.69 MP bs69 = 68.5 GB vs Q8's 65.5), so it thrashed an 80 GB A100 at a batch the Q8
+#       profile cleared. Same shape as "3b" with FIXED bumped +3.0 (6.40 -> 9.40).
 # SAFETY 0.80 leaves ~20% free for the allocator to breathe (7B 4K bs33 ran clean at 85%, and
 # 3B bs117 thrashed at 98%). The model sizes the AUTO batch AND clamps a too-big explicit pick;
 # OOM-recovery backstops any remaining miss.
 _VRAM_PROFILES = {       # model family -> (FIXED, A, B, C)
-    "7b": (16.3, 15.98, 0.01096, 0.000111),
-    "3b": (6.40,  8.55, 0.0932,  0.0),
+    "7b":      (16.3, 15.98, 0.01096, 0.000111),
+    "3b":      (6.40,  8.55, 0.0932,  0.0),
+    "3b_fp16": (9.40,  8.55, 0.0932,  0.0),
 }
 _VRAM_SAFETY = 0.80          # max working-set fraction of the card (allocator thrashes near 1.0)
 _BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknown content on
@@ -307,10 +311,16 @@ _BATCH_FLOOR = 5             # below this a temporal window barely helps
 
 
 def _vram_profile(model):
-    """The (FIXED, A, B, C) VRAM coefficients for a dit_model. Matches the 3B family (incl.
-    GGUF quants) by name; the 7B family and any UNKNOWN model fall back to the heavier 7B
-    profile, which over-estimates safely rather than risking a thrash."""
-    return _VRAM_PROFILES["3b"] if "3b" in (model or "").lower() else _VRAM_PROFILES["7b"]
+    """The (FIXED, A, B, C) VRAM coefficients for a dit_model, by name. 3B splits into the
+    unquantised fp16 (heavier weights) and the Q8 GGUF; the 7B family and any UNKNOWN model
+    fall back to the heavier 7B profile, which over-estimates safely rather than risking a
+    thrash."""
+    m = (model or "").lower()
+    if "3b" in m:
+        if "fp16" in m and "gguf" not in m:     # unquantised 3B (~3 GB heavier than Q8)
+            return _VRAM_PROFILES["3b_fp16"]
+        return _VRAM_PROFILES["3b"]
+    return _VRAM_PROFILES["7b"]
 
 
 def _ws_gb(mp, batch, model=None):
