@@ -6138,12 +6138,18 @@ def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
     if has_frames:
         done = seg_done
         if live_spf and live_spf > 0 and last_fp_time:
-            chunk_frames = seg_frames / tc
-            fwd = min(chunk_frames, max(0.0, (now - last_fp_time) / live_spf))
+            # Smooth forward from the last real anchor, capped at HALF a chunk: the worker
+            # now reports ~6x per chunk (encode/upscale/decode phases), so a real anchor is
+            # never far off — a small cap fills the gap without overshooting the next one.
+            cap = seg_frames / (2 * tc)
+            fwd = min(cap, max(0.0, (now - last_fp_time) / live_spf))
             done = min(seg_frames, seg_done + fwd)
         return run_done + min(seg_frames, done)
     if seg_expected and seg_start and seg_expected > 0:
-        frac = min(1.0 / tc, (now - seg_start) / seg_expected)
+        # Before the first real anchor: crawl on the time estimate, but cap LOW (half a
+        # chunk) — the first phase report lands early (chunk 1 encode), so a high cap would
+        # overshoot it and the monotonic bar could then sit ahead of reality.
+        frac = min(0.5 / tc, (now - seg_start) / seg_expected)
         return run_done + frac * seg_frames
     return run_done
 
@@ -7265,9 +7271,11 @@ class VideoTab(ttk.Frame):
                         conn=self._conn(), src_w=getattr(self, "_cur_w", None),
                         src_h=getattr(self, "_cur_h", None))
                 if fp is not None:               # real within-segment frames, if any
-                    self._cur_seg_done = min(fp, seg_frames)
+                    nd = min(fp, seg_frames)
+                    if nd != self._cur_seg_done:  # only restart the interp clock on a CHANGE
+                        self._last_fp_time = time.time()  # (polls repeat the same fp otherwise)
+                    self._cur_seg_done = nd
                     self._seg_has_frames = True  # real data overrides the clock
-                    self._last_fp_time = time.time()
             elif state == "done":
                 self._run_done += seg_frames
                 self._cur_seg_done = 0
@@ -7276,9 +7284,11 @@ class VideoTab(ttk.Frame):
                 self._live_spf = None
                 self._last_fp_time = None
             elif fp is not None:
-                self._cur_seg_done = min(fp, seg_frames)
+                nd = min(fp, seg_frames)
+                if nd != self._cur_seg_done:      # only restart the interp clock on a CHANGE
+                    self._last_fp_time = time.time()
+                self._cur_seg_done = nd
                 self._seg_has_frames = True      # real data: it overrides the clock
-                self._last_fp_time = time.time()
             # _run_tick (1 s) owns the bar via _paint_bar; repaint here too on a real
             # frame count / 'done' so the bar reacts immediately to new data.
             self._paint_bar("seg")

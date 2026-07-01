@@ -368,7 +368,13 @@ _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
 # guessing at the per-chunk batch count (the live s/frame + frame bar were built on an
 # UNVALIDATED assumption about it). Diagnostic only — fail-safe, bounded, never affects the run.
 _PHASE_RE = re.compile(r"(Encoding|Upscaling|Decoding) batch\s+(\d+)\s*/\s*(\d+)")
-_UPSCALE_BATCH_RE = re.compile(r"Upscaling batch\s+(\d+)\s*/\s*(\d+)")  # DiT phase, per batch
+_PHASE_IDX = {"Encoding": 0, "Upscaling": 1, "Decoding": 2}
+# Within a streaming chunk the pipeline runs encode -> upscale -> decode. At 1440p+ the
+# VAE encode/decode DOMINATE the wall-time (the DiT upscale is a few seconds), so the
+# progress bar must advance through E and D, not only U (mining U alone froze the bar for
+# minutes each chunk then jumped). Each phase gets a (start, width) slice of the chunk's
+# [0,1]; weighted toward E and D to roughly track where the time actually goes.
+_PHASE_SPAN = {0: (0.00, 0.45), 1: (0.45, 0.10), 2: (0.55, 0.45)}
 
 
 class _HeartbeatTee:
@@ -388,9 +394,8 @@ class _HeartbeatTee:
     def __init__(self, real, job):
         self._real = real
         self._job = job
-        self._last_bn = 0          # last DiT batch index seen (for live s/frame timing)
-        self._last_bt = None       # wall-clock when that batch line arrived
-        self._chunks_done = 0      # streaming chunks whose DiT phase has finished
+        self._last_phase_idx = -1  # last phase seen (E=0/U=1/D=2); a DROP means a new chunk
+        self._chunks_done = 0      # streaming chunks fully finished
 
     def write(self, s):
         try:
@@ -420,54 +425,38 @@ class _HeartbeatTee:
         total = self._job.get("total_frames") or 0
         if total <= 0:
             return
+        # Mine ALL three phase lines (encode/upscale/decode), each force-printed as
+        # "<phase> batch N/M" (M = latent batches in THIS chunk). Mining only the upscale
+        # phase left the bar blind through the long encode/decode (most of the wall-time at
+        # 1440p+), so it froze then jumped. A chunk runs E -> U -> D; a new chunk begins when
+        # the phase index DROPS (D/U -> E). Progress = (chunks_done + within-chunk fraction)
+        # / total_chunks, weighted by _PHASE_SPAN and kept MONOTONIC. Fail-safe.
         try:
-            for m in _NT_RE.finditer(s):
-                n, tot = int(m.group(1)), int(m.group(2))
-                # Frame-scaled bar: denominator ~= the segment frame count.
-                if tot > 0 and abs(tot - total) <= max(2, int(total * 0.05)):
-                    self._job["frames_processed"] = min(n, total)
-        except Exception:
-            pass
-        # The DiT phase prints "Upscaling batch N/M" per batch (force=True), where M is
-        # the batch count of the CURRENT streaming chunk (it restarts each chunk). It's
-        # the dominant, compile-affected phase, so we mine those lines for (a) a frame
-        # bar and (b) a LIVE seconds/frame. The bar must stay MONOTONIC across chunks:
-        # N/M alone restarts 0->100% every chunk, so we scope it to this chunk's slice
-        # of the run -> (chunks_done + N/M) / total_chunks. The live s/frame is the gap
-        # between consecutive in-chunk batches / the frames each contributes
-        # (stride = batch - overlap); the first batch carries the one-time torch.compile
-        # cost, so its number is high then drops — the warm-up the user wants to watch.
-        # Fail-safe: any parse miss just leaves the old time-based bar.
-        try:
-            bm = _UPSCALE_BATCH_RE.search(s)
-            if not bm:
+            pm = _PHASE_RE.search(s)
+            if not pm:
                 return
-            n, mtot = int(bm.group(1)), int(bm.group(2))
-            now = time.time()
-            reset = n <= self._last_bn        # index went backwards -> a new chunk began
-            if reset:
+            phase, n, mt = pm.group(1), int(pm.group(2)), int(pm.group(3))
+            pidx = _PHASE_IDX.get(phase)
+            if pidx is None or mt <= 0:
+                return
+            if pidx < self._last_phase_idx:      # wrapped D/U -> E: the next chunk started
                 self._chunks_done += 1
+            self._last_phase_idx = pidx
+            start, span = _PHASE_SPAN[pidx]
+            within = start + span * (min(n, mt) / mt)
             tc = int(self._job.get("total_chunks") or 1)
-            # A SINGLE batch over a single chunk (mtot==1, tc==1) has no within-run signal:
-            # "Upscaling batch 1/1" means the whole-clip batch STARTED, not finished, and
-            # SeedVR2 is a 1-step sampler so there's nothing finer to mine. Reporting it
-            # would pin the bar at 100% for the whole run, so we leave frames_processed
-            # unset and let the GUI's time-based estimate drive the bar. Multi-batch or
-            # multi-chunk runs do report — their N/M (scoped to the chunk) is real progress.
-            if mtot > 1 or tc > 1:
-                frac = min(1.0, (self._chunks_done + n / mtot) / tc)
-                self._job["frames_processed"] = min(total, int(round(frac * total)))
-            # Live s/frame = a RUNNING AVERAGE (elapsed / frames processed so far), not a
-            # fragile per-batch delta: it appears from the FIRST frame report, always has a
-            # value once frames flow, and converges to the true final rate (incl. the
-            # one-time compile warm-up, which is the honest cost the user is watching).
-            fp = self._job.get("frames_processed") or 0
+            frac = min(1.0, (self._chunks_done + within) / tc)
+            prev = self._job.get("frames_processed") or 0
+            self._job["frames_processed"] = min(total, max(prev, int(round(frac * total))))
+            # Live s/frame = a RUNNING AVERAGE (elapsed / frames processed so far): appears
+            # from the first report, always defined, converges to the true final rate (incl.
+            # the one-time compile warm-up, the honest cost the user is watching).
+            fp = self._job["frames_processed"]
             started = self._job.get("started")
             if fp > 0 and started:
-                el = now - started
+                el = time.time() - started
                 if el > 0:
                     self._job["live_spf"] = round(el / fp, 2)
-            self._last_bn, self._last_bt = n, now
         except Exception:
             pass
 
