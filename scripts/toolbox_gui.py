@@ -6111,6 +6111,34 @@ class UpdateDialog(tk.Toplevel):
         self.destroy()
 
 
+def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
+                    seg_start, seg_expected, total_chunks, has_frames):
+    """Frames-done estimate for the Video tab's progress bar (the caller divides by the
+    run total and enforces monotonicity). Two regimes:
+
+    - The worker IS reporting real within-segment frames (`has_frames`): anchor to them
+      (`seg_done`) and smooth FORWARD from the last report with the pod's measured live
+      s/frame, but never past one chunk's worth (the next real anchor) or the segment
+      end. This fills the long encode/decode phases where `seg_done` would otherwise sit
+      frozen and then jump.
+    - No frame report yet: use the time estimate, but CAP it at the first chunk's share
+      (1/total_chunks). The first real anchor lands around the end of chunk 1, so a
+      too-low estimate can no longer rush the bar to ~100 % and snap back when it arrives.
+    """
+    tc = max(1, int(total_chunks or 1))
+    if has_frames:
+        done = seg_done
+        if live_spf and live_spf > 0 and last_fp_time:
+            chunk_frames = seg_frames / tc
+            fwd = min(chunk_frames, max(0.0, (now - last_fp_time) / live_spf))
+            done = min(seg_frames, seg_done + fwd)
+        return run_done + min(seg_frames, done)
+    if seg_expected and seg_start and seg_expected > 0:
+        frac = min(1.0 / tc, (now - seg_start) / seg_expected)
+        return run_done + frac * seg_frames
+    return run_done
+
+
 # ─────────────────────────────────────────────
 #  APP WINDOW
 # ─────────────────────────────────────────────
@@ -7062,6 +7090,9 @@ class VideoTab(ttk.Frame):
         self._seg_has_frames = False  # worker reported real frames_processed for it
         self._cur_status = ""         # base status line the tick appends ETA to
         self._live_spf = None         # live seconds/frame the pod measures per DiT batch
+        self._seg_total_chunks = 1    # streaming chunks in the segment (caps the pre-report bar)
+        self._last_fp_time = None     # wall-clock of the last real frames_processed report
+        self._bar_frac = 0.0          # last painted bar fraction (kept MONOTONIC)
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -7208,6 +7239,8 @@ class VideoTab(ttk.Frame):
             state = data.get("state")
             self._cur_seg_frames = seg_frames
             self._live_spf = data.get("live_spf")   # pod's measured s/frame (DiT phase)
+            if data.get("total_chunks"):
+                self._seg_total_chunks = int(data["total_chunks"])
             if state == "running":
                 # "running" arrives on EVERY status poll (~5 s), not just once. Anchor
                 # the time-based estimate the FIRST time only (_seg_start is None),
@@ -7225,21 +7258,21 @@ class VideoTab(ttk.Frame):
                 if fp is not None:               # real within-segment frames, if any
                     self._cur_seg_done = min(fp, seg_frames)
                     self._seg_has_frames = True  # real data overrides the clock
+                    self._last_fp_time = time.time()
             elif state == "done":
                 self._run_done += seg_frames
                 self._cur_seg_done = 0
                 self._seg_start = None
                 self._seg_has_frames = False
                 self._live_spf = None
+                self._last_fp_time = None
             elif fp is not None:
                 self._cur_seg_done = min(fp, seg_frames)
                 self._seg_has_frames = True      # real data: it overrides the clock
-            # Only repaint the bar from REAL frame counts (or on 'done'). While a
-            # segment runs without frame reports, _run_tick owns the bar (time-based);
-            # repainting here would snap it back to the completed-segment fraction
-            # every poll (~5 s), which read as a 0 % flicker.
-            if state == "done" or self._seg_has_frames:
-                self._update_progress()
+                self._last_fp_time = time.time()
+            # _run_tick (1 s) owns the bar via _paint_bar; repaint here too on a real
+            # frame count / 'done' so the bar reacts immediately to new data.
+            self._paint_bar()
         elif kind == "VTOTAL" and data is not None:
             # The runner re-reads the live queue each job and sends the current total
             # frame count, so the progress denominator tracks mid-run queue edits.
@@ -7249,20 +7282,29 @@ class VideoTab(ttk.Frame):
         elif kind == "RTELEM" and data:
             self.app.apply_remote_telemetry(self, data)
 
-    def _update_progress(self):
+    def _paint_bar(self):
+        """Single owner of the progress bar. Computes a frames-done estimate (real
+        within-segment frames anchored + live-s/frame smoothing, or a capped time
+        estimate before the first report) and paints it MONOTONICALLY, so the bar never
+        jumps backward (the old rush-to-100 %-then-snap) and never freezes mid-chunk."""
         if self._run_total <= 0:
             return
-        done = self._run_done + self._cur_seg_done
-        self.progress.set(100.0 * done / self._run_total)
-        self.app.taskbar_progress(done, self._run_total)
+        done = _video_bar_done(
+            self._run_done, self._cur_seg_frames, self._cur_seg_done,
+            self._last_fp_time, time.time(), self._live_spf,
+            self._seg_start, self._seg_expected, self._seg_total_chunks,
+            self._seg_has_frames)
+        frac = min(1.0, done / self._run_total)
+        self._bar_frac = max(getattr(self, "_bar_frac", 0.0), frac)
+        self.progress.set(100.0 * self._bar_frac)
+        self.app.taskbar_progress(int(self._bar_frac * self._run_total),
+                                  max(1, self._run_total))
 
     def _run_tick(self):
-        """1 s heartbeat during a run. The worker usually can't report within-segment
-        frame progress (SeedVR2's bar counts batches, not frames), so while a segment
-        is running we ADVANCE THE BAR from elapsed-vs-expected time, capped just below
-        100 %, and show an ETA. Real frame counts, when they arrive, take over via
-        _update_progress and we only refresh the ETA here. With no benchmark for the
-        card we can't estimate, so we show an elapsed counter to prove it is alive."""
+        """1 s heartbeat during a run. Repaints the bar every tick via _paint_bar (the
+        single bar owner: real frames when the pod reports them, else a capped time
+        estimate) and refreshes the ETA + the pod's live s/frame. With no benchmark for
+        the card we can't estimate, so we show an elapsed counter to prove it is alive."""
         if self.proc is None:
             self._run_tick_job = None
             return
@@ -7271,17 +7313,15 @@ class VideoTab(ttk.Frame):
         done_now = self._run_done + self._cur_seg_done
         if done_now > 0 and elapsed > 0:
             self._rate = elapsed / done_now           # real seconds/frame for ETA
+        self._paint_bar()
         base = getattr(self, "_cur_status", "") or ""
         tail = ""
         running = self._seg_start is not None and not self._seg_has_frames
         if running and self._seg_expected and self._run_total > 0:
-            frac = min(0.97, (time.time() - self._seg_start) / self._seg_expected)
-            done_est = self._run_done + frac * self._cur_seg_frames
-            self.progress.set(100.0 * done_est / self._run_total)
-            self.app.taskbar_progress(int(done_est), max(1, self._run_total))
             per_frame = self._seg_expected / self._cur_seg_frames if self._cur_seg_frames else 0
             if per_frame:
-                tail = f" · ETA {ve.fmt_duration((self._run_total - done_est) * per_frame)}"
+                remaining = max(0.0, self._run_total * (1.0 - self._bar_frac))
+                tail = f" · ETA {ve.fmt_duration(remaining * per_frame)}"
         elif running:
             # No benchmark for this card: prove liveness with an elapsed counter.
             tail = f" · running {ve.fmt_duration(time.time() - self._seg_start)}"

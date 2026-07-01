@@ -690,6 +690,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                                   "frames_processed": st.get("frames_processed"),
                                   "seg_frames": _tot,
                                   "live_spf": st.get("live_spf"),
+                                  "total_chunks": st.get("total_chunks"),
                                   "output_bytes": st.get("output_bytes")})
 
         _progress({"state": "running"})

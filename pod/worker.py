@@ -447,13 +447,6 @@ class _HeartbeatTee:
             reset = n <= self._last_bn        # index went backwards -> a new chunk began
             if reset:
                 self._chunks_done += 1
-            batch = int(self._job.get("resolved_batch") or 0)
-            overlap = int(self._job.get("resolved_overlap") or 0)
-            stride = max(1, batch - overlap) if batch else 1
-            if not reset and self._last_bt is not None and n > self._last_bn:
-                frames = (n - self._last_bn) * stride
-                if frames > 0:
-                    self._job["live_spf"] = round((now - self._last_bt) / frames, 2)
             tc = int(self._job.get("total_chunks") or 1)
             # A SINGLE batch over a single chunk (mtot==1, tc==1) has no within-run signal:
             # "Upscaling batch 1/1" means the whole-clip batch STARTED, not finished, and
@@ -464,6 +457,16 @@ class _HeartbeatTee:
             if mtot > 1 or tc > 1:
                 frac = min(1.0, (self._chunks_done + n / mtot) / tc)
                 self._job["frames_processed"] = min(total, int(round(frac * total)))
+            # Live s/frame = a RUNNING AVERAGE (elapsed / frames processed so far), not a
+            # fragile per-batch delta: it appears from the FIRST frame report, always has a
+            # value once frames flow, and converges to the true final rate (incl. the
+            # one-time compile warm-up, which is the honest cost the user is watching).
+            fp = self._job.get("frames_processed") or 0
+            started = self._job.get("started")
+            if fp > 0 and started:
+                el = now - started
+                if el > 0:
+                    self._job["live_spf"] = round(el / fp, 2)
             self._last_bn, self._last_bt = n, now
         except Exception:
             pass
@@ -895,6 +898,7 @@ class Handler(BaseHTTPRequestHandler):
             "resolved_batch":   job.get("resolved_batch"),
             "resolved_overlap": job.get("resolved_overlap"),
             "resolved_chunk":   job.get("resolved_chunk"),
+            "total_chunks":     job.get("total_chunks"),   # GUI caps the pre-report bar to 1/this
             "resolved_attention": getattr(getattr(_ENGINE, "args", None),
                                           "attention_mode", None),
             "compile_dit":      getattr(getattr(_ENGINE, "args", None), "compile_dit", None),
