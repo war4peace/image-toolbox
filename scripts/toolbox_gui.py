@@ -6111,6 +6111,15 @@ class UpdateDialog(tk.Toplevel):
         self.destroy()
 
 
+# Progress-bar debug (TEMPORARY, being validated): log every bar value change with the
+# inputs, so the bar can be checked over a long run without eyeballing it. Modes:
+#   "window" -> the log window (and backlog) — what you watch live;
+#   "file"   -> logs/video_progress_debug.log only, kept OFF the window (flip to this
+#               once the bar is trusted, so the window stays clean);
+#   None     -> off (remove the instrumentation).
+_PROGRESS_DEBUG_MODE = "window"
+
+
 def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
                     seg_start, seg_expected, total_chunks, has_frames):
     """Frames-done estimate for the Video tab's progress bar (the caller divides by the
@@ -7272,7 +7281,7 @@ class VideoTab(ttk.Frame):
                 self._last_fp_time = time.time()
             # _run_tick (1 s) owns the bar via _paint_bar; repaint here too on a real
             # frame count / 'done' so the bar reacts immediately to new data.
-            self._paint_bar()
+            self._paint_bar("seg")
         elif kind == "VTOTAL" and data is not None:
             # The runner re-reads the live queue each job and sends the current total
             # frame count, so the progress denominator tracks mid-run queue edits.
@@ -7282,7 +7291,7 @@ class VideoTab(ttk.Frame):
         elif kind == "RTELEM" and data:
             self.app.apply_remote_telemetry(self, data)
 
-    def _paint_bar(self):
+    def _paint_bar(self, src="tick"):
         """Single owner of the progress bar. Computes a frames-done estimate (real
         within-segment frames anchored + live-s/frame smoothing, or a capped time
         estimate before the first report) and paints it MONOTONICALLY, so the bar never
@@ -7294,11 +7303,42 @@ class VideoTab(ttk.Frame):
             self._last_fp_time, time.time(), self._live_spf,
             self._seg_start, self._seg_expected, self._seg_total_chunks,
             self._seg_has_frames)
-        frac = min(1.0, done / self._run_total)
-        self._bar_frac = max(getattr(self, "_bar_frac", 0.0), frac)
+        raw = min(1.0, done / self._run_total)
+        prev = getattr(self, "_bar_frac", 0.0)
+        self._bar_frac = max(prev, raw)
         self.progress.set(100.0 * self._bar_frac)
         self.app.taskbar_progress(int(self._bar_frac * self._run_total),
                                   max(1, self._run_total))
+        if self._bar_frac != prev:
+            self._dbg_progress(src, raw, done)
+
+    def _dbg_progress(self, src, raw, done):
+        """TEMPORARY: log each bar value change with the inputs behind it, so the bar
+        can be validated over a long run. Routed by _PROGRESS_DEBUG_MODE (window/file/
+        off). `src` = who painted ('tick' = 1 s heartbeat, 'seg' = a SEGMENT event);
+        `raw` = the pre-monotonic fraction (a raw < the painted bar means a value was
+        clamped, i.e. it wanted to go backward)."""
+        mode = _PROGRESS_DEBUG_MODE
+        if not mode:
+            return
+        try:
+            age = (f"{time.time() - self._last_fp_time:.1f}"
+                   if self._last_fp_time else "-")
+            line = (f"[progress {_log_hms()}] bar={100 * self._bar_frac:6.2f}% "
+                    f"(raw {100 * raw:6.2f}%) src={src} done={done:.1f} "
+                    f"run_done={self._run_done} "
+                    f"seg_done={self._cur_seg_done}/{self._cur_seg_frames} "
+                    f"total={self._run_total} has_frames={self._seg_has_frames} "
+                    f"live_spf={self._live_spf} fp_age={age}s "
+                    f"chunks={self._seg_total_chunks}\n")
+            if mode == "file":
+                with open(os.path.join(APP_ROOT, "logs", "video_progress_debug.log"),
+                          "a", encoding="utf-8") as f:
+                    f.write(line)
+            else:
+                self.console.feed(line)
+        except Exception:
+            pass
 
     def _run_tick(self):
         """1 s heartbeat during a run. Repaints the bar every tick via _paint_bar (the
@@ -7313,7 +7353,7 @@ class VideoTab(ttk.Frame):
         done_now = self._run_done + self._cur_seg_done
         if done_now > 0 and elapsed > 0:
             self._rate = elapsed / done_now           # real seconds/frame for ETA
-        self._paint_bar()
+        self._paint_bar("tick")
         base = getattr(self, "_cur_status", "") or ""
         tail = ""
         running = self._seg_start is not None and not self._seg_has_frames
