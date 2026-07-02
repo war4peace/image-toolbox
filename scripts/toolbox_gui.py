@@ -7108,6 +7108,8 @@ class VideoTab(ttk.Frame):
         self._seg_total_chunks = 1    # streaming chunks in the segment (caps the pre-report bar)
         self._last_fp_time = None     # wall-clock of the last real frames_processed report
         self._bar_frac = 0.0          # last painted bar fraction (kept MONOTONIC)
+        self._eta_finish = None       # projected finish time; refreshed only when progress advances
+        self._eta_done = 0            # done_now at the last ETA refresh (so a stall can't inflate it)
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -7359,24 +7361,31 @@ class VideoTab(ttk.Frame):
             self._run_tick_job = None
             return
         import video_estimate as ve
-        elapsed = time.time() - (self._run_start or time.time())
+        now = time.time()
+        elapsed = now - (self._run_start or now)
         done_now = self._run_done + self._cur_seg_done
-        if done_now > 0 and elapsed > 0:
-            self._rate = elapsed / done_now           # real seconds/frame for ETA
+        # Project the finish time, refreshed ONLY when progress actually advances. Between
+        # advances done_now is frozen while elapsed climbs, so recomputing the rate every
+        # tick would inflate the ETA (the old sawtooth: creep up 1-2 s/tick, drop on report).
+        # Instead we hold the projection and let the display count DOWN to it.
+        if done_now > self._eta_done and self._run_total > 0 and elapsed > 0:
+            self._rate = elapsed / done_now           # running-average seconds/frame
+            self._eta_finish = (self._run_start or now) + self._rate * self._run_total
+            self._eta_done = done_now
         self._paint_bar("tick")
         base = getattr(self, "_cur_status", "") or ""
         tail = ""
-        running = self._seg_start is not None and not self._seg_has_frames
-        if running and self._seg_expected and self._run_total > 0:
+        if self._eta_finish is not None and done_now > 0:
+            tail = f" · ETA {ve.fmt_duration(max(0.0, self._eta_finish - now))}"
+        elif self._seg_start is not None and self._seg_expected and self._run_total > 0:
+            # No real frames yet: a rough estimate from the benchmark, counted off the bar.
             per_frame = self._seg_expected / self._cur_seg_frames if self._cur_seg_frames else 0
             if per_frame:
                 remaining = max(0.0, self._run_total * (1.0 - self._bar_frac))
                 tail = f" · ETA {ve.fmt_duration(remaining * per_frame)}"
-        elif running:
+        elif self._seg_start is not None:
             # No benchmark for this card: prove liveness with an elapsed counter.
-            tail = f" · running {ve.fmt_duration(time.time() - self._seg_start)}"
-        elif self._rate and self._run_total > 0:
-            tail = f" · ETA {ve.fmt_duration((self._run_total - done_now) * self._rate)}"
+            tail = f" · running {ve.fmt_duration(now - self._seg_start)}"
         # The pod measures real seconds/frame per DiT batch (first batch is high while
         # torch.compile warms up, then it drops): show it live so a benchmarking run
         # isn't flying blind on an estimate. See worker _HeartbeatTee / SEGMENT events.
