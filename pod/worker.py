@@ -303,6 +303,9 @@ _VRAM_PROFILES = {       # model family -> (FIXED, A, B, C)
     "3b_fp16": (9.40,  8.55, 0.0932,  0.0),
 }
 _VRAM_SAFETY = 0.80          # max working-set fraction of the card (allocator thrashes near 1.0)
+_VRAM_HEADROOM_GB = 6.0      # absolute breathing room reserved on top of the fraction, so a
+                             # SMALL card (32 GB) isn't clamped into the thrash zone the way a
+                             # 3B-fp16 1080p fit did (peaked 92%); negligible on big cards.
 _BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknown content on
                              # any card. Bigger windows add temporal consistency (SeedVR2's
                              # ideal is batch = shot length); a manual override can go far
@@ -337,7 +340,13 @@ def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
     mp = (out_w * out_h) / 1_000_000.0
     if mp <= 0 or vram_gb <= 0:
         return 997
-    budget = vram_gb * (_VRAM_SAFETY if resident else 0.90)
+    # The fraction alone is calibrated for big cards: 10% of an 80 GB card is ~8 GB of
+    # allocator breathing room, but 10% of a 32 GB card is only ~3 GB, so the same 0.90
+    # let a 3B-fp16 auto-fit clamp scrape 92% and thrash the decode tail. Also reserve an
+    # ABSOLUTE headroom (_VRAM_HEADROOM_GB): it only bites small cards (the fraction still
+    # dominates on big ones), keeping a 32 GB card usable but out of the thrash zone.
+    frac = _VRAM_SAFETY if resident else 0.90
+    budget = min(vram_gb * frac, vram_gb - _VRAM_HEADROOM_GB)
     best, b = _BATCH_FLOOR, _BATCH_FLOOR
     while b <= 997:
         if _ws_gb(mp, b, model) <= budget:
@@ -410,7 +419,14 @@ def _time_fill_frames(job):
     cd = int(job.get("prog_chunks_done") or 0)
     frac = min(1.0, (cd + within) / tc)
     prev = int(job.get("frames_processed") or 0)
-    job["frames_processed"] = min(total, max(prev, int(round(frac * total))))
+    # The ESTIMATE must never reach 100%: only the real completion (state=done, which sets
+    # frames_processed = total in _run_video_job) fills the last frame. process_video is one
+    # blocking call with no per-frame callback, so a final chunk that runs far slower than the
+    # earlier ones (e.g. a VRAM-thrashing tail on an undersized card) would otherwise coast the
+    # estimate to 100% while minutes of real decode remain (the "100% for 24 min" report). Cap
+    # one frame short so a slow tail reads an honest "~99%, still working", then snaps to 100%.
+    ceil_running = total - 1 if total > 1 else total
+    job["frames_processed"] = min(ceil_running, max(prev, int(round(frac * total))))
     started = job.get("started")
     fp = job["frames_processed"]
     if fp > 0 and started:
@@ -662,6 +678,9 @@ def _run_video_job(job, params):
         except Exception:
             pass
         job["frames_written"] = n
+        # Only real completion fills the bar to 100% (the running estimate is capped one frame
+        # short in _time_fill_frames, so "100%" always means the pod finished, not a guess).
+        job["frames_processed"] = job.get("total_frames") or n or job.get("frames_processed")
         job["output_bytes"] = out_bytes
         job["seconds"] = dt
         job["state"] = "done"
