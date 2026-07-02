@@ -379,12 +379,44 @@ _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
 # UNVALIDATED assumption about it). Diagnostic only — fail-safe, bounded, never affects the run.
 _PHASE_RE = re.compile(r"(Encoding|Upscaling|Decoding) batch\s+(\d+)\s*/\s*(\d+)")
 _PHASE_IDX = {"Encoding": 0, "Upscaling": 1, "Decoding": 2}
-# Within a streaming chunk the pipeline runs encode -> upscale -> decode. At 1440p+ the
-# VAE encode/decode DOMINATE the wall-time (the DiT upscale is a few seconds), so the
-# progress bar must advance through E and D, not only U (mining U alone froze the bar for
-# minutes each chunk then jumped). Each phase gets a (start, width) slice of the chunk's
-# [0,1]; weighted toward E and D to roughly track where the time actually goes.
-_PHASE_SPAN = {0: (0.00, 0.45), 1: (0.45, 0.10), 2: (0.55, 0.45)}
+# Within a streaming chunk the pipeline runs encode -> upscale -> decode. Measured: the VAE
+# DECODE dominates the wall-time (encode ~seconds, upscale ~seconds, decode = minutes), so
+# the phase lines alone can't smooth the bar — decode is often ONE atomic step (M=1) that
+# emits nothing for minutes. So the phase lines only mark chunk BOUNDARIES + rough within-
+# chunk snap points (weighted decode-heavy below), and `_time_fill_frames` fills each chunk
+# smoothly BY TIME using the previous chunk's measured duration (computed at status-poll
+# time, so the opaque decode still advances). These spans are lower bounds time overtakes.
+_PHASE_SPAN = {0: (0.00, 0.03), 1: (0.03, 0.05), 2: (0.08, 0.92)}
+
+
+def _time_fill_frames(job):
+    """Progress = (chunks_done + within-chunk fraction) / total_chunks, as OUTPUT frames.
+    The within-chunk fraction is driven BY TIME (elapsed-in-chunk / the previous chunk's
+    measured duration), floored by the last phase-line snap point, and capped at 0.98 until
+    the chunk's final phase line snaps it to 1.0 — so a chunk slower than the estimate stalls
+    just short of its boundary instead of overshooting into the next one. Called both when a
+    phase line arrives AND on every status poll (so the long decode keeps advancing with no
+    phase output). Monotonic; also refreshes the running-average live s/frame. Fail-safe."""
+    total = int(job.get("total_frames") or 0)
+    tc = max(1, int(job.get("total_chunks") or 1))
+    within = job.get("prog_phase_within")
+    if total <= 0 or within is None:
+        return
+    est = job.get("prog_chunk_dur_est")
+    st = job.get("prog_chunk_start_t")
+    if est and st and est > 0:
+        tfrac = min(1.0, (time.time() - st) / est)
+        within = min(0.98, max(within, tfrac))
+    cd = int(job.get("prog_chunks_done") or 0)
+    frac = min(1.0, (cd + within) / tc)
+    prev = int(job.get("frames_processed") or 0)
+    job["frames_processed"] = min(total, max(prev, int(round(frac * total))))
+    started = job.get("started")
+    fp = job["frames_processed"]
+    if fp > 0 and started:
+        el = time.time() - started
+        if el > 0:
+            job["live_spf"] = round(el / fp, 2)
 
 
 class _HeartbeatTee:
@@ -406,6 +438,8 @@ class _HeartbeatTee:
         self._job = job
         self._last_phase_idx = -1  # last phase seen (E=0/U=1/D=2); a DROP means a new chunk
         self._chunks_done = 0      # streaming chunks fully finished
+        self._chunk_start_t = None # wall-clock the current chunk started (for the time fill)
+        self._prev_chunk_dur = None  # the last completed chunk's duration (the fill estimate)
 
     def write(self, s):
         try:
@@ -435,12 +469,11 @@ class _HeartbeatTee:
         total = self._job.get("total_frames") or 0
         if total <= 0:
             return
-        # Mine ALL three phase lines (encode/upscale/decode), each force-printed as
-        # "<phase> batch N/M" (M = latent batches in THIS chunk). Mining only the upscale
-        # phase left the bar blind through the long encode/decode (most of the wall-time at
-        # 1440p+), so it froze then jumped. A chunk runs E -> U -> D; a new chunk begins when
-        # the phase index DROPS (D/U -> E). Progress = (chunks_done + within-chunk fraction)
-        # / total_chunks, weighted by _PHASE_SPAN and kept MONOTONIC. Fail-safe.
+        # Phase lines (E/U/D batch N/M) mark chunk BOUNDARIES and rough within-chunk snap
+        # points; the actual smoothing is done BY TIME in _time_fill_frames (the decode is
+        # often one atomic minutes-long step with no output, so phase lines alone can't fill
+        # it). A chunk runs E -> U -> D; a new chunk begins when the phase index DROPS. On a
+        # boundary we bank the finished chunk's DURATION as the next chunk's fill estimate.
         try:
             pm = _PHASE_RE.search(s)
             if not pm:
@@ -449,24 +482,21 @@ class _HeartbeatTee:
             pidx = _PHASE_IDX.get(phase)
             if pidx is None or mt <= 0:
                 return
+            now = time.time()
             if pidx < self._last_phase_idx:      # wrapped D/U -> E: the next chunk started
+                if self._chunk_start_t is not None:
+                    self._prev_chunk_dur = now - self._chunk_start_t
+                self._chunk_start_t = now
                 self._chunks_done += 1
+            elif self._chunk_start_t is None:    # very first phase line of the run
+                self._chunk_start_t = now
             self._last_phase_idx = pidx
             start, span = _PHASE_SPAN[pidx]
-            within = start + span * (min(n, mt) / mt)
-            tc = int(self._job.get("total_chunks") or 1)
-            frac = min(1.0, (self._chunks_done + within) / tc)
-            prev = self._job.get("frames_processed") or 0
-            self._job["frames_processed"] = min(total, max(prev, int(round(frac * total))))
-            # Live s/frame = a RUNNING AVERAGE (elapsed / frames processed so far): appears
-            # from the first report, always defined, converges to the true final rate (incl.
-            # the one-time compile warm-up, the honest cost the user is watching).
-            fp = self._job["frames_processed"]
-            started = self._job.get("started")
-            if fp > 0 and started:
-                el = time.time() - started
-                if el > 0:
-                    self._job["live_spf"] = round(el / fp, 2)
+            self._job["prog_phase_within"] = start + span * (min(n, mt) / mt)
+            self._job["prog_chunks_done"] = self._chunks_done
+            self._job["prog_chunk_start_t"] = self._chunk_start_t
+            self._job["prog_chunk_dur_est"] = self._prev_chunk_dur
+            _time_fill_frames(self._job)         # snap to the boundary now; status fills between
         except Exception:
             pass
 
@@ -884,6 +914,9 @@ class Handler(BaseHTTPRequestHandler):
                 out_bytes = os.path.getsize(job["output"])
             except OSError:
                 out_bytes = 0
+            # Advance the time-based within-chunk fill NOW, so the long decode phase (which
+            # emits no phase lines for minutes) still moves between the boundary snaps.
+            _time_fill_frames(job)
         body = json.dumps({
             "id":               job["id"],
             "state":            job["state"],

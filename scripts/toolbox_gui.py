@@ -6136,15 +6136,11 @@ def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
     """
     tc = max(1, int(total_chunks or 1))
     if has_frames:
-        done = seg_done
-        if live_spf and live_spf > 0 and last_fp_time:
-            # Smooth forward from the last real anchor, capped at HALF a chunk: the worker
-            # now reports ~6x per chunk (encode/upscale/decode phases), so a real anchor is
-            # never far off — a small cap fills the gap without overshooting the next one.
-            cap = seg_frames / (2 * tc)
-            fwd = min(cap, max(0.0, (now - last_fp_time) / live_spf))
-            done = min(seg_frames, seg_done + fwd)
-        return run_done + min(seg_frames, done)
+        # The worker now TIME-fills within each chunk (see _time_fill_frames) and reports it
+        # every status poll, so we just track its frame count. No local live-spf interpolation:
+        # live_spf is dominated by the fast encode/upscale, so interpolating with it RUSHED the
+        # bar through the slow decode and then froze. (last_fp_time / live_spf kept for the tail.)
+        return run_done + min(seg_frames, seg_done)
     if seg_expected and seg_start and seg_expected > 0:
         # Before the first real anchor: crawl on the time estimate, but cap LOW (half a
         # chunk) — the first phase report lands early (chunk 1 encode), so a high cap would
