@@ -39,7 +39,8 @@ or on a remote machine using RunPod.io infrastructure.
 
 The first launch opens a setup window that downloads the required components:
 Python, PyTorch with CUDA, the SeedVR2 engine (about 3 GB, if you also picked 
-the option to use local resources) and then starts the app. It also offers to install
+the option to use local resources), a pinned checksum-verified ffmpeg build
+(~110 MB, used by the Video Upscaler) and then starts the app. It also offers to install
 [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works 
 without it, and you can decline). The first upscale process you run additionally downloads
 the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved 
@@ -108,7 +109,7 @@ so you can mix and match freely.
 
 ## The app
 
-Windows GUI (pure Python standard-library tkinter, no extra packages) with five tabs.
+Windows GUI (pure Python standard-library tkinter, no extra packages) with six tabs.
 
 ### Common features
 
@@ -190,6 +191,40 @@ are replaced by their high-quality versions. No manual shuffling required.
   (e.g. a leftover `__upscaled__`) are cleaned up. The tab is locked while the
   Upscaler or Tag & Rename is running, since they may share the same folders.
 
+### Video Upscaler
+
+Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler
+uses, on a **rented RunPod GPU**. This feature is remote-only by design: video
+means a diffusion pass per output frame, which is impractical on a home GPU.
+Your source videos are never modified.
+
+- **Scan, queue, go:** scan a folder, filter the list (by path, resolution,
+  duration or FPS), pick a target per video (1080p / 1440p / 4K; only targets
+  the source is actually below are offered), build a queue, pick a GPU from the
+  live price list, press Start.
+- **Cost estimate + confirm-before-rent:** the estimated duration and cost for
+  the whole queue is shown *before* any pod is rented, and the estimator
+  improves itself from your own finished runs.
+- **Pay in installments:** each video is split into ~1-minute segments and
+  every finished segment is progress saved. Stop any time; the next Start
+  resumes at the first unfinished segment. Optional per-run minute / dollar
+  caps keep a long job on budget.
+- **The original audio is kept** (muxed back into the upscaled result), and a
+  drift check warns if the output timing ever diverges from the source.
+- **High-quality deliverable:** H.265 10-bit by default (selectable in
+  Settings), written to a mirrored `__upscaled__` output tree.
+- **Compare:** a before/after wipe comparison window for videos, with shared
+  zoom/pan, timestamp-aligned scrubbing and frame stepping.
+- **Auto-tuned:** you pick the target and the GPU; batch size, temporal overlap
+  and the remaining SeedVR2 knobs are resolved on the pod for the rented card's
+  actual VRAM, with automatic out-of-memory recovery. A choice of SeedVR2
+  models (7B / 3B variants) is available in Settings.
+
+Video upscaling is compute-heavy: as a rough guide, one hour of footage
+upscaled to 1080p costs about $28-46 of GPU time depending on the card (the
+in-app estimator shows the real numbers for your queue before you commit).
+Requires a RunPod account, like the other remote features.
+
 ### Settings
 
 Most of what is used to require hand-editing `config.json` is here:
@@ -205,6 +240,11 @@ Most of what is used to require hand-editing `config.json` is here:
   *Save as Default* button.
 - **MQTT** settings (host, port, credentials, test button, manual publish button)
 - **Update checker** settings.
+- **Video Upscaler** settings: deliverable codec/quality, SeedVR2 model, and
+  the advanced tuning knobs (best left on Auto).
+
+Remote (RunPod) settings - the API key, region/data center, model volume, GPU
+preferences and pod management - live on the dedicated **RunPod** tab.
 
 > **Maintainers:** before committing or sharing `config.json`, clear personal
 > data from **Default folders**, the **Notifications** section (Discord webhook,
