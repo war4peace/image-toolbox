@@ -719,15 +719,17 @@ reassembly are proven.
   ~253 MB load-all) and otherwise wall-clock. Encode the per-target default `batch_size`
   from the chosen card's VRAM plateau AND its cgroup RAM, and gate 4K windows behind a
   RAM/time check rather than assuming VRAM is the limit.
-- **ffmpeg build (source chosen: gyan.dev `release-essentials`, GPLv3, includes
-  nvenc + libx264/libx265; latest verified 8.1.1 / 2026-05-04).** For
-  `bootstrap.ps1`: download the **`.zip`** (native `Expand-Archive`; the `.7z` is
-  ~3x smaller but needs a 7-Zip extractor the app doesn't ship) and verify the
-  published `.sha256` sidecar. Pin a version via the packages URL
-  (`builds/packages/ffmpeg-<ver>-essentials_build.zip`, retained one release back)
-  or read `builds/release-version` and fetch the moving
-  `builds/ffmpeg-release-essentials.zip`. Extract only **`ffmpeg.exe` + `ffprobe.exe`**
-  (skip `ffplay`) into an `APP_ROOT`-resolved tools dir; ship the build's `LICENSE`.
+- **ffmpeg build — DONE (2026-07-03, `bootstrap.ps1` `Install-Ffmpeg`).** Source
+  as chosen: gyan.dev `release-essentials` (GPLv3, includes nvenc +
+  libx264/libx265), pinned at **8.1.2** via the packages URL
+  (`builds/packages/ffmpeg-<ver>-essentials_build.zip`) with the moving
+  `builds/ffmpeg-release-essentials.zip` as fallback (the pinned package is
+  retained only a few releases back — 8.1.1 had already aged off by
+  2026-07-03). The `.zip` is verified against the published `.sha256` sidecar;
+  only **`ffmpeg.exe` + `ffprobe.exe`** are extracted (skip `ffplay`) into
+  `<APP_ROOT>\ffmpeg\bin` (where `find_ffmpeg` looks), plus the build's
+  `LICENSE`. Runs in BOTH install modes; a failure warns and continues, and the
+  Video tab's readiness strip reports missing ffmpeg with guidance.
 - Confirm nvenc availability at runtime: NVIDIA GPU/driver present **and**
   `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
   libx265/libx264 fallback (6.4).
