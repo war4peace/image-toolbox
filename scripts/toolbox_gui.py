@@ -6414,6 +6414,16 @@ class VideoTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _readiness_text(self, rpc):
+        # Local ffmpeg first (a purely local check): every video job needs the
+        # local split/reassemble/mux, so without it nothing else matters. Only
+        # a successful lookup is cached, so installing ffmpeg later and
+        # re-entering the tab picks it up without a restart.
+        try:
+            import video_pipeline as vp
+            vp.find_ffmpeg()
+        except Exception:
+            return ("Not ready: ffmpeg not found - re-run the first-launch setup, or "
+                    "put ffmpeg.exe + ffprobe.exe in ffmpeg\\bin (or on the PATH).", False)
         if not rpc.get("api_key"):
             return "Not ready: set a RunPod API key (RunPod tab).", False
         try:

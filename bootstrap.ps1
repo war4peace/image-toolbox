@@ -10,6 +10,7 @@
 #   2. Installs Python 3.12 if not present (downloads from python.org)
 #   3. Creates the .venv virtual environment
 #   4. Downloads the SeedVR2 engine (GitHub zip - no git required)
+#      and ffmpeg (pinned build, SHA-256 verified - used by the Video Upscaler)
 #   5. Installs PyTorch with CUDA and the remaining Python packages
 #
 # Internet connection required. Downloads roughly 3 GB of components.
@@ -43,6 +44,13 @@ $PYTHON_VERSION = "3.12.9"
 $PYTHON_URL     = "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-amd64.exe"
 $SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/refs/heads/main.zip"
 $TORCH_INDEX    = "https://download.pytorch.org/whl/cu128"
+# Pinned ffmpeg for the Video Upscaler (gyan.dev release-essentials build: GPL,
+# includes nvenc + libx264/libx265 - see docs/video-upscaler.md section 6.4).
+# gyan.dev retains pinned packages only a few releases back, so the moving
+# latest-release zip is the fallback; both carry a .sha256 sidecar to verify.
+$FFMPEG_VERSION = "8.1.2"
+$FFMPEG_PKG_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$FFMPEG_VERSION-essentials_build.zip"
+$FFMPEG_REL_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 function Step($msg) {
     Write-Host ""
@@ -66,6 +74,71 @@ function Invoke-Pip {
     param([string[]]$PipArgs)
     & ".venv\Scripts\python.exe" -m pip @PipArgs
     if ($LASTEXITCODE -ne 0) { throw "pip failed: pip $($PipArgs -join ' ')" }
+}
+
+function Get-ExpectedSha256($url) {
+    # Fetch the .sha256 sidecar published next to a gyan.dev build and return
+    # the bare hex digest, or $null when it can't be read (caller then warns).
+    try {
+        $resp = Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing
+        $content = $resp.Content
+        if ($content -is [byte[]]) { $content = [System.Text.Encoding]::ASCII.GetString($content) }
+        if ("$content" -match "([0-9a-fA-F]{64})") { return $Matches[1].ToLower() }
+    } catch {}
+    return $null
+}
+
+function Install-Ffmpeg($appRoot) {
+    # Bundled ffmpeg/ffprobe for the Video Upscaler (docs/video-upscaler.md 6.4):
+    # ALL container work (probe/split/reassemble/audio-mux) runs locally, so this
+    # is needed in BOTH install modes - even Remote-only. The zip is verified
+    # against its published SHA-256 sidecar and extracted to ffmpeg\bin, where
+    # video_pipeline.find_ffmpeg() looks for it. Only ffmpeg.exe + ffprobe.exe
+    # are kept (ffplay is not needed); the build's GPL LICENSE ships alongside.
+    $binDir = Join-Path $appRoot "ffmpeg\bin"
+    if ((Test-Path (Join-Path $binDir "ffmpeg.exe")) -and (Test-Path (Join-Path $binDir "ffprobe.exe"))) {
+        Write-Host "  Already present - keeping it."
+        return
+    }
+    $zip = Join-Path $env:TEMP "ffmpeg-essentials.zip"
+    $url = $FFMPEG_PKG_URL
+    # Function-scoped: Invoke-WebRequest's progress rendering slows a ~110 MB
+    # download by an order of magnitude under PowerShell 5.1.
+    $ProgressPreference = "SilentlyContinue"
+    Write-Host "  Downloading ffmpeg $FFMPEG_VERSION essentials (~110 MB) ..."
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    } catch {
+        # The pinned package may have aged off gyan.dev; use the latest release.
+        Write-Host "  Pinned build unavailable - downloading the latest release build instead ..."
+        $url = $FFMPEG_REL_URL
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    }
+    $expected = Get-ExpectedSha256 $url
+    if ($expected) {
+        $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $expected) {
+            Remove-Item $zip -ErrorAction SilentlyContinue
+            throw "ffmpeg download failed its SHA-256 check (got $actual, expected $expected)."
+        }
+        Write-Host "  SHA-256 verified."
+    } else {
+        Write-Host "  WARNING: could not fetch the SHA-256 sidecar - continuing without the integrity check." -ForegroundColor Yellow
+    }
+    $extract = Join-Path $env:TEMP "ffmpeg_extract"
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -Path $zip -DestinationPath $extract -Force
+    $pkg = Get-ChildItem $extract -Directory | Select-Object -First 1
+    if (-not $pkg) { throw "The ffmpeg archive did not contain the expected build folder." }
+    New-Item -ItemType Directory -Force $binDir | Out-Null
+    foreach ($exe in @("ffmpeg.exe", "ffprobe.exe")) {
+        Copy-Item (Join-Path $pkg.FullName "bin\$exe") (Join-Path $binDir $exe) -Force
+    }
+    $lic = Join-Path $pkg.FullName "LICENSE"
+    if (Test-Path $lic) { Copy-Item $lic (Join-Path $appRoot "ffmpeg\LICENSE") -Force }
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "  Installed: $(Join-Path $binDir 'ffmpeg.exe')"
 }
 
 function Find-Ollama {
@@ -163,6 +236,21 @@ try {
         Move-Item $extracted.FullName (Join-Path $root "seedvr2")
         Remove-Item $zip -ErrorAction SilentlyContinue
         Remove-Item "$env:TEMP\seedvr2_extract" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # -- 4b. ffmpeg (Video Upscaler: local split/reassemble/mux) ---------------
+    # Runs in BOTH install modes: even a Remote-only install does the video
+    # split/reassembly locally (only the upscale itself runs on the pod).
+    Step "Setting up ffmpeg (used by the Video Upscaler)"
+    try {
+        Install-Ffmpeg $root
+    } catch {
+        # One optional feature must not abort the whole setup. The Video
+        # Upscaler tab shows "Not ready: ffmpeg not found" with guidance
+        # until the binaries exist.
+        Write-Host "  WARNING: ffmpeg setup failed: $_" -ForegroundColor Yellow
+        Write-Host "  The Video Upscaler will be unavailable. Fix: reinstall, or place"    -ForegroundColor Yellow
+        Write-Host "  ffmpeg.exe + ffprobe.exe in $root\ffmpeg\bin (or on the PATH)."      -ForegroundColor Yellow
     }
 
     # -- 5. Python packages ---------------------------------------------------

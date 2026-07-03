@@ -4,6 +4,7 @@ scans/
 db/
 .venv/
 seedvr2/
+ffmpeg/
 models/
 test_output/
 benchmark-videos/

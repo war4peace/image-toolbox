@@ -86,6 +86,8 @@ Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (fir
 ; The user's photos are never touched — they live elsewhere.
 Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\seedvr2"
+; The bundled ffmpeg build downloaded by bootstrap.ps1 (Video Upscaler)
+Type: filesandordirs; Name: "{app}\ffmpeg"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\scans"
 Type: filesandordirs; Name: "{app}\trcache"
