@@ -17,20 +17,30 @@ that core, not changing its architecture.
 
 ## 1. Release blocker: the Video Upscaler's local ffmpeg is never installed
 
-> **Status: DONE (2026-07-03).** `bootstrap.ps1` now installs a pinned ffmpeg
-> (`Install-Ffmpeg`: gyan.dev release-essentials 8.1.2, verified against its
-> published SHA-256 sidecar, with the moving latest-release build as fallback
-> when the pinned package ages off gyan.dev) into `ffmpeg\bin` in BOTH install
-> modes; a failure warns and continues (the readiness strip is the safety net).
-> `VideoTab._readiness_text` now checks ffmpeg first and shows a "Not ready"
-> message with the fix. `ffmpeg\` was added to `.gitignore` and to the
-> installer's `[UninstallDelete]`. Upgraders are covered automatically: the
-> installer already deletes `.setup_complete` on every (re)install, so the
-> idempotent bootstrap re-runs and adds ffmpeg. Verified end to end: real
-> download + hash check + extraction (ffmpeg/ffprobe run, LICENSE shipped),
-> idempotent second run, and both readiness branches (missing -> guidance,
-> present -> proceeds to the API-key check; an install-after-launch is picked
-> up on tab re-entry because only successful lookups are cached).
+> **Status: DONE (2026-07-03; shipped in 0.4.0, download revised on
+> 0.4.1-experimental).** `bootstrap.ps1` installs ffmpeg into `ffmpeg\bin` in
+> BOTH install modes (`Install-Ffmpeg`), and `VideoTab._readiness_text` checks
+> ffmpeg first and shows a "Not ready" message with the fix. `ffmpeg\` was added
+> to `.gitignore` and to the installer's `[UninstallDelete]`; upgraders are
+> covered because the installer deletes `.setup_complete` on every (re)install
+> so the idempotent bootstrap re-runs.
+>
+> The 0.4.0 build downloaded from gyan.dev with the progress bar silenced (its
+> rendering cripples `Invoke-WebRequest` throughput on PS 5.1), which left a
+> non-technical user staring at a frozen window for ~10 min on gyan's slow
+> (~275 KB/s) host. **Revised on 0.4.1-experimental** (user feedback): the
+> download now uses **`curl.exe`** (ships in Windows 10/11; a real progress bar
+> and much faster than IWR) and pulls from **BtbN's GitHub build** (github.com
+> CDN, durable URL pinned to the ffmpeg 8.1 branch), with gyan.dev's
+> release-essentials as a fallback. BtbN publishes no `.sha256` sidecar and
+> rebuilds in place, so the BtbN path can't be hash-pinned; integrity there is
+> HTTPS-to-github plus a functional post-extract check (`ffprobe -version` must
+> run and report the expected version). The gyan fallback keeps its real
+> SHA-256 sidecar check. Verified end to end on both source paths (curl
+> download, extraction, functional check, idempotent second run) and both
+> readiness branches (missing -> guidance; present -> proceeds to the API-key
+> check; an install-after-launch is picked up on tab re-entry because only
+> successful lookups are cached).
 
 **What:** `video_pipeline.find_ffmpeg()` resolves `$IMGTBX_FFMPEG_DIR` ->
 `<APP_ROOT>/ffmpeg/bin` ("downloaded by bootstrap.ps1") -> PATH, and the design

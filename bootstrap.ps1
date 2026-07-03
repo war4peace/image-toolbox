@@ -10,7 +10,7 @@
 #   2. Installs Python 3.12 if not present (downloads from python.org)
 #   3. Creates the .venv virtual environment
 #   4. Downloads the SeedVR2 engine (GitHub zip - no git required)
-#      and ffmpeg (pinned build, SHA-256 verified - used by the Video Upscaler)
+#      and ffmpeg (GitHub build with a curl.exe progress bar - Video Upscaler)
 #   5. Installs PyTorch with CUDA and the remaining Python packages
 #
 # Internet connection required. Downloads roughly 3 GB of components.
@@ -44,13 +44,16 @@ $PYTHON_VERSION = "3.12.9"
 $PYTHON_URL     = "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-amd64.exe"
 $SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/refs/heads/main.zip"
 $TORCH_INDEX    = "https://download.pytorch.org/whl/cu128"
-# Pinned ffmpeg for the Video Upscaler (gyan.dev release-essentials build: GPL,
-# includes nvenc + libx264/libx265 - see docs/video-upscaler.md section 6.4).
-# gyan.dev retains pinned packages only a few releases back, so the moving
-# latest-release zip is the fallback; both carry a .sha256 sidecar to verify.
-$FFMPEG_VERSION = "8.1.2"
-$FFMPEG_PKG_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$FFMPEG_VERSION-essentials_build.zip"
-$FFMPEG_REL_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# ffmpeg for the Video Upscaler (a GPL build with nvenc + libx264/libx265 - see
+# docs/video-upscaler.md 6.4). Primary source is BtbN's GitHub build: it comes off
+# the github.com CDN (fast, unlike gyan.dev's ~275 KB/s) and the URL is durable,
+# pinned to the ffmpeg 8.1 branch. BtbN rebuilds that build in place and ships no
+# .sha256 sidecar, so it can't be hash-pinned; integrity there rests on HTTPS to
+# github.com plus a functional version check after extraction. gyan.dev's moving
+# release-essentials build is the fallback, verified against its .sha256 sidecar.
+$FFMPEG_LABEL    = "n8.1 win64-gpl"
+$FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
+$FFMPEG_GYAN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 function Step($msg) {
     Write-Host ""
@@ -88,43 +91,68 @@ function Get-ExpectedSha256($url) {
     return $null
 }
 
+function Get-Download($url, $dest) {
+    # Prefer curl.exe (ships in Windows 10/11 since build 17063): it shows a real
+    # progress bar AND downloads far faster than Invoke-WebRequest, whose progress
+    # rendering cripples throughput on PowerShell 5.1 (why the earlier version had
+    # to silence it, leaving the user with no feedback for minutes). Fall back to
+    # Invoke-WebRequest only if curl is somehow absent. Throws on failure.
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if (-not (Test-Path $curl)) {
+        $c = Get-Command curl.exe -ErrorAction SilentlyContinue
+        $curl = if ($c) { $c.Source } else { $null }
+    }
+    if ($curl) {
+        # No 2>&1: curl writes its progress meter to stderr; redirecting it under
+        # $ErrorActionPreference='Stop' would turn the meter into a terminating
+        # error. Left alone it renders in the console; we gate on the exit code.
+        & $curl -L --fail --retry 3 --retry-delay 2 -o $dest $url
+        if ($LASTEXITCODE -ne 0) { throw "download failed (curl exit $LASTEXITCODE): $url" }
+    } else {
+        Write-Host "  (curl not found - downloading without a progress bar; this can take several minutes) ..."
+        $ProgressPreference = "SilentlyContinue"
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+    }
+}
+
 function Install-Ffmpeg($appRoot) {
     # Bundled ffmpeg/ffprobe for the Video Upscaler (docs/video-upscaler.md 6.4):
     # ALL container work (probe/split/reassemble/audio-mux) runs locally, so this
-    # is needed in BOTH install modes - even Remote-only. The zip is verified
-    # against its published SHA-256 sidecar and extracted to ffmpeg\bin, where
-    # video_pipeline.find_ffmpeg() looks for it. Only ffmpeg.exe + ffprobe.exe
+    # is needed in BOTH install modes - even Remote-only. Extracted to ffmpeg\bin,
+    # where video_pipeline.find_ffmpeg() looks for it. Only ffmpeg.exe + ffprobe.exe
     # are kept (ffplay is not needed); the build's GPL LICENSE ships alongside.
     $binDir = Join-Path $appRoot "ffmpeg\bin"
     if ((Test-Path (Join-Path $binDir "ffmpeg.exe")) -and (Test-Path (Join-Path $binDir "ffprobe.exe"))) {
         Write-Host "  Already present - keeping it."
         return
     }
-    $zip = Join-Path $env:TEMP "ffmpeg-essentials.zip"
-    $url = $FFMPEG_PKG_URL
-    # Function-scoped: Invoke-WebRequest's progress rendering slows a ~110 MB
-    # download by an order of magnitude under PowerShell 5.1.
-    $ProgressPreference = "SilentlyContinue"
-    Write-Host "  Downloading ffmpeg $FFMPEG_VERSION essentials (~110 MB) ..."
+    $zip = Join-Path $env:TEMP "ffmpeg-imgtbx.zip"
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    $hashChecked = $false
+    # 1) Primary: BtbN's GitHub build (fast github.com CDN; no hash sidecar, so
+    #    integrity is HTTPS + the functional version check below).
     try {
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        Write-Host "  Downloading ffmpeg ($FFMPEG_LABEL) from GitHub (~160 MB) ..."
+        Get-Download $FFMPEG_BTBN_URL $zip
     } catch {
-        # The pinned package may have aged off gyan.dev; use the latest release.
-        Write-Host "  Pinned build unavailable - downloading the latest release build instead ..."
-        $url = $FFMPEG_REL_URL
-        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-    }
-    $expected = Get-ExpectedSha256 $url
-    if ($expected) {
-        $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
-        if ($actual -ne $expected) {
-            Remove-Item $zip -ErrorAction SilentlyContinue
-            throw "ffmpeg download failed its SHA-256 check (got $actual, expected $expected)."
+        # 2) Fallback: gyan.dev's release-essentials build, verified against its
+        #    published .sha256 sidecar.
+        Write-Host "  GitHub source unavailable ($_)" -ForegroundColor Yellow
+        Write-Host "  Trying the gyan.dev build (may be slower) ..." -ForegroundColor Yellow
+        Remove-Item $zip -ErrorAction SilentlyContinue
+        Get-Download $FFMPEG_GYAN_URL $zip
+        $expected = Get-ExpectedSha256 $FFMPEG_GYAN_URL
+        if ($expected) {
+            $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+            if ($actual -ne $expected) {
+                Remove-Item $zip -ErrorAction SilentlyContinue
+                throw "ffmpeg download failed its SHA-256 check (got $actual, expected $expected)."
+            }
+            Write-Host "  SHA-256 verified."
+            $hashChecked = $true
         }
-        Write-Host "  SHA-256 verified."
-    } else {
-        Write-Host "  WARNING: could not fetch the SHA-256 sidecar - continuing without the integrity check." -ForegroundColor Yellow
     }
+    # Extract ffmpeg.exe + ffprobe.exe (both builds put them in <top>\bin\).
     $extract = Join-Path $env:TEMP "ffmpeg_extract"
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $zip -DestinationPath $extract -Force
@@ -132,10 +160,24 @@ function Install-Ffmpeg($appRoot) {
     if (-not $pkg) { throw "The ffmpeg archive did not contain the expected build folder." }
     New-Item -ItemType Directory -Force $binDir | Out-Null
     foreach ($exe in @("ffmpeg.exe", "ffprobe.exe")) {
-        Copy-Item (Join-Path $pkg.FullName "bin\$exe") (Join-Path $binDir $exe) -Force
+        $srcExe = Join-Path $pkg.FullName "bin\$exe"
+        if (-not (Test-Path $srcExe)) { throw "The ffmpeg archive is missing bin\$exe." }
+        Copy-Item $srcExe (Join-Path $binDir $exe) -Force
     }
-    $lic = Join-Path $pkg.FullName "LICENSE"
-    if (Test-Path $lic) { Copy-Item $lic (Join-Path $appRoot "ffmpeg\LICENSE") -Force }
+    # Ship the build's GPL license (gyan names it LICENSE, BtbN LICENSE.txt).
+    $lic = Get-ChildItem $pkg.FullName -Filter "LICENSE*" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($lic) { Copy-Item $lic.FullName (Join-Path $appRoot "ffmpeg\LICENSE.txt") -Force }
+    # Functional check: prove the extracted binary runs and is the expected major
+    # version. This is the real integrity gate on the BtbN path (no hash sidecar),
+    # and catches a corrupt download on either. Capture-then-slice so the process
+    # exit code is read cleanly (no broken pipe from Select-Object).
+    $out  = & (Join-Path $binDir "ffprobe.exe") -version
+    $code = $LASTEXITCODE
+    $line = ($out | Select-Object -First 1)
+    if ($code -ne 0 -or "$line" -notmatch "ffprobe version") {
+        throw "the downloaded ffprobe.exe did not run correctly (exit $code): $line"
+    }
+    if (-not $hashChecked) { Write-Host "  Verified: $line" }
     Remove-Item $zip -ErrorAction SilentlyContinue
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "  Installed: $(Join-Path $binDir 'ffmpeg.exe')"

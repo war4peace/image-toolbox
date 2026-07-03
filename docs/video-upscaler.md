@@ -719,17 +719,22 @@ reassembly are proven.
   ~253 MB load-all) and otherwise wall-clock. Encode the per-target default `batch_size`
   from the chosen card's VRAM plateau AND its cgroup RAM, and gate 4K windows behind a
   RAM/time check rather than assuming VRAM is the limit.
-- **ffmpeg build — DONE (2026-07-03, `bootstrap.ps1` `Install-Ffmpeg`).** Source
-  as chosen: gyan.dev `release-essentials` (GPLv3, includes nvenc +
-  libx264/libx265), pinned at **8.1.2** via the packages URL
-  (`builds/packages/ffmpeg-<ver>-essentials_build.zip`) with the moving
-  `builds/ffmpeg-release-essentials.zip` as fallback (the pinned package is
-  retained only a few releases back — 8.1.1 had already aged off by
-  2026-07-03). The `.zip` is verified against the published `.sha256` sidecar;
-  only **`ffmpeg.exe` + `ffprobe.exe`** are extracted (skip `ffplay`) into
-  `<APP_ROOT>\ffmpeg\bin` (where `find_ffmpeg` looks), plus the build's
-  `LICENSE`. Runs in BOTH install modes; a failure warns and continues, and the
-  Video tab's readiness strip reports missing ffmpeg with guidance.
+- **ffmpeg build — DONE (2026-07-03, `bootstrap.ps1` `Install-Ffmpeg`).** A GPL
+  build with nvenc + libx264/libx265. Primary source is **BtbN's GitHub build**
+  (`releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip`): the
+  github.com CDN is fast (~9 s / 160 MB in testing vs ~7 min on gyan.dev) and the
+  URL is durable, pinned to the 8.1 branch. Downloaded via **`curl.exe`** (ships
+  in Windows 10/11) for a real progress bar: `Invoke-WebRequest`'s progress
+  rendering cripples PS 5.1 throughput, so the first cut silenced it and left the
+  user with no feedback for minutes; curl fixes both. gyan.dev's moving
+  `release-essentials` is the fallback, verified against its `.sha256` sidecar.
+  BtbN ships no sidecar and rebuilds in place (no hash pin possible), so integrity
+  on that path is HTTPS + a **functional check** (`ffprobe -version` must run and
+  report the expected version). Only **`ffmpeg.exe` + `ffprobe.exe`** are
+  extracted (skip `ffplay`) into `<APP_ROOT>\ffmpeg\bin` (where `find_ffmpeg`
+  looks), plus the build's GPL `LICENSE.txt`. Runs in BOTH install modes; a
+  failure warns and continues, and the Video tab's readiness strip reports
+  missing ffmpeg with guidance.
 - Confirm nvenc availability at runtime: NVIDIA GPU/driver present **and**
   `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
   libx265/libx264 fallback (6.4).

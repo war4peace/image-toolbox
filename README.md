@@ -39,8 +39,8 @@ or on a remote machine using RunPod.io infrastructure.
 
 The first launch opens a setup window that downloads the required components:
 Python, PyTorch with CUDA, the SeedVR2 engine (about 3 GB, if you also picked 
-the option to use local resources), a pinned checksum-verified ffmpeg build
-(~110 MB, used by the Video Upscaler) and then starts the app. It also offers to install
+the option to use local resources), a GPL ffmpeg build (~160 MB, used by the
+Video Upscaler) and then starts the app. It also offers to install
 [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works 
 without it, and you can decline). The first upscale process you run additionally downloads
 the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved 
