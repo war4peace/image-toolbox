@@ -6175,6 +6175,7 @@ class VideoTab(ttk.Frame):
         self.active_pod_id = None
         self._gpu_choices = []
         self._scan_rows = {}        # tree iid -> dict(rel, abs, width, height, ...)
+        self._scan_order = []       # iids in insertion order (filtered detach/reattach)
         self._root_id = None
         self._src_root = None
         self._out_root = None
@@ -6236,11 +6237,37 @@ class VideoTab(ttk.Frame):
             row=1, column=2, pady=(4, 0))
 
         # 3) Scan list.
-        sf = ttk.LabelFrame(self, text=" Videos in this folder ", padding=4)
+        sf = ttk.LabelFrame(self, text=" Eligible videos ", padding=4)
         sf.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
         self.rowconfigure(2, weight=3)
-        sf.rowconfigure(0, weight=1)
+        sf.rowconfigure(1, weight=1)          # the tree row (row 0 is the filter bar)
         sf.columnconfigure(0, weight=1)
+
+        # Filter bar: narrow the list by folder path, resolution, duration bucket or
+        # FPS. Each combo is fed the DISTINCT values actually present after a scan (plus
+        # "All"); changing any re-applies the combined (AND) filter by detaching the
+        # non-matching rows. See _populate_scan_filters / _apply_scan_filters.
+        filt = ttk.Frame(sf)
+        filt.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(filt, text="Filter:").pack(side="left")
+        self.filter_path_var = tk.StringVar(value="All")
+        self.filter_res_var = tk.StringVar(value="All")
+        self.filter_dur_var = tk.StringVar(value="All")
+        self.filter_fps_var = tk.StringVar(value="All")
+        self._filter_combos = {}
+        for label, var, width in (("Path", self.filter_path_var, 26),
+                                  ("Resolution", self.filter_res_var, 12),
+                                  ("Duration", self.filter_dur_var, 16),
+                                  ("FPS", self.filter_fps_var, 9)):
+            ttk.Label(filt, text=label).pack(side="left", padx=(10, 2))
+            cb = ttk.Combobox(filt, textvariable=var, state="readonly",
+                              width=width, values=["All"])
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_scan_filters())
+            self._filter_combos[label] = cb
+        ttk.Button(filt, text="Reset", width=6,
+                   command=self._reset_scan_filters).pack(side="left", padx=(10, 0))
+
         cols = ("res", "dur", "codec", "fps", "up", "upres", "status")
         self.scan_tree = ttk.Treeview(sf, columns=cols, show="tree headings", height=7)
         self._scan_sort = {}             # sort direction state for the scan headers
@@ -6260,9 +6287,9 @@ class VideoTab(ttk.Frame):
                 command=lambda c=c: self._sort_tree(
                     self.scan_tree, c, self._scan_sort_key(c), self._scan_sort))
         self.scan_tree.tag_configure("haveup", foreground="#2f6f3f")
-        self.scan_tree.grid(row=0, column=0, sticky="nsew")
+        self.scan_tree.grid(row=1, column=0, sticky="nsew")
         sb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        sb.grid(row=1, column=1, sticky="ns")
         self.scan_tree.configure(yscrollcommand=sb.set)
         self.scan_tree.bind("<<TreeviewSelect>>", self._on_scan_select)
         self.scan_tree.bind("<Double-1>", self._on_scan_double)
@@ -6450,10 +6477,13 @@ class VideoTab(ttk.Frame):
         set_default_folder("video_output", self._out_root)
         self.scan_tree.delete(*self.scan_tree.get_children())
         self._scan_rows.clear()
+        self._scan_order.clear()
+        self._reset_scan_filters(apply=False)   # drop the previous scan's filter values
         self.progress.set(0)
         self._scanning = True
         self._scan_total = self._scan_done = 0
         self._scan_skipped = []          # rels ffprobe could not read
+        self._scan_ineligible = []       # rels already >= the largest target (4K source)
         self._scan_res = {}              # "WxH" -> count, for the summary breakdown
         self._scan_listing = 0           # files found so far during the tree walk
         self._scan_removed = []          # (rel, target) outputs reconciled off disk
@@ -6501,6 +6531,11 @@ class VideoTab(ttk.Frame):
                     self._scan_q.put(("skip", rel))
                     continue
                 elig = bv.eligible_targets(r["width"], r["height"], cutoff)
+                if not elig:
+                    # Already fills the largest target box (a 4K / >=3840-long-side source
+                    # has nothing to upscale to) -> not an eligible video, so skip it.
+                    self._scan_q.put(("ineligible", rel))
+                    continue
                 outs = [(o["target"], o["status"], o["output_path"])
                         for o in bv.db.get_video_outputs_for(conn, self._root_id, rel)]
                 self._scan_q.put(("row", (rel, abs_path, dict(r), elig, outs)))
@@ -6545,6 +6580,10 @@ class VideoTab(ttk.Frame):
                 self._scan_done += 1
                 self._scan_skipped.append(data)
                 self.console.feed(f"  {data}  (unreadable, skipped)\n")
+            elif kind == "ineligible":
+                self._scan_done += 1
+                self._scan_ineligible.append(data)
+                self.console.feed(f"  {data}  (already >= 4K, skipped)\n")
             elif kind == "error":
                 self.status_var.set(f"Scan failed: {data}")
                 self._finish_scan()
@@ -6615,25 +6654,31 @@ class VideoTab(ttk.Frame):
             tags=("haveup",) if done else ())
         self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig,
                                 "outs": outs, "r": dict(r)}
+        self._scan_order.append(iid)
 
     def _finish_scan(self):
         self._scanning = False
         self.scan_btn.configure(state="normal")
         n = len(self._scan_rows)
         skipped = getattr(self, "_scan_skipped", [])
+        ineligible = getattr(self, "_scan_ineligible", [])
         res = getattr(self, "_scan_res", {})
         removed = getattr(self, "_scan_removed", [])
         self.progress.set(100 if self._scan_total else 0)
-        tail = f", {len(skipped)} unreadable (skipped)" if skipped else ""
+        tail = f", {len(ineligible)} already ≥ 4K (skipped)" if ineligible else ""
+        tail += f", {len(skipped)} unreadable (skipped)" if skipped else ""
         tail += f", {len(removed)} stale removed" if removed else ""
-        self.status_var.set(f"Found {n} video(s){tail}." if n
-                            else "No videos found in this folder.")
+        self.status_var.set(f"{n} eligible video(s){tail}." if n
+                            else f"No eligible videos found{tail}.")
+        self._populate_scan_filters()
         # A clearly delimited summary block (find-able after the long per-file run):
         # totals, then a count grouped by resolution, then the skipped files.
         bar = "=" * 56
         self.console.feed(f"\n{bar}\n")
         self.console.feed("Scan summary\n")
         self.console.feed(f"  Videos ready to queue: {n}\n")
+        if ineligible:
+            self.console.feed(f"  Already >= 4K (skipped): {len(ineligible)}\n")
         if skipped:
             self.console.feed(f"  Unreadable (skipped):  {len(skipped)}\n")
         if removed:
@@ -6649,6 +6694,89 @@ class VideoTab(ttk.Frame):
             for rel in skipped:
                 self.console.feed(f"     {rel}\n")
         self.console.feed(f"{bar}\n")
+
+    # ── scan-list filters ──────────────────────────────────────────────────────
+
+    _DUR_BUCKETS = (("0-10 seconds", 10), ("11-30 seconds", 30),
+                    ("31-60 seconds", 60), ("60-300 seconds", 300),
+                    ("over 300 seconds", None))
+
+    def _dur_bucket(self, seconds):
+        """The duration-filter bucket label for `seconds` (None if unknown)."""
+        if not seconds:
+            return None
+        for label, hi in self._DUR_BUCKETS:
+            if hi is None or seconds <= hi:
+                return label
+        return None
+
+    @staticmethod
+    def _fps_label(fps):
+        """The FPS-filter value for a probed fps (2 decimals; None if unknown)."""
+        return f"{fps:.2f}" if fps else None
+
+    def _populate_scan_filters(self):
+        """Fill the filter combos with the DISTINCT values present in the current scan
+        (each list prefixed with 'All'). Called at scan end. Duration is fed only the
+        buckets that actually occur, in canonical order."""
+        rows = list(self._scan_rows.values())
+        paths = sorted({(os.path.dirname(row["rel"]) or "(root)") for row in rows},
+                       key=str.lower)
+        res = sorted({f"{row['r']['width']}x{row['r']['height']}"
+                      for row in rows if row["r"].get("width")},
+                     key=lambda s: [int(x) for x in s.split("x")])
+        durs = [lbl for lbl, _hi in self._DUR_BUCKETS
+                if any(self._dur_bucket(row["r"].get("duration")) == lbl for row in rows)]
+        fpss = sorted({self._fps_label(row["r"].get("fps")) for row in rows
+                       if self._fps_label(row["r"].get("fps"))}, key=float)
+        for label, values in (("Path", paths), ("Resolution", res),
+                              ("Duration", durs), ("FPS", fpss)):
+            self._filter_combos[label].configure(values=["All"] + list(values))
+
+    def _reset_scan_filters(self, apply=True):
+        """Set every filter back to 'All' (keeps the populated value lists). The Reset
+        button (apply=True) also re-shows all rows; a new scan calls it with apply=False,
+        which additionally empties the stale value lists (repopulated at scan end)."""
+        for var in (self.filter_path_var, self.filter_res_var,
+                    self.filter_dur_var, self.filter_fps_var):
+            var.set("All")
+        if not apply:
+            for cb in self._filter_combos.values():
+                cb.configure(values=["All"])
+        if apply:
+            self._apply_scan_filters()
+
+    def _apply_scan_filters(self):
+        """Show only the rows matching every active filter, by detaching the rest and
+        reattaching matches in insertion order. Safe before any scan (empty order)."""
+        idx = 0
+        for iid in self._scan_order:
+            if iid not in self._scan_rows:
+                continue
+            if self._row_matches_filters(iid):
+                self.scan_tree.reattach(iid, "", idx)
+                idx += 1
+            else:
+                self.scan_tree.detach(iid)
+
+    def _row_matches_filters(self, iid):
+        row = self._scan_rows.get(iid)
+        if not row:
+            return False
+        r = row.get("r") or {}
+        pf = self.filter_path_var.get()
+        if pf and pf != "All" and (os.path.dirname(row["rel"]) or "(root)") != pf:
+            return False
+        rf = self.filter_res_var.get()
+        if rf and rf != "All" and f"{r.get('width')}x{r.get('height')}" != rf:
+            return False
+        df = self.filter_dur_var.get()
+        if df and df != "All" and self._dur_bucket(r.get("duration")) != df:
+            return False
+        ff = self.filter_fps_var.get()
+        if ff and ff != "All" and self._fps_label(r.get("fps")) != ff:
+            return False
+        return True
 
     def _done_targets(self, rel):
         """Targets already upscaled for `rel`, read LIVE from the DB (not the scan
