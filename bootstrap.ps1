@@ -42,7 +42,20 @@ try { Start-Transcript -Path (Join-Path $root "bootstrap.log") -Append | Out-Nul
 
 $PYTHON_VERSION = "3.12.9"
 $PYTHON_URL     = "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-amd64.exe"
-$SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/refs/heads/main.zip"
+# Pinned SHA-256 of python-3.12.9-amd64.exe (confirmed against python.org's own
+# published MD5 at pin time). Pinning the digest IN THIS FILE - not fetching a
+# hash sidecar from python.org - is what gives tamper protection: an attacker who
+# swapped the file on the server would control any hash served alongside it, but
+# not this git-tracked value. python.org publishes only an MD5 for the installer,
+# so this SHA-256 was computed locally from the MD5-verified download.
+$PYTHON_SHA256  = "2a52993092a19cfdffe126e2eeac46a4265e25705614546604ad44988e040c0f"
+# Pinned to a specific commit (not the moving main branch) so a fresh install
+# always gets the known-good engine snapshot this app version was validated
+# against. GitHub regenerates archive zips (compression can change), so the bytes
+# can't be hash-pinned; the commit pin is the reproducibility guarantee. Bump
+# deliberately after validating a newer engine.
+$SEEDVR2_COMMIT = "4490bd1f482e026674543386bb2a4d176da245b9"   # v2.5.24, 2025-12-24
+$SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/$SEEDVR2_COMMIT.zip"
 $TORCH_INDEX    = "https://download.pytorch.org/whl/cu128"
 # ffmpeg for the Video Upscaler (a GPL build with nvenc + libx264/libx265 - see
 # docs/video-upscaler.md 6.4). Primary source is BtbN's GitHub build: it comes off
@@ -246,7 +259,13 @@ try {
     } else {
         Write-Host "  Not found - downloading Python $PYTHON_VERSION (~25 MB) ..."
         $tmp = Join-Path $env:TEMP "python-$PYTHON_VERSION-amd64.exe"
-        Invoke-WebRequest -Uri $PYTHON_URL -OutFile $tmp -UseBasicParsing
+        Get-Download $PYTHON_URL $tmp
+        $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $PYTHON_SHA256) {
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+            throw "Python installer failed its SHA-256 check (got $actual, expected $PYTHON_SHA256). Download may be corrupt or tampered; re-run to retry."
+        }
+        Write-Host "  SHA-256 verified."
         Write-Host "  Installing Python (a progress window will appear) ..."
         Start-Process -Wait $tmp -ArgumentList "/passive InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_test=0"
         Remove-Item $tmp -ErrorAction SilentlyContinue
@@ -272,7 +291,8 @@ try {
         Write-Host "  Already present - keeping it."
     } else {
         $zip = Join-Path $env:TEMP "seedvr2.zip"
-        Invoke-WebRequest -Uri $SEEDVR2_ZIP -OutFile $zip -UseBasicParsing
+        Write-Host "  Downloading the SeedVR2 engine (commit $($SEEDVR2_COMMIT.Substring(0,7))) ..."
+        Get-Download $SEEDVR2_ZIP $zip
         Expand-Archive -Path $zip -DestinationPath "$env:TEMP\seedvr2_extract" -Force
         $extracted = Get-ChildItem "$env:TEMP\seedvr2_extract" -Directory | Select-Object -First 1
         Move-Item $extracted.FullName (Join-Path $root "seedvr2")

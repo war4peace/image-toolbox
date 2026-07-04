@@ -6153,7 +6153,7 @@ class UpdateDialog(tk.Toplevel):
         try:
             path = updater.download_installer(
                 self.info.asset_url, expected_size=self.info.asset_size,
-                progress_cb=on_progress)
+                sha256_url=self.info.sha256_url, progress_cb=on_progress)
         except Exception as exc:
             self.after(0, lambda: self._on_download_error(str(exc)))
             return

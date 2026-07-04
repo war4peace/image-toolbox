@@ -22,6 +22,7 @@ Design notes:
 import os
 import re
 import json
+import hashlib
 import tempfile
 import subprocess
 import urllib.request
@@ -31,18 +32,20 @@ GITHUB_REPO        = "war4peace/image-toolbox"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE      = f"https://github.com/{GITHUB_REPO}/releases/latest"
 INSTALLER_ASSET    = "ImageToolboxSetup.exe"
+SHA256SUMS_ASSET   = "SHA256SUMS"     # emitted alongside the installer by CI
 _USER_AGENT        = "ImageToolbox-Updater"
 
 
 class UpdateInfo:
     """A newer release than the one running."""
 
-    def __init__(self, version, tag, notes, asset_url, asset_size):
+    def __init__(self, version, tag, notes, asset_url, asset_size, sha256_url=None):
         self.version    = version      # e.g. "0.2.3" (tag without the leading v)
         self.tag        = tag          # e.g. "v0.2.3"
         self.notes      = notes        # release body (patch notes), may be ""
         self.asset_url  = asset_url    # direct download URL, or None if missing
         self.asset_size = asset_size   # bytes, or 0 if unknown
+        self.sha256_url = sha256_url   # SHA256SUMS asset URL, or None if absent
 
 
 def clean_notes(body):
@@ -133,26 +136,86 @@ def check_for_update(current_version, timeout=10):
     if not is_newer(latest, current_version):
         return "current", latest
 
-    asset_url, asset_size = None, 0
+    asset_url, asset_size, sha256_url = None, 0, None
     for asset in data.get("assets", []):
-        if (asset.get("name") or "").lower() == INSTALLER_ASSET.lower():
+        name = (asset.get("name") or "").lower()
+        if name == INSTALLER_ASSET.lower():
             asset_url  = asset.get("browser_download_url")
             asset_size = int(asset.get("size") or 0)
-            break
+        elif name == SHA256SUMS_ASSET.lower():
+            sha256_url = asset.get("browser_download_url")
 
     notes = clean_notes(data.get("body") or "")
-    return "update", UpdateInfo(latest, tag, notes, asset_url, asset_size)
+    return "update", UpdateInfo(latest, tag, notes, asset_url, asset_size, sha256_url)
 
 
-def download_installer(url, expected_size=0, dest_dir=None, progress_cb=None, timeout=30):
+def parse_sha256sums(text, asset_name=INSTALLER_ASSET):
+    """
+    Extract the SHA-256 digest recorded for asset_name from the text of a
+    SHA256SUMS file, or None when it isn't present. The format is the standard
+    `sha256sum` output, one entry per line:
+
+        <64 hex chars><spaces>[*]<filename>
+
+    Matching is by basename and case-insensitive on the name; the digest is
+    returned lower-cased. Robust to the binary-mode '*' marker and to full or
+    bare filenames. Pure (no I/O) so it can be unit-tested.
+    """
+    want = os.path.basename(asset_name).lower()
+    for line in (text or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        digest = parts[0]
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            continue
+        name = os.path.basename(parts[-1].lstrip("*")).lower()
+        if name == want:
+            return digest.lower()
+    return None
+
+
+def fetch_expected_sha256(sums_url, asset_name=INSTALLER_ASSET, timeout=30):
+    """
+    Download the release's SHA256SUMS file and return the digest recorded for
+    asset_name, or None when the file (or that entry) can't be read. Fail-safe:
+    any network/parse error yields None so a release published without the asset
+    (older releases) simply falls back to the size check rather than blocking.
+    """
+    if not sums_url:
+        return None
+    try:
+        req = urllib.request.Request(sums_url, headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    return parse_sha256sums(text, asset_name)
+
+
+def sha256_of_file(path, chunk=1 << 20):
+    """Streaming SHA-256 of a file, returned as lower-case hex."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download_installer(url, expected_size=0, sha256_url=None, dest_dir=None,
+                       progress_cb=None, timeout=30):
     """
     Download the installer to a temp file (written to a .part file, then renamed
     so a partial download can't be mistaken for a complete one).
 
     progress_cb(downloaded_bytes, total_bytes) is called as data arrives; total
     is 0 when the server doesn't send Content-Length. Returns the final path.
-    Raises on any network/IO error, or if the finished size doesn't match the
-    release's recorded asset size (a corruption / truncation guard).
+    Raises on any network/IO error, if the finished size doesn't match the
+    release's recorded asset size (a corruption / truncation guard), or if the
+    file fails the SHA-256 recorded in the release's SHA256SUMS. When no
+    SHA256SUMS is available (sha256_url absent, or an older release without the
+    asset) the size check remains the only guard - the hash step is skipped, not
+    treated as a failure.
     """
     if not url:
         raise ValueError("No installer asset was attached to the release.")
@@ -183,6 +246,20 @@ def download_installer(url, expected_size=0, dest_dir=None, progress_cb=None, ti
         raise IOError(
             f"Download size mismatch (got {done} bytes, expected {expected_size}). "
             f"The file may be corrupted; please try again.")
+
+    # Integrity gate: verify against the release-published SHA-256 when present.
+    expected_hash = fetch_expected_sha256(sha256_url)
+    if expected_hash:
+        actual = sha256_of_file(part)
+        if actual != expected_hash:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            raise IOError(
+                "The downloaded installer failed its SHA-256 integrity check "
+                f"(got {actual}, expected {expected_hash}). The file may be "
+                "corrupted or tampered with; the update was aborted.")
 
     os.replace(part, dest)
     return dest

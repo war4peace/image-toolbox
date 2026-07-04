@@ -36,6 +36,20 @@ jobs:
           name: ImageToolboxSetup
           path: installer/Output/ImageToolboxSetup.exe
 
+      - name: Compute SHA256SUMS
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          # Publish the installer's SHA-256 as a release asset so the in-app
+          # updater (updater.download_installer) can verify the exact bytes it
+          # downloaded before launching them. Standard `sha256sum` format:
+          # "<hex>  <filename>". ASCII, no BOM, so any parser reads it cleanly.
+          $exe  = "installer\Output\ImageToolboxSetup.exe"
+          $hash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ImageToolboxSetup.exe" | Out-File -FilePath SHA256SUMS -Encoding ascii -NoNewline
+          "----- SHA256SUMS -----"
+          Get-Content SHA256SUMS
+
       - name: Build release notes from the tag message
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -62,5 +76,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          files: installer/Output/ImageToolboxSetup.exe
+          files: |
+            installer/Output/ImageToolboxSetup.exe
+            SHA256SUMS
           body_path: RELEASE_NOTES.md

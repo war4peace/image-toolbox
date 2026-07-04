@@ -171,6 +171,39 @@ the bar looks hung is a money bug, not a cosmetic one.
 
 ## 4. Supply-chain integrity: verify what you download and ship
 
+> **Status: DONE (steps 1-2; 2026-07-04, 0.4.2-experimental).** Everything the
+> app downloads or ships is now pinned and verified where a trustworthy digest
+> exists; step 3 (code signing) stays a deliberate "when it matters" item.
+>
+> - **`bootstrap.ps1` Python** now downloads via the robust `Get-Download`
+>   helper (curl `--fail --retry`, real progress) and verifies the installer
+>   against a **repo-pinned SHA-256** (`$PYTHON_SHA256`). Pinning the hash *in the
+>   file* (not fetching a sidecar from python.org) is the actual tamper guard: an
+>   attacker who swapped the server file can't change this git-tracked value.
+>   python.org publishes only an MD5 for the installer, so the pinned SHA-256 was
+>   computed locally from the MD5-confirmed download.
+> - **SeedVR2 engine** is pinned to a **specific commit**
+>   (`$SEEDVR2_COMMIT`, v2.5.24) instead of the moving `main` branch, so a fresh
+>   install always gets the known-good snapshot this version was validated
+>   against. GitHub regenerates archive zips (compression can change) so the bytes
+>   can't be hash-pinned; the commit pin is the reproducibility guarantee. It too
+>   now downloads via `Get-Download`.
+> - **ffmpeg** already verifies (gyan.dev `.sha256` sidecar; BtbN has no sidecar
+>   so it rests on HTTPS-to-github + a functional `ffprobe -version` check) - done
+>   in 0.4.1.
+> - **Updater**: CI (`build-installer.yml`) now emits a **`SHA256SUMS`** asset
+>   next to `ImageToolboxSetup.exe`, and `updater.download_installer` fetches it
+>   and **verifies the installer's SHA-256 before launching** (on top of the
+>   existing size check). A mismatch aborts and deletes the file; a release with
+>   no `SHA256SUMS` (older builds) cleanly falls back to the size check.
+>   `updater.parse_sha256sums` / `sha256_of_file` are pure and unit-tested
+>   (`tests/test_updater_integrity.py`, 11 tests: parsing formats, streaming hash,
+>   and the download gate's pass / mismatch-abort / no-sums-fallback / size paths).
+> - **Ollama** (`OllamaSetup.exe`) is left unpinned: it is optional, its download
+>   URL is a moving "latest", and it's out of this item's scope.
+> - **Code signing (step 3)** remains unaddressed by design (cost vs. a free
+>   personal project); noted below as a future "when it matters" item.
+
 Nothing the app downloads or ships is integrity-checked today:
 
 - `bootstrap.ps1` downloads the Python runtime, the SeedVR2 engine zip, and
