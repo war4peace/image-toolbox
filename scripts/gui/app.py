@@ -66,6 +66,13 @@ class App(tk.Tk):
         super().__init__()
         self.title(f"{APP_TITLE} {APP_VERSION}")
         self.minsize(900, 560)
+        # App icon for the title bar and taskbar button (app.ico at APP_ROOT, shipped
+        # to {app} by the installer). Fail-safe: a missing icon just falls back to the
+        # default tkinter feather, never blocks startup.
+        try:
+            self.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+        except Exception:
+            pass
         try:
             ttk.Style(self).theme_use("vista")
         except tk.TclError:
@@ -801,6 +808,15 @@ def main():
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    # Give the process its own taskbar identity (AppUserModelID) so the taskbar
+    # button shows app.ico and groups under Image Toolbox instead of inheriting
+    # pythonw.exe's icon/grouping. Must be set before the first window appears.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "war4peace.ImageToolbox")
     except Exception:
         pass
     App().mainloop()
