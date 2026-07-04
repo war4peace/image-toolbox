@@ -5,11 +5,21 @@ Design and planning notes for the **Video Upscaler**, a major new
 engine the Batch Upscaler already uses for stills. UI tab name: **"Video
 Upscaler"**.
 
-> Status: **planning only.** Nothing here is built yet. Per-frame timing numbers
-> are carried over from the image path's benchmarks and MUST be re-measured for
-> the temporal-batch video path before the cost estimator is trusted (see
-> "Benchmark prerequisite"). This doc is the single source of truth for the
-> feature; `docs/future-features.md` #2 is just a pointer here.
+> Status: **BUILT (experimental).** The tool ships behind the **Video Upscaler**
+> tab: the local ffmpeg container pipeline (`video_pipeline.py`), the RunPod worker
+> path (`pod/worker.py --mode video` + `remote_video_engine.py`), the orchestrator
+> with two-granularity resume/installments (`batch_video_upscale.py`), and the cost
+> estimator (`video_estimate.py`) are all in place. This doc remains the design +
+> as-built source of truth (`docs/future-features.md` #2 is just a pointer here);
+> the sections below marked with a phase or a decision reflect what was built.
+>
+> **Benchmark status:** a first-pass temporal-batch benchmark has been run
+> (`pod/bench_video.py`), so the estimator no longer relies purely on the carried-
+> over single-frame image numbers; cheaper-card calibration is still being refined,
+> and the user's own `db.gpu_perf` history supersedes the table per card over time.
+> Two SeedVR2 limits are inherent and NOT tunable: temporal jitter of fine detail
+> on slow pans/slow-mo (the 4x causal temporal VAE) and text/plate/logo distortion
+> (generative SR, no OCR) — see the findings noted inline.
 
 ---
 

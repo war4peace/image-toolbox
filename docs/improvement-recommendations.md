@@ -476,6 +476,29 @@ upgrades keep working. While in there: drop the legacy
 
 ## 10. Fix documentation drift (it directly degrades the AI-assisted workflow)
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** Re-audited against the actual
+> tree (the review's own snapshot had itself drifted: `toolbox_gui.py` was already a
+> 65-line shim from item 6, `APP_VERSION` was already `0.4.2` not `0.3.9`, and the
+> README already said "six tabs" with a Video Upscaler section). Fixed what was
+> genuinely stale:
+> - **CLAUDE.md**: added a **Video Upscaler** feature paragraph and a **Video
+>   Upscaler cluster** module row (`batch_video_upscale`, `video_pipeline`,
+>   `video_estimate`, `remote_video_engine`, `pod/bench_video`, `pod/ram_probe`),
+>   plus rows for `funds_guard.py` (item 3) and `benchmarks.py` that were missing;
+>   noted `pod/upscale_one.py`; updated the one-line intro to mention video; fixed
+>   the `docs/` bullet that still called the Video Upscaler "planned"; added a
+>   **release checklist** (bump APP_VERSION, update the module table/README, update
+>   `config_store.SECRET_FIELDS` + config docs, write the tag message).
+> - **README.md**: added `mqtt`/`updates`/`runpod`/`video` to the config-section
+>   table; replaced the obsolete "maintainers: scrub `config.json` before
+>   committing" note with the item-9 reality (secrets live in `config.local.json`).
+> - **docs/video-upscaler.md**: replaced the "planning only, nothing built yet"
+>   status header with a BUILT (experimental) header + benchmark status.
+>
+> The module table has been kept current as items 1-9 landed, so this pass was
+> mostly the Video Upscaler cluster, the README config table, and the two status
+> headers. The release checklist is the durable fix against re-drift.
+
 CLAUDE.md is the context every future session starts from, and it is now
 materially wrong: `toolbox_gui.py` listed at ~2.6k lines (actual 8.2k); the
 entire Video Upscaler cluster is absent from the module table

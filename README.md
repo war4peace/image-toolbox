@@ -246,10 +246,12 @@ Most of what is used to require hand-editing `config.json` is here:
 Remote (RunPod) settings - the API key, region/data center, model volume, GPU
 preferences and pod management - live on the dedicated **RunPod** tab.
 
-> **Maintainers:** before committing or sharing `config.json`, clear personal
-> data from **Default folders**, the **Notifications** section (Discord webhook,
-> Telegram bot token and chat ID, ntfy topic/token), and the **MQTT** section —
-> keeping only the `client_id` default (`image-toolbox-beededbe`).
+> **Secrets never touch `config.json`.** The API key, MQTT password and
+> notification tokens/webhook URLs are stored in an untracked `config.local.json`
+> overlay; `config.json` keeps only blank placeholders, so it is safe to share or
+> commit without scrubbing. (Personal **Default folders** and non-secret fields
+> like your MQTT host still live in `config.json` — clear those by hand if you want
+> a pristine template to share.)
 
 ### Notifications
 
@@ -282,11 +284,20 @@ Settings live in `config.json` next to the app, with these sections:
 | `upscale`  | Resolution target, skip-cutoff, SeedVR pipeline options.            |
 | `tagging`  | Resolution threshold, timeouts, camera-filename patterns, etc.       |
 | `defaults` | Pinned default folders for each tool.                                |
+| `mqtt`     | Home Assistant / MQTT broker host, port, credentials, client id.     |
+| `updates`  | In-app update-checker preferences.                                   |
+| `runpod`   | Remote-pod settings: GPU/region/volume prefs and pod-management limits. |
+| `video`    | Video Upscaler deliverable codec/quality and SeedVR tuning knobs.    |
 | `notifications` | Discord webhook, Telegram bot token/chat ID, ntfy server/topic. |
 
 You normally never edit this file by hand — use the **Settings** tab. The
 installer never overwrites your `config.json` on upgrade, and removes it only on
 a full uninstall.
+
+**Secrets are kept out of `config.json`.** The RunPod API key, MQTT password and
+notification tokens/webhook URLs live in an untracked `config.local.json` next to
+it (created automatically the first time you save settings); `config.json` itself
+only ever holds blank placeholders for those fields, so it is safe to share.
 
 ---
 
