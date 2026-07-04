@@ -60,6 +60,10 @@ Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
 ; (benchmarks.py reads it from {app}\docs).
 Source: "..\docs\Benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "toolbox.ico";            DestDir: "{app}"; Flags: ignoreversion
+; Running-app icon: shown on the main window title bar and taskbar button at
+; runtime (gui/app.py loads {app}\app.ico via APP_ROOT). Distinct from
+; toolbox.ico, which is the setup/uninstall/shortcut icon.
+Source: "..\app.ico";             DestDir: "{app}"; Flags: ignoreversion
 ; Never overwrite the user's configuration on upgrades, never delete it on uninstall
 Source: "..\config.json";         DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 
@@ -83,8 +87,18 @@ Name: "{autodesktop}\Image Toolbox";  Filename: "{app}\Image Toolbox.cmd"; Worki
 ; Remote/Both need a RunPod account with credit to rent a GPU. Offer to open the
 ; referral sign-up page (opt-in checkbox on the finished page; only shown for a
 ; Remote/Both install). shellexec opens the URL in the default browser.
-Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your browser) - needed to rent a remote GPU"; Flags: postinstall shellexec nowait skipifsilent; Check: NeedsRunPodAccount
-Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (first launch downloads ~3 GB of components)"; Flags: postinstall nowait skipifsilent unchecked
+;
+; The default checked-state differs between a first install and an upgrade, so the
+; same offer is defined twice with mutually-exclusive Check functions:
+;  - FIRST INSTALL: checked by default (the common first-run onboarding case).
+;  - UPGRADE: shown UNCHECKED - by now the user already has an account or already
+;    declined, so pre-ticking it would re-open the browser on every version bump.
+; (Inno's `unchecked` flag is static per line, hence the two lines.)
+Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your browser) - needed to rent a remote GPU"; Flags: postinstall shellexec nowait skipifsilent; Check: OfferRunPodChecked
+Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your browser) - needed to rent a remote GPU"; Flags: postinstall shellexec nowait skipifsilent unchecked; Check: OfferRunPodUnchecked
+; Launch the app when the wizard finishes - checked by default on BOTH a first
+; install and an upgrade (so no `unchecked` flag).
+Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (first launch downloads ~3 GB of components)"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 ; Remove what the bootstrap and the app created inside the install folder.
@@ -114,6 +128,21 @@ Type: files; Name: "{app}\install_mode.txt"
   skips the ~3 GB local GPU stack (PyTorch CUDA + SeedVR2 + Ollama). }
 var
   InstallModePage: TInputOptionWizardPage;
+  gIsUpgrade: Boolean;      { set once in InitializeSetup, read by the Check funcs }
+
+function InitializeSetup(): Boolean;
+begin
+  { Decide first-install vs upgrade BEFORE anything is installed. This run writes
+    its OWN Inno uninstall key during the install step, so the check must happen
+    here (the earliest event) or it would always look like an upgrade. A prior
+    version's "..._is1" uninstall key present now = this is an upgrade. The app is
+    always a per-user (lowest-privilege) install, so the key lives under HKCU;
+    HKLM is checked too as a harmless belt-and-suspenders. }
+  gIsUpgrade :=
+    RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B4D4B6F2-1B0E-4A41-9C4B-1D0A6E4B7C21}_is1') or
+    RegKeyExists(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B4D4B6F2-1B0E-4A41-9C4B-1D0A6E4B7C21}_is1');
+  Result := True;
+end;
 
 procedure InitializeWizard;
 begin
@@ -145,6 +174,18 @@ end;
 function NeedsRunPodAccount: Boolean;
 begin
   Result := (InstallModeValue = 'remote') or (InstallModeValue = 'both');
+end;
+
+{ First install + Remote/Both: show the sign-up offer CHECKED by default. }
+function OfferRunPodChecked: Boolean;
+begin
+  Result := NeedsRunPodAccount and (not gIsUpgrade);
+end;
+
+{ Upgrade + Remote/Both: still show the offer, but UNCHECKED (see the [Run] note). }
+function OfferRunPodUnchecked: Boolean;
+begin
+  Result := NeedsRunPodAccount and gIsUpgrade;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
