@@ -293,6 +293,43 @@ runner at a time. Pure moves, no behavior change; the installer's
 
 ## 6. Split `toolbox_gui.py` (8,170 lines) into a package
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** `toolbox_gui.py` went from
+> ~8,400 lines to a **65-line entry-point shim**; the GUI now lives in a
+> `scripts/gui/` package of 14 focused modules, built bottom-up so imports never
+> cycle:
+> - `gui/common.py` (foundation: paths/version, config.json + gui_settings.json,
+>   the funds/mqtt/ollama helpers, `GUI_MARKER`),
+> - `gui/widgets.py` (Tooltip, ProgressBar, TelemetryRow, LogPane, ConsoleBuffer,
+>   LogViewer, `_ScrollFrame`, sanitize/_fmt_eta/_log_hms),
+> - `gui/comparison.py` (ComparisonWindow + VideoComparisonWindow),
+> - `gui/filmstrip.py` (FilmStrip), `gui/tooltab.py` (ToolTab base),
+> - one module per tab (`tab_upscale`, `tab_tag`, `tab_settings`, `tab_runpod`,
+>   `tab_conciliate`, `tab_video`) + `gui/dialogs.py` (UpdateDialog),
+> - `gui/app.py` (the App window + `main()`).
+>
+> `toolbox_gui.py` stays the launch path (`Image Toolbox.cmd` / bootstrap /
+> installer run it): it arms crash logging **before** importing the package (so an
+> import-time failure still logs + shows a dialog) and re-exports the public API
+> (App, main, APP_VERSION, GUI_MARKER, ToolTab, funds_color, fmt_funds, ...) so
+> `import toolbox_gui` callers and the tests are unchanged. The move was pure (no
+> behaviour change): tabs talk to App only via `self.app` at runtime, so no tab
+> imports the app module.
+>
+> **The packaging trap was handled up front:** `installer/ImageToolbox.iss` now
+> ships `..\scripts\gui\*.py` (the top-level `scripts\*.py` glob is non-recursive),
+> and the import smoke test (item 2) sweeps every `gui.*` module, so a subpackage
+> module left out of the installer fails CI. Verification at every stage: a
+> package-wide `pyflakes` undefined-name sweep (catches a moved-global-not-imported
+> that tests would miss since Python resolves function-body globals lazily), the
+> full suite (now 205, sweeping the new modules), and a headless `App()` that
+> builds/selects/renders all six tabs and tears down cleanly.
+>
+> **Deferred (separate, behaviour-changing follow-ups, NOT part of the pure
+> move):** making `VideoTab` subclass `ToolTab` (it still has its own copy of the
+> subprocess plumbing / `@@TBX@@` parser), and factoring the shared
+> `is_dirty`/`_collect`/`revert` dirty-tracking out of `SettingsTab`/`RunPodTab`
+> into a common base. Both are noted below and want their own change.
+
 CLAUDE.md still describes it as ~2.6k lines; it has tripled. It now holds ~30
 classes: generic widgets (Tooltip, ProgressBar, TelemetryRow, LogPane,
 FilmStrip, two comparison windows), six tabs, the update dialog, and the app
