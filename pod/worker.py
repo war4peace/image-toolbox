@@ -89,6 +89,65 @@ def _log(msg):
     print(f"[worker] {msg}", flush=True)
 
 
+# ── trusted-volume model validation (cold-start, recommendations item 11) ────
+# The SeedVR2 engine validates each weight file before loading. It first checks a
+# fast size+mtime cache (.validation_cache.json in the model dir); only on a MISS
+# does it read the whole 16 GB DiT to re-compute a SHA-256 — the ~354 s vs ~97 s
+# cold-start spread the notes recorded. That miss happens when the cache is wiped
+# or an mtime drifts (e.g. after volume maintenance), NOT because the file is bad:
+# we provisioned these weights and validated them once at provision time, so they
+# are trusted. Seeding the cache from the current size+mtime before the engine
+# loads makes the check always hit, so no pod ever pays the full re-hash. A
+# genuinely corrupt file would fail at torch load anyway. This is the "skip the
+# safetensors hash-validation on a trusted volume" win from item 11 (the sibling
+# copy-to-local idea was rejected: the resident worker loads once per pod, so an
+# extra volume->local copy isn't amortised).
+
+def _validation_cache_entries(model_dir, filenames, hash_lookup):
+    """Build {basename: {size, mtime, hash}} for each `filenames` entry present in
+    `model_dir`, trusting size+mtime (no file read). `hash_lookup(name)` returns
+    the expected SHA-256 (from the seedvr2 registry) or None. Pure/stdlib so it is
+    unit-testable off the pod."""
+    entries = {}
+    for name in filenames:
+        if not name:
+            continue
+        path = os.path.join(model_dir, name)
+        if not os.path.exists(path):
+            continue
+        st = os.stat(path)
+        entries[os.path.basename(path)] = {
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "hash": hash_lookup(name),
+        }
+    return entries
+
+
+def _seed_validation_cache(model_dir, dit_model):
+    """Seed the seedvr2 validation cache for the DiT + VAE this run will load, so
+    the engine's pre-load check hits and never triggers a full re-hash. Fail-safe:
+    any error leaves the engine's own validation in place (the old behaviour)."""
+    try:
+        from src.utils.downloads import load_validation_cache, save_validation_cache
+        from src.utils.model_registry import MODEL_REGISTRY, DEFAULT_VAE
+
+        def _hash(name):
+            info = MODEL_REGISTRY.get(name)
+            return getattr(info, "sha256", None) if info else None
+
+        entries = _validation_cache_entries(model_dir, (dit_model, DEFAULT_VAE), _hash)
+        if not entries:
+            return
+        cache = load_validation_cache(model_dir)
+        cache.update(entries)
+        save_validation_cache(cache, model_dir)
+        _log(f"validation cache seeded for {', '.join(sorted(entries))} "
+             f"(trusted volume; skips the re-hash)")
+    except Exception as exc:                                  # noqa: BLE001 (fail-safe)
+        _log(f"validation-cache seed skipped ({exc}); engine will self-validate")
+
+
 # ── pod telemetry (remote #1, Feature #4) ───────────────────────────────────
 # Linux equivalents of the app's system_telemetry.py (which is Windows-only):
 # CPU from /proc/stat (busy fraction between calls), RAM from /proc/meminfo,
@@ -1029,6 +1088,11 @@ def main(argv=None):
         from upscale_engine import UpscaleEngine
         with open(args.settings, encoding="utf-8") as f:
             settings = json.load(f)
+        # Trusted-volume cold-start guard (item 11): make the engine's weight
+        # validation hit its fast cache instead of re-hashing 16 GB on a miss.
+        _seed_validation_cache(
+            args.model_dir,
+            settings.get("dit_model", "seedvr2_ema_7b_fp16.safetensors"))
         _log(f"loading engine ({args.mode} mode, repo={args.repo_dir} "
              f"models={args.model_dir}) …")
         t0 = time.time()

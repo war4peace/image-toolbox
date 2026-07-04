@@ -518,6 +518,34 @@ message. Cheap discipline, big payoff for a repo maintained through AI sessions.
 
 ## 11. Pod cold-start optimization (billed dead time on every run)
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental) — scoped down after investigation.**
+> Tracing the actual path changed the plan:
+> - **The hash-validation is NOT paid per pod.** `download_weight` checks a fast
+>   size+mtime cache (`.validation_cache.json` in the model dir, i.e. ON the network
+>   volume) before hashing, and `provision.sh` seeds it when it downloads the
+>   weights. So every user pod already hits the cache and skips the 16 GB SHA-256
+>   read — this is exactly why the notes recorded load dropping 239 s -> 97 s "once
+>   the volume held the validation cache". The 97 s/354 s spread in the item text is
+>   the cache-HIT vs cache-MISS difference, not a constant per-pod tax.
+> - **Copy models -> container-local NVMe was rejected, not implemented.** The
+>   resident worker loads the model ONCE per pod, so a volume->local copy (itself a
+>   full slow NFS read) is never amortised: it pays the slow read plus an extra
+>   local read for a single load. Best case (perfect overlap with torch/CUDA init)
+>   ~10 %; realistic case net-negative, and storage-fragile on a near-full volume /
+>   tight container disk (the user's flag). Not worth it for this architecture.
+>
+> **What shipped:** the real, safe win is guaranteeing the cache always hits so no
+> pod ever pays the ~354 s re-hash on a MISS (a wiped cache, an mtime drift after
+> volume maintenance). `pod/worker.py` now seeds the seedvr2 validation cache from
+> the DiT+VAE files' current size+mtime (the registry's expected hash included)
+> right before loading the engine (`_seed_validation_cache` /
+> `_validation_cache_entries`). We provisioned and validated these weights once, so
+> trusting them is the intended "skip the hash-validation on a trusted volume"; a
+> genuinely corrupt file still fails at torch load. Pod-side only, no extra disk, no
+> copy, fail-safe (any error leaves the engine's own validation in place). 3 tests
+> in `test_worker_validation_cache.py`. The remaining ~97 s is the unavoidable
+> single 16 GB read from the network volume into VRAM.
+
 Already on the TODO list in `docs/runpod-notes.md` but worth promoting now that
 every video run pays it: engine load was measured at ~97-354 s per pod,
 dominated by reading the 16 GB DiT from the network volume plus a safetensors

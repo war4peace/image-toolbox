@@ -22,10 +22,17 @@ the parts that are still worth reusing when remote-pod support is rebuilt.
   custom-command images; we use `PUBLIC_KEY`, which the pytorch base image reads.)
 - **Pod cold-start is slow — mostly network-volume read throughput.** The ~239 s
   engine load is dominated by reading the 16 GB DiT from the **network volume**
-  (NFS-like, far slower than local NVMe) plus a hash-validation pass that reads it
-  *again*. Mitigations to try: copy models volume→local container disk once on pod
-  start then load locally; **skip the safetensors hash-validation** on a trusted
-  volume; keep the worker resident so the load is paid once per pod, not per image.
+  (NFS-like, far slower than local NVMe) plus, on a validation-cache MISS, a
+  hash-validation pass that reads it *again*. **Resolved (item 11, 0.4.3):** the
+  worker seeds the seedvr2 size+mtime validation cache before loading
+  (`pod/worker.py` `_seed_validation_cache`), so a cache miss (wiped cache, mtime
+  drift) never triggers the full 16 GB re-hash — the ~354 s worst case is gone and
+  every pod loads at the ~97 s cached rate. **Copy models volume→local NVMe was
+  investigated and rejected:** the resident worker loads once per pod, so an extra
+  volume→local copy (a full slow read itself) isn't amortised and is storage-
+  fragile on a near-full volume. The worker stays resident so the ~97 s load is
+  paid once per pod, not per image; the remaining cost is the unavoidable single
+  16 GB volume→VRAM read.
 - **Warm upscale throughput — RESOLVED (the 78 s was cold-start).** Measured via
   the resident worker (`bench`): cold image #1 ≈ 41 s, then **warm ≈ 7.6 s/image at
   1080** (1620×1080) and **≈ 13.4 s/image at 4K-class** (3240×2160). So the 78 s
