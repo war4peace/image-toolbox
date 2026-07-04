@@ -42,6 +42,11 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; crash_logger.py missing). Non-recursive, so the vendored seedvr2\ tree and
 ; tools\ are not swept in.
 Source: "..\scripts\*.py";        DestDir: "{app}\scripts"; Flags: ignoreversion
+; The GUI package (scripts\gui\, split out of toolbox_gui.py in 0.4.3). The glob
+; above is NON-recursive, so this subfolder needs its own entry or the whole GUI
+; ships broken. Kept as a glob (like scripts\) so a new gui/ module is never left
+; out. The import smoke test (tests/test_import_smoke.py) guards this too.
+Source: "..\scripts\gui\*.py";    DestDir: "{app}\scripts\gui"; Flags: ignoreversion
 ; Remote-upscaling (#1) pod-side code: worker.py / deadman.py are SCP'd to the
 ; RunPod pod at runtime, provision.sh fills the model volume. provision.sh must
 ; stay LF (the .gitattributes rule keeps it LF; Inno ships byte-for-byte).

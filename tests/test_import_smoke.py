@@ -22,15 +22,28 @@ import pytest
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.join(os.path.dirname(_TESTS_DIR), "scripts")
 
-# toolbox_gui imports tkinter at module load; skip that one module (only) where
-# tkinter is unavailable, rather than failing the whole sweep.
-_NEEDS_TK = {"toolbox_gui"}
-
 _MODULES = sorted(
     os.path.splitext(f)[0]
     for f in os.listdir(SCRIPTS_DIR)
     if f.endswith(".py") and not f.startswith("_")
 )
+
+# The GUI package (scripts/gui/, split out of toolbox_gui.py in 0.4.3). Swept as
+# `gui.<name>` so a subpackage module left out of the installer glob (the packaging
+# trap called out in the split) fails here too. gui.common is tkinter-free; the
+# widget/tab modules import tkinter at load.
+_GUI_DIR = os.path.join(SCRIPTS_DIR, "gui")
+_GUI_MODULES = sorted(
+    "gui." + os.path.splitext(f)[0]
+    for f in os.listdir(_GUI_DIR)
+    if f.endswith(".py") and f != "__init__.py"
+) if os.path.isdir(_GUI_DIR) else []
+
+_MODULES += _GUI_MODULES
+
+# toolbox_gui and the gui widget/tab modules import tkinter at module load; skip
+# those (only) where tkinter is unavailable, rather than failing the whole sweep.
+_NEEDS_TK = {"toolbox_gui"} | {m for m in _GUI_MODULES if m != "gui.common"}
 
 
 def test_there_are_modules_to_import():
