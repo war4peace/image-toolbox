@@ -511,3 +511,31 @@ class LogViewer(tk.Toplevel):
         self.save_geometry()
         self._console.remove_observer(self._on_console)
         self.destroy()
+
+
+# ─────────────────────────────────────────────
+#  SCROLLABLE FRAME
+# ─────────────────────────────────────────────
+
+class _ScrollFrame(ttk.Frame):
+    """A vertically scrollable container. Add child widgets to `.body`."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.body.bind("<Configure>",
+                       lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        # Mouse wheel scrolls only while the pointer is over this canvas.
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _wheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
