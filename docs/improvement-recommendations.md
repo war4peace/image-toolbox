@@ -229,6 +229,42 @@ download is tampered with or corrupted.
 
 ## 5. Extract a shared runner-support module (the duplication is now measurable)
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** New `scripts/runner_common.py`
+> (stdlib-only, torch-free) now holds the genuinely-shared runner scaffolding, and
+> all four runners plus were migrated to it:
+> - `load_config()` + `APP_ROOT`, `harden_stdout()`, the `@@TBX@@` protocol
+>   (`GUI_MARKER` / `stdin_is_piped()` / `GUI_MODE` / `gui_event()`), `fmt_duration`
+>   / `fmt_mmss` / `fmt_hhmmss`, `get_image_dimensions()` + the 5 header parsers,
+>   `is_oom_error()`, and `remote_pod_stopped(session)`.
+> - Each runner re-exports these under its old local names (`_gui_event`,
+>   `get_image_dimensions`, `_is_oom_error`, ...), so call sites and any external
+>   attribute access are unchanged - a pure move.
+> - **The drift the item called out is fixed**: `harden_stdout()` (the UTF-8
+>   stdout reconfigure) is now applied by **every** runner, not just the video one.
+> - **Consolidation surfaced and fixed a latent bug**: both `get_image_dimensions`
+>   copies mis-parsed lossy-WebP (VP8) headers (wrong byte skip + a spurious +1),
+>   returning wrong non-zero dimensions; because they returned without raising,
+>   tag_and_rename's Pillow fallback never corrected it. The unified reader is a
+>   superset (all 5 header formats + a Pillow fallback) and is tested against real
+>   Pillow-written images across formats.
+> - **Deliberately left per-runner** (divergent by design, NOT pure moves): the
+>   session loggers (`batch_upscale.Logger` / `tag_and_rename._TeeOutput` /
+>   `conciliate.Logger` - different tee strategies and user-visible `log_`/`tag_`/
+>   `conc_`/`video_` filenames); the stdin control loops (`PauseController` vs
+>   `RemoteControl` - different command sets and pause semantics); the one-line
+>   `send_notification` wrappers (differ only by username); `runpod_provision`'s
+>   config loader (a specialised variant that returns the validated `runpod`
+>   section, not the whole config); and `video_estimate.fmt_duration` (a different
+>   colon-separated format).
+> - 35 tests (`tests/test_runner_common.py`): the fmt helpers, OOM classifier,
+>   `remote_pod_stopped` (incl. fail-safe), the `gui_event` wire format (plain +
+>   raw-stream-when-wrapped + no-op), the image reader across formats + fallback,
+>   and a re-export check that the same functions back every runner. Full suite 192
+>   passing.
+>
+> `toolbox_gui.py`'s own copies (item 6) are a separate, larger job (a GUI package
+> split) and are not part of this move.
+
 The three image-era runners and the video runner each carry private copies of
 the same infrastructure. Confirmed by search:
 

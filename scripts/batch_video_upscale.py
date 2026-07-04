@@ -47,14 +47,13 @@ try:
 except Exception:
     pass
 
-# Make stdout robust to non-ASCII (unicode filenames, drift warnings, the §
-# section marks) regardless of the console's code page — a headless runner must
-# never die on a UnicodeEncodeError (the Windows console defaults to cp1252).
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+import runner_common
+
+# Make stdout/stderr non-ASCII-proof before any output (see runner_common):
+# a headless runner must never die on a UnicodeEncodeError from a unicode
+# filename, drift warning or § section mark (the Windows console defaults to
+# cp1252). This hardening used to live only here; runner_common now shares it.
+runner_common.harden_stdout()
 
 import db
 import notifications
@@ -176,13 +175,8 @@ def _start_remote_telemetry(engine, stop, interval=10.0):
     threading.Thread(target=_loop, daemon=True).start()
 
 
-def _load_config():
-    path = os.path.join(APP_ROOT, "config.json")
-    if not os.path.exists(path):
-        print(f"\nERROR: config.json not found at: {path}\n")
-        sys.exit(1)
-    with open(path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
+# config.json load lives in runner_common (shared by every runner).
+_load_config = runner_common.load_config
 
 
 class StopInstallment(Exception):

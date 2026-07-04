@@ -31,7 +31,6 @@ import sys
 import os
 import json
 import time
-import struct
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -52,26 +51,17 @@ except Exception:
 
 import db
 import notifications
+import runner_common
+
+# Make stdout/stderr non-ASCII-proof before any output (see runner_common).
+runner_common.harden_stdout()
 
 # ─────────────────────────────────────────────
 #  CONFIG  –  loaded from config.json
 # ─────────────────────────────────────────────
 
-def _load_config():
-    """
-    Load settings from config.json at the app root (the parent of scripts/).
-    Raises a clear error if the file is missing or malformed.
-    """
-    import json as _json
-    app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    config_path = os.path.join(app_root, "config.json")
-    if not os.path.exists(config_path):
-        print(f"\nERROR: config.json not found at: {config_path}")
-        print("Run setup.ps1 first to generate it, or create it manually.")
-        print("See README.md for the expected format.\n")
-        sys.exit(1)
-    with open(config_path, "r", encoding="utf-8-sig") as _f:
-        return _json.load(_f)
+# config.json load lives in runner_common (shared by every runner).
+_load_config = runner_common.load_config
 
 _CFG = _load_config()
 _S   = _CFG.get("seedvr2", {})
@@ -144,38 +134,15 @@ REMOTE_STRAIGHTEN     = False
 ENGINE = None
 
 
-def _stdin_is_piped():
-    """True when stdin is a pipe — i.e. we are driven by toolbox_gui.py."""
-    try:
-        return sys.stdin is not None and not sys.stdin.isatty()
-    except Exception:
-        return False
-
-# GUI mode: control arrives as stdin lines instead of keypresses, and
-# machine-readable event lines keep the GUI's preview strip in sync.
-GUI_MODE = _stdin_is_piped()
-
-# Marker prefix the GUI intercepts (never shown to the user there).
-GUI_MARKER = "@@TBX@@"
-
-
-def _gui_event(kind, payload):
-    """
-    Emit one event line for the GUI (no-op outside GUI mode).
-      IMG|<path>          – image now being processed
-      QUEUE|<json>        – ordered list of queued image paths for this pass
-      RESULT|<json>       – [path, "ok"|"fail"(, out_path)] outcome for one image;
-                            the strip frames it green (an upscaled counterpart now
-                            exists, so it is comparable) or red (processing
-                            failed). On "ok" the third element is the upscaled
-                            output path, so a double-click can compare the pair.
-    """
-    if GUI_MODE:
-        # One atomic write (not print's two) so a background-thread event — the
-        # remote telemetry sampler — can't be byte-split by the main thread's
-        # concurrent per-image writes. The GUI parser strips it even mid-line.
-        sys.stdout.write(f"{GUI_MARKER}{kind}|{payload}\n")
-        sys.stdout.flush()
+# The @@TBX@@ event protocol + GUI-mode detection live in runner_common. The
+# event kinds this runner emits: IMG|<path> (image being processed),
+# QUEUE|<json> (queued paths this pass), RESULT|<json> ([path, "ok"|"fail"(,
+# out_path)]; the strip frames it green when an upscaled counterpart exists so it
+# is comparable, red on failure).
+_stdin_is_piped = runner_common.stdin_is_piped
+GUI_MODE        = runner_common.GUI_MODE
+GUI_MARKER      = runner_common.GUI_MARKER
+_gui_event      = runner_common.gui_event
 
 
 # Remote-pod teardown override (roadmap #1): when the GUI's "Stop" modal lets the
@@ -196,21 +163,10 @@ def _set_remote_teardown(value):
 
 
 def _remote_pod_stopped():
-    """True if the remote pod is no longer RUNNING — its dead-man's switch fired
-    (idle / max-runtime) or it was stopped/terminated. Called only AFTER an
-    upscale request has failed, so a pod that is gone/EXITED/TERMINATED (or
-    unreadable — a terminated pod 404s) means: end the run gracefully (the resume
-    cache continues next time) instead of treating the dropped connection as a
-    recoverable local GPU outage. A still-RUNNING pod returns False, so a genuine
-    transient blip still uses the normal outage path."""
-    if REMOTE_SESSION is None:
-        return False
-    try:
-        import runpod_client as rp
-        status = rp.pod_status(REMOTE_SESSION.api_key, REMOTE_SESSION.pod_id)
-    except Exception:                                  # noqa: BLE001 (fail-safe)
-        return False
-    return status in (None, rp.STATUS_EXITED, rp.STATUS_TERMINATED)
+    """See runner_common.remote_pod_stopped: True if this run's remote pod is no
+    longer RUNNING (dead-man's switch fired / stopped / terminated), so a failed
+    upscale ends the run gracefully instead of looking like a local GPU outage."""
+    return runner_common.remote_pod_stopped(REMOTE_SESSION)
 
 
 def _start_remote_telemetry(engine, interval=10.0):
@@ -241,45 +197,11 @@ UPSCALE_CUTOFF_PCT = _U.get("upscale_cutoff_pct", 66)
 #  TIMING HELPERS
 # ─────────────────────────────────────────────
 
-def fmt_duration(seconds):
-    """Format a duration in seconds as  Xh Ym Zs  or  Ym Zs  or  Zs."""
-    seconds = int(seconds)
-    h, rem  = divmod(seconds, 3600)
-    m, s    = divmod(rem, 60)
-    if h:
-        return f"{h}h {m:02d}m {s:02d}s"
-    if m:
-        return f"{m}m {s:02d}s"
-    return f"{s}s"
-
-
-def fmt_mmss(seconds):
-    """Format a duration as mm:ss — used for per-image elapsed time."""
-    seconds = int(seconds)
-    m, s    = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
-
-
-def fmt_hhmmss(seconds):
-    """Format a duration as hh:mm:ss — used for total elapsed time."""
-    seconds = int(seconds)
-    h, rem  = divmod(seconds, 3600)
-    m, s    = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _is_oom_error(exc):
-    """
-    True when an exception looks like a CUDA/torch out-of-memory error. With
-    "Prefer No Sysmem Fallback" set in the NVIDIA panel, the degraded GPU fails
-    fast with a hard OOM instead of crawling — the watchdog treats that as the
-    same degradation episode as a sustained slow streak.
-    """
-    s = f"{type(exc).__name__}: {exc}".lower()
-    return ("out of memory" in s
-            or "outofmemory" in s
-            or "cuda_error_out_of_memory" in s
-            or ("cuda error" in s and "memory" in s))
+# Duration formatting + OOM classification live in runner_common (shared).
+fmt_duration  = runner_common.fmt_duration
+fmt_mmss      = runner_common.fmt_mmss
+fmt_hhmmss    = runner_common.fmt_hhmmss
+_is_oom_error = runner_common.is_oom_error
 
 
 # ─────────────────────────────────────────────
@@ -531,116 +453,9 @@ class EligibilityCache:
     def entry_count(self):
         return len(self._data)
 
-# ─────────────────────────────────────────────
-#  IMAGE DIMENSION READER  (no Pillow needed)
-# ─────────────────────────────────────────────
-
-def _read_png_dimensions(f):
-    f.read(8)
-    f.read(4)
-    assert f.read(4) == b"IHDR"
-    w = struct.unpack(">I", f.read(4))[0]
-    h = struct.unpack(">I", f.read(4))[0]
-    return w, h
-
-
-def _read_jpeg_dimensions(f):
-    assert f.read(2) == b"\xff\xd8"
-    while True:
-        marker = f.read(2)
-        if len(marker) < 2:
-            break
-        if marker[0] != 0xFF:
-            break
-        marker_type = marker[1]
-        length = struct.unpack(">H", f.read(2))[0]
-        if 0xC0 <= marker_type <= 0xCF and marker_type not in (0xC4, 0xC8, 0xCC):
-            f.read(1)
-            h = struct.unpack(">H", f.read(2))[0]
-            w = struct.unpack(">H", f.read(2))[0]
-            return w, h
-        else:
-            f.read(length - 2)
-    raise ValueError("Could not find JPEG SOF marker")
-
-
-def _read_bmp_dimensions(f):
-    f.read(18)
-    w = struct.unpack("<I", f.read(4))[0]
-    h = struct.unpack("<I", f.read(4))[0]
-    return w, abs(h)
-
-
-def _read_webp_dimensions(f):
-    f.read(4)
-    f.read(4)
-    assert f.read(4) == b"WEBP"
-    chunk = f.read(4)
-    f.read(4)
-    if chunk == b"VP8 ":
-        f.read(3)
-        raw = f.read(4)
-        w = (struct.unpack("<H", raw[:2])[0] & 0x3FFF) + 1
-        h = (struct.unpack("<H", raw[2:])[0] & 0x3FFF) + 1
-        return w, h
-    elif chunk == b"VP8L":
-        f.read(1)
-        b = f.read(4)
-        bits = struct.unpack("<I", b)[0]
-        w = (bits & 0x3FFF) + 1
-        h = ((bits >> 14) & 0x3FFF) + 1
-        return w, h
-    elif chunk == b"VP8X":
-        f.read(4)
-        w = struct.unpack("<I", f.read(3) + b"\x00")[0] + 1
-        h = struct.unpack("<I", f.read(3) + b"\x00")[0] + 1
-        return w, h
-    raise ValueError("Unknown WebP sub-format")
-
-
-def _read_tiff_dimensions(f):
-    """Read width/height from a TIFF file header (supports little and big endian)."""
-    header = f.read(4)
-    if header[:2] == b"II":
-        endian = "<"
-    elif header[:2] == b"MM":
-        endian = ">"
-    else:
-        raise ValueError("Not a TIFF file")
-    ifd_offset = struct.unpack(endian + "I", f.read(4))[0]
-    f.seek(ifd_offset)
-    num_entries = struct.unpack(endian + "H", f.read(2))[0]
-    w = h = 0
-    for _ in range(num_entries):
-        tag, typ, count, val_raw = struct.unpack(endian + "HHI4s", f.read(12))
-        if typ in (3, 4):  # SHORT or LONG
-            fmt = endian + ("H" if typ == 3 else "I")
-            val = struct.unpack(fmt, val_raw[:struct.calcsize(fmt)])[0]
-            if tag == 256:   w = val   # ImageWidth
-            elif tag == 257: h = val   # ImageLength
-        if w and h:
-            break
-    return w, h
-
-
-def get_image_dimensions(path):
-    ext = os.path.splitext(path)[1].lower()
-    with open(path, "rb") as f:
-        try:
-            if ext == ".png":
-                return _read_png_dimensions(f)
-            elif ext in (".jpg", ".jpeg"):
-                return _read_jpeg_dimensions(f)
-            elif ext == ".bmp":
-                return _read_bmp_dimensions(f)
-            elif ext == ".webp":
-                return _read_webp_dimensions(f)
-            elif ext in (".tif", ".tiff"):
-                return _read_tiff_dimensions(f)
-            else:
-                return (0, 0)
-        except Exception:
-            return (0, 0)
+# Header-based image-size reader lives in runner_common (shared with the other
+# runners; superset with a Pillow fallback for the formats the fast path misses).
+get_image_dimensions = runner_common.get_image_dimensions
 
 
 def _skip_for_dims(w, h, cutoff_pct):

@@ -45,7 +45,6 @@ import os
 import re
 import json
 import time
-import struct
 import base64
 import hashlib
 import unicodedata
@@ -67,45 +66,30 @@ except Exception:
 
 import db
 import notifications
+import runner_common
+
+# Make stdout/stderr non-ASCII-proof before any output (see runner_common). Done
+# before the session-log tee wraps stdout, so the tee inherits the utf-8 stream.
+runner_common.harden_stdout()
 
 # App root = parent of scripts/. config.json, logs/ and the trcache/ import
 # folder live at the app root, not beside this module.
-APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_ROOT = runner_common.APP_ROOT
 
 
 # ─────────────────────────────────────────────────────────────
 #  GUI INTEGRATION  (event lines + session log)
 # ─────────────────────────────────────────────────────────────
 
-def _stdin_is_piped():
-    """True when stdin is a pipe — i.e. we are driven by toolbox_gui.py."""
-    try:
-        return sys.stdin is not None and not sys.stdin.isatty()
-    except Exception:
-        return False
-
-GUI_MODE   = _stdin_is_piped()
-GUI_MARKER = "@@TBX@@"
-
-
-def _gui_event(kind, payload):
-    """
-    Emit one event line for the GUI (no-op outside GUI mode):
-      IMG|<path>      – image now being processed (preview strip)
-      QUEUE|<json>    – ordered list of queued image paths
-      LOG|<path>      – session log file location
-      RENAME|<json>   – [old_path, new_path]: a queued file changed name
-      REFRESH|<path>  – the file's pixels changed (rotation); re-decode its thumb
-      RESULT|<json>   – [path, "ok"|"fail"]: per-image outcome; the strip frames
-                        it green (tagged) or red (failed). Key by the FINAL path
-                        (after any rename), which the strip already tracks.
-    Written to the raw stdout so markers never end up in the session log.
-    """
-    if GUI_MODE:
-        out = sys.stdout
-        raw = getattr(out, "raw", out)
-        raw.write(f"{GUI_MARKER}{kind}|{payload}\n")
-        raw.flush()
+# The @@TBX@@ event protocol + GUI-mode detection live in runner_common; its
+# gui_event targets stdout's raw stream, so markers still bypass the session-log
+# tee this runner installs later. The event kinds this runner emits: IMG|<path>,
+# QUEUE|<json>, LOG|<path>, RENAME|<json> ([old, new]), REFRESH|<path> (pixels
+# changed - re-decode the thumb), RESULT|<json> ([final_path, "ok"|"fail"]).
+_stdin_is_piped = runner_common.stdin_is_piped
+GUI_MODE        = runner_common.GUI_MODE
+GUI_MARKER      = runner_common.GUI_MARKER
+_gui_event      = runner_common.gui_event
 
 
 class _TeeOutput:
@@ -240,20 +224,8 @@ class RemoteControl:
 #  CONFIG  –  loaded from config.json
 # ─────────────────────────────────────────────────────────────
 
-def _load_config():
-    """
-    Load settings from config.json at the app root (the parent of scripts/).
-    Raises a clear error if the file is missing or malformed.
-    """
-    import json as _json
-    config_path = os.path.join(APP_ROOT, "config.json")
-    if not os.path.exists(config_path):
-        print(f"\nERROR: config.json not found at: {config_path}")
-        print("Run setup.ps1 first to generate it, or create it manually.")
-        print("See README.md for the expected format.\n")
-        sys.exit(1)
-    with open(config_path, "r", encoding="utf-8-sig") as _f:
-        return _json.load(_f)
+# config.json load lives in runner_common (shared by every runner).
+_load_config = runner_common.load_config
 
 _CFG = _load_config()
 _O   = _CFG.get("ollama",  {})
@@ -279,19 +251,11 @@ def _set_remote_teardown(value):
 
 
 def _remote_pod_stopped():
-    """True if the remote tag pod is no longer RUNNING — its dead-man's switch
-    fired (idle / max-runtime) or it was stopped. Called after a failure so the
-    run ends cleanly (already-tagged files are skipped on re-run) instead of
-    pausing on what looks like an Ollama outage. A still-RUNNING pod returns
-    False (a transient blip uses the normal outage path)."""
-    if REMOTE_SESSION is None:
-        return False
-    try:
-        import runpod_client as rp
-        status = rp.pod_status(REMOTE_SESSION.api_key, REMOTE_SESSION.pod_id)
-    except Exception:                                  # noqa: BLE001 (fail-safe)
-        return False
-    return status in (None, rp.STATUS_EXITED, rp.STATUS_TERMINATED)
+    """See runner_common.remote_pod_stopped: True if this run's remote tag pod is
+    no longer RUNNING (dead-man's switch fired / stopped), so a failure ends the
+    run cleanly (already-tagged files are skipped on re-run) instead of pausing on
+    what looks like an Ollama outage."""
+    return runner_common.remote_pod_stopped(REMOTE_SESSION)
 
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
@@ -444,123 +408,15 @@ _TRACKED_EXIF_FIELDS = {
 #  TIMING HELPERS
 # ─────────────────────────────────────────────────────────────
 
-def fmt_mmss(seconds):
-    seconds = int(seconds)
-    m, s = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
+# Duration formatting lives in runner_common (shared).
+fmt_mmss     = runner_common.fmt_mmss
+fmt_hhmmss   = runner_common.fmt_hhmmss
+fmt_duration = runner_common.fmt_duration
 
 
-def fmt_hhmmss(seconds):
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s   = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def fmt_duration(seconds):
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s   = divmod(rem, 60)
-    if h:   return f"{h}h {m:02d}m {s:02d}s"
-    if m:   return f"{m}m {s:02d}s"
-    return f"{s}s"
-
-
-# ─────────────────────────────────────────────────────────────
-#  IMAGE DIMENSION READER  (no Pillow needed)
-# ─────────────────────────────────────────────────────────────
-
-JPEG_SOI = bytes([0xFF, 0xD8])
-WEBP_SIG = bytes([0x52, 0x49, 0x46, 0x46])   # "RIFF"
-WEBP_ID  = bytes([0x57, 0x45, 0x42, 0x50])   # "WEBP"
-PNG_SIG  = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
-IHDR     = bytes([0x49, 0x48, 0x44, 0x52])   # "IHDR"
-NULL1    = bytes([0x00])
-
-
-def _read_png_dims(f):
-    f.read(8)   # PNG signature
-    f.read(4)   # chunk length
-    assert f.read(4) == IHDR
-    w = struct.unpack(">I", f.read(4))[0]
-    h = struct.unpack(">I", f.read(4))[0]
-    return w, h
-
-
-def _read_jpeg_dims(f):
-    assert f.read(2) == JPEG_SOI
-    while True:
-        marker = f.read(2)
-        if len(marker) < 2 or marker[0] != 0xFF:
-            break
-        t = marker[1]
-        length = struct.unpack(">H", f.read(2))[0]
-        if 0xC0 <= t <= 0xCF and t not in (0xC4, 0xC8, 0xCC):
-            f.read(1)
-            h = struct.unpack(">H", f.read(2))[0]
-            w = struct.unpack(">H", f.read(2))[0]
-            return w, h
-        f.read(length - 2)
-    raise ValueError("No JPEG SOF marker found")
-
-
-def _read_bmp_dims(f):
-    f.read(18)
-    w = struct.unpack("<I", f.read(4))[0]
-    h = abs(struct.unpack("<I", f.read(4))[0])
-    return w, h
-
-
-def _read_webp_dims(f):
-    f.read(4)   # RIFF
-    f.read(4)   # file size
-    assert f.read(4) == WEBP_ID
-    chunk = f.read(4)
-    f.read(4)   # chunk size
-    if chunk == b"VP8 ":
-        f.read(3)
-        raw = f.read(4)
-        w = (struct.unpack("<H", raw[:2])[0] & 0x3FFF) + 1
-        h = (struct.unpack("<H", raw[2:])[0] & 0x3FFF) + 1
-        return w, h
-    elif chunk == b"VP8L":
-        f.read(1)
-        b = f.read(4)
-        bits = struct.unpack("<I", b)[0]
-        w = (bits & 0x3FFF) + 1
-        h = ((bits >> 14) & 0x3FFF) + 1
-        return w, h
-    elif chunk == b"VP8X":
-        f.read(4)
-        w = struct.unpack("<I", f.read(3) + NULL1)[0] + 1
-        h = struct.unpack("<I", f.read(3) + NULL1)[0] + 1
-        return w, h
-    raise ValueError("Unknown WebP sub-format")
-
-
-def get_image_dimensions(path):
-    """Return (width, height). Tries fast struct reader first, Pillow as fallback."""
-    ext = os.path.splitext(path)[1].lower()
-    try:
-        with open(path, "rb") as f:
-            if ext == ".png":
-                return _read_png_dims(f)
-            elif ext in (".jpg", ".jpeg"):
-                return _read_jpeg_dims(f)
-            elif ext == ".bmp":
-                return _read_bmp_dims(f)
-            elif ext == ".webp":
-                return _read_webp_dims(f)
-    except Exception:
-        pass
-    # Fallback: use Pillow (handles all edge cases including progressive JPEGs)
-    try:
-        from PIL import Image
-        with Image.open(path) as img:
-            return img.size  # (width, height)
-    except Exception:
-        pass
-    return 0, 0
+# Header-based image-size reader (with a Pillow fallback) lives in runner_common,
+# shared with the other runners.
+get_image_dimensions = runner_common.get_image_dimensions
 
 
 # ─────────────────────────────────────────────────────────────

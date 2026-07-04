@@ -1,0 +1,319 @@
+"""
+runner_common.py
+----------------
+Shared infrastructure for the headless runners (batch_upscale, tag_and_rename,
+conciliate, batch_video_upscale) and the provisioning driver. The runners each
+grew private copies of the same helpers; the cost was drift (the clearest case:
+the UTF-8 stdout hardening lived only in the video runner, leaving the others
+crashable on a non-ASCII glyph in an odd console). 0.3.8 proved the pattern by
+unifying notifications into notifications.py; this does the same for the rest of
+the runner scaffolding.
+
+What lives here (the genuinely shared, behaviour-identical pieces):
+  * APP_ROOT + load_config()          - config.json at the app root
+  * harden_stdout()                   - make stdout/stderr non-ASCII-proof
+  * GUI_MARKER / stdin_is_piped() / GUI_MODE / gui_event()  - the @@TBX@@ protocol
+  * fmt_duration / fmt_mmss / fmt_hhmmss                     - duration formatting
+  * get_image_dimensions() + header parsers                 - Pillow-free size read
+  * is_oom_error()                    - CUDA/torch OOM classifier (watchdog)
+  * remote_pod_stopped(session)       - "did the pod's dead-man's switch fire?"
+
+What deliberately stays per-runner (divergent by design, NOT pure moves):
+  * The session loggers (batch_upscale.Logger vs tag_and_rename._TeeOutput vs
+    conciliate.Logger) - different tee strategies and user-visible log-file
+    names (log_/tag_/conc_).
+  * The stdin control loops (PauseController vs RemoteControl) - different
+    command sets and pause semantics.
+  * The send_notification wrappers - one line each, differing only by username.
+
+Stdlib only; heavy imports (runpod_client, Pillow) stay lazy so this module
+loads torch-free and instantly.
+"""
+
+import os
+import sys
+import struct
+
+# App root = parent of scripts/. config.json, seedvr2/, models/, logs/ and the
+# .venv all live at the app root, not beside these modules. Anchored off this
+# file so it is correct regardless of the current working directory.
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_config():
+    """
+    Load settings from config.json at the app root (the parent of scripts/).
+    Prints a clear error and exits if the file is missing or malformed - the
+    same behaviour every runner had in its private _load_config().
+    """
+    import json
+    config_path = os.path.join(APP_ROOT, "config.json")
+    if not os.path.exists(config_path):
+        print(f"\nERROR: config.json not found at: {config_path}")
+        print("Run setup.ps1 first to generate it, or create it manually.")
+        print("See README.md for the expected format.\n")
+        sys.exit(1)
+    with open(config_path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def harden_stdout():
+    """
+    Make stdout/stderr robust to non-ASCII output (unicode filenames, the ⏸/▶/⏹
+    control glyphs, section marks) regardless of the console code page. A
+    headless runner must never die on a UnicodeEncodeError - the Windows console
+    defaults to cp1252. Fail-safe: a stream that can't be reconfigured is left
+    as-is. Call once, as early as possible, before any output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
+#  GUI EVENT PROTOCOL  (the @@TBX@@ line channel)
+# ─────────────────────────────────────────────
+
+# Marker prefix the GUI intercepts and strips (never shown to the user there).
+GUI_MARKER = "@@TBX@@"
+
+
+def stdin_is_piped():
+    """True when stdin is a pipe - i.e. we are driven by toolbox_gui.py."""
+    try:
+        return sys.stdin is not None and not sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+# GUI mode: control arrives as stdin lines instead of keypresses, and
+# machine-readable event lines keep the GUI's preview strip in sync. Computed
+# once at import, exactly as each runner did (stdin state does not change).
+GUI_MODE = stdin_is_piped()
+
+
+def gui_event(kind, payload):
+    """
+    Emit one event line for the GUI (no-op outside GUI mode):
+
+        <GUI_MARKER><KIND>|<payload>\\n
+
+    Written as ONE atomic write (not print's two) so a background-thread event -
+    e.g. the remote telemetry sampler - can't be byte-split by the main thread's
+    concurrent writes; the GUI parser strips it even mid-line. Targets the RAW
+    stream when stdout has been wrapped by a logging tee (tag_and_rename), so a
+    marker never leaks into the on-disk session log; a plain stdout has no .raw
+    attribute and is written directly.
+    """
+    if GUI_MODE:
+        out = getattr(sys.stdout, "raw", sys.stdout)
+        out.write(f"{GUI_MARKER}{kind}|{payload}\n")
+        out.flush()
+
+
+# ─────────────────────────────────────────────
+#  DURATION FORMATTING
+# ─────────────────────────────────────────────
+
+def fmt_duration(seconds):
+    """Format a duration in seconds as  Xh Ym Zs  or  Ym Zs  or  Zs."""
+    seconds = int(seconds)
+    h, rem  = divmod(seconds, 3600)
+    m, s    = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def fmt_mmss(seconds):
+    """Format a duration as mm:ss - used for per-image elapsed time."""
+    seconds = int(seconds)
+    m, s    = divmod(seconds, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def fmt_hhmmss(seconds):
+    """Format a duration as hh:mm:ss - used for total elapsed time."""
+    seconds = int(seconds)
+    h, rem  = divmod(seconds, 3600)
+    m, s    = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ─────────────────────────────────────────────
+#  IMAGE DIMENSION READER  (no Pillow needed for the common formats)
+# ─────────────────────────────────────────────
+# Reads width/height straight from the file header, avoiding a full decode
+# during eligibility scanning. Supersedes the two drifted copies (batch_upscale
+# had TIFF but no Pillow fallback; tag_and_rename had the fallback but no TIFF) -
+# this handles png/jpeg/bmp/webp/tiff via headers AND falls back to Pillow for
+# anything the fast path can't parse (progressive JPEGs, odd variants). Any
+# failure yields (0, 0), exactly as both originals did.
+#
+# Consolidating also fixed a latent bug both copies shared: the lossy-WebP (VP8)
+# branch skipped the wrong number of header bytes and applied a spurious +1, so a
+# .webp reported wrong (non-zero) dimensions - and because it returned without
+# raising, tag_and_rename's Pillow fallback never got a chance to correct it. Now
+# tested against real Pillow-written WebP files.
+
+def _read_png_dimensions(f):
+    f.read(8)                       # PNG signature
+    f.read(4)                       # first chunk length
+    assert f.read(4) == b"IHDR"
+    w = struct.unpack(">I", f.read(4))[0]
+    h = struct.unpack(">I", f.read(4))[0]
+    return w, h
+
+
+def _read_jpeg_dimensions(f):
+    assert f.read(2) == b"\xff\xd8"
+    while True:
+        marker = f.read(2)
+        if len(marker) < 2 or marker[0] != 0xFF:
+            break
+        marker_type = marker[1]
+        length = struct.unpack(">H", f.read(2))[0]
+        if 0xC0 <= marker_type <= 0xCF and marker_type not in (0xC4, 0xC8, 0xCC):
+            f.read(1)
+            h = struct.unpack(">H", f.read(2))[0]
+            w = struct.unpack(">H", f.read(2))[0]
+            return w, h
+        else:
+            f.read(length - 2)
+    raise ValueError("Could not find JPEG SOF marker")
+
+
+def _read_bmp_dimensions(f):
+    f.read(18)
+    w = struct.unpack("<I", f.read(4))[0]
+    h = struct.unpack("<I", f.read(4))[0]
+    return w, abs(h)
+
+
+def _read_webp_dimensions(f):
+    f.read(4)                       # "RIFF"
+    f.read(4)                       # file size
+    assert f.read(4) == b"WEBP"
+    chunk = f.read(4)
+    f.read(4)                       # chunk size
+    if chunk == b"VP8 ":
+        f.read(3)               # frame tag
+        f.read(3)               # keyframe start code (0x9d 0x01 0x2a)
+        raw = f.read(4)         # 14-bit width then 14-bit height (stored as-is)
+        w = struct.unpack("<H", raw[:2])[0] & 0x3FFF
+        h = struct.unpack("<H", raw[2:])[0] & 0x3FFF
+        return w, h
+    elif chunk == b"VP8L":
+        f.read(1)
+        b = f.read(4)
+        bits = struct.unpack("<I", b)[0]
+        w = (bits & 0x3FFF) + 1
+        h = ((bits >> 14) & 0x3FFF) + 1
+        return w, h
+    elif chunk == b"VP8X":
+        f.read(4)
+        w = struct.unpack("<I", f.read(3) + b"\x00")[0] + 1
+        h = struct.unpack("<I", f.read(3) + b"\x00")[0] + 1
+        return w, h
+    raise ValueError("Unknown WebP sub-format")
+
+
+def _read_tiff_dimensions(f):
+    """Read width/height from a TIFF header (little and big endian)."""
+    header = f.read(4)
+    if header[:2] == b"II":
+        endian = "<"
+    elif header[:2] == b"MM":
+        endian = ">"
+    else:
+        raise ValueError("Not a TIFF file")
+    ifd_offset = struct.unpack(endian + "I", f.read(4))[0]
+    f.seek(ifd_offset)
+    num_entries = struct.unpack(endian + "H", f.read(2))[0]
+    w = h = 0
+    for _ in range(num_entries):
+        tag, typ, count, val_raw = struct.unpack(endian + "HHI4s", f.read(12))
+        if typ in (3, 4):           # SHORT or LONG
+            fmt = endian + ("H" if typ == 3 else "I")
+            val = struct.unpack(fmt, val_raw[:struct.calcsize(fmt)])[0]
+            if tag == 256:   w = val    # ImageWidth
+            elif tag == 257: h = val    # ImageLength
+        if w and h:
+            break
+    return w, h
+
+
+def get_image_dimensions(path):
+    """Return (width, height), or (0, 0) if it can't be determined. Tries the
+    fast header reader first, then falls back to Pillow (handles progressive
+    JPEGs and other edge cases). Never raises."""
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        with open(path, "rb") as f:
+            if ext == ".png":
+                return _read_png_dimensions(f)
+            elif ext in (".jpg", ".jpeg"):
+                return _read_jpeg_dimensions(f)
+            elif ext == ".bmp":
+                return _read_bmp_dimensions(f)
+            elif ext == ".webp":
+                return _read_webp_dimensions(f)
+            elif ext in (".tif", ".tiff"):
+                return _read_tiff_dimensions(f)
+    except Exception:
+        pass
+    # Fallback: Pillow parses formats/variants the fast path can't (e.g.
+    # progressive JPEGs). Lazy import keeps this module torch/Pillow-free to load.
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return img.size        # (width, height)
+    except Exception:
+        pass
+    return (0, 0)
+
+
+# ─────────────────────────────────────────────
+#  ERROR CLASSIFICATION
+# ─────────────────────────────────────────────
+
+def is_oom_error(exc):
+    """
+    True when an exception looks like a CUDA/torch out-of-memory error. With
+    "Prefer No Sysmem Fallback" set in the NVIDIA panel, a degraded GPU fails
+    fast with a hard OOM instead of crawling - the watchdog treats that as the
+    same degradation episode as a sustained slow streak.
+    """
+    s = f"{type(exc).__name__}: {exc}".lower()
+    return ("out of memory" in s
+            or "outofmemory" in s
+            or "cuda_error_out_of_memory" in s
+            or ("cuda error" in s and "memory" in s))
+
+
+# ─────────────────────────────────────────────
+#  REMOTE POD STATE  (roadmap #1)
+# ─────────────────────────────────────────────
+
+def remote_pod_stopped(session):
+    """
+    True if the remote pod is no longer RUNNING - its dead-man's switch fired
+    (idle / max-runtime) or it was stopped/terminated. Called only AFTER a remote
+    request has failed, so a pod that is gone/EXITED/TERMINATED (or unreadable - a
+    terminated pod 404s) means: end the run gracefully (the resume/skip logic
+    continues next time) instead of treating the dropped connection as a
+    recoverable local outage. A still-RUNNING pod returns False, so a genuine
+    transient blip still uses the normal outage path.
+    """
+    if session is None:
+        return False
+    try:
+        import runpod_client as rp
+        status = rp.pod_status(session.api_key, session.pod_id)
+    except Exception:                # noqa: BLE001 (fail-safe)
+        return False
+    return status in (None, rp.STATUS_EXITED, rp.STATUS_TERMINATED)

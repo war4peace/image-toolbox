@@ -54,29 +54,22 @@ except Exception:
     pass
 
 import db
+import runner_common
+
+# Make stdout/stderr non-ASCII-proof before any output (see runner_common).
+runner_common.harden_stdout()
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 # App root = parent of scripts/. Data folders (logs/, db/, …) live there.
-APP_ROOT    = os.path.dirname(SCRIPT_DIR)
-GUI_MARKER  = "@@TBX@@"
+APP_ROOT    = runner_common.APP_ROOT
 IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 ARCHIVE_DIRNAME = "__Archive__"
 
-
-def _stdin_is_piped():
-    """True when stdin is a pipe — i.e. we are driven by toolbox_gui.py."""
-    try:
-        return sys.stdin is not None and not sys.stdin.isatty()
-    except Exception:
-        return False
-
-GUI_MODE = _stdin_is_piped()
-
-
-def _gui_event(kind, payload):
-    """Emit one machine-readable event line for the GUI (no-op in a terminal)."""
-    if GUI_MODE:
-        print(f"{GUI_MARKER}{kind}|{payload}", flush=True)
+# The @@TBX@@ event protocol + GUI-mode detection live in runner_common.
+_stdin_is_piped = runner_common.stdin_is_piped
+GUI_MODE        = runner_common.GUI_MODE
+GUI_MARKER      = runner_common.GUI_MARKER
+_gui_event      = runner_common.gui_event
 
 
 def _norm(p):
