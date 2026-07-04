@@ -26,17 +26,19 @@ and live cost tracking (the deployed pod's real `costPerHr` driving the
 "Est. Time Remaining / Cost" and "$ / 100 images" readouts). See `CLAUDE.md` and
 `docs/runpod-notes.md` for the shipped design. The one piece still open:
 
-- **Funds-floor safety-net + auto-stop** (API verified live, 2026-06-21). Per-run
-  cost is already tracked live, but the *account balance* isn't. Pull it from the
-  **legacy GraphQL** API: `query { myself { clientBalance currentSpendPerHr } }`
-  at `https://api.runpod.io/graphql`. The REST key authenticates it (Bearer or
-  `?api_key=`) but Cloudflare blocks the default `Python-urllib` User-Agent —
-  **must send a browser-like `User-Agent`** (REST has no balance endpoint; all
-  probes 400). Derived **time until funds depleted** = `clientBalance /
-  currentSpendPerHr`. Then **auto-stop** (or refuse to start) when session cost
-  exceeds a configurable cap *or* remaining balance drops below a floor — a money
-  safety-net alongside the time/idle dead-man's switch. Keep it in one isolated,
-  fail-safe helper (no balance → skip the checks, never block on it).
+- **Funds-floor safety-net + auto-stop** — **SHIPPED (0.4.2-experimental,
+  2026-07-04).** `scripts/funds_guard.py` (isolated, fail-safe: pure decisions +
+  a background `FundsGuard` poller) + `runpod_client.account_balance()` (the
+  legacy GraphQL `myself { clientBalance currentSpendPerHr }` query — REST has no
+  balance endpoint; Cloudflare needs a browser User-Agent, which `_graphql`
+  already sends). Wired through the single `RemoteSession` chokepoint:
+  `_preflight_funds()` refuses to start when the estimate would breach the floor
+  (Video tab passes the real estimate via `IMGTBX_RUN_ESTIMATE`);
+  `_arm_funds_guard()` polls during the run and stops the pod when this run's
+  accrued cost crosses `session_cost_cap_usd` OR the live balance hits
+  `balance_floor_usd` (both 0/off by default), after which the run takes the
+  existing graceful "pod stopped mid-run" path. Settings → Remote → "Money safety".
+  Still wants one live-pod confirmation of the stop-mid-run teardown.
 
 ## 2. Video upscaling (RunPod-only) — Moderate, builds on #1
 
@@ -98,13 +100,13 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1's core is shipped;** only the funds-floor safety-net above remains, and it
-  is independent of everything below.
+- **#1 is complete** — the core shipped earlier and the funds-floor safety-net
+  landed 0.4.2-experimental (above). It is independent of everything below.
 - **#2 (video) builds directly on #1** and is the clear next feature: it reuses the
   pod lifecycle, network volume, GPU picker, cost tracking, and the per-item
   streaming/resume machinery almost wholesale. Its only hard prerequisite is the
-  SeedVR2 video-settings benchmark pass (and it inherits #1's funds-floor work for
-  free once that lands).
+  SeedVR2 video-settings benchmark pass. It inherits #1's funds-floor safety-net
+  for free (the Video tab already passes its estimate to the pre-start refuse).
 - **#3 and #4 are much lower priority** and are otherwise large, mostly
   independent milestones. With Home Assistant already done over MQTT, the old
   telemetry coupling no longer drives sequencing.

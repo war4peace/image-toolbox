@@ -26,11 +26,20 @@ import subprocess
 
 import runpod_client as rp
 import ssh_setup
+import funds_guard
 from remote_upscale_engine import RemoteUpscaleEngine
 from remote_video_engine import RemoteVideoEngine
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
 HEARTBEAT = "/tmp/upscale_heartbeat"
+
+
+def _to_float(value, default=0.0):
+    """Best-effort float (config values can be strings/blank); default on junk."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _is_transient_gpu_error(text):
@@ -90,6 +99,16 @@ class RemoteSession:
         self.public_key = ssh_setup.read_public_key(self.key_path) if self.key_path else None
         self.worker_port = int(runpod_cfg.get("worker_port", 8200))
         self.terminate_when_done = bool(runpod_cfg.get("terminate_when_done", True))
+        # Money safety-net (funds_guard, roadmap #1). Both default OFF (0 = disabled)
+        # so wiring it in costs nothing until the user opts in. Read here (not just in
+        # the GUI) so a headless run honours the same config. balance_floor stops the
+        # pod when the live account balance falls to/below it; session_cost_cap stops
+        # it once THIS run's accrued cost crosses it.
+        self.balance_floor = _to_float(runpod_cfg.get("balance_floor_usd", 0))
+        self.session_cost_cap = _to_float(runpod_cfg.get("session_cost_cap_usd", 0))
+        self.funds_poll_seconds = int(runpod_cfg.get("funds_poll_seconds", 60) or 60)
+        self._funds_guard = None
+        self._funds_tripped = False
         self.on_event = on_event or (lambda *a: None)
         self.known_hosts = os.path.join(app_root, "logs", "runpod_known_hosts")
         self._attach = attach
@@ -179,6 +198,7 @@ class RemoteSession:
             raise rp.RunPodError("No RunPod API key configured.")
         if not (self.key_path and os.path.exists(self.key_path)):
             raise rp.RunPodError(f"SSH key not found: {self.key_path}")
+        self._preflight_funds()
         if not self.host:
             # Reuse a still-running app pod (faster, and avoids double-spinning);
             # mark it as attached so close() won't terminate a pod we didn't make.
@@ -198,6 +218,7 @@ class RemoteSession:
         if self.mode == "tag":
             self._start_ollama()
         self._arm_deadman()
+        self._arm_funds_guard()
         self._emit("Connecting to the worker …")
         engine_cls = RemoteVideoEngine if self.mode == "video" else RemoteUpscaleEngine
         self.engine = engine_cls(
@@ -519,6 +540,77 @@ class RemoteSession:
             f"setsid sh -c '{inner}' < /dev/null > /root/deadman.log 2>&1 & echo armed")
         self._ssh(launch, check=False, timeout=60)
 
+    def _preflight_funds(self):
+        """Refuse to START when finishing this run would drop the balance below the
+        floor (roadmap #1). Runs before any pod is created, so a run the account
+        can't afford never spins a billed pod. The GUI can set IMGTBX_RUN_ESTIMATE
+        ($) so the check uses the real queue estimate; without it the test reduces
+        to 'is the balance already at/below the floor'. Fail-safe: an unreadable
+        balance never blocks (the in-run guard is the backstop)."""
+        if not self.balance_floor or self.balance_floor <= 0:
+            return
+        info = rp.account_balance(self.api_key)
+        bal = (info or {}).get("balance")
+        est = _to_float(os.environ.get("IMGTBX_RUN_ESTIMATE"), 0.0)
+        blocked, reason = funds_guard.start_blocked(bal, est, self.balance_floor)
+        if blocked:
+            raise rp.RunPodError(
+                "Run refused by the funds safety-net: " + reason
+                + ". Add funds, or lower the floor in Settings -> Remote.")
+
+    def _arm_funds_guard(self):
+        """Start the local money safety-net for this run (roadmap #1). Inert unless
+        a floor or cap is configured. Polls the account balance and, once the run's
+        accrued cost crosses the cap OR the balance falls to the floor, STOPS the
+        pod — the run then hits the same 'pod stopped mid-run' path the on-pod
+        dead-man's switch uses (resume cache saved, continue later). Fail-safe: any
+        problem arming it just leaves the run unguarded, never blocks it."""
+        try:
+            guard = funds_guard.FundsGuard(
+                fetch_balance=lambda: rp.account_balance(self.api_key),
+                cost_per_hr=self.cost_per_hr,
+                floor=self.balance_floor,
+                cap=self.session_cost_cap,
+                poll_seconds=self.funds_poll_seconds,
+                on_trip=self._on_funds_trip)
+            self._funds_guard = guard
+            if not guard.active:
+                return
+            # One up-front runway line so the user sees the guard is watching.
+            info = rp.account_balance(self.api_key)
+            bal = (info or {}).get("balance")
+            limits = []
+            if self.session_cost_cap > 0:
+                limits.append(f"cap ${self.session_cost_cap:.2f}/run")
+            if self.balance_floor > 0:
+                limits.append(f"floor ${self.balance_floor:.2f}")
+            runway = ""
+            if bal is not None and self.cost_per_hr:
+                hrs = funds_guard.hours_until_depleted(bal, self.cost_per_hr)
+                runway = (f"; balance ${bal:.2f}"
+                          + (f", ~{hrs:.1f}h at ${self.cost_per_hr:.2f}/h" if hrs else ""))
+            self._emit(f"Funds guard armed ({', '.join(limits)}){runway}.")
+            guard.start()
+        except Exception as exc:                         # noqa: BLE001 (fail-safe)
+            self._emit(f"Funds guard could not start (continuing unguarded): {exc}")
+
+    def _on_funds_trip(self, reason):
+        """Balance floor / cost cap crossed while billing: stop the pod now. The
+        runner detects the pod is gone and ends the run cleanly (resume cache
+        saved). Guarded so it fires at most once."""
+        if self._funds_tripped:
+            return
+        self._funds_tripped = True
+        self._emit(f"FUNDS SAFETY: stopping the pod — {reason}. "
+                   f"The resume cache is saved; continue later when funded.")
+        try:
+            _ok, msg = rp.ensure_stopped(self.api_key, self.pod_id,
+                                         terminate=self.terminate_when_done)
+            self._emit(msg)
+        except Exception as exc:                         # noqa: BLE001 (fail-safe)
+            self._emit(f"Funds safety could not stop the pod ({exc}); the on-pod "
+                       f"dead-man's switch will stop it on the idle timeout.")
+
     def close(self, stop_pod=None):
         """Disconnect and tear the pod down. The on-pod deadman is the backup if
         this fails (e.g. the client crashed before reaching here).
@@ -527,6 +619,12 @@ class RemoteSession:
         uses it): None = default (stop only a pod we created, never a reused one);
         True = stop the pod now regardless (even a reused one); False = leave the
         pod running (the dead-man's switch stops it on the idle timeout)."""
+        if self._funds_guard:
+            try:
+                self._funds_guard.stop()
+            except Exception:
+                pass
+            self._funds_guard = None
         if self.engine:
             try:
                 self.engine.close()

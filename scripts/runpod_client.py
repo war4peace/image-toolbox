@@ -741,6 +741,33 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
     return out
 
 
+_BALANCE_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
+
+
+def account_balance(api_key, timeout=15):
+    """Live account balance for the money safety-net (funds_guard, roadmap #1).
+
+    Returns {"balance": float (USD), "spend_per_hr": float (USD/h)} or None on ANY
+    failure — no key, unreachable, unparseable. Fail-safe by contract: the funds
+    guard skips its checks when the balance is unknown and never blocks a run on
+    it. The balance is not in the REST API; only the legacy GraphQL `myself` query
+    exposes it (which _graphql already reaches with the browser User-Agent
+    Cloudflare requires)."""
+    try:
+        data = _graphql(api_key, _BALANCE_QUERY, timeout=timeout)
+    except Exception:                                    # noqa: BLE001 (fail-safe)
+        return None
+    me = (data or {}).get("myself") or {}
+    bal = me.get("clientBalance")
+    if bal is None:
+        return None
+    try:
+        return {"balance": float(bal),
+                "spend_per_hr": float(me.get("currentSpendPerHr") or 0.0)}
+    except (TypeError, ValueError):
+        return None
+
+
 _DC_QUERY = "{ dataCenters { id name location storageSupport listed } }"
 
 

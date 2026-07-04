@@ -246,6 +246,53 @@ def report_issue():
 
 
 # ─────────────────────────────────────────────
+#  RUNPOD FUNDS READOUT  (Settings + tool-tab status bars)
+# ─────────────────────────────────────────────
+# The account balance, coloured by how far it sits above the configured funds
+# floor (balance_floor_usd). The bands reuse the telemetry colours (TelemetryRow)
+# so the readouts read as one system.
+
+_FUNDS_GREY = "#7f8a99"   # unknown/disabled — matches TelemetryRow.GREY
+
+
+def funds_color(funds, floor):
+    """Colour a balance by its margin above the funds floor (mirrors the telemetry
+    bands): blue >= +$10, green +$5-10, dark yellow +$1-5, red at/near the floor.
+    Unknown balance → grey."""
+    if funds is None:
+        return _FUNDS_GREY
+    delta = funds - (floor or 0.0)
+    if delta >= 10:
+        return "#3a86ff"      # blue
+    if delta >= 5:
+        return "#1a9e4b"      # green
+    if delta > 1:
+        return "#b58900"      # dark yellow
+    return "#d11a2a"          # red
+
+
+def config_funds_floor():
+    """The saved funds floor ($) from config; 0.0 if unset/invalid."""
+    try:
+        return float(CFG.get("runpod", {}).get("balance_floor_usd", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fmt_funds(info):
+    """(display text, balance-or-None) for a runpod_client.account_balance result.
+    A missing/failed lookup reads as 'Unknown'."""
+    bal = info.get("balance") if isinstance(info, dict) else None
+    if bal is None:
+        return "Unknown", None
+    try:
+        bal = float(bal)
+    except (TypeError, ValueError):
+        return "Unknown", None
+    return f"${bal:.2f}", bal
+
+
+# ─────────────────────────────────────────────
 #  MQTT / HOME ASSISTANT  (config.json "mqtt" section)
 # ─────────────────────────────────────────────
 
@@ -1581,6 +1628,8 @@ class ToolTab(ttk.Frame):
             self.cost100_var.set("")
         if on and not self._gpu_loaded:
             self._refresh_gpus()
+        # Enable/disable the bottom-bar funds readout to match the remote toggle.
+        self.app.refresh_funds_readout()
 
     def _refresh_gpus(self):
         rp_cfg = CFG.get("runpod", {})
@@ -4528,6 +4577,9 @@ class RunPodTab(ttk.Frame):
                 "to pull the live list (data centers, GPUs and volumes) from RunPod.")
         ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters).grid(
             row=0, column=4, sticky="w", padx=(8, 0))
+        # The account balance is shown in the shared bottom-bar "Funds" readout
+        # (always visible on this tab), so it isn't duplicated here; Refresh still
+        # updates it (see _refresh_datacenters).
 
         # Upscale GPU, Tag GPU and Model volume share ONE grid (column 0 = labels,
         # column 1 = comboboxes) so the three comboboxes line up under each other,
@@ -4664,11 +4716,37 @@ class RunPodTab(ttk.Frame):
                               "timeout doesn't apply here — no heartbeat is written "
                               "during a download.)")
 
+        # ── Money safety-net (funds_guard, roadmap #1) ──────────────────────────
+        money = ttk.Frame(sec)
+        money.grid(row=8, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(money, text="Money safety:  stop the run at $").pack(side="left", padx=(0, 4))
+        self.runpod_cap_var = tk.StringVar(value=str(rp.get("session_cost_cap_usd", 0)))
+        cap_spin = ttk.Spinbox(money, from_=0, to=10000, increment=5, width=7,
+                               textvariable=self.runpod_cap_var)
+        cap_spin.pack(side="left")
+        ttk.Label(money, text="/run cost,").pack(side="left", padx=(4, 12))
+        Tooltip(cap_spin, "Auto-stop the pod once THIS run's accrued cost (its real "
+                          "billed $/h times how long it has run) reaches this many "
+                          "dollars. 0 = no cap. The resume cache is saved, so you "
+                          "continue later. A money backstop alongside the time/idle "
+                          "dead-man's switch.")
+        ttk.Label(money, text="or below $").pack(side="left", padx=(0, 4))
+        self.runpod_floor_var = tk.StringVar(value=str(rp.get("balance_floor_usd", 0)))
+        floor_spin = ttk.Spinbox(money, from_=0, to=100000, increment=5, width=7,
+                                 textvariable=self.runpod_floor_var)
+        floor_spin.pack(side="left")
+        ttk.Label(money, text="balance").pack(side="left", padx=(4, 0))
+        Tooltip(floor_spin, "Keep at least this much in your RunPod account: the app "
+                            "refuses to START a run that would drop below it, and "
+                            "auto-stops a running pod if the live balance falls to "
+                            "it. 0 = no floor. Needs the RunPod API key set. "
+                            "Unreadable balance never blocks a run (fail-safe).")
+
         self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", True)))
         term_chk = ttk.Checkbutton(
             sec, text="Terminate (delete) the pod when done, not just stop it",
             variable=self.runpod_terminate_var)
-        term_chk.grid(row=8, column=0, columnspan=4, sticky="w", pady=3)
+        term_chk.grid(row=9, column=0, columnspan=4, sticky="w", pady=3)
         Tooltip(term_chk, "ON (recommended): the disposable pod is deleted when a "
                           "run ends, freeing ALL billing. This NEVER deletes your "
                           "model network volume — that's a separate resource. OFF "
@@ -4677,7 +4755,7 @@ class RunPodTab(ttk.Frame):
                           "pod, so OFF just leaves billing cruft.")
 
         self.runpod_status = ttk.Label(sec, text="", foreground="#666")
-        self.runpod_status.grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.runpod_status.grid(row=10, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
         # ── Your pods ───────────────────────────────────────────────────────────
         # List every pod on the account (running or exited) with a Terminate
@@ -4796,6 +4874,8 @@ class RunPodTab(ttk.Frame):
         self.runpod_maxrun_var.set(str(rp.get("max_runtime_minutes", 0)))
         self.runpod_idle_var.set(str(rp.get("idle_timeout_minutes", 15)))
         self.runpod_provrun_var.set(str(rp.get("provision_max_runtime_minutes", 60)))
+        self.runpod_cap_var.set(str(rp.get("session_cost_cap_usd", 0)))
+        self.runpod_floor_var.set(str(rp.get("balance_floor_usd", 0)))
         self.runpod_terminate_var.set(bool(rp.get("terminate_when_done", True)))
         # Reset the GPU combos to the curated lists (discard any live-refresh state).
         self.runpod_gpu_cmb.configure(values=runpod_client.GPU_TYPES)
@@ -4834,6 +4914,8 @@ class RunPodTab(ttk.Frame):
             "max_runtime_minutes":  _num(self.runpod_maxrun_var, 0, int),
             "idle_timeout_minutes": _num(self.runpod_idle_var, 15, int),
             "provision_max_runtime_minutes": _num(self.runpod_provrun_var, 60, int),
+            "session_cost_cap_usd": _num(self.runpod_cap_var, 0, float),
+            "balance_floor_usd":    _num(self.runpod_floor_var, 0, float),
             "terminate_when_done":  bool(self.runpod_terminate_var.get()),
             "gpu_type_id":      self._gpu_id_by_label.get(
                 self.runpod_gpu_var.get(),
@@ -4977,8 +5059,14 @@ class RunPodTab(ttk.Frame):
                 err = None
             except runpod_client.RunPodError as exc:
                 dcs, err = [], str(exc)
+            funds = runpod_client.account_balance(key)      # fail-safe (None on failure)
 
             def apply():
+                # Push the fetched balance to the shared bottom-bar Funds readout.
+                try:
+                    self.app.set_funds_cache(funds)
+                except Exception:
+                    pass
                 if err:
                     self.runpod_status.configure(text=err, foreground="#b3261e")
                     return
@@ -7219,7 +7307,13 @@ class VideoTab(ttk.Frame):
         # TYPE. If it can't be deployed (sold out / unavailable by start time), the
         # run fails with a clear message and the user refreshes (↻) and picks
         # another card themselves.
-        env = {"IMGTBX_GPU_OVERRIDE": g["id"]} if g.get("id") else None
+        env = {}
+        if g.get("id"):
+            env["IMGTBX_GPU_OVERRIDE"] = g["id"]
+        # Hand the queue's cost estimate to the funds safety-net so it can refuse a
+        # run that would drop the balance below the floor before renting a pod (#1).
+        if est and est.get("cost"):
+            env["IMGTBX_RUN_ESTIMATE"] = f"{est['cost']:.4f}"
         self._run_gpu = g.get("id") or g.get("name")     # for the time-based estimate
         self._begin_run(sum(j["frames"] for j in jobs))
         self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
@@ -7598,6 +7692,11 @@ class App(tk.Tk):
         self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.add(self.runpod_tab,     text="  RunPod  ")
+        # RunPod funds readout state (bottom bar). Cached briefly so switching tabs
+        # doesn't hammer the balance API.
+        self._funds_cache = None
+        self._funds_cache_at = 0.0
+        self._funds_fetching = False
         # Bottom status bar with a right-aligned "Report an issue" link (Future
         # Feature #3). Packed before the notebook so it reserves the bottom strip;
         # always visible regardless of the active tab.
@@ -7668,8 +7767,10 @@ class App(tk.Tk):
         return "break"
 
     def _build_statusbar(self):
-        """A thin bottom strip with a right-aligned 'Report an issue' link
-        (Future Feature #3). The link opens a pre-filled GitHub new-issue page."""
+        """A thin bottom strip with a right-aligned 'Report an issue' link (Future
+        Feature #3) and a left-aligned RunPod 'Funds' readout. The link opens a
+        pre-filled GitHub new-issue page; the funds readout shows the account
+        balance (coloured against the funds floor) on the remote-capable tabs."""
         bar = ttk.Frame(self)
         bar.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         link = tk.Label(bar, text="Report an issue", fg="#3a86ff",
@@ -7679,6 +7780,117 @@ class App(tk.Tk):
         # Subtle hover feedback (darker blue) so it reads as a link.
         link.bind("<Enter>", lambda _e: link.configure(fg="#1a5fd0"))
         link.bind("<Leave>", lambda _e: link.configure(fg="#3a86ff"))
+        # Funds readout on the far left of the same row. Disabled (grey) unless the
+        # active tab bills a remote pod: Batch Upscaler / Tag & Rename only when
+        # 'Run on remote pod' is ticked; the Video Upscaler always.
+        self.funds_caption = tk.Label(bar, text="Funds:", fg=_FUNDS_GREY,
+                                      font=("Consolas", 9))
+        self.funds_caption.pack(side="left")
+        self.funds_value = tk.Label(bar, text="n/a", fg=_FUNDS_GREY,
+                                    font=("Consolas", 9))
+        self.funds_value.pack(side="left", padx=(4, 0))
+        self._funds_shown = True     # tracks whether the two labels are packed
+        Tooltip(self.funds_value,
+                "Your RunPod account balance, coloured by how far it sits above the "
+                "funds floor (Settings -> RunPod). Active only when the current tab "
+                "runs on a remote pod. 'Unknown' if it can't be read.")
+
+    # ── RunPod funds readout (bottom bar) ────────────────────────────────────
+    def _selected_widget(self):
+        try:
+            return self.nb.nametowidget(self.nb.select())
+        except Exception:
+            return None
+
+    def _funds_visible_for(self, tab):
+        """Whether to SHOW the readout at all. Hidden on Conciliation and Settings
+        (they never bill a pod, so it would only ever read 'n/a' there). Shown on
+        the three tool tabs and the RunPod tab."""
+        return tab in (self.upscale_tab, self.tag_tab, self.video_tab, self.runpod_tab)
+
+    def _funds_enabled_for(self, tab):
+        """Is the readout LIVE (fetches + colours) for this tab? Always for the
+        Video Upscaler and the RunPod tab; for Batch Upscaler / Tag & Rename only
+        when 'Run on remote pod' is ticked (otherwise it shows a grey 'n/a')."""
+        if tab in (self.video_tab, self.runpod_tab):
+            return True
+        if tab in (self.upscale_tab, self.tag_tab):
+            rv = getattr(tab, "remote_var", None)
+            return bool(rv and rv.get())
+        return False
+
+    def _show_funds_readout(self, show):
+        """Pack or unpack the funds labels (far left of the status bar)."""
+        if show and not self._funds_shown:
+            self.funds_caption.pack(side="left")
+            self.funds_value.pack(side="left", padx=(4, 0))
+            self._funds_shown = True
+        elif not show and self._funds_shown:
+            self.funds_caption.pack_forget()
+            self.funds_value.pack_forget()
+            self._funds_shown = False
+
+    def refresh_funds_readout(self):
+        """Update the bottom-bar funds readout for the active tab. Hidden on
+        Conciliation / Settings; grey 'n/a' when a tool tab isn't running remote;
+        otherwise the (cached, then freshly fetched) balance. Fail-safe."""
+        try:
+            tab = self._selected_widget()
+            if not self._funds_visible_for(tab):
+                self._show_funds_readout(False)
+                return
+            self._show_funds_readout(True)
+            if self._funds_enabled_for(tab):
+                self._render_funds()          # show what we have immediately
+                self._fetch_funds_async()     # then refresh in the background
+            else:
+                self.funds_caption.configure(fg=_FUNDS_GREY)
+                self.funds_value.configure(text="n/a", fg=_FUNDS_GREY)
+        except Exception:
+            pass
+
+    def _render_funds(self):
+        """Paint the funds value from the cache, coloured against the saved floor."""
+        text, bal = fmt_funds(self._funds_cache)
+        self.funds_caption.configure(fg=_FUNDS_GREY)
+        self.funds_value.configure(text=text, fg=funds_color(bal, config_funds_floor()))
+
+    def _fetch_funds_async(self):
+        """Fetch the balance off the UI thread (cached ~30 s to avoid hammering the
+        API on rapid tab switches). No key → 'Unknown'. Fail-safe throughout."""
+        key = (CFG.get("runpod", {}).get("api_key") or "").strip()
+        if not key:
+            self._funds_cache = None
+            self._render_funds()
+            return
+        if self._funds_fetching:
+            return
+        if self._funds_cache is not None and (time.time() - self._funds_cache_at) < 30:
+            return
+        self._funds_fetching = True
+
+        def work():
+            info = runpod_client.account_balance(key)   # fail-safe (None on failure)
+
+            def apply():
+                self._funds_fetching = False
+                self._funds_cache = info
+                self._funds_cache_at = time.time()
+                if self._funds_enabled_for(self._selected_widget()):
+                    self._render_funds()
+            try:
+                self.after(0, apply)
+            except Exception:
+                self._funds_fetching = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_funds_cache(self, info):
+        """Adopt a balance fetched elsewhere (the RunPod tab's Refresh) as the shared
+        cache and repaint the bottom-bar readout, so the two stay in sync."""
+        self._funds_cache = info
+        self._funds_cache_at = time.time()
+        self.refresh_funds_readout()
 
     def _migrate_default_folders(self):
         """Carry default folders saved by older builds in gui_settings.json over
@@ -7766,6 +7978,8 @@ class App(tk.Tk):
             # configured in the RunPod tab AFTER startup is picked up (not only the
             # one-time check at launch), and refresh the durable queue.
             self.video_tab.on_enter()
+        # Update the bottom-bar funds readout for the tab we just entered.
+        self.refresh_funds_readout()
 
     def _confirm_unsaved(self, context, tab=None, name="Settings"):
         """Modal Save / Don't save / Cancel prompt for unsaved edits in a

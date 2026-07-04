@@ -112,6 +112,41 @@ this list becomes safer to do once a test net exists.
 
 ## 3. Money safety: implement the funds-floor safety net (roadmap #1 remainder)
 
+> **Status: DONE (2026-07-04, 0.4.2-experimental).** New isolated, fail-safe
+> `scripts/funds_guard.py` (pure decision logic + a background `FundsGuard`
+> poller) plus `runpod_client.account_balance()` (the legacy GraphQL
+> `myself { clientBalance currentSpendPerHr }` query, browser User-Agent, returns
+> None on any failure). Two protections, both OFF by default (0 = disabled), both
+> fail-safe (unreadable balance never blocks a run):
+> - **Start floor** — `RemoteSession._preflight_funds()` refuses to start (before
+>   any pod is created) when finishing the run would drop the balance below the
+>   floor. The Video tab passes its real queue estimate via `IMGTBX_RUN_ESTIMATE`;
+>   other paths reduce to "is the balance already below the floor".
+> - **Session cap + balance floor auto-stop** — `RemoteSession._arm_funds_guard()`
+>   starts a poller on run start (the single chokepoint for every remote tool) that
+>   stops the pod once this run's accrued cost crosses the cap OR the live balance
+>   hits the floor. The run then follows the existing "pod stopped mid-run" path
+>   (resume cache saved, continue later), the same graceful teardown the on-pod
+>   dead-man's switch uses. Edge-triggered; `close()` stops the poller.
+>
+> Config (runpod section): `session_cost_cap_usd`, `balance_floor_usd` (both 0 by
+> default), plus config-only `funds_poll_seconds` (default 60). Settings → Remote
+> has a "Money safety" row (cap + floor spinboxes, tooltips). A **live Funds
+> readout** on the far left of the shared bottom status bar shows the account
+> balance, coloured by margin above the floor (the telemetry bands: blue >= +$10,
+> green +$5-10, dark yellow +$1-5, red at/near the floor, grey = Unknown). Live on
+> the Video Upscaler and RunPod tabs always; on Batch Upscaler / Tag & Rename only
+> when "Run on remote pod" is on (grey "n/a" otherwise); hidden entirely on
+> Conciliation and Settings. The RunPod tab's Region Refresh also updates it.
+> 18 unit tests cover
+> the pure logic (`session_cost`, `hours_until_depleted`, `start_blocked`,
+> `evaluate`, and the poller's `check_once`). **Not yet exercised on a live billed
+> pod** — the decision logic and wiring are tested/imported, but the actual
+> stop-mid-run teardown interaction wants one live-pod confirmation.
+>
+> The within-segment progress-honesty concern (below) is left on the list — treat
+> it separately from the funds work.
+
 `docs/future-features.md` #1 marks this as the one open piece, API verified live
 2026-06-21. The app now runs **multi-hour billed video jobs** (a 1-hour 1080p
 video is ~$28-46 of GPU time), which raises the stakes well beyond the image
