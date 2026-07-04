@@ -560,6 +560,28 @@ pod-side only, no local changes.
 
 ## 12. Smaller findings (grouped, low urgency)
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** Worked through all five:
+> - **`find_upscale_root`/`find_tag_root` O(n) scan** — left as-is (fine at the
+>   low-tens scale) with a docstring noting the indexed-`_norm`-column path if it
+>   ever grows to hundreds.
+> - **`_upsert` builds SQL from kwargs** — added a SECURITY docstring: `table`/
+>   column names are interpolated so they must stay trusted code literals (all call
+>   sites pass hard-coded names; VALUES are bound as params). No code change.
+> - **SSH `StrictHostKeyChecking=no`** — investigated and DECIDED to keep it, with
+>   a rationale comment in `_ssh_base`. `accept-new` would MITM-protect after first
+>   contact, but RunPod reuses a finite pool of proxy (ip, port) endpoints across
+>   pods each with a fresh host key, so a persisted known_hosts + accept-new would
+>   HARD-FAIL a reused endpoint with "REMOTE HOST IDENTIFICATION HAS CHANGED" — a
+>   scary, unresolvable error for this app's non-technical audience, worse than the
+>   low RunPod-infra-internal MITM risk it guards. (If we ever want the protection,
+>   the clean way is accept-new PLUS scrubbing the pod's known_hosts entry on
+>   teardown; deferred as not worth the added failure surface here.)
+> - **README run-from-source pip line** — added `paho-mqtt` for parity.
+> - **`video-upscaler.md` at 1,145 lines** — DEFERRED. Splitting the measured
+>   benchmark passes into `docs/video-benchmarks.md` is a churny structural reorg
+>   with real cross-reference-breakage risk and no functional payoff; not worth it
+>   in a low-urgency batch. Left as a noted future cleanup.
+
 - **`db.find_upscale_root` / `find_tag_root`** scan the whole roots table in
   Python for case-insensitive matching. Fine at current scale; if roots ever
   number in the hundreds, store `_norm(path)` in a column and index it.

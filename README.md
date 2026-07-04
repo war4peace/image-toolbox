@@ -84,7 +84,7 @@ git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
 # 2. Create the Python environment (Python 3.12, NVIDIA GPU required).
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm
+.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm paho-mqtt
 
 # 3. Launch the GUI (model weights ~16 GB download automatically on first use).
 .venv\Scripts\pythonw.exe scripts\toolbox_gui.py

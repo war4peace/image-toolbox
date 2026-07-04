@@ -68,6 +68,16 @@ def _ssh_base(key, port, known_hosts):
     # which drops the channel and blanks the result. With the server alive the
     # probes are answered so the connection persists; CountMax 40 only gives up
     # after ~20 min of a truly unresponsive host.
+    #
+    # StrictHostKeyChecking=no is deliberate for these disposable pods (weighed in
+    # recommendations item 12). `accept-new` would add MITM protection after first
+    # contact, BUT RunPod hands out pods behind a finite pool of proxy (ip, port)
+    # endpoints that get REUSED across pods, each with its own fresh host key. With
+    # a persisted known_hosts + accept-new, a reused endpoint serving a new pod trips
+    # "REMOTE HOST IDENTIFICATION HAS CHANGED" and the connection HARD-FAILS — a
+    # scary, hard-to-self-resolve error for this app's non-technical audience, and a
+    # worse outcome than the low, RunPod-infra-internal MITM risk it would guard. So
+    # we keep `no` (accept the key, log the host) rather than gain fragile protection.
     return ["-i", key, "-p", str(port),
             "-o", "StrictHostKeyChecking=no",
             "-o", f"UserKnownHostsFile={known_hosts}",

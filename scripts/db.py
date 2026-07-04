@@ -386,7 +386,12 @@ def get_tag_root_id(conn, source_root, create=True, created_at=None):
 
 @_locked
 def find_upscale_root(conn, source_root):
-    """Find an upscale root by path (case-insensitive). Returns a Row or None."""
+    """Find an upscale root by path (case-insensitive). Returns a Row or None.
+
+    Scans the roots table in Python (SQLite can't case/normcase-fold Windows paths
+    in SQL). Fine at real scale (roots number in the low tens); if that ever grew
+    to hundreds, store `_norm(source_root)` in an indexed column and look it up
+    directly (recommendations item 12). Same note applies to `find_tag_root`."""
     target = _norm(source_root)
     for row in conn.execute("SELECT id, source_root, output_root FROM upscale_roots"):
         if _norm(row["source_root"]) == target:
@@ -432,7 +437,13 @@ def get_video_root_id(conn, source_root, output_root=None, create=True):
 def _upsert(conn, table, key_cols, key_vals, fields):
     """Generic insert-or-update helper for the video_* tables. Stamps updated_at,
     commits. `key_cols`/`key_vals` are the primary-key columns/values; `fields` is
-    the dict of other columns to set."""
+    the dict of other columns to set.
+
+    SECURITY (recommendations item 12): `table`, `key_cols` and `fields` keys are
+    interpolated straight into the SQL, so they MUST stay trusted, code-supplied
+    literals — never a user string. Every call site passes hard-coded column names
+    (see upsert_video_*), so there is no injection surface; keep it that way if you
+    add a caller (bind VALUES as params, as here; never a column/table name)."""
     fields = dict(fields)
     fields["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     where = " AND ".join(f"{c} = ?" for c in key_cols)
