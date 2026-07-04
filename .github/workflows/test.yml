@@ -1,0 +1,28 @@
+name: Tests
+
+# Runs the pure-logic test suite on every push and PR. A Windows runner (the app
+# is Windows-only) with a plain system Python and NO GPU stack: the suite is
+# torch-free by design (see tests/test_import_smoke.py), so it is fast and cheap
+# and needs none of the ~3 GB CUDA/SeedVR2 download the app itself pulls.
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]     # tag pushes run build-installer.yml, not this
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run tests
+        run: python -m pytest -ra

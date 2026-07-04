@@ -65,6 +65,23 @@ but not ffmpeg, so the failure surfaces as a raw error mid-scan instead of a
 
 ## 2. No automated tests and no test CI, at 22k lines and growing
 
+> **Status: DONE (2026-07-04, 0.4.2-experimental).** Added a `tests/` folder
+> (pytest) and a `Tests` GitHub Actions workflow (`.github/workflows/test.yml`,
+> windows-latest, system Python 3.12, `pip install pytest` only, no GPU stack).
+> 109 tests, ~0.4 s, covering the pure logic called out below: `batch_upscale`
+> fit math (`_skip_for_dims`, `compute_seedvr2_resolution`), `video_pipeline`
+> (`plan_split` re-encode triggers + `check_drift`, the ffmpeg-free branches),
+> `video_estimate` (box-fit + the aspect-ratio megapixel regression + queue/
+> recommend), `pod/deadman.evaluate`, `notifications.resolve_settings` (legacy
+> migration), and `db.py` (the video-table migration + the lineage round trip
+> against a temp cache.db). Plus the two guards this item asked for: an **import
+> smoke test** over every `scripts/*.py` that also asserts torch/timm/cv2 stay
+> lazy (Remote-only-install guard + 0.2.5 packaging guard), and a **golden test
+> for the `@@TBX@@` protocol** driving the real `ToolTab._filter_markers` parser
+> through mid-line and chunk-split marker cases. Verified the whole suite passes
+> in a fresh torch-free venv (the exact CI condition), not just the app venv.
+> The workflow ignores `v*` tag pushes (those build the installer instead).
+
 The repo has no `tests/` directory and the only workflow is
 `build-installer.yml`. Every regression so far was caught by live runs on
 billed pods or by users. The codebase is now past the size where that scales,
