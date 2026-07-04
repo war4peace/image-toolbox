@@ -44,6 +44,11 @@ CREATE_NO_WINDOW = 0x08000000
 # Matches the per-image counters both scripts print, e.g. "[37/59]"
 PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 
+# Marker prefix the runners emit on stdout for machine-readable event lines
+# (@@TBX@@KIND|payload); the GUI strips it before showing the log. The runner
+# side has its own copy in runner_common (they must agree on the literal).
+GUI_MARKER = "@@TBX@@"
+
 
 # ─────────────────────────────────────────────
 #  CONFIG / INTERPRETER
