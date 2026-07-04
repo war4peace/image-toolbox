@@ -18,6 +18,11 @@ import updater  # noqa: E402
 ASSET = "ImageToolboxSetup.exe"
 
 
+def _read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 # ── parse_sha256sums ─────────────────────────────────────────────────────────
 
 def test_parse_two_space_format():
@@ -100,7 +105,7 @@ def test_download_passes_matching_hash(tmp_path, monkeypatch):
     path = updater.download_installer(
         "http://x/" + ASSET, expected_size=len(data),
         sha256_url="http://x/" + updater.SHA256SUMS_ASSET, dest_dir=str(tmp_path))
-    assert open(path, "rb").read() == data
+    assert _read_bytes(path) == data
     assert not os.path.exists(path + ".part")
 
 
@@ -124,7 +129,7 @@ def test_download_falls_back_when_no_sha256_url(tmp_path, monkeypatch):
     path = updater.download_installer(
         "http://x/" + ASSET, expected_size=len(data),
         sha256_url=None, dest_dir=str(tmp_path))
-    assert open(path, "rb").read() == data
+    assert _read_bytes(path) == data
 
 
 def test_download_skips_check_when_asset_missing_the_entry(tmp_path, monkeypatch):
@@ -135,7 +140,7 @@ def test_download_skips_check_when_asset_missing_the_entry(tmp_path, monkeypatch
     path = updater.download_installer(
         "http://x/" + ASSET, expected_size=len(data),
         sha256_url="http://x/" + updater.SHA256SUMS_ASSET, dest_dir=str(tmp_path))
-    assert open(path, "rb").read() == data
+    assert _read_bytes(path) == data
 
 
 def test_download_size_mismatch_still_raises(tmp_path, monkeypatch):
