@@ -53,6 +53,13 @@ import db
 import notifications
 import runner_common
 
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 # Make stdout/stderr non-ASCII-proof before any output (see runner_common).
 runner_common.harden_stdout()
 
@@ -367,8 +374,10 @@ class EligibilityCache:
                     (self.output_root, datetime.datetime.now().isoformat(), self._root_id))
             self._dirty.clear()
             self._removed.clear()
-        except Exception:
-            pass   # non-fatal — cache is best-effort
+        except Exception as exc:
+            # Non-fatal (cache is best-effort), but a save that never lands means
+            # a stopped batch won't resume: leave a trail.
+            debug_log("EligibilityCache.save", exc=exc)
 
     def _fingerprint(self, path):
         """Return (mtime, size) for a file, or (0, 0) if unreadable."""
@@ -424,8 +433,10 @@ class EligibilityCache:
             out_hash = db.hash_file_cached(self._conn, out_path)
             db.record_upscale_lineage(self._conn, src_hash, out_hash,
                                       src_path, out_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Best-effort: a missing lineage row only makes conciliation fall
+            # back to name matching, but record why it was skipped.
+            debug_log("EligibilityCache.record_lineage", exc=exc)
 
     def remove_missing(self, source_root, progress_cb=None, abort_check=None):
         """

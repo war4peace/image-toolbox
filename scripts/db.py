@@ -37,6 +37,14 @@ import sqlite3
 import hashlib
 import datetime
 
+# Fail-safe diagnostic trail for the swallowed-error handlers below. Guarded so
+# an old install missing debug_log.py can't break the cache layer.
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # App root = parent of scripts/. The cache DB and the legacy scans/ & trcache/
 # import folders live at the app root, not beside this module.
@@ -241,8 +249,8 @@ def _migrate_video_tables(conn):
                 "DROP TABLE IF EXISTS video_outputs;"
                 "DROP TABLE IF EXISTS video_files;")
             conn.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        debug_log("db._migrate_video_tables", exc=exc)
 
 
 def _ensure_video_columns(conn):
@@ -252,8 +260,8 @@ def _ensure_video_columns(conn):
         cols = [r[1] for r in conn.execute("PRAGMA table_info(video_files)")]
         if cols and "probe_version" not in cols:
             conn.execute("ALTER TABLE video_files ADD COLUMN probe_version INTEGER")
-    except Exception:
-        pass
+    except Exception as exc:
+        debug_log("db._ensure_video_columns", exc=exc)
 
 
 def _norm(p):

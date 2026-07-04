@@ -68,6 +68,13 @@ import db
 import notifications
 import runner_common
 
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 # Make stdout/stderr non-ASCII-proof before any output (see runner_common). Done
 # before the session-log tee wraps stdout, so the tee inherits the utf-8 stream.
 runner_common.harden_stdout()
@@ -912,6 +919,9 @@ def save_cache(cache, source_root):
                          (cache["last_updated"], root_id))
     except Exception as exc:
         print(f"  WARNING: Could not save cache to database ({exc}).")
+        # The print reaches the live log pane but not across sessions: also
+        # persist it, since a cache that never saves re-tags already-done files.
+        debug_log("tag_and_rename.save_cache", exc=exc)
 
 
 def _snapshot_exif(path):
@@ -1646,8 +1656,8 @@ def main():
             try:
                 out_hash = db.hash_file_cached(db.get_conn(), new_path)
                 db.record_tag_lineage(db.get_conn(), in_hash, out_hash, new_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                debug_log("tag_and_rename.record_tag_lineage", exc=exc)
 
             # An auto-straightened image was rotated on disk AFTER its strip
             # thumbnail was first decoded, so that thumbnail is stale. Ask the

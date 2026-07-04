@@ -30,6 +30,13 @@ import funds_guard
 from remote_upscale_engine import RemoteUpscaleEngine
 from remote_video_engine import RemoteVideoEngine
 
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
 HEARTBEAT = "/tmp/upscale_heartbeat"
 
@@ -622,21 +629,23 @@ class RemoteSession:
         if self._funds_guard:
             try:
                 self._funds_guard.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                debug_log("RemoteSession.close: funds_guard.stop", exc=exc)
             self._funds_guard = None
         if self.engine:
             try:
                 self.engine.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                debug_log("RemoteSession.close: engine.close", exc=exc)
             self.engine = None
         if self._ollama_tunnel and self._ollama_tunnel.poll() is None:
             try:
                 self._ollama_tunnel.terminate()
                 self._ollama_tunnel.wait(timeout=5)
-            except Exception:
-                pass
+            except Exception as exc:
+                # A stranded ssh tunnel process is worth a trail (money-adjacent
+                # cleanup path).
+                debug_log("RemoteSession.close: ollama tunnel terminate", exc=exc)
             self._ollama_tunnel = None
         if not self.pod_id:
             return

@@ -353,6 +353,30 @@ from item 2 is the guard.
 
 ## 7. Give the fail-safe `except Exception: pass` blocks a debug trail
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** New `scripts/debug_log.py`:
+> `debug_log(msg, exc=None, tb=False)` appends one timestamped, source-tagged line
+> to `logs/debug.log`. It is itself fail-safe (any internal error swallowed, so it
+> can never reintroduce a crash into a fail-safe handler) and size-capped (rolls to
+> `debug.log.1` past 2 MB so a long-lived install can't grow it without bound). The
+> source tag (entry-point script name) distinguishes the GUI from each subprocess
+> runner, all of which append to the same file. Stdlib only.
+>
+> The **priority handlers named in this item** were routed through it (not all 66:
+> the interesting persistence + money-adjacent ones): `EligibilityCache.save` and
+> `.record_lineage` (batch_upscale), `save_cache` and the tag-lineage recording
+> (tag_and_rename), the two video-table **DB migrations** (`db._migrate_video_tables`
+> / `_ensure_video_columns`), the pod/tunnel/funds-guard **teardown** in
+> `RemoteSession.close`, and the live **MQTT publish** (`MqttClient.publish`,
+> rate-limited to one line per broken streak so a down broker can't flood the log).
+> Each importer pulls `debug_log` **guarded** (`try: from debug_log import debug_log
+> / except: no-op`) so an old install missing the module can't break the cache /
+> runner / MQTT layers. Handlers that already print to the live log pane
+> (`save_cache`) now also persist the line, since the pane is ephemeral across
+> sessions. 9 tests in `test_debug_log.py` (append/format/exc/tb/rollover/never-raises).
+> The GUI's own `except: pass` blocks (geometry/thumbnail persistence, lower
+> stakes) were left untouched: the helper is in place for them if a field report
+> ever points there.
+
 There are 66 silent `except Exception: pass` blocks across `scripts/` (19 in
 the GUI alone, 11 in tag_and_rename). The fail-safe philosophy is right for
 this app; the problem is only that a swallowed failure leaves no trail, so a

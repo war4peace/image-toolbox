@@ -16,6 +16,13 @@ Network calls block; call them from a background thread (the GUI does).
 
 import threading
 
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 DEFAULT_CLIENT_ID = "image-toolbox-beededbe"
 BASE_TOPIC        = "image-toolbox"
 
@@ -279,8 +286,14 @@ class MqttClient:
             return
         try:
             client.publish(topic, payload, qos=qos, retain=retain)
-        except Exception:
-            pass
+            self._publish_broken = False
+        except Exception as exc:
+            # Publishes can fire every few seconds, so log the first failure of a
+            # broken streak only (reset on the next success) to avoid flooding
+            # debug.log while the broker is down.
+            if not getattr(self, "_publish_broken", False):
+                self._publish_broken = True
+                debug_log("MqttClient.publish (silenced until recovery)", exc=exc)
 
     def publish_many(self, values, retain=True):
         for topic, payload in values.items():
