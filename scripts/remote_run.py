@@ -93,6 +93,12 @@ class RemoteSession:
         self.app_root = app_root
         self.mode = mode
         self.worker_mode = {"tag": "tag", "video": "video"}.get(mode, "full")
+        # Pod name is mode-aware so an image run and a video run never reuse each
+        # other's pod: Image Upscaler + Tag & Rename share "image-toolbox-remote"
+        # (both are image-side, safe to share), the Video Upscaler gets its own
+        # "video-toolbox-remote". _find_existing_pod matches on this same prefix.
+        self.pod_name = "video-toolbox-remote" if mode == "video" else "image-toolbox-remote"
+        self.pod_name_prefix = "video-toolbox" if mode == "video" else "image-toolbox"
         self.ollama_url = None        # set in tag mode (local end of the tunnel)
         self._ollama_tunnel = None
         self.api_key = runpod_cfg.get("api_key", "")
@@ -263,7 +269,7 @@ class RemoteSession:
         for p in pods:
             if not isinstance(p, dict) or p.get("desiredStatus") != rp.STATUS_RUNNING:
                 continue
-            if not str(p.get("name", "")).startswith("image-toolbox"):
+            if not str(p.get("name", "")).startswith(self.pod_name_prefix):
                 continue
             host, port = rp.ssh_endpoint(p)
             if host and port:
@@ -292,7 +298,7 @@ class RemoteSession:
         else:
             gpu_ids = [self.cfg.get("gpu_type_id", "NVIDIA GeForce RTX 5090")]
         spec = {
-            "name": "image-toolbox-remote",
+            "name": self.pod_name,
             "imageName": self.cfg.get("image_name") or DEFAULT_IMAGE,
             "gpuTypeIds": gpu_ids,
             "gpuCount": 1, "cloudType": "SECURE",
