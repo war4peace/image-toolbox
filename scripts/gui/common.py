@@ -28,6 +28,7 @@ import urllib.error   # noqa: F401 (kept for parity; callers catch broad Excepti
 import updater
 import system_telemetry
 import notifications
+import config_store
 
 # SCRIPT_DIR is where the gui package's parent (scripts/) lives; APP_ROOT is its
 # parent - where config.json, gui_settings.json, the .venv, logs/, db/ and the
@@ -55,31 +56,25 @@ GUI_MARKER = "@@TBX@@"
 # ─────────────────────────────────────────────
 
 def _load_config():
-    path = os.path.join(APP_ROOT, "config.json")
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    # Merged view of the tracked config.json plus the untracked config.local.json
+    # secrets overlay (config_store). The rest of the GUI reads CFG exactly as
+    # before; it never needs to know secrets live in a separate file.
+    return config_store.load(APP_ROOT) or {}
 
 CFG = _load_config()
 
 
 def save_config(cfg=None):
     """
-    Write config.json back to disk (the Settings tab edits CFG in place, then
-    calls this). Returns True on success. The backend scripts read config.json
-    fresh at launch, so saved changes take effect on the next run.
+    Write the settings back to disk (the Settings tab edits CFG in place, then
+    calls this). Returns True on success. Secrets go to config.local.json and a
+    secret-free copy to config.json (config_store.save); the tracked file never
+    gains a credential. The backend scripts read both files fresh at launch, so
+    saved changes take effect on the next run.
     """
     if cfg is None:
         cfg = CFG
-    path = os.path.join(APP_ROOT, "config.json")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=4)
-        return True
-    except OSError:
-        return False
+    return config_store.save(cfg, APP_ROOT)
 
 
 # Default folders the user pins for each tool. Stored in config.json so they

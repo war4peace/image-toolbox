@@ -10,6 +10,7 @@ test_output/
 benchmark-videos/
 *.log
 gui_settings.json
+config.local.json
 __pycache__/
 trcache/
 .setup_complete

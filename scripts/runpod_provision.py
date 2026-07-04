@@ -29,6 +29,7 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runpod_client as rp
 import ssh_setup
+import config_store
 
 APP_ROOT   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG     = os.path.join(APP_ROOT, "config.json")
@@ -50,8 +51,9 @@ PROVISION_MAX_CHAIN   = 6     # bound how many cards we try before giving up
 
 
 def _load_config():
-    with open(CONFIG, encoding="utf-8") as f:
-        cfg = json.load(f)
+    # Merge the tracked config.json with the config.local.json secrets overlay so
+    # the API key (now stored in the overlay) is picked up.
+    cfg = config_store.load(APP_ROOT) or {}
     rpc = cfg.get("runpod", {})
     if not rpc.get("api_key"):
         sys.exit("No runpod.api_key in config.json (Settings → Remote upscaling).")

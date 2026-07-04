@@ -430,6 +430,35 @@ grow background threads.
 
 ## 9. Move secrets out of the tracked `config.json`
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** New `scripts/config_store.py`
+> splits the settings across two files at the app root: the tracked `config.json`
+> (which now NEVER holds a secret value: every secret key is present but blank) and
+> an untracked `config.local.json` overlay (added to `.gitignore`) that holds ONLY
+> the secret fields. `config_store.load()` deep-merges the overlay over the base so
+> the rest of the app still sees one merged dict; `config_store.save()` does the
+> reverse (secret fields to the overlay, a secret-free copy to `config.json`, base
+> written first so a failed overlay write can never leak). `SECRET_FIELDS` =
+> `runpod.api_key`, `mqtt.password`, `notifications.{discord_webhook_url,
+> telegram_bot_token, ntfy_token}`, and the legacy `upscale.discord_webhook_url`.
+>
+> Wired through the three load sites (`gui/common` load+`save_config`,
+> `runner_common.load_config`, `runpod_provision`) so both the GUI and every
+> subprocess runner read the merged view. A one-time GUI migration
+> (`App._migrate_secrets_to_overlay`, guarded by `config_store.base_has_secrets`)
+> moves an existing install's secrets out of `config.json` into the overlay on the
+> next launch and blanks them in the tracked file; idempotent afterwards. The
+> `skip-worktree` bit + the webhook git clean filter are now redundant belt-and-
+> suspenders (left in place, harmless). 12 tests in `test_config_store.py` incl. the
+> leak invariant (no secret literal appears in the written `config.json`) and the
+> full migration flow.
+>
+> **Deferred (cosmetic, needs the skip-worktree dance on a secret-laden working
+> copy, so out of scope for this automated change):** physically dropping the
+> now-blank legacy `upscale.discord_webhook_url` and the dead
+> `runpod.max_price_per_hour_*` keys from the *tracked* template. `split_secrets`
+> already blanks the webhook on every save, so it never carries a value; the key
+> removal is purely tidiness.
+
 `config.json` is tracked as a credential-free template, locally
 `skip-worktree`'d, and the README carries a "maintainers: remember to scrub"
 note. That works only as long as one person remembers two non-obvious git

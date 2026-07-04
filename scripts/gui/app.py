@@ -12,13 +12,20 @@ import sys
 import time
 import datetime
 import threading
-import urllib.parse
 
 import updater
 import mqtt_publisher
 import system_telemetry
 import taskbar_progress
 import runpod_client
+import config_store
+
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
 # Single-instance guard is optional — a packaging miss must not brick startup.
 try:
     import single_instance
@@ -70,6 +77,7 @@ class App(tk.Tk):
         self.comparison_window = None   # single shared ComparisonWindow (images)
         self.video_comparison_window = None  # single shared VideoComparisonWindow
         self._migrate_default_folders()
+        self._migrate_secrets_to_overlay()
         self._restore_geometry()
         self._install_picklist_wheel_guard()
 
@@ -285,6 +293,20 @@ class App(tk.Tk):
         self._funds_cache = info
         self._funds_cache_at = time.time()
         self.refresh_funds_readout()
+
+    def _migrate_secrets_to_overlay(self):
+        """One-time: an older install kept secrets (RunPod key, MQTT password,
+        notification tokens/webhooks) inside the tracked config.json. If any are
+        still there, resave through config_store, which writes them to the
+        untracked config.local.json overlay and blanks them in config.json - so the
+        tracked file stops holding credentials (item 9). Idempotent: once migrated,
+        config.json has no secret left and this is a no-op. Fail-safe: CFG already
+        carries the merged values, so a save here never loses a secret."""
+        try:
+            if config_store.base_has_secrets(APP_ROOT):
+                save_config()   # partitions CFG into config.json + config.local.json
+        except Exception:
+            debug_log("App._migrate_secrets_to_overlay")
 
     def _migrate_default_folders(self):
         """Carry default folders saved by older builds in gui_settings.json over

@@ -42,19 +42,23 @@ APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def load_config():
     """
-    Load settings from config.json at the app root (the parent of scripts/).
-    Prints a clear error and exits if the file is missing or malformed - the
+    Load settings from config.json at the app root (the parent of scripts/),
+    merged with the untracked config.local.json secrets overlay (config_store).
+    Prints a clear error and exits if the base file is missing or malformed - the
     same behaviour every runner had in its private _load_config().
     """
-    import json
+    import config_store
     config_path = os.path.join(APP_ROOT, "config.json")
     if not os.path.exists(config_path):
         print(f"\nERROR: config.json not found at: {config_path}")
         print("Run setup.ps1 first to generate it, or create it manually.")
         print("See README.md for the expected format.\n")
         sys.exit(1)
-    with open(config_path, "r", encoding="utf-8-sig") as f:
-        return json.load(f)
+    cfg = config_store.load(APP_ROOT)
+    if cfg is None:                 # present but malformed
+        print(f"\nERROR: could not parse config.json at: {config_path}\n")
+        sys.exit(1)
+    return cfg
 
 
 def harden_stdout():
