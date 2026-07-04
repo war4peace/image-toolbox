@@ -1,56 +1,36 @@
-# RunPod remote-pod notes (for a future feature)
+# RunPod remote-pod notes
 
-Reference notes distilled from the old `remote-image-upscale.ps1` /
-`remote-tag-and-rename.ps1` scripts (removed — see git history before commit
-`baf6f8b` for the full originals). Those scripts targeted the **pre-0.1.0
-ComfyUI architecture** and do not run against the current app; this file keeps
-the parts that are still worth reusing when remote-pod support is rebuilt.
+Reference notes for the **shipped** remote-pod feature (remote Image Upscaler,
+Tag & Rename, and Video Upscaler — future-features #1/#2, live since 0.3.1). This
+is the design-of-record and the hard-won RunPod API / provisioning knowledge that
+backs the code; `CLAUDE.md` has the user-facing feature summary. (Originally
+distilled from the pre-0.1.0 ComfyUI-era `remote-*.ps1` scripts, long since
+removed — see git history before `baf6f8b`.)
 
-## Open items / TODO
+## Performance findings (measured on the pod)
 
-- **SSH onboarding for non-technical users — DONE (0.3.2, zero-config).** The app
-  now owns a dedicated ed25519 key (`scripts/ssh_setup.py`): it locates OpenSSH
-  (Windows 10/11 optional feature; detected + guided if absent), generates the key
-  on demand (Settings → "Set up SSH key", and auto-ensured in the remote-run
-  preflight), and hands its **public half to every pod via the `PUBLIC_KEY` env
-  var** — RunPod's base images append it to `authorized_keys` at boot, so **no key
-  is ever registered on the RunPod website** and `ssh_key_path` needn't be edited
-  (empty → the managed default). Verified live: SSH connected first try on the
-  production image with only `PUBLIC_KEY`, no account key. The old plan's manual
-  "show the key + link to the RunPod SSH page" step was dropped — `PUBLIC_KEY`
-  makes it unnecessary. (RunPod also honours an `SSH_PUBLIC_KEY` override for
-  custom-command images; we use `PUBLIC_KEY`, which the pytorch base image reads.)
-- **Pod cold-start is slow — mostly network-volume read throughput.** The ~239 s
-  engine load is dominated by reading the 16 GB DiT from the **network volume**
-  (NFS-like, far slower than local NVMe) plus, on a validation-cache MISS, a
-  hash-validation pass that reads it *again*. **Resolved (item 11, 0.4.3):** the
-  worker seeds the seedvr2 size+mtime validation cache before loading
-  (`pod/worker.py` `_seed_validation_cache`), so a cache miss (wiped cache, mtime
-  drift) never triggers the full 16 GB re-hash — the ~354 s worst case is gone and
-  every pod loads at the ~97 s cached rate. **Copy models volume→local NVMe was
-  investigated and rejected:** the resident worker loads once per pod, so an extra
-  volume→local copy (a full slow read itself) isn't amortised and is storage-
-  fragile on a near-full volume. The worker stays resident so the ~97 s load is
-  paid once per pod, not per image; the remaining cost is the unavoidable single
-  16 GB volume→VRAM read.
-- **Warm upscale throughput — RESOLVED (the 78 s was cold-start).** Measured via
-  the resident worker (`bench`): cold image #1 ≈ 41 s, then **warm ≈ 7.6 s/image at
-  1080** (1620×1080) and **≈ 13.4 s/image at 4K-class** (3240×2160). So the 78 s
-  smoke number was one-time warmup (CUDA/cuDNN + first-run Blackwell kernel JIT),
-  paid once by the resident worker and amortised over the queue. The pod 5090 at
-  ~13.4 s/4K beats the local 3090 (17–19 s) and is close to a local 5090 (~10 s).
-  Engine load also dropped from 239 s (first ever) to **97 s** once the volume
-  held the validation cache.
-- **SageAttention experiment — marginal with the pip version.** PyPI
-  `sageattention` is the old **v1.0.6 (INT8)**; with SeedVR2's `attention_mode=
-  sageattn_2` it gave only **12.9 s vs 13.4 s** at 4K (~4%). The real speedups
-  need **SageAttention 2 (FP8)** or **3 (Blackwell FP4)**, neither on PyPI
-  (`sageattn3` does not exist as a package) — they're **source builds** from
-  thu-ml/SageAttention (nvcc compile, ~10 min, some risk). Deferred as an OPTIONAL
-  tuning pass: the pod 5090 already does ~13 s/4K vs the user's 3090 at 17–19 s
-  (~30% faster) without it, so it doesn't block the overnight-run goal. (v1.0.6 is
-  now installed in the volume venv; the worker accepts an `attention_mode`
-  override, e.g. `worker sageattn_2`.)
+- **Warm upscale throughput.** Measured via the resident worker (`bench`): cold
+  image #1 ≈ 41 s, then **warm ≈ 7.6 s/image at 1080** (1620×1080) and **≈ 13.4
+  s/image at 4K-class** (3240×2160). The pod 5090 at ~13.4 s/4K beats the local
+  3090 (17–19 s) and is close to a local 5090 (~10 s). The 78 s in early smoke
+  tests was one-time warmup (CUDA/cuDNN + first-run Blackwell kernel JIT), paid
+  once by the resident worker and amortised over the queue.
+- **Tag throughput (cheap card).** The vision model uses only ~6.6 GB VRAM, so
+  tagging runs on a cheap card (RTX 2000 Ada, 16 GB, ~$0.24/h): session up ~32 s,
+  cold inference 24.4 s (model load), **warm ~2.6 s/image** — ~3.5–4× cheaper/hour
+  than the RTX 5090 for near-equivalent tag throughput.
+- **Cold engine load ≈ 97 s** (once the volume holds the validation cache; a miss
+  used to re-hash the 16 GB DiT for ~354 s — closed in 0.4.3 item 11, see
+  `pod/worker.py` `_seed_validation_cache`). The remaining ~97 s is the unavoidable
+  single 16 GB volume→VRAM read; copy-to-local-NVMe was investigated and rejected
+  (a resident worker loads once per pod, so the extra copy isn't amortised).
+- **SageAttention — not worth the pip version.** PyPI `sageattention` is the old
+  v1.0.6 (INT8); with `attention_mode=sageattn_2` it gave only 12.9 s vs 13.4 s at
+  4K (~4%). The real speedups need SageAttention 2 (FP8) / 3 (Blackwell FP4),
+  neither on PyPI — source builds from thu-ml/SageAttention (nvcc, ~10 min, some
+  risk). Deferred: the pod 5090 is already ~30% faster than the user's 3090
+  without it. (v1.0.6 is in the volume venv; the worker accepts an `attention_mode`
+  override.)
 
 ## Architecture: what changed, and what still maps
 
@@ -133,152 +113,97 @@ GPU-hour time on a pure download. The fix (decided 2026-06-20):
 - **Caveat — network volumes are region-locked.** The volume is pinned to one
   data center, so every pod that mounts it **must** be created in that same data
   center. `dataCenterIds` on `create_pod` is therefore *derived from the volume's
-  region*, not a free choice. `runpod.network_volume_id` is in `config.json`
-  (Phase 2 wires create_pod + a one-time "provision the model volume" flow:
-  create volume → spin a pod with it mounted → download models → done).
+  region*, not a free choice. `runpod.network_volume_id` is in `config.json`; the
+  one-time "provision the model volume" flow (Settings → Remote) creates the volume,
+  spins a pod with it mounted, downloads the models, and terminates.
 
-## Install modes & a first-run wizard (bootstrap rework — late phase)
+## Install modes (as built, 0.3.2)
 
-Once remote upscaling works end-to-end, the **bootstrap/installer should branch
-on how the user intends to run**, so someone without a capable GPU isn't forced
-through the ~20 GB local download. A first-run wizard records the mode in config:
+The installer branches on how the user intends to run, so someone without a
+capable GPU isn't forced through the ~20 GB local download. The mode is written to
+`install_mode.txt` and read by `bootstrap.ps1`:
 
-- **Local** (current default): full `bootstrap.ps1` — Python, **PyTorch CUDA
-  (~3 GB)**, **SeedVR2 engine + weights (~16 GB)**, Pillow, paho-mqtt. Needs an
-  NVIDIA GPU (8 GB+).
+- **Local** (default): full `bootstrap.ps1` — Python, PyTorch CUDA (~3 GB), SeedVR2
+  engine + weights (~16 GB), Pillow, paho-mqtt. Needs an NVIDIA GPU (8 GB+).
 - **Remote:** lightweight — Python, Pillow, paho-mqtt, the RunPod control plane;
-  OpenSSH ships with Windows. **Skips torch CUDA and SeedVR2 weights** (GPU work
-  is on the pod). A ~20 GB install becomes tiny; no GPU required.
-- **Both:** full local bootstrap + the remote control plane available.
+  OpenSSH ships with Windows. **Skips torch CUDA and SeedVR2 weights** (GPU work is
+  on the pod). No GPU required.
+- **Both:** full local bootstrap + the remote control plane.
 
-Wrinkles to honour when this is built:
+Design points that made Remote-only viable:
 
-- **Auto-straighten needs torch.** `orientation.py`'s CNN runs *locally* today,
-  before upscaling. Remote-only has no local torch, so the straighten step must
-  **move onto the pod worker** (straighten → upscale in one round-trip), for both
-  Batch Upscale and Tag & Rename. So "remote-only" is only viable once the worker
-  straightens — which is why the wizard lands *after* Phases 2–3, not now.
-- **`upscale_engine` import must stay lazy/conditional.** `batch_upscale.py` must
-  not import the SeedVR2 engine (torch) when running in remote mode, or a
-  torch-less install can't launch. Select Remote vs Local engine before importing.
-- **Tagging in remote mode — DONE (0.3.2), now automated.** The GUI sets
-  `IMGTBX_TAG_REMOTE=1`; `tag_and_rename._setup_remote_tagging()` starts a
-  `RemoteSession(mode="tag")` which: starts the worker in **tag mode** (skips the
-  SeedVR2 load, serves `/orient` only — leaves the VRAM for Ollama), starts
-  `ollama serve` on the pod (models from the volume; the ollama **binary** is
-  cached on the volume by provision.sh, with an install-if-missing fallback),
-  opens a **second ssh -L tunnel** to 11434, and exposes `session.ollama_url`.
-  tag_and_rename then repoints `OLLAMA_URL` at the tunnel and routes
-  auto-straighten detection to the pod's `/orient` (rotation stays local PIL).
-  bootstrap still never installs Ollama locally. **Known v1 gap:** no remote
-  telemetry row for tagging yet (the upscale path has one).
-- **Tag GPU tier — cheap card + fallback chain (0.3.2, benchmarked live).** The
-  vision model uses only **~6.6 GB** VRAM (measured), so tagging runs on a cheap
-  card, NOT the upscale GPU. `runpod.tag_gpu_type_id` (Settings → "Tag GPU")
-  picks the primary; `remote_run` builds an ordered fallback chain from the
-  curated `TAG_GPU_TYPES` (RTX 2000 Ada → A4000 → A4500 → RTX 4000 Ada, all
-  16–20 GB, EU-available, ~$0.24–0.26/h). **Benchmark (RTX 2000 Ada, 16 GB,
-  EU-RO-1):** session up ~32 s, cold inference 24.4 s (model load), **warm
-  ~2.6 s/image**, VRAM 6.6/16 GB, 37 °C — ~3.5–4× cheaper/hour than the RTX 5090
-  ($0.99/h) for near-equivalent tag throughput.
-- **Pillow and the comparison view stay in every mode** — the GUI needs Pillow,
-  and the before/after wipe compares the local original against the locally
-  downloaded result, so it works unchanged for remote runs.
+- **Auto-straighten runs on the pod for remote runs.** `orientation.py`'s CNN needs
+  torch, which a Remote-only install doesn't have locally, so the worker serves
+  `/orient` and straighten happens on the pod (for both Upscale and Tag & Rename).
+- **The SeedVR2 engine import stays lazy/conditional.** `batch_upscale.py` selects
+  the remote vs local engine *before* importing, so a torch-less install launches.
+- **Remote Tag & Rename** (`IMGTBX_TAG_REMOTE=1`,
+  `tag_and_rename._setup_remote_tagging`): a `RemoteSession(mode="tag")` starts the
+  worker in tag mode (skips SeedVR2, serves `/orient` only — leaves the VRAM for
+  Ollama), starts `ollama serve` on the pod (models + the `ollama` runtime cached on
+  the volume by `provision.sh`), opens a second `ssh -L` tunnel to 11434, and
+  repoints `OLLAMA_URL` at it. Bootstrap never installs Ollama locally.
+- **Tagging uses a cheap GPU tier.** The vision model needs only ~6.6 GB VRAM
+  (measured), so tagging runs on a cheap card (RTX 2000 Ada, ~$0.24/h, warm
+  ~2.6 s/image), NOT the upscale GPU. The card is the user's live picker choice
+  (`runpod.tag_gpu_type_id` is the default); note there is **no** automatic GPU
+  substitution as of 0.4.0 — a sold-out pick fails cleanly rather than swapping.
+- **Pillow + the comparison view stay in every mode** (the GUI needs Pillow, and
+  the before/after wipe compares the local original against the downloaded result).
 
-### Status
-
-- **Phase 0 (done):** control plane + config + Settings. `scripts/runpod_client.py`
-  wraps the REST calls (stdlib `urllib`); `config.json` has a `runpod` section;
-  Settings → *Remote upscaling (RunPod)* holds the API key (with a **Test**
-  button), hourly rate, and the dead-man's-switch limits. Nothing is provisioned
-  yet — Test only lists pods (free).
-- **Phase 1 (in progress):** the on-pod dead-man's switch — `pod/deadman.py` is
-  done (self-stops on max-runtime/idle via `runpodctl stop pod $RUNPOD_POD_ID`,
-  pure tested `evaluate()`; the user's API key never lives on the pod). Remaining:
-  the local after-run auto-stop with a cancel countdown (wired in with the run
-  flow, Phase 3). The on-pod half is fully exercisable only once Phase 2
-  provisions a real pod, but its decision logic is verified off-pod (`--selftest`).
-- **Phase 2a (done):** region-aware provisioning groundwork. `runpod_client` has
-  network-volume CRUD (`/networkvolumes`, verified live) + curated `GPU_TYPES` and
-  EU-only `EU_DATACENTERS` enums (the REST API has no list endpoint). Settings now
-  has a GPU-type picklist, an **EU data-center picklist (defaults to EU-RO-1)**, and
-  a model-volume row (Refresh lists, Create makes one in the chosen DC with a cost
-  confirmation). No pod spun up.
-- **Phase 2b (done — validated live on an RTX 5090 in EU-RO-1):** provision +
-  one-image upscale proven end-to-end. `runpod_client` helpers `wait_until_running`
-  / `ssh_endpoint` / `volume_region`; `scripts/runpod_provision.py` dev driver
-  (create/status/probe/provision/smoke/ssh/terminate); `pod/provision.sh` filled
-  the volume (16 GB weights + 5.6 GB Ollama + 2.6 GB venv + 50 MB engine ≈ 24 GB);
-  `pod/upscale_one.py` upscaled 900×600 → 1620×1080 via the **unchanged**
-  `UpscaleEngine`, models loaded from the volume, result fetched back. Pod then
-  terminated; the volume persists for the next pod.
-
-  **Hard-won provisioning lessons (baked into provision.sh / the driver):**
-  - **Base image:** `runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204` (the
-    plausible `2.8.0-...-cuda12.8.1-...` tag does NOT exist on the registry —
-    `create` failed cleanly with RunPod's own message, no pod leaked). Ships
-    Python 3.12, torch 2.9.1+cu128, torchaudio 2.9.1 — but **no torchvision**.
-  - **Torch pinning is essential.** Installing the seedvr2 deps naively makes
-    `timm`/`torchvision` drag in a newer torch (2.12 + CUDA 13) that mismatches
-    the image's torchaudio 2.9.1 → `libtorchaudio.so: undefined symbol` at import
-    (diffusers→transformers→torchaudio). Fix: a venv with `--system-site-packages`
-    + a constraints file pinning `torch==2.9.1` + install matching
-    `torchvision==0.24.1` from the cu128 index. Final: torch/tv/ta all 2.9.1+cu128.
-  - **Volume mounts at `/workspace`.** Models auto-download there via the engine's
-    `download_weight` (skips if present, so later pods reuse them).
-  - **Cold start ≈ 5 min per fresh pod:** ~239 s engine load (incl. one-time 16 GB
-    safetensors hash-validation) + ~78 s first-image warmup (no Sage/Flash attn;
-    sdpa). **Phase 3's resident worker pays this once and amortizes it over the
-    whole queue** — and we may skip the hash-validation on a trusted volume.
-
-### Provisioning architecture (Phase 2b)
+### Provisioning (as built)
 
 - **Everything heavy lives on the network volume** (mounted at `/workspace`): the
   Python venv (torch CUDA + seedvr2 requirements), the SeedVR2 weights, and the
-  Ollama models. A one-time provisioning builds them once; every disposable pod
-  just mounts the volume and starts fast — no ~20 GB reinstall/redownload per pod.
+  Ollama models. A one-time provisioning (`pod/provision.sh`, driven by
+  `scripts/runpod_provision.py`) builds them once (≈ 24 GB: 16 GB weights + 5.6 GB
+  Ollama + 2.6 GB venv + engine); every disposable pod just mounts the volume and
+  starts fast — no ~20 GB reinstall/redownload per pod.
 - **Models auto-populate.** `UpscaleEngine.__init__` calls
   `src.utils.downloads.download_weight(..., model_dir=...)`, which downloads the
   weights to `model_dir` if missing. Point `model_dir` at a path on the volume and
   the **first run fills the volume**; later pods find them present. Same idea for
-  Ollama via `OLLAMA_MODELS` on the volume. So there is **no separate model
-  uploader** — provisioning just sets the paths and triggers one download.
+  Ollama via `OLLAMA_MODELS` on the volume — so there is **no separate model
+  uploader**.
 - **The worker reuses `UpscaleEngine` unchanged.** `pod/worker.py` is a thin
-  resident wrapper: load the engine once (models from the volume), then serve one
-  image per request, touching the heartbeat `deadman.py` watches.
+  resident wrapper: load the engine once (models from the volume), serve one image
+  per request over localhost (reached via `ssh -L`), touch the `deadman.py`
+  heartbeat. `scripts/remote_run.RemoteSession` orchestrates create → push → start
+  worker → arm dead-man's switch → stream → teardown.
 - **Connectivity.** Pod is created with `ports: ["22/tcp"]`; only port 22 is
-  public (`publicIp:portMappings["22"]`). The worker binds localhost on the pod
-  and is reached through an `ssh -L` tunnel — never exposed publicly. SSH auth is
-  the dev box's `id_ed25519_runpod` key (public half added to the RunPod account).
+  public (`publicIp:portMappings["22"]`). The worker binds localhost and is reached
+  through an `ssh -L` tunnel — never exposed publicly.
 - **Region.** The pod's `dataCenterIds` is derived from the volume's region
-  (`volume_region`), keeping pod and volume co-located (EU for this user).
-- **Phase 3 (core built + validated live):** `pod/worker.py` — resident worker,
-  loads `UpscaleEngine` once, serves one image per HTTP request over localhost
-  (reached via `ssh -L`), touches the deadman heartbeat. `scripts/remote_upscale_engine.py`
-  — `RemoteUpscaleEngine` (same interface as `UpscaleEngine`) opens the tunnel and
-  streams each image. Dev driver gained `worker` (start it; kills a prior one by
-  **pidfile** — not `pkill -f worker.py`, which matches the launching shell) and
-  `bench` (cold-vs-warm timing). Also `runpod_client.create_pod_resilient` — a
-  **deploy watchdog**: each pod gets a deploy budget (240 s); on timeout or early
-  EXIT it terminates the bad pod and tries a fresh one (RunPod sometimes hands out
-  pods that never finish deploying), up to N attempts.
-- **Phase 3 integration (done — real batch validated):** `scripts/remote_run.py`
-  (`RemoteSession`: create pod via watchdog → push engine/worker/deadman → start
-  worker → **arm the on-pod dead-man's switch** → hand back a connected
-  `RemoteUpscaleEngine` → terminate on close; has an `attach` mode for dev).
-  `batch_upscale.py` selects the remote engine when `IMGTBX_UPSCALE_REMOTE=1`
-  (queue/resume/skip/watchdog stay local) and tears the pod down via `atexit`.
-  Validated: a real 7-image batch ran on the pod at ~12 s/image (4K), results
-  written locally, 0 failed.
-  **SSH gotchas solved:** (1) a pod self-terminates via the REST API with the key
-  ON the pod — REST-created pods have NO pre-authed runpodctl and no
-  $RUNPOD_POD_ID, so key-on-pod is unavoidable (written to a 0600 file; use a
-  SCOPED key in prod). (2) a backgrounded daemon must be launched as
-  `setsid sh -c '…' </dev/null >log 2>&1 &` with the redirect directly on the
-  backgrounded command — a `cd && …` wrapper (or missing redirect) keeps the ssh
-  channel open and the call hangs.
-  Remaining for Phase 3: the GUI "Run on remote pod" toggle, `DEGRADED`
-  teardown/re-provision, cost embed.
+  (`volume_region`), keeping pod and volume co-located (network volumes are
+  region-locked).
+- **Deploy watchdog.** `runpod_client.create_pod_resilient` gives each pod a
+  deploy budget (240 s); on timeout or early EXIT it terminates the bad pod and
+  tries a fresh one (RunPod sometimes hands out pods that never finish deploying),
+  up to N attempts.
+
+**Hard-won provisioning lessons (baked into `provision.sh` / the driver):**
+
+- **Base image:** `runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204` (the plausible
+  `2.8.0-...-cuda12.8.1-...` tag does NOT exist on the registry). Ships Python
+  3.12, torch 2.9.1+cu128, torchaudio 2.9.1 — but **no torchvision**.
+- **Torch pinning is essential.** Installing the seedvr2 deps naively makes
+  `timm`/`torchvision` drag in a newer torch (2.12 + CUDA 13) that mismatches the
+  image's torchaudio 2.9.1 → `libtorchaudio.so: undefined symbol` at import. Fix: a
+  venv with `--system-site-packages` + a constraints file pinning `torch==2.9.1` +
+  matching `torchvision==0.24.1` from the cu128 index (torch/tv/ta all 2.9.1+cu128).
+- **Volume mounts at `/workspace`.** Models auto-download there via the engine's
+  `download_weight` (skips if present, so later pods reuse them). Cold engine load
+  is ~97 s (see Performance findings; the one-time hash-validation is cached on the
+  volume, item 11).
+
+**SSH & launch gotchas (solved):**
+
+- A pod **self-terminates via the REST API with the key ON the pod** — REST-created
+  pods have NO pre-authed `runpodctl` and no `$RUNPOD_POD_ID`, so key-on-pod is
+  unavoidable (written to a 0600 file; use a SCOPED key in prod).
+- A backgrounded daemon must be launched as `setsid sh -c '…' </dev/null >log 2>&1
+  &` with the redirect **directly on the backgrounded command** — a `cd && …`
+  wrapper (or a missing redirect) keeps the ssh channel open and the call hangs.
 
 ## RunPod REST API
 
@@ -296,9 +221,9 @@ Wrinkles to honour when this is built:
   | `POST`   | `/pods/{id}/stop`   | stop (storage still billed while stopped) |
   | `DELETE` | `/pods/{id}`        | terminate (frees all billing) |
 
-- The exact `gpuTypeIds` string (e.g. for a 5090) should be read from the GPU
-  types endpoint at provision time rather than hard-coded — the config default is
-  a best guess to be confirmed in Phase 2.
+- The exact `gpuTypeIds` string (e.g. `"NVIDIA GeForce RTX 5090"`) comes from the
+  live GPU list, not a hard-coded default — see the GraphQL section below (the REST
+  create enum is a subset of what's actually deployable, so pods deploy via GraphQL).
 
 ## Live GPU availability + pricing (GraphQL, 0.3.3)
 
@@ -434,28 +359,35 @@ VRAM floor (>=32 GB upscale, >=16 GB tag) and defaulting to RTX 5090 / RTX 2000 
 Model volume comboboxes share one aligned grid column, stacked below the
 Region/Data center row with the volume action buttons beneath them.
 
-## `runpod` config section (shipped in 0.3.1)
+## `runpod` config section
 
-The block now in `config.json` (`api_key` blank in the tracked template — a
-credential, same rule as the `mqtt` block):
+The `runpod` block in `config.json` (the `api_key` is a secret and lives in the
+untracked `config.local.json` overlay, item 9 — the tracked template keeps it
+blank):
 
 ```jsonc
 "runpod": {
-    "api_key": "",                  // RunPod REST key; local only, never committed
-    "gpu_type_id": "NVIDIA GeForce RTX 5090",
-    "image_name": "",               // or template_id; set in Phase 2
+    "api_key": "",                  // secret; stored in config.local.json
+    "gpu_type_id": "NVIDIA GeForce RTX 5090",  // upscale card (live-picker default)
+    "tag_gpu_type_id": "",          // cheap tag card (live-picker default)
+    "image_name": "",               // or template_id (blank = built-in default image)
     "template_id": "",
-    "data_center_ids": [],
+    "network_volume_id": "",        // region-locked model volume
+    "network_volume_label": "",     // full display label, for the Settings readout
+    "data_center_ids": [],          // derived from the volume's region
     "container_disk_gb": 30,
-    "ssh_key_path": "%USERPROFILE%\\.ssh\\id_ed25519_runpod",
-    "worker_port": 8200,            // on-pod upscale worker, tunnelled via ssh -L
-    "hourly_rate": 0.90,            // USD/h, for cost estimates
+    "ssh_key_path": "",             // blank = the app's managed ed25519 key (ssh_setup)
+    "worker_port": 8200,            // on-pod worker, tunnelled via ssh -L
+    "hourly_rate": 0.90,            // USD/h fallback for cost estimates
     "stop_pod_when_done": true,
-    "terminate_when_done": false,   // true = disposable: delete, don't just stop
-    "max_runtime_minutes": 720,     // dead-man's switch, enforced on the pod
-    "idle_timeout_minutes": 15
+    "terminate_when_done": true,    // disposable: delete (not just stop) when done
+    "max_runtime_minutes": 0,       // dead-man's switch hard ceiling; 0 = no limit
+    "idle_timeout_minutes": 15      // the real switch: stops a billed pod on a drop
 }
 ```
+
+The deprecated `max_price_per_hour*` keys were removed in 0.4.0 (no automatic GPU
+substitution) and are dropped from `config.json` on the next Settings save.
 
 ## SSH connectivity + tunnel
 

@@ -16,7 +16,10 @@ two pairs of cache tables plus the content-hash lineage:
 
 The lineage table is the relationship that lets conciliation re-match a source
 photo to its processed counterpart by content even after the user moves or
-renames folders. See docs/content-hash-lineage.md.
+renames folders (each stage rewrites the bytes, so H0/H1/H2 are mutually
+underivable and the link must be recorded at processing time; the hash only
+re-identifies a file after its path changed). See record_upscale_lineage /
+record_tag_lineage / lineage_final_hash below.
 
 Logs are intentionally NOT stored here — they stay as human-readable text files
 in logs/.

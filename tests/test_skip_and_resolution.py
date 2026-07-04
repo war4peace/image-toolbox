@@ -1,5 +1,5 @@
 """
-Fit-math for the Batch Upscaler (item 2 in docs/improvement-recommendations.md).
+Fit-math for the Batch Upscaler.
 
 `_skip_for_dims` (the skip rule) and `compute_seedvr2_resolution` (the portrait
 short-side fix) are pure functions with real edge cases the comments call out.

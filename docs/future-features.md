@@ -1,67 +1,34 @@
 # Future Features
 
-Candidate features that are **not yet implemented (or only partly implemented)**,
-sorted by implementation difficulty (easiest first), with a feasibility
-assessment for each. See "Sequencing & dependencies" for the cross-feature
-threads that should drive ordering, and "Decided against / constraints" at the
-bottom for ideas investigated and dropped.
+Candidate features that are **not yet implemented**, sorted by difficulty
+(easiest first), with a feasibility assessment for each. See "Sequencing &
+dependencies" for the threads that drive ordering, and "Decided against /
+constraints" at the bottom for ideas investigated and dropped.
 
-What remains is the tail of the remote-pod work (#1), a substantial new
-RunPod-only **video upscaling** feature that builds directly on it (#2), then two
-much-lower-priority milestones (HTTP interface #3, Unraid #4) that each introduce
-a new process model, networking, or packaging. Anything already shipped has been
-removed from this list (see `CLAUDE.md` for the feature set as built).
+Both remote-pod milestones have shipped: **#1 (remote upscaling)** and **#2 (video
+upscaling)** are done and live in the app (see `CLAUDE.md` for the built feature
+set). They are kept below as one-line pointers only, because code and other docs
+cite them by number. What actually remains is two much-lower-priority milestones
+(HTTP interface #3, Unraid #4), each of which introduces a new process model,
+networking, or packaging.
 
 ---
 
-## 1. Remote upscaling (RunPod) — core shipped, one enhancement remains
+## 1. Remote upscaling (RunPod) — SHIPPED (0.3.1–0.4.2)
 
-The remote path itself is **done** (0.3.1–0.3.9): a disposable pod streams one
-image at a time to a resident on-pod worker, with straighten-on-pod, pod
-telemetry, the dead-man's switch (idle-timeout + max-runtime), zero-config SSH,
-the Local/Remote/Both install-mode wizard, one-click model-volume provisioning,
-remote Tag & Rename, a world-wide Region/Data-center picker, a live cheapest-first
-GPU picker with a per-task price ceiling and ordered fallback chain (both tabs),
-and live cost tracking (the deployed pod's real `costPerHr` driving the
-"Est. Time Remaining / Cost" and "$ / 100 images" readouts). See `CLAUDE.md` and
-`docs/runpod-notes.md` for the shipped design. The one piece still open:
+Done and live. A disposable pod streams one image at a time to a resident on-pod
+worker (straighten-on-pod, pod telemetry, dead-man's switch, zero-config SSH, the
+install-mode wizard, one-click model-volume provisioning, remote Tag & Rename, the
+Region/DC + live cheapest-first GPU pickers, live cost tracking), with the
+**funds-floor safety-net + auto-stop** (`scripts/funds_guard.py`) landing in 0.4.2.
+Design of record: `CLAUDE.md` + `docs/runpod-notes.md`.
 
-- **Funds-floor safety-net + auto-stop** — **SHIPPED (0.4.2-experimental,
-  2026-07-04).** `scripts/funds_guard.py` (isolated, fail-safe: pure decisions +
-  a background `FundsGuard` poller) + `runpod_client.account_balance()` (the
-  legacy GraphQL `myself { clientBalance currentSpendPerHr }` query — REST has no
-  balance endpoint; Cloudflare needs a browser User-Agent, which `_graphql`
-  already sends). Wired through the single `RemoteSession` chokepoint:
-  `_preflight_funds()` refuses to start when the estimate would breach the floor
-  (Video tab passes the real estimate via `IMGTBX_RUN_ESTIMATE`);
-  `_arm_funds_guard()` polls during the run and stops the pod when this run's
-  accrued cost crosses `session_cost_cap_usd` OR the live balance hits
-  `balance_floor_usd` (both 0/off by default), after which the run takes the
-  existing graceful "pod stopped mid-run" path. Settings → Remote → "Money safety".
-  Still wants one live-pod confirmation of the stop-mid-run teardown.
+## 2. Video upscaling (RunPod-only) — SHIPPED (experimental)
 
-## 2. Video upscaling (RunPod-only) — Moderate, builds on #1
-
-> **Full design & plan: [`docs/video-upscaler.md`](video-upscaler.md).** That doc
-> is the single source of truth; this entry is just the roadmap pointer.
-
-A major new RunPod-only feature (UI tab **"Video Upscaler"**) that upscales a
-collection of videos with SeedVR2, the same engine the Batch Upscaler uses for
-stills. SeedVR2 already has mature native video support the image path bypasses, so
-this is an **orchestration + UX + tuning** feature, not an upscaler build.
-
-Chosen architecture: split each source into ~1-minute **segments** locally with
-ffmpeg, make a segment the **queue unit** streamed through #1's existing per-item
-remote path (upload → pod upscales → download), then reassemble and mux the
-original audio locally. This reuses #1's pod/queue/resume/cost machinery almost
-wholesale and gives **segment-level resume**, which makes the dominant constraint
-(cost: a diffusion pass per frame means ~$3.80 per 1080p minute, ~$220 for a 1-hour
-video) payable **in installments**. Shared `config.json` (new `video` section) and
-`db/cache.db` (new `video_*` tables); no new files. The hard prerequisite is a
-**SeedVR2 video-settings benchmark pass** (`batch_size`/`temporal_overlap`/segment
-length per target x card) to set defaults and produce trustworthy cost rates. See
-the design doc for the locked decisions (keyframe handling, fixed-seed seams,
-duration-drift detection), gotchas, config/DB schema, build pieces, and phasing.
+Done and live behind the **Video Upscaler** tab: split each source into segments
+locally with ffmpeg, stream each segment through #1's remote path, reassemble +
+mux audio locally, with segment-level resume/installments. Design + as-built
+source of truth: **[`docs/video-upscaler.md`](video-upscaler.md)**.
 
 ## 3. HTTP interface — Hard (low priority)
 Spin up a small HTTP server with a UI that mirrors the application UI.
@@ -100,22 +67,15 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1 is complete** — the core shipped earlier and the funds-floor safety-net
-  landed 0.4.2-experimental (above). It is independent of everything below.
-- **#2 (video) builds directly on #1** and is the clear next feature: it reuses the
-  pod lifecycle, network volume, GPU picker, cost tracking, and the per-item
-  streaming/resume machinery almost wholesale. Its only hard prerequisite is the
-  SeedVR2 video-settings benchmark pass. It inherits #1's funds-floor safety-net
-  for free (the Video tab already passes its estimate to the pre-start refuse).
-- **#3 and #4 are much lower priority** and are otherwise large, mostly
-  independent milestones. With Home Assistant already done over MQTT, the old
-  telemetry coupling no longer drives sequencing.
+- **#1 and #2 are complete** (remote upscaling + funds-floor, then video), so the
+  remaining sequencing is only among the two low-priority milestones below.
+- **#3 and #4 are much lower priority** — large, mostly independent milestones.
+  With Home Assistant already done over MQTT, the old telemetry coupling no longer
+  drives sequencing.
 - **#4 depends on #3** (headless Unraid needs a web UI).
 - **Architectural watch-item:** the app is dependency-light and Windows-only. #3
   and #4 each push toward extra packages, a long-running server, and
-  cross-platform support, so adopt those deliberately. #2 stays within the existing
-  dependency-light, RunPod-only envelope (ffmpeg is the one new external tool, and
-  it ships on the pod).
+  cross-platform support, so adopt those deliberately.
 
 ---
 

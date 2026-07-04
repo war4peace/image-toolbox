@@ -1,4 +1,4 @@
-# Video Upscaler (design & plan)
+# Video Upscaler (design & as-built)
 
 Design and planning notes for the **Video Upscaler**, a major new
 **RunPod-only** feature: upscale a collection of videos with SeedVR2, the same
@@ -611,7 +611,7 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
   doubles as hang-detection (a stuck GPU stops emitting progress, so the heartbeat
   goes stale and the dead-man's switch reclaims the pod). Sibling to `full` / `tag`.
   Proven locally with a fake engine (full protocol + 409 + heartbeat + frame-count
-  read) — see commit. **Still to wire (phase 4): the client half.**
+  read). The client half (`RemoteVideoEngine`) is built (see below).
 - **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): **DONE** by
   extending `RemoteSession` with `mode="video"` (worker `--mode video`) — the same
   create -> push -> start worker -> arm dead-man's switch -> teardown lifecycle,
@@ -657,101 +657,38 @@ Reused unchanged from #1: pod lifecycle, network-volume + models, SSH/key
 injection, GraphQL deploy + GPU picker, per-task price ceiling + fallback chain,
 cost tracking, notifications, taskbar progress/flash.
 
-## 12. Phasing
+## 13. Operational gotchas & runtime checks
 
-1. **Benchmark pass first** (section 7): real per-frame rates and good
-   `batch_size`/`overlap`/`segment_seconds` defaults per (target x card) on a pod,
-   before any UI. De-risks the cost estimator and the whole feature. **Harness
-   built: `pod/bench_video.py`** — loads the engine once and drives its video core
-   across a (target short-side x batch_size) grid, reporting per-frame time, peak
-   VRAM, and the OOM ceiling to a CSV (scp it next to `upscale_engine.py`, run with
-   the volume venv's python).
-2. **ffmpeg split/reassemble/mux + drift detection** locally (no pod): prove the
-   segment -> concat -> audio-mux -> drift-warn pipeline on already-upscaled or
-   passthrough segments. **DONE — `scripts/video_pipeline.py`** (probe / plan /
-   split / concat / mux / drift, CLI passthrough round-trip proof). See section 14
-   for what the proof surfaced.
-3. **Worker `--mode video` + submit/poll protocol + heartbeat-per-chunk.**
-   **DONE** — `pod/worker.py` (async submit/status/fetch, one segment at a time)
-   + `UpscaleEngine.process_video`. Heartbeat is progress-line-gated via a tqdm
-   tee (finer than per-chunk + hang-detection), see section 11. Client half is
-   phase 4.
-4. **`batch_video_upscale.py`** wiring the `video_*` tables, per-segment streaming,
-   resume, and the per-run cap. **DONE** — plus `RemoteVideoEngine`, `RemoteSession`
-   `mode="video"`, and the `db.py` `video_roots/video_files/video_segments` tables.
-   Proven end to end locally with `--passthrough` (no pod): installment cap stops
-   cleanly mid-video, a resume run picks up at the first unfinished SEGMENT off the
-   reused split, recursion/mirroring works, and the round trip is frame-perfect
-   (4835->4835) with drift OK. See section 14.
-5. **GUI "Video Upscaler" tab** with the cost estimator/gate and segment progress,
-   plus the **original-vs-upscaled video comparison window** (the video analogue of
-   the image `ComparisonWindow`; before/after wipe, shared zoom/pan, timestamp-aligned
-   scrub + frame-step, frames decoded on demand via the bundled ffmpeg — see the
-   build piece in section 11). **DONE** — `VideoTab` + `VideoComparisonWindow` in
-   `toolbox_gui.py`, `video_estimate.py`, the worker's `frames_processed`, Settings
-   -> Video, and `db.get_conn(check_same_thread=False)` for the GUI's worker
-   threads. All logic tested headless (fake-app + temp-DB smoke tests); the
-   **live running view is still un-exercised against a real pod** (a GUI run is the
-   next validation).
+(Section 12, the build-phase plan, is retired now that the feature ships; the
+numbering is kept so `section 14`/`section 15` references elsewhere stay valid.)
 
-**Reasonable v1 scope:** 1080p target only; fixed seed per video (6.2); plain
-`-c copy` splitting with the sparse-GOP re-encode fallback (6.1); CFR normalize +
-duration-drift detection/warning (6.3); file-level + segment-level resume; a
-per-run minute/$ cap on by default. Lift the cap, add 1440p/4K, and consider
-multi-pod parallelism and `prepend_frames` seam-blending once the cost UX and
-reassembly are proven.
-
-## 13. To verify before/while building
-
-- **DONE on the RTX PRO 6000** (96 GB): per-frame rates + batch_size/VRAM curve +
-  ceilings (see section 7 measured results). **Still needed: the same grid on the
-  cards users actually rent** (RTX 5090 32 GB, RTX PRO 4500 32 GB) for the real cost
-  calibration. A 32 GB card offloads DiT (resident=False), so its VRAM profile and
-  per-frame both differ from the PRO 6000; the cost estimator must use *those*
-  numbers, not the 96 GB ones.
-- **Batch-size continuity A/B (perceptual, not yet measured).** Source confirms a
-  larger `batch_size`/window improves temporal coherence (section 7 note), but the
-  throughput grid ran `temporal_overlap=0` and judged nothing visually. Before locking
-  the per-target defaults, render the same clip at a small window + overlap vs the
-  largest the card fits and compare seam visibility / flicker, to choose `batch_size`,
-  `temporal_overlap` and `segment_seconds` on quality, not just VRAM/throughput. This
-  also sets whether 4K justifies a 96 GB+ card for the *window* (continuity), not only
-  to fit at all.
-- **Pod RAM must come from the cgroup, not `free`/host (measured trap).** A RunPod pod
-  is a host-shared container: `free` reported 2015 GB on a 1-GPU H200 pod whose real cap
-  (cgroup + RunPod listing) is **251 GB / 234 GiB**, 24 vCPU. The worker's window/RAM
-  sizing and the estimator's fit check must read `/sys/fs/cgroup/memory.max` (v2) or
-  `memory/memory.limit_in_bytes` (v1). **Fix `pod/worker.py` `/telemetry`** if it reports
-  host RAM/CPU (it would overstate the pod ~8x and mislead the remote telemetry row).
-- **Per-target window ceiling = min(VRAM, cgroup-RAM, time).** 4K VRAM plateaus (~128 GB
-  H200 / ~135 GB B200, flat from ~bs9), so the GPU only OOMs at impractically large
-  windows; the binding limit is pod RAM on small pods (~130 MB/frame held streaming at 4K,
-  ~253 MB load-all) and otherwise wall-clock. Encode the per-target default `batch_size`
-  from the chosen card's VRAM plateau AND its cgroup RAM, and gate 4K windows behind a
-  RAM/time check rather than assuming VRAM is the limit.
-- **ffmpeg build — DONE (2026-07-03, `bootstrap.ps1` `Install-Ffmpeg`).** A GPL
-  build with nvenc + libx264/libx265. Primary source is **BtbN's GitHub build**
-  (`releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip`): the
-  github.com CDN is fast (~9 s / 160 MB in testing vs ~7 min on gyan.dev) and the
-  URL is durable, pinned to the 8.1 branch. Downloaded via **`curl.exe`** (ships
-  in Windows 10/11) for a real progress bar: `Invoke-WebRequest`'s progress
-  rendering cripples PS 5.1 throughput, so the first cut silenced it and left the
-  user with no feedback for minutes; curl fixes both. gyan.dev's moving
-  `release-essentials` is the fallback, verified against its `.sha256` sidecar.
-  BtbN ships no sidecar and rebuilds in place (no hash pin possible), so integrity
-  on that path is HTTPS + a **functional check** (`ffprobe -version` must run and
-  report the expected version). Only **`ffmpeg.exe` + `ffprobe.exe`** are
-  extracted (skip `ffplay`) into `<APP_ROOT>\ffmpeg\bin` (where `find_ffmpeg`
-  looks), plus the build's GPL `LICENSE.txt`. Runs in BOTH install modes; a
-  failure warns and continues, and the Video tab's readiness strip reports
-  missing ffmpeg with guidance.
-- Confirm nvenc availability at runtime: NVIDIA GPU/driver present **and**
+- **Pod RAM must come from the cgroup, not `free`/host (measured trap).** A RunPod
+  pod is a host-shared container: `free` reported 2015 GB on a 1-GPU H200 pod whose
+  real cap (cgroup + RunPod listing) is **251 GB / 234 GiB**, 24 vCPU. The worker's
+  window/RAM sizing and the estimator's fit check must read
+  `/sys/fs/cgroup/memory.max` (v2) or `memory/memory.limit_in_bytes` (v1), and
+  `pod/worker.py` `/telemetry` must report the cgroup cap (host RAM would overstate
+  the pod ~8x and mislead the remote telemetry row).
+- **Per-target window ceiling = min(VRAM, cgroup-RAM, time).** 4K VRAM plateaus
+  (~128 GB H200 / ~135 GB B200, flat from ~bs9), so the GPU only OOMs at
+  impractically large windows; the binding limit is pod RAM on small pods (~130
+  MB/frame held streaming at 4K, ~253 MB load-all) and otherwise wall-clock. The
+  per-target default `batch_size` is set from the card's VRAM plateau AND its
+  cgroup RAM, with 4K windows gated behind a RAM/time check rather than assuming
+  VRAM is the limit.
+- **Batch-size continuity A/B (perceptual, still worth a look).** A larger
+  `batch_size`/window improves temporal coherence (section 7 note), but the
+  throughput grid ran `temporal_overlap=0` and judged nothing visually. To refine
+  the per-target defaults on quality (not just VRAM/throughput), render the same
+  clip at a small window + overlap vs the largest the card fits and compare seam
+  visibility / flicker.
+- **nvenc availability is checked at runtime:** NVIDIA GPU/driver present **and**
   `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
   libx265/libx264 fallback (6.4).
 
-## 14. Phase 2 built: `scripts/video_pipeline.py` (local container pipeline)
+## 14. As built: `scripts/video_pipeline.py` (local container pipeline)
 
-The phase-2 deliverable (section 12.2) is built and proven on the real motivating
+This local container pipeline is built and proven on the real motivating
 asset (`benchmark-videos/Pisici.AVI`, 320x240 mjpeg/AVI, pcm_mulaw audio). The
 module is **stdlib + a bundled ffmpeg/ffprobe, no torch, never touches the
 source**: `probe` / `count_frames` / `max_keyframe_gap` / `plan_split` /
@@ -786,8 +723,8 @@ on a clean copy and **fires** on a real timing change.
   possible; the re-encode path can nudge timing on sources whose own metadata is
   internally inconsistent.)
 
-**Phase 4 built (the integration step):** `batch_video_upscale.py` ties the phase-2
-local ffmpeg pipeline to the phase-3 worker. New pieces:
+**The integration step (as built):** `batch_video_upscale.py` ties the local
+ffmpeg pipeline to the on-pod worker. Pieces:
 `scripts/remote_video_engine.py` (`RemoteVideoEngine.process_segment` = submit ->
 poll -> fetch), `remote_run.RemoteSession` `mode="video"`, and `db.py`
 `video_roots/video_files/video_segments` (resume at TWO granularities: a stopped
@@ -831,12 +768,11 @@ the ~0.1 s overshoot. The two other notes: the opencv backend writes **mpeg4**
 deliverable once ffmpeg is confirmed on the pod; and the pod's worker re-runs the
 SeedVR2 video path with no code change from #1.
 
-**Still to build (phase 5):** the GUI "Video Upscaler" tab (cost estimator/gate +
-per-video segment progress, consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI
-events the runner already emits) and its `cost_confirm_usd` gate. The full UX spec
-is section 15.
+The GUI "Video Upscaler" tab (cost estimator/gate + per-video segment progress,
+consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI events the runner emits, plus
+the `cost_confirm_usd` gate) is built; its full UX spec is section 15.
 
-## 15. Phase 5: GUI "Video Upscaler" tab (UX spec)
+## 15. GUI "Video Upscaler" tab (UX spec)
 
 Settled with the user before building. The tab is the front end of the existing
 `batch_video_upscale.py` runner (launched as a subprocess, same stdin/stdout seam
