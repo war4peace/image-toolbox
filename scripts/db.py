@@ -36,6 +36,8 @@ import json
 import sqlite3
 import hashlib
 import datetime
+import threading
+import functools
 
 # Fail-safe diagnostic trail for the swallowed-error handlers below. Guarded so
 # an old install missing debug_log.py can't break the cache layer.
@@ -203,20 +205,49 @@ CREATE TABLE IF NOT EXISTS gpu_perf (
 
 _conn = None   # one connection per process
 
+# get_conn hands out ONE shared connection (check_same_thread=False) and the GUI
+# touches it from short-lived scan/prepare worker threads (Video Upscaler tab).
+# Nothing enforced that only one op runs at a time, so two helpers on different
+# threads could interleave statements inside each other's implicit transaction on
+# that single connection (a dirty read, or one thread's commit landing another
+# thread's half-written rows). This reentrant lock serialises every DB helper so
+# each read-modify-write runs atomically. Reentrant so a guarded helper may call
+# another; every helper is short, so contention is negligible. It also guards the
+# lazy connection init below so two threads can't both build the connection.
+_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    """Run a DB helper while holding _LOCK (see its comment)."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
 
 def get_conn():
     """Open (once per process) and return the shared cache.db connection."""
-    global _conn
     if _conn is not None:
         return _conn
+    with _LOCK:
+        if _conn is not None:       # another thread built it while we waited
+            return _conn
+        return _open_conn()
+
+
+def _open_conn():
+    """Build, initialise and cache the shared connection. Caller holds _LOCK."""
+    global _conn
     os.makedirs(DB_DIR, exist_ok=True)
     fresh = not os.path.exists(DB_PATH)
     # check_same_thread=False: the GUI (Video Upscaler tab) touches this one shared
     # connection from short-lived worker threads (scan / prepare run off the UI
-    # thread). The app already serialises DB work in practice — the tools are
-    # separate single-threaded subprocesses and the GUI runs one background op at a
-    # time — and WAL keeps concurrent readers safe, so disabling the thread guard
-    # is safe here and avoids a per-thread connection.
+    # thread). Cross-thread use of the single connection is now made safe by _LOCK
+    # (every helper is @_locked, so their read-modify-writes can't interleave); WAL
+    # keeps the on-disk file safe for the separate subprocess runners too. This
+    # avoids a per-thread connection (which the connection-caching callers, e.g.
+    # EligibilityCache, would defeat anyway by holding one connection across threads).
     conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -272,6 +303,7 @@ def _norm(p):
 #  GPU PERFORMANCE (remote cost estimator)
 # ─────────────────────────────────────────────
 
+@_locked
 def record_gpu_perf(conn, task, gpu_id, images, seconds, min_images=20):
     """Accumulate a finished remote run's GPU timing for (task, gpu_id). Stores
     cumulative images + processing seconds (a lifetime average); a run shorter
@@ -296,6 +328,7 @@ def record_gpu_perf(conn, task, gpu_id, images, seconds, min_images=20):
     conn.commit()
 
 
+@_locked
 def get_gpu_perf(conn, task, gpu_id, min_images=100):
     """The user's own seconds-per-100-images for (task, gpu_id), or None until
     there is enough recorded history (< `min_images` cumulative). Used to
@@ -317,6 +350,7 @@ def get_gpu_perf(conn, task, gpu_id, min_images=100):
 #  ROOT HELPERS
 # ─────────────────────────────────────────────
 
+@_locked
 def get_upscale_root_id(conn, source_root, output_root=None, create=True):
     """Return the id of an upscale root (creating/updating it when create=True)."""
     row = conn.execute("SELECT id FROM upscale_roots WHERE source_root = ?",
@@ -334,6 +368,7 @@ def get_upscale_root_id(conn, source_root, output_root=None, create=True):
     return cur.lastrowid
 
 
+@_locked
 def get_tag_root_id(conn, source_root, create=True, created_at=None):
     """Return the id of a tag root (creating it when create=True)."""
     row = conn.execute("SELECT id FROM tag_roots WHERE source_root = ?",
@@ -349,6 +384,7 @@ def get_tag_root_id(conn, source_root, create=True, created_at=None):
     return cur.lastrowid
 
 
+@_locked
 def find_upscale_root(conn, source_root):
     """Find an upscale root by path (case-insensitive). Returns a Row or None."""
     target = _norm(source_root)
@@ -358,6 +394,7 @@ def find_upscale_root(conn, source_root):
     return None
 
 
+@_locked
 def find_tag_root(conn, source_root):
     """Find a tag root by path (case-insensitive). Returns a Row or None."""
     target = _norm(source_root)
@@ -371,6 +408,7 @@ def find_tag_root(conn, source_root):
 #  VIDEO UPSCALER  (resume + queue, two granularities)
 # ─────────────────────────────────────────────
 
+@_locked
 def get_video_root_id(conn, source_root, output_root=None, create=True):
     """Return the id of a video root (creating/updating it when create=True)."""
     row = conn.execute("SELECT id FROM video_roots WHERE source_root = ?",
@@ -390,6 +428,7 @@ def get_video_root_id(conn, source_root, output_root=None, create=True):
     return cur.lastrowid
 
 
+@_locked
 def _upsert(conn, table, key_cols, key_vals, fields):
     """Generic insert-or-update helper for the video_* tables. Stamps updated_at,
     commits. `key_cols`/`key_vals` are the primary-key columns/values; `fields` is
@@ -412,12 +451,14 @@ def _upsert(conn, table, key_cols, key_vals, fields):
 
 # ── video_files (source properties) ──────────────────────────────────────────
 
+@_locked
 def upsert_video_file(conn, root_id, rel_path, **fields):
     """Insert/update source properties (width, height, vcodec, acodec, fps,
     nb_frames, duration, mtime, size, src_hash). Stamps updated_at, commits."""
     _upsert(conn, "video_files", ("root_id", "rel_path"), (root_id, rel_path), fields)
 
 
+@_locked
 def get_video_file(conn, root_id, rel_path):
     """Return the video_files Row for a source video, or None."""
     return conn.execute(
@@ -430,6 +471,7 @@ def get_video_file(conn, root_id, rel_path):
 VIDEO_PROBE_VERSION = 2
 
 
+@_locked
 def video_file_is_fresh(conn, root_id, rel_path, mtime, size):
     """True if the cached fast-scan row matches the file's current (mtime, size) AND
     was probed by the current probe version, so a re-scan can skip re-probing it
@@ -444,6 +486,7 @@ def video_file_is_fresh(conn, root_id, rel_path, mtime, size):
 
 # ── video_outputs (the per-target job = the durable queue) ───────────────────
 
+@_locked
 def upsert_video_output(conn, root_id, rel_path, target, **fields):
     """Insert/update one (source, target) job row (status, skip_reason,
     output_path, out_frames, queue_order). Sets created_at on first insert."""
@@ -456,6 +499,7 @@ def upsert_video_output(conn, root_id, rel_path, target, **fields):
             (root_id, rel_path, target), fields)
 
 
+@_locked
 def get_video_output(conn, root_id, rel_path, target):
     """Return the (source, target) job Row, or None."""
     return conn.execute(
@@ -463,6 +507,7 @@ def get_video_output(conn, root_id, rel_path, target):
         (root_id, rel_path, target)).fetchone()
 
 
+@_locked
 def get_video_outputs_for(conn, root_id, rel_path):
     """All target jobs for one source (so the list can show every upscaled
     counterpart)."""
@@ -471,6 +516,7 @@ def get_video_outputs_for(conn, root_id, rel_path):
         (root_id, rel_path)).fetchall()
 
 
+@_locked
 def get_video_outputs_all(conn, root_id):
     """Every output job for a root in ONE query, so the GUI can refresh a large
     scan list without a query per file (which froze the UI thread)."""
@@ -479,6 +525,7 @@ def get_video_outputs_all(conn, root_id):
         "WHERE root_id = ?", (root_id,)).fetchall()
 
 
+@_locked
 def get_video_queue(conn, root_id):
     """The queue: every job not yet 'done'/'skipped', in queue order. This IS the
     durable, restart-surviving queue + resume set (section 15.1)."""
@@ -488,6 +535,7 @@ def get_video_queue(conn, root_id):
         "ORDER BY queue_order, rowid", (root_id,)).fetchall()
 
 
+@_locked
 def next_queue_order(conn, root_id):
     """The next queue_order to append at the end of the queue."""
     row = conn.execute(
@@ -496,6 +544,7 @@ def next_queue_order(conn, root_id):
     return (row["m"] + 1) if row and row["m"] is not None else 0
 
 
+@_locked
 def set_queue_order(conn, root_id, rel_path, target, order):
     """Reorder one queued job. Commits."""
     conn.execute(
@@ -504,6 +553,7 @@ def set_queue_order(conn, root_id, rel_path, target, order):
     conn.commit()
 
 
+@_locked
 def delete_video_output(conn, root_id, rel_path, target):
     """Remove a job from the queue (and its segment rows). Commits."""
     conn.execute(
@@ -517,6 +567,7 @@ def delete_video_output(conn, root_id, rel_path, target):
 
 # ── video_segments (per-target resume) ───────────────────────────────────────
 
+@_locked
 def upsert_video_segment(conn, root_id, rel_path, target, seg_index, **fields):
     """Insert/update one segment row (in_frames, out_frames, status, seconds,
     output_path). Stamps updated_at, commits."""
@@ -525,6 +576,7 @@ def upsert_video_segment(conn, root_id, rel_path, target, seg_index, **fields):
             (root_id, rel_path, target, seg_index), fields)
 
 
+@_locked
 def get_video_segments(conn, root_id, rel_path, target):
     """All segment rows for a (source, target) job, ordered by index."""
     return conn.execute(
@@ -532,6 +584,7 @@ def get_video_segments(conn, root_id, rel_path, target):
         "ORDER BY seg_index", (root_id, rel_path, target)).fetchall()
 
 
+@_locked
 def clear_video_segments(conn, root_id, rel_path, target):
     """Drop a job's segment rows (a fresh split supersedes the old plan). Commits."""
     conn.execute(
@@ -562,6 +615,12 @@ def hash_file_cached(conn, path):
     Content hash of `path`, memoised in file_hashes by (path, mtime, size); the
     file is re-read only when that fingerprint changes. Does NOT commit — the
     caller commits (so a big rescan flushes once). Returns the hex digest or None.
+
+    Deliberately NOT @_locked: it reads the whole file (a multi-GB video in the
+    Video Upscaler path), and holding the global DB lock across that read would
+    stall every other DB op. The only race is two threads hashing the same file at
+    once, which is harmless — both write the identical digest (INSERT OR REPLACE),
+    and SQLite's own mutex keeps each individual statement safe.
     """
     norm = _norm(path)
     try:
@@ -586,6 +645,7 @@ def hash_file_cached(conn, path):
 #  LINEAGE  (source → upscaled → tagged, by content hash)
 # ─────────────────────────────────────────────
 
+@_locked
 def record_upscale_lineage(conn, src_hash, upscaled_hash, src_path=None, upscaled_path=None):
     """
     Link a source photo to its upscaled output. Keyed on src_hash: re-upscaling
@@ -609,6 +669,7 @@ def record_upscale_lineage(conn, src_hash, upscaled_hash, src_path=None, upscale
     conn.commit()
 
 
+@_locked
 def record_tag_lineage(conn, in_hash, tagged_hash, tagged_path=None):
     """
     Link a tagged & renamed file back to the upscaled file it was made from
@@ -632,6 +693,7 @@ def record_tag_lineage(conn, in_hash, tagged_hash, tagged_path=None):
     conn.commit()
 
 
+@_locked
 def lineage_final_hash(conn, src_hash):
     """
     Given a source photo's content hash, return the content hash of its final
@@ -645,6 +707,7 @@ def lineage_final_hash(conn, src_hash):
     return row["tagged_hash"] or row["upscaled_hash"]
 
 
+@_locked
 def lineage_has_rows(conn):
     """True if any lineage has been recorded (lets callers skip hashing work)."""
     return conn.execute("SELECT 1 FROM lineage LIMIT 1").fetchone() is not None
@@ -654,6 +717,7 @@ def lineage_has_rows(conn):
 #  LEGACY JSON IMPORT  (one-shot, on db creation)
 # ─────────────────────────────────────────────
 
+@_locked
 def import_legacy_json(conn):
     """
     Import the old JSON caches into the freshly created database. A cache is

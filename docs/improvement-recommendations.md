@@ -394,6 +394,27 @@ reports diagnosable, and it matches the user preference for richer logs.
 
 ## 8. Harden the shared SQLite connection against GUI threading
 
+> **Status: DONE (2026-07-04, 0.4.3-experimental).** `db.py` grew a module-level
+> reentrant lock (`_LOCK = threading.RLock()`) and a `@_locked` decorator, applied
+> to **every** helper that touches the shared connection (the video cache/queue,
+> roots, gpu_perf, lineage, legacy import) so each helper's whole read-modify-write
+> runs atomically instead of interleaving with another thread's statements on the
+> single connection. `get_conn()` now double-checks under the lock and defers to a
+> new `_open_conn()` so two threads can't both build the connection. Chose the lock
+> over per-thread connections deliberately: callers (e.g. `EligibilityCache`) cache
+> the connection object across threads, which a `threading.local` connection would
+> defeat.
+>
+> Two helpers are **intentionally not locked**: `content_hash` (pure file I/O, no
+> conn) and `hash_file_cached` (it reads the whole file, a multi-GB video in the
+> Video path, and holding the global DB lock across that read would stall every
+> other DB op; its only race is two threads writing the *identical* memoised digest,
+> which is harmless, and SQLite's own mutex keeps each statement safe). Reentrant so
+> the nested helper calls (`upsert_video_* -> _upsert`) don't deadlock. 3 tests in
+> `test_db.py` (concurrent distinct-row writers all land; concurrent same-row
+> upserts don't raise a duplicate-PK IntegrityError, which they *do* without the
+> lock, verified; reentrancy doesn't deadlock).
+
 `db.get_conn()` hands one process-wide connection out with
 `check_same_thread=False`, and the Video tab uses it from short-lived scan /
 prepare worker threads. Safety currently rests on a convention ("the GUI runs

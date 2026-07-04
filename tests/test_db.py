@@ -6,6 +6,7 @@ stubs the one-shot legacy-JSON import so nothing on the real machine is touched.
 """
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -110,3 +111,57 @@ def test_empty_hashes_are_noops(db_conn):
 
 def test_unknown_source_has_no_final_hash(db_conn):
     assert db.lineage_final_hash(db_conn, "nope") is None
+
+
+# ── GUI-threading safety (item 8: the _LOCK serialising the shared conn) ──────
+
+def _run_threads(target, count):
+    """Start `count` threads on target(i), join them, return any exceptions."""
+    errors = []
+
+    def wrapped(i):
+        try:
+            target(i)
+        except Exception as exc:            # capture so the assert can show it
+            errors.append(exc)
+
+    threads = [threading.Thread(target=wrapped, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors
+
+
+def test_concurrent_writers_distinct_rows_all_land(db_conn):
+    # Many worker threads writing distinct rows through @_locked helpers on the one
+    # shared connection: every row must land and none may raise.
+    root = db.get_video_root_id(db_conn, "/src", create=True)
+    n = 40
+    errors = _run_threads(
+        lambda i: db.upsert_video_output(db_conn, root, f"clip{i}.mp4", "4K",
+                                         status="queued", queue_order=i), n)
+    assert not errors, errors
+    assert len(db.get_video_outputs_all(db_conn, root)) == n
+
+
+def test_concurrent_upserts_same_row_no_duplicate_insert(db_conn):
+    # The real discriminator for the lock: _upsert does a SELECT-exists then an
+    # INSERT/UPDATE in Python. Many threads first-inserting the SAME (rel_path,
+    # target) would, unserialised, both see "not exists" and both plain-INSERT,
+    # raising a duplicate-PK IntegrityError. Under _LOCK exactly one row results.
+    root = db.get_video_root_id(db_conn, "/src", create=True)
+    errors = _run_threads(
+        lambda i: db.upsert_video_output(db_conn, root, "same.mp4", "4K",
+                                         status=f"s{i}"), 40)
+    assert not errors, errors
+    assert len(db.get_video_outputs_for(db_conn, root, "same.mp4")) == 1
+
+
+def test_lock_is_reentrant(db_conn):
+    # A @_locked helper may be called while already holding _LOCK (helpers call
+    # each other, e.g. upsert_video_* -> _upsert): RLock must not deadlock.
+    root = db.get_video_root_id(db_conn, "/src", create=True)
+    with db._LOCK:
+        db.upsert_video_output(db_conn, root, "a.mp4", "4K", status="queued")
+        assert db.get_video_output(db_conn, root, "a.mp4", "4K") is not None
