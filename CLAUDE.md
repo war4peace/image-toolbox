@@ -413,9 +413,6 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `tools/git-clean-webhook.py` — repo maintenance helper (a git clean filter that
-  blanked `discord_webhook_url` on stage; redundant since item 9 keeps all secrets
-  in the untracked `config.local.json`, kept as belt-and-suspenders).
 - `docs/` — `future-features.md` (roadmap: open milestones #3/#4 + the "decided
   against" record; shipped #1/#2 are brief pointers), `runpod-notes.md` (remote-pod
   upscaling notes), `video-upscaler.md` (design + as-built notes for the RunPod-only
