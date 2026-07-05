@@ -2,9 +2,10 @@
 tag_and_rename.py
 -----------------
 Analyses images using a local Ollama vision model, writes a long description
-into EXIF ImageDescription, stores the original filename in EXIF XPComment,
-writes a processing timestamp into EXIF UserComment (used to skip already-
-processed files on re-run), and renames each file to:
+into EXIF ImageDescription (UTF-8) and the Windows XPTitle field, stores the
+original filename in EXIF XPComment, writes a processing timestamp into EXIF
+UserComment (used to skip already-processed files on re-run), and renames each
+file to:
 
     ORIGINAL_STEM_Condensed_Description.ext
 
@@ -22,8 +23,8 @@ Renaming:
     renamed. Files with human-readable names are tagged only.
 
 Undo support:
-  - A cache file (trcache/<md5>.cache) records the original filename and
-    EXIF state of every scanned file before any modification is made.
+  - The shared SQLite cache (db/cache.db, tag_files table) records the original
+    filename and EXIF state of every scanned file before any modification is made.
   - Undo can be run at any time to revert renames, EXIF changes, or both.
 
 Usage:
@@ -79,8 +80,8 @@ except Exception:
 # before the session-log tee wraps stdout, so the tee inherits the utf-8 stream.
 runner_common.harden_stdout()
 
-# App root = parent of scripts/. config.json, logs/ and the trcache/ import
-# folder live at the app root, not beside this module.
+# App root = parent of scripts/. config.json, logs/ and db/cache.db live at the
+# app root, not beside this module.
 APP_ROOT = runner_common.APP_ROOT
 
 
@@ -353,10 +354,11 @@ def check_dependencies():
 #  CACHE CONSTANTS
 # ─────────────────────────────────────────────────────────────
 
-# Cache files live in a "trcache" subfolder at the app root.
-# Each source folder gets its own cache file named after the MD5 of the
-# normalised absolute path, e.g.  trcache/ab4531c2f8d9.cache
-CACHE_DIR            = os.path.join(APP_ROOT, "trcache")
+# The tag/rename cache lives in the shared SQLite db (db/cache.db, tag_files
+# table); see db.py. The legacy per-folder trcache/<md5>.cache JSON files are
+# read only once, on first DB creation, for the one-time import (in db.py) and are
+# otherwise vestigial. This version stamps each entry so a schema change can be
+# detected on load.
 CACHE_SCHEMA_VERSION = 1
 
 # ─────────────────────────────────────────────────────────────
@@ -403,9 +405,10 @@ def resolve_language(code_or_name):
     return stripped.title()
 
 
-# The three EXIF fields this script writes – all are tracked for undo.
+# The EXIF fields this script writes – all are tracked for undo.
 _TRACKED_EXIF_FIELDS = {
-    "ImageDescription": ("0th",  270),    # piexif.ImageIFD.ImageDescription
+    "ImageDescription": ("0th",  270),    # piexif.ImageIFD.ImageDescription (UTF-8)
+    "XPTitle":          ("0th",  40091),  # Windows XP Title (UTF-16LE) — item 3
     "XPComment":        ("0th",  40092),  # Windows XP Comment (UTF-16LE)
     "UserComment":      ("Exif", 37510),  # piexif.ExifIFD.UserComment
 }
@@ -451,6 +454,18 @@ def has_camera_default_name(filename):
 #  OLLAMA  –  connectivity check and image analysis
 # ─────────────────────────────────────────────────────────────
 
+def _ollama_model_available(models):
+    """True if OLLAMA_MODEL is present in `models` (a list of names from /api/tags
+    or /api/ps). Matches on the model name up to the ':tag' boundary, NOT as a
+    loose substring: a configured 'llava' matches 'llava:latest' but not
+    'llava-phi3', and 'qwen2.5vl' does not match a future 'qwen2.5vl-max'. The old
+    `base in m` substring test let those through, so the pre-flight could pass
+    while /api/generate then failed with 'model not found' and burned the outage
+    path instead of the clean startup error. See item 11."""
+    base = OLLAMA_MODEL.split(":")[0]
+    return any(m == base or m.startswith(base + ":") for m in models)
+
+
 def check_ollama():
     """Return (ok: bool, message: str)."""
     try:
@@ -458,8 +473,7 @@ def check_ollama():
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
         models = [m["name"] for m in data.get("models", [])]
-        base   = OLLAMA_MODEL.split(":")[0]
-        found  = any(base in m for m in models)
+        found  = _ollama_model_available(models)
         if not found:
             return False, (
                 f"Ollama is running but model '{OLLAMA_MODEL}' is not pulled.\n"
@@ -487,8 +501,7 @@ def unload_model():
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=5) as resp:
             loaded = [m.get("name", "") for m in json.loads(resp.read()).get("models", [])]
-        base = OLLAMA_MODEL.split(":")[0]
-        if not any(base in name for name in loaded):
+        if not _ollama_model_available(loaded):
             return False
         payload = json.dumps({"model": OLLAMA_MODEL, "keep_alive": 0}).encode("utf-8")
         req = urllib.request.Request(
@@ -658,47 +671,143 @@ def _load_exif_safe(path):
         return {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
 
 
+# Formats where embedding EXIF is safe AND reversible: Pillow re-saves keeping the
+# container, piexif reads the block back (so the skip-on-rerun marker round-trips)
+# and the undo snapshot/restore path works. JPEG is the only one that clears all
+# three: piexif can't read PNG/TIFF EXIF back (the marker would never round-trip and
+# undo couldn't strip it), and although WebP round-trips it's left out to keep one
+# simple rule. Non-JPEG files are still RENAMED (format-agnostic) and their
+# skip-on-rerun marker lives in the cache ("processed" status) instead of EXIF.
+# See item 2 in docs/improvement-recommendations.md.
+_EXIF_WRITABLE_FORMATS = {"JPEG", "MPO"}
+
+
+def _image_format(path):
+    """The image's true container format (Pillow name, upper-case), read from the
+    file content rather than the extension. None if it can't be opened. Used to
+    decide whether EXIF can be embedded safely — the extension can lie (an upscaled
+    tree can hold a .png that is really a PNG, never a JPEG)."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return (im.format or "").upper()
+    except Exception:
+        return None
+
+
+def _exif_writable(path):
+    """True only for formats where embedding EXIF is safe and reversible (JPEG)."""
+    return _image_format(path) in _EXIF_WRITABLE_FORMATS
+
+
 def _save_with_exif(path, exif_dict):
     """
-    Save EXIF back to a JPEG using Pillow's Image.save(), which works on any
-    JPEG including bare files with no existing APP0/APP1 markers (e.g. ComfyUI
-    SaveImage output). This re-encodes the JPEG at quality=95 to preserve
-    near-lossless quality while writing the EXIF block.
+    Embed EXIF into a JPEG.
+
+    Preferred path is piexif.insert(): it rewrites ONLY the APP1/EXIF segment and
+    leaves the compressed pixel data byte-for-byte untouched — no generation loss,
+    minimal I/O, and safe to repeat any number of times (re-tagging never degrades
+    the image). This is what makes tagging effectively lossless (item 6). It works
+    even on a bare JPEG with no existing APP0/APP1 markers (e.g. ComfyUI SaveImage
+    output).
+
+    Fallback is a full Pillow re-encode at quality=95 (near-lossless), used only if
+    insert() can't patch the file in place (a malformed/unusual JPEG). It is one
+    re-encode, not two — the old code re-encoded once for the description and again
+    for the processed marker; those are now a single write.
+
+    JPEG-ONLY BY CONTRACT: callers gate on _exif_writable(). The guard below makes
+    it impossible to ever save "jpeg" bytes over a .png/.webp/.tif (which would
+    corrupt the file or raise on an RGBA image) even if a future caller forgets.
+    See items 2 and 6 in docs/improvement-recommendations.md.
     """
     import piexif
     from PIL import Image
 
+    fmt = _image_format(path)
+    if fmt not in _EXIF_WRITABLE_FORMATS:
+        raise ValueError(
+            f"refusing to write JPEG EXIF into a {fmt or 'non-JPEG'} file "
+            f"(would corrupt it): {path}")
     exif_bytes = piexif.dump(exif_dict)
+    try:
+        piexif.insert(exif_bytes, path)   # lossless: touches only the EXIF segment
+        return
+    except Exception as exc:
+        # Rare: an odd JPEG insert() can't patch. Fall back to a single re-encode.
+        debug_log("tag_and_rename._save_with_exif: insert failed, re-encoding", exc=exc)
     img = Image.open(path)
     img.save(path, "jpeg", exif=exif_bytes, quality=95, subsampling=0)
 
 
 def write_exif(path, long_description, original_filename):
     """
-    Write long_description to ImageDescription (0th IFD tag 270).
-    Write original_filename to XPComment (0th IFD tag 40092, UTF-16LE).
+    Write ALL of the tag's EXIF in ONE save (item 6): the description to
+    ImageDescription (0th IFD tag 270, UTF-8) mirrored into XPTitle (tag 40091,
+    UTF-16LE); original_filename to XPComment (tag 40092, UTF-16LE); and the
+    processed-marker timestamp to Exif.UserComment (the skip-on-rerun signal).
+
+    This used to be two calls (write_exif then write_processed_marker), each doing
+    its own JPEG save — two generations of loss and double the I/O per image. They
+    are now one dict and one _save_with_exif call, and that save is itself lossless
+    (piexif.insert, see _save_with_exif), so tagging no longer degrades the pixels
+    at all.
+
+    The description is written as UTF-8 bytes, NOT ascii/replace — the selectable
+    description language means a Romanian/German/etc. description is the flagship
+    output, and ascii-replacing it turned every diacritic into "?" in the one
+    place it is persisted ("Pisică" -> "Pisic?"). UTF-8 in ImageDescription is
+    read correctly by essentially every modern viewer; XPTitle (UTF-16LE) is the
+    Windows-native Unicode field Explorer shows as "Title", so the full accented
+    text also appears in the shell. See item 3. (Filenames stay ASCII-sanitised
+    on purpose — that is elsewhere and unaffected.)
+
+    JPEG only: for PNG/WebP/TIFF, embedding EXIF would corrupt the container or
+    fail to round-trip, so the EXIF write is skipped (the file is left byte-for-
+    byte untouched) and the descriptive filename carries the result instead; the
+    cache's 'processed' status is then the skip-on-rerun signal (is_already_processed
+    consults it). Returns True if EXIF was written, False if skipped. See item 2.
     """
     import piexif
 
+    if not _exif_writable(path):
+        return False
+
     exif_dict = _load_exif_safe(path)
 
-    # ImageDescription: ASCII bytes
+    # ImageDescription (tag 270): UTF-8 bytes, so diacritics survive.
     exif_dict["0th"][piexif.ImageIFD.ImageDescription] = (
-        long_description.encode("ascii", "replace")
+        long_description.encode("utf-8")
     )
-
+    # XPTitle (tag 40091): UTF-16LE — the Windows-native Unicode title field.
+    exif_dict["0th"][40091] = long_description.encode("utf-16-le")
     # XPComment (tag 40092): UTF-16LE bytes — Windows standard for XP* fields
     exif_dict["0th"][40092] = original_filename.encode("utf-16-le")
 
+    # UserComment: the processed marker + timestamp, folded into this same save.
+    timestamp    = time.strftime("%Y-%m-%d %H:%M:%S")
+    marker_text  = f"{PROCESSED_MARKER} @ {timestamp}"
+    exif_dict.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = (
+        _EXIF_ASCII_HEADER + marker_text.encode("ascii")
+    )
+
     _save_with_exif(path, exif_dict)
+    return True
 
 
 def write_processed_marker(path):
     """
-    Write a processing timestamp into EXIF Exif.UserComment.
-    Format: "TaggedBy:Image Toolbox (https://github.com/war4peace/image-toolbox) @ 2026-03-24 23:15:42"
+    Write ONLY the processed-marker timestamp into Exif.UserComment.
+
+    Kept for callers/tests that want the skip-on-rerun marker on its own; the main
+    tag loop no longer calls this, because write_exif now folds the marker into its
+    single save (item 6). JPEG only (a non-JPEG carries the 'processed' status in
+    the cache instead). Returns True if written, False if skipped. See item 2.
     """
     import piexif
+
+    if not _exif_writable(path):
+        return False
 
     timestamp    = time.strftime("%Y-%m-%d %H:%M:%S")
     marker_text  = f"{PROCESSED_MARKER} @ {timestamp}"
@@ -708,24 +817,34 @@ def write_processed_marker(path):
     exif_dict.setdefault("Exif", {})[piexif.ExifIFD.UserComment] = user_comment
 
     _save_with_exif(path, exif_dict)
+    return True
 
 
-def is_already_processed(path):
+def is_already_processed(path, cache=None, source_root=None):
     """
     Return True if the file has already been tagged by this script.
-    Checks EXIF Exif.UserComment for the PROCESSED_MARKER prefix.
+
+    Primary signal: the EXIF Exif.UserComment PROCESSED_MARKER (JPEG). Fallback:
+    the cache's 'processed' status — the ONLY skip signal for non-JPEG files,
+    which carry no EXIF marker (see write_processed_marker / item 2). Pass
+    cache+source_root to enable the fallback; without them only EXIF is checked.
     """
     try:
         import piexif
         exif_dict = _load_exif_safe(path)
         raw = exif_dict.get("Exif", {}).get(piexif.ExifIFD.UserComment, b"")
-        if not raw:
-            return False
-        # Skip the 8-byte charset header, decode remaining ASCII
-        text = raw[8:].decode("ascii", "ignore").strip()
-        return text.startswith((PROCESSED_MARKER,) + LEGACY_MARKERS)
+        if raw:
+            # Skip the 8-byte charset header, decode remaining ASCII
+            text = raw[8:].decode("ascii", "ignore").strip()
+            if text.startswith((PROCESSED_MARKER,) + LEGACY_MARKERS):
+                return True
     except Exception:
-        return False
+        pass
+    if cache is not None and source_root is not None:
+        _key, entry = _find_entry(cache, source_root, path)
+        if entry is not None and entry.get("status") == "processed":
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -826,26 +945,54 @@ def build_new_path(original_path, condensed, base_stem=None):
         counter += 1
 
 
+def _decode_xp_field(raw, ext_should_match=None):
+    """Decode a Windows XP* EXIF field (UTF-16LE, stored as bytes or piexif's int
+    tuple) to a stripped string, or None. If ext_should_match is given, the decoded
+    value must carry that extension (guards against unrelated content)."""
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, (tuple, list)):
+            raw = bytes(raw)
+        name = raw.decode("utf-16-le", "ignore").rstrip("\x00").strip()
+    except Exception:
+        return None
+    if not name:
+        return None
+    if ext_should_match is not None and \
+            os.path.splitext(name)[1].lower() != ext_should_match.lower():
+        return None
+    return name
+
+
+def _recorded_original_name(path):
+    """The original filename this tool stored in EXIF XPComment when it first
+    tagged `path` (JPEG), or None. Lets a rename recover the true original after
+    the cache is lost, so it rebuilds from '001.jpg' rather than appending to an
+    already-renamed '001_Child_At_Window.jpg'."""
+    try:
+        exif = _load_exif_safe(path)
+    except Exception:
+        return None
+    raw = exif.get("0th", {}).get(40092)   # XPComment, UTF-16LE
+    return _decode_xp_field(raw, ext_should_match=os.path.splitext(path)[1])
+
+
 def get_original_name(path, cache, source_root):
     """
     The file's original name from before any rename by this script.
-    Sources, in order: the undo cache entry; the EXIF XPComment field
-    (where the original filename was stored when first tagged); failing
-    both, the current name.
+
+    Source of truth: the cache entry's original_rel_path (seeded once, on first
+    scan, and never changed). Falls back to the EXIF XPComment record, then the
+    current name. Because the descriptive suffix is always rebuilt from THIS name
+    (build_new_path), a wrong answer here is what makes a re-rename append instead
+    of overwrite — so ensure_cache_entry seeds the entry from XPComment too, and a
+    correct entry is virtually always found here.
     """
     _key, entry = _find_entry(cache, source_root, path)
     if entry is not None and entry.get("original_rel_path"):
         return os.path.basename(entry["original_rel_path"])
-    try:
-        exif = _load_exif_safe(path)
-        raw  = exif.get("0th", {}).get(40092)   # XPComment, UTF-16LE
-        if raw:
-            name = bytes(raw).decode("utf-16-le", "ignore").rstrip("\x00").strip()
-            if name and os.path.splitext(name)[1].lower() == os.path.splitext(path)[1].lower():
-                return name
-    except Exception:
-        pass
-    return os.path.basename(path)
+    return _recorded_original_name(path) or os.path.basename(path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -869,12 +1016,18 @@ def load_cache(source_root):
     conn = db.get_conn()
     root = db.find_tag_root(conn, source_root)
     now  = time.strftime("%Y-%m-%dT%H:%M:%S")
+    # "_dirty"/"_index" are in-memory only (never serialised into a row): the set
+    # of keys awaiting an incremental save_cache, and the O(1) lookup index
+    # {normcase(current_rel_path): key} that keeps _find_entry off a linear scan.
+    # See item 5.
     cache = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "source_root":    os.path.abspath(source_root),
         "created_at":     now,
         "last_updated":   now,
         "files":          {},
+        "_dirty":         set(),
+        "_index":         {},
     }
     if root is None:
         return cache
@@ -887,36 +1040,77 @@ def load_cache(source_root):
             "SELECT original_rel_path, entry_json FROM tag_files WHERE root_id = ?",
             (root["id"],)):
         try:
-            cache["files"][row["original_rel_path"]] = json.loads(row["entry_json"])
+            key   = row["original_rel_path"]
+            entry = json.loads(row["entry_json"])
+            cache["files"][key] = entry
+            cache["_index"][os.path.normcase(
+                entry.get("current_rel_path") or key)] = key
         except Exception:
             pass
     return cache
 
 
-def save_cache(cache, source_root):
-    """Persist the cache dict to the shared database (atomic, full rewrite of
-    this root's rows)."""
+def _entry_row(root_id, key, entry):
+    """One tag_files row tuple for a cache entry."""
+    return (root_id,
+            entry.get("original_rel_path", key),
+            entry.get("current_rel_path"),
+            entry.get("status"),
+            json.dumps(entry, ensure_ascii=False))
+
+
+_TAG_FILES_UPSERT = (
+    "INSERT OR REPLACE INTO tag_files "
+    "(root_id, original_rel_path, current_rel_path, status, entry_json) "
+    "VALUES (?, ?, ?, ?, ?)")
+
+
+def save_cache(cache, source_root, full=False):
+    """Persist the cache dict to the shared database (atomic).
+
+    Incremental by default: only the entries marked dirty since the last save are
+    upserted (tag_files' PRIMARY KEY (root_id, original_rel_path) makes
+    INSERT OR REPLACE a true upsert). The old code deleted and re-inserted EVERY
+    row of the root on every call, and it is called after each processed image /
+    failure / skip / rotation — O(N^2) JSON-serialisations + DB work over a run,
+    minutes of pure overhead on a large photo tree. See item 5.
+
+    full=True (or a cache built without dirty tracking) does the whole-root
+    rewrite — used by undo, which saves once at the end and rewrites in place."""
     cache["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     conn    = db.get_conn()
     root_id = db.get_tag_root_id(conn, os.path.abspath(source_root),
                                  created_at=cache.get("created_at"))
-    rows = []
-    for key, entry in cache["files"].items():
-        rows.append((root_id,
-                     entry.get("original_rel_path", key),
-                     entry.get("current_rel_path"),
-                     entry.get("status"),
-                     json.dumps(entry, ensure_ascii=False)))
+    dirty   = cache.get("_dirty")
+
+    if full or dirty is None:
+        rows = [_entry_row(root_id, k, e) for k, e in cache["files"].items()]
+        try:
+            with conn:   # one transaction; rolls back on error
+                conn.execute("DELETE FROM tag_files WHERE root_id = ?", (root_id,))
+                if rows:
+                    conn.executemany(_TAG_FILES_UPSERT, rows)
+                conn.execute("UPDATE tag_roots SET last_updated = ? WHERE id = ?",
+                             (cache["last_updated"], root_id))
+            if dirty is not None:
+                dirty.clear()
+        except Exception as exc:
+            print(f"  WARNING: Could not save cache to database ({exc}).")
+            debug_log("tag_and_rename.save_cache", exc=exc)
+        return
+
+    if not dirty:
+        return   # nothing changed since the last save — no DB churn
+
+    rows = [_entry_row(root_id, k, cache["files"][k])
+            for k in dirty if k in cache["files"]]
     try:
         with conn:   # one transaction; rolls back on error
-            conn.execute("DELETE FROM tag_files WHERE root_id = ?", (root_id,))
             if rows:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO tag_files "
-                    "(root_id, original_rel_path, current_rel_path, status, entry_json) "
-                    "VALUES (?, ?, ?, ?, ?)", rows)
+                conn.executemany(_TAG_FILES_UPSERT, rows)
             conn.execute("UPDATE tag_roots SET last_updated = ? WHERE id = ?",
                          (cache["last_updated"], root_id))
+        dirty.clear()
     except Exception as exc:
         print(f"  WARNING: Could not save cache to database ({exc}).")
         # The print reaches the live log pane but not across sessions: also
@@ -926,7 +1120,7 @@ def save_cache(cache, source_root):
 
 def _snapshot_exif(path):
     """
-    Snapshot the three tracked EXIF fields from a file.
+    Snapshot the tracked EXIF fields from a file.
     Returns a dict  { field_name: base64(raw_bytes) | None }.
     None means the field was absent in the file.
     Raw bytes are base64-encoded so they survive JSON round-trips safely.
@@ -936,26 +1130,72 @@ def _snapshot_exif(path):
         exif = _load_exif_safe(path)
         for name, (ifd, tag) in _TRACKED_EXIF_FIELDS.items():
             raw = exif.get(ifd, {}).get(tag)
-            if raw is not None:
-                snap[name] = base64.b64encode(raw).decode("ascii")
+            if raw is None:
+                continue
+            # piexif returns the XP* tags (XPTitle/XPComment) as int TUPLES, not
+            # bytes; base64.b64encode chokes on a tuple. Normalise first, or a
+            # snapshot that reaches an XP field would abort mid-loop and silently
+            # drop the fields after it (a latent undo gap before item 3 added a
+            # second XP tag). bytes() maps the 0-255 int tuple back to raw bytes.
+            if isinstance(raw, (tuple, list)):
+                raw = bytes(raw)
+            snap[name] = base64.b64encode(raw).decode("ascii")
     except Exception:
         pass
     return snap
 
 
+def _mark_dirty(cache, key):
+    """Flag a cache entry for the next incremental save_cache (item 5). No-op on a
+    cache built without dirty tracking (that path does a full rewrite instead)."""
+    d = cache.get("_dirty")
+    if d is not None and key is not None:
+        d.add(key)
+
+
+def _index_set(cache, key, current_rel_path, old_current=None):
+    """Maintain the {normcase(current_rel_path): key} lookup index so _find_entry
+    stays O(1) after a rename. Drops the old current-path mapping first."""
+    idx = cache.get("_index")
+    if idx is None:
+        return
+    if old_current is not None and os.path.normcase(old_current) != os.path.normcase(current_rel_path):
+        idx.pop(os.path.normcase(old_current), None)
+    idx[os.path.normcase(current_rel_path)] = key
+
+
 def _find_entry(cache, source_root, abs_path):
     """
     Locate a cache entry for the given absolute path.
-    Searches by original_rel_path first (cache key), then by current_rel_path.
+
+    Fast path: the cache key (original_rel_path) directly, then the
+    {normcase(current_rel_path): key} index — O(1), maintained by
+    ensure_cache_entry / update_cache_entry (item 5; _find_entry is called
+    several times per image, so the old linear scan was O(N^2) over a run). A
+    cache built WITHOUT that index (e.g. a hand-built one in tests) falls back to
+    the linear scan — same result, just O(N).
     Returns (cache_key, entry_dict) or (None, None).
     """
+    files = cache["files"]
     rel = os.path.relpath(abs_path, source_root)
     # Direct key match (original path, or file was never renamed)
-    if rel in cache["files"]:
-        return rel, cache["files"][rel]
-    # Search by current path (file was renamed in a previous run)
+    if rel in files:
+        return rel, files[rel]
     rel_norm = os.path.normcase(rel)
-    for key, entry in cache["files"].items():
+    index = cache.get("_index")
+    if index is not None:
+        # Index is authoritative: a miss means the file is genuinely not cached
+        # (e.g. a brand-new file during the scan) — return in O(1), don't scan.
+        key = index.get(rel_norm)
+        if key is None:
+            return None, None
+        entry = files.get(key)
+        # Verify against the live entry so a stale index can never return a wrong
+        # match; it would just fall through to the scan below.
+        if entry is not None and os.path.normcase(entry.get("current_rel_path", "")) == rel_norm:
+            return key, entry
+    # No index (hand-built cache), or a stale hit: authoritative linear scan.
+    for key, entry in files.items():
         if os.path.normcase(entry.get("current_rel_path", "")) == rel_norm:
             return key, entry
     return None, None
@@ -967,6 +1207,13 @@ def ensure_cache_entry(cache, source_root, abs_path):
     If the entry already exists (from a prior run), it is left untouched so
     the original snapshot is never overwritten.
     Returns the cache key (always the original_rel_path).
+
+    When NO entry exists but the file was already tagged by a previous run whose
+    cache we've since lost (a reset DB, or the same folder reached via a different
+    root path, e.g. mapped drive vs UNC), the file still carries its ORIGINAL name
+    in EXIF XPComment. We seed original_rel_path from that, so a re-rename rebuilds
+    from '001.jpg' instead of appending to the renamed '001_Child_At_Window.jpg'
+    (which then poisons XPComment too, and the name keeps growing every pass).
     """
     key, entry = _find_entry(cache, source_root, abs_path)
     if entry is not None:
@@ -974,18 +1221,40 @@ def ensure_cache_entry(cache, source_root, abs_path):
 
     rel  = os.path.relpath(abs_path, source_root)
     snap = _snapshot_exif(abs_path)
-    cache["files"][rel] = {
-        "original_rel_path": rel,
+
+    # Recover the true original name from the file's own XPComment record (decoded
+    # from the snapshot we just took, so no extra EXIF read). Only accept it if it
+    # differs from the current name AND its key isn't already claimed by another
+    # file, so we never clobber an existing entry.
+    recorded = _decode_xp_field(
+        base64.b64decode(snap["XPComment"]) if snap.get("XPComment") else None,
+        ext_should_match=os.path.splitext(abs_path)[1])
+    original_rel = rel
+    was_renamed  = False
+    original_exif = snap                 # brand-new file: current IS the original
+    if recorded and recorded != os.path.basename(abs_path):
+        cand = os.path.join(os.path.dirname(rel), recorded) if os.path.dirname(rel) else recorded
+        if cand not in cache["files"]:
+            original_rel  = cand
+            was_renamed   = True
+            # The pristine original had none of the fields this tool writes, so
+            # undo (revert to original) should strip them: snapshot them as absent.
+            original_exif = {name: None for name in _TRACKED_EXIF_FIELDS}
+
+    cache["files"][original_rel] = {
+        "original_rel_path": original_rel,
         "current_rel_path":  rel,
-        "original_exif":     snap,
-        "current_exif":      snap.copy(),
-        "was_renamed":       False,
+        "original_exif":     original_exif,
+        "current_exif":      dict(snap),
+        "was_renamed":       was_renamed,
         "rotation":          0,   # net clockwise degrees auto-straighten applied
         "first_seen_at":     time.strftime("%Y-%m-%dT%H:%M:%S"),
         "last_processed_at": None,
         "status":            "scanned",
     }
-    return rel
+    _index_set(cache, original_rel, rel)
+    _mark_dirty(cache, original_rel)
+    return original_rel
 
 
 def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
@@ -999,6 +1268,7 @@ def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
     if entry is None:
         return  # safety guard – should not happen
 
+    old_current = entry.get("current_rel_path")
     new_rel = os.path.relpath(new_abs_path, source_root)
     entry["current_rel_path"]  = new_rel
     entry["was_renamed"]       = (
@@ -1009,6 +1279,8 @@ def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
     # Always reflect the latest outcome — a file that was undone and then
     # re-tagged is "processed" again, not stuck at "undone".
     entry["status"] = status
+    _index_set(cache, key, new_rel, old_current=old_current)
+    _mark_dirty(cache, key)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1017,15 +1289,16 @@ def update_cache_entry(cache, source_root, orig_abs_path, new_abs_path, status):
 
 def _restore_exif_fields(path, original_snap):
     """
-    Restore the three tracked EXIF fields to their original state.
+    Restore the tracked EXIF fields to their original state.
     Fields that were absent originally (None in snapshot) are DELETED — this
     includes the processed marker, so an undone file is re-taggable.
     Fields that existed are written back from the stored raw bytes.
     Only saves the file if at least one field actually changed.
     Returns (success, changed).
 
-    Note: uses _save_with_exif which re-encodes as JPEG at quality=95,
-    consistent with how the fields were written in the first place.
+    Note: uses _save_with_exif, which patches only the EXIF segment losslessly
+    (piexif.insert, with a single re-encode fallback), consistent with how the
+    fields were written in the first place (item 6).
     """
     try:
         exif    = _load_exif_safe(path)
@@ -1055,7 +1328,7 @@ def _undo_entry(entry, source_root, undo_names, undo_exif):
     """
     Perform the undo operation for a single cache entry.
     undo_names – if True, rename the file back to its original name
-    undo_exif  – if True, restore the three tracked EXIF fields
+    undo_exif  – if True, restore the tracked EXIF fields
 
     Returns (success: bool, summary_message: str).
     The entry dict is mutated in-place on success to reflect the new state.
@@ -1199,7 +1472,10 @@ def run_undo(root, target, undo_names, undo_exif):
         else:
             fail_count += 1
 
-    save_cache(cache, root)
+    # Undo mutates entries in place and saves once at the end (not the per-image
+    # hot path), so a full rewrite is simplest and keeps the DB in step with the
+    # reverted current_rel_path / status of every entry.
+    save_cache(cache, root, full=True)
 
     print()
     print(f"  Undo complete — {ok_count} OK, {fail_count} failed.")
@@ -1336,8 +1612,9 @@ def main():
         print("    * Only files matching a camera default pattern (IMG_, DSC_, etc.)")
         print("      are renamed. Others are tagged but keep their existing name.")
         print()
-        print("  EXIF fields written:")
-        print("    * ImageDescription  — long natural-language description (20-40 words)")
+        print("  EXIF fields written (JPEG only; other formats are renamed, pixels untouched):")
+        print("    * ImageDescription  — long natural-language description (20-40 words, UTF-8)")
+        print("    * XPTitle           — same description in the Windows 'Title' field (UTF-16LE)")
         print("    * XPComment         — original filename before rename (UTF-16LE)")
         print("    * UserComment       — processing timestamp (used for skip-on-rerun)")
         print()
@@ -1349,8 +1626,8 @@ def main():
         print("    and waits for Enter before retrying.")
         print()
         print("  Undo support:")
-        print("    Every run saves a cache of original filenames and EXIF data to:")
-        print(f"    {CACHE_DIR}\\<folderhash>.cache")
+        print("    Every run records original filenames and EXIF data in the shared")
+        print(f"    SQLite cache:  {os.path.join(APP_ROOT, 'db', 'cache.db')}  (tag_files table)")
         print("    This lets you reverse renames, EXIF changes, or both at any time.")
         print()
         print("  Configuration (edit config.json at the app root, the parent of scripts/):")
@@ -1580,12 +1857,15 @@ def main():
             print(f"\n[DIR]  {rel_folder}\n")
 
         # ── Already processed? ───────────────────────────────
-        if not force_tag and is_already_processed(path):
+        # EXIF marker (JPEG) OR the cache's "processed" status (the skip signal
+        # for non-JPEG files, which carry no EXIF marker — item 2).
+        if not force_tag and is_already_processed(path, cache, root):
             print(f"  {prefix} SKIP (already tagged)  {path}")
             # Mark as skipped in cache only if it hasn't been fully processed before
             _key, _entry = _find_entry(cache, root, path)
             if _entry and _entry.get("status") == "scanned":
                 _entry["status"] = "skipped"
+                _mark_dirty(cache, _key)
                 save_cache(cache, root)
             folder_stats[dirpath]["skipped"] += 1
             total_skipped += 1
@@ -1616,6 +1896,7 @@ def main():
                 _re["rotation"] = (_re.get("rotation", 0) + rotation_cw) % 360
                 # Persist immediately so a mid-image crash can't orphan a
                 # rotated file from its undo record.
+                _mark_dirty(cache, _rk)
                 save_cache(cache, root)
 
         w, h    = get_image_dimensions(path)
@@ -1627,8 +1908,13 @@ def main():
             # 1. Analyse
             long_desc, condensed = analyse_image(path, language=language)
 
-            # 2. Write EXIF description + original filename
-            write_exif(path, long_desc, original_name)
+            # 2. Write ALL of the tag's EXIF in one lossless save (item 6):
+            #    description + XPTitle + original filename (XPComment) + the
+            #    processed marker (UserComment), before the rename so it lands on
+            #    the same bytes either way. JPEG only; a non-JPEG is left byte-for-
+            #    byte untouched and carries its description in the filename + a
+            #    "processed" marker in the cache (item 2).
+            exif_written = write_exif(path, long_desc, original_name)
 
             # 3. Rename if camera default name
             will_rename = force_rename or has_camera_default_name(original_name)
@@ -1644,14 +1930,11 @@ def main():
                 result_name = filename
                 print(f"           -> {result_name}  (tagged only, name kept)")
 
-            # 4. Write processing marker (uses final path after rename)
-            write_processed_marker(new_path)
-
-            # 5. Update cache with final state
+            # 4. Update cache with final state (also the non-JPEG skip marker)
             update_cache_entry(cache, root, path, new_path, "processed")
             save_cache(cache, root)
 
-            # 5b. Link the tagged result back to its upscaled input by content
+            # 4b. Link the tagged result back to its upscaled input by content
             # hash, so conciliation can match it even after a folder move.
             try:
                 out_hash = db.hash_file_cached(db.get_conn(), new_path)
@@ -1668,6 +1951,10 @@ def main():
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start
             print(f"           -> \"{long_desc}\"")
+            if not exif_written:
+                ext = os.path.splitext(path)[1].lower()
+                print(f"           (EXIF not embedded for {ext}: description is in "
+                      f"the filename, skip-marker in the cache)")
             if straighten_msg:
                 print(f"           {straighten_msg}")
             print(f"           Done in {fmt_mmss(img_elapsed)} | "

@@ -814,6 +814,17 @@ class PauseController:
                     return True
             time.sleep(0.5)
 
+    def force_pause(self):
+        """Programmatically enter the paused state (as if the user pressed Pause),
+        so a following .check() blocks until Resume/Stop. Used by the outage
+        handler, which must hold the run open until the user acts. Idempotent: a
+        no-op if already paused, so it never clobbers a running pause's start time
+        (which would corrupt the paused_seconds accounting)."""
+        with self._lock:
+            if not self._paused:
+                self._paused      = True
+                self._pause_start = time.time()
+
     @property
     def quit_requested(self):
         """True once a graceful quit/cancel has been requested."""
@@ -938,6 +949,48 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
         logger.terminal_only(f"  [skipped {summary}]")
 
 
+# Per-folder counters accumulated during a pass. Built from ONE factory so
+# run_pass and the two-pass merge() can't drift: merge()'s template used to omit
+# "skipped_corrupt", so `merged[d]["skipped_corrupt"] += ...` KeyError'd and took
+# down the whole end-of-run summary (table + DONE event + MQTT + notification) on
+# any run that had a rescan second pass. See item 4.
+_FOLDER_STAT_KEYS = ("processed", "skipped_done", "skipped_size",
+                     "skipped_missing", "skipped_corrupt", "failed")
+
+
+def _new_folder_stats():
+    stats = {k: 0 for k in _FOLDER_STAT_KEYS}
+    stats["elapsed"] = 0.0
+    return stats
+
+
+def _merge_pass_stats(s1, s2):
+    """Combine the stats dicts from the first pass and the rescan second pass into
+    one for the end-of-run summary. `s2` is None when there was no second pass
+    (returns `s1` unchanged). Pure and module-level so it is unit-testable; the
+    per-run flags (user_quit/degraded/remote_stopped) are deliberately NOT merged —
+    the caller reads those from the individual passes. See item 4."""
+    if s2 is None:
+        return s1
+    merged = defaultdict(_new_folder_stats)
+    for d, v in s1["folder_stats"].items():
+        for k in v:
+            merged[d][k] += v[k]
+    for d, v in s2["folder_stats"].items():
+        for k in v:
+            merged[d][k] += v[k]
+    return {
+        "folder_stats":          merged,
+        "total_processed":       s1["total_processed"]       + s2["total_processed"],
+        "total_skipped_done":    s1["total_skipped_done"]    + s2["total_skipped_done"],
+        "total_skipped_size":    s1["total_skipped_size"]    + s2["total_skipped_size"],
+        "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
+        "total_skipped_corrupt": s1["total_skipped_corrupt"] + s2["total_skipped_corrupt"],
+        "total_failed":          s1["total_failed"]          + s2["total_failed"],
+        "corrupt_files":         s1.get("corrupt_files", []) + s2.get("corrupt_files", []),
+    }
+
+
 def run_pass(work_items, root, output_root, grand_start, pause, logger,
              processed_paths, cache=None, pass_label="Pass"):
     """
@@ -986,10 +1039,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     if GUI_MODE:
         _gui_event("QUEUE", json.dumps([item[1] for item in work_items]))
 
-    folder_stats = defaultdict(lambda: {
-        "processed": 0, "skipped_done": 0, "skipped_size": 0,
-        "skipped_missing": 0, "skipped_corrupt": 0, "failed": 0, "elapsed": 0.0
-    })
+    folder_stats = defaultdict(_new_folder_stats)
 
     total_processed       = 0
     total_skipped_done    = 0
@@ -1259,10 +1309,8 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                     ]
                 )
 
-                with pause._lock:
-                    pause._paused      = True
-                    pause._pause_start = time.time()
-                    consecutive_failures = 0
+                pause.force_pause()
+                consecutive_failures = 0
 
                 if not pause.check():
                     logger.tee("  Stopping at user request.")
@@ -1317,7 +1365,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "total_skipped_corrupt": total_skipped_corrupt,
         "total_failed":          total_failed,
         "corrupt_files":         corrupt_files,
-        "user_quit":             pause._quit if hasattr(pause, '_quit') else False,
+        "user_quit":             getattr(pause, "quit_requested", False),
         "degraded":              degraded_stop,
         "remote_stopped":        remote_stopped,
     }
@@ -1712,30 +1760,8 @@ def main():
     # ── Combined summary table ──────────────────────────────────────────────
     grand_elapsed = time.time() - grand_start
 
-    # Merge stats from both passes
-    def merge(s1, s2):
-        if s2 is None:
-            return s1
-        merged = defaultdict(lambda: {
-            "processed": 0, "skipped_done": 0, "skipped_size": 0,
-            "skipped_missing": 0, "failed": 0, "elapsed": 0.0
-        })
-        for d, v in s1["folder_stats"].items():
-            for k in v: merged[d][k] += v[k]
-        for d, v in s2["folder_stats"].items():
-            for k in v: merged[d][k] += v[k]
-        return {
-            "folder_stats":          merged,
-            "total_processed":       s1["total_processed"]       + s2["total_processed"],
-            "total_skipped_done":    s1["total_skipped_done"]    + s2["total_skipped_done"],
-            "total_skipped_size":    s1["total_skipped_size"]    + s2["total_skipped_size"],
-            "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
-            "total_skipped_corrupt": s1["total_skipped_corrupt"] + s2["total_skipped_corrupt"],
-            "total_failed":          s1["total_failed"]          + s2["total_failed"],
-            "corrupt_files":         s1.get("corrupt_files", []) + s2.get("corrupt_files", []),
-        }
-
-    combined        = merge(stats1, stats2)
+    # Merge stats from both passes (module-level _merge_pass_stats, unit-tested).
+    combined        = _merge_pass_stats(stats1, stats2)
     folder_stats    = combined["folder_stats"]
     total_processed       = combined["total_processed"]
     total_skipped_done    = combined["total_skipped_done"]

@@ -425,7 +425,7 @@ class App(tk.Tk):
         """Pod ids currently in use by a running remote task, so the RunPod tab
         won't offer to terminate a pod a live run depends on."""
         ids = set()
-        for t in (self.upscale_tab, self.tag_tab):
+        for t in (self.upscale_tab, self.tag_tab, self.video_tab):
             pid = getattr(t, "active_pod_id", None)
             if pid and t.running:
                 ids.add(pid)
@@ -618,7 +618,8 @@ class App(tk.Tk):
 
     def _any_task_running(self):
         return any(t.running for t in
-                   (self.upscale_tab, self.tag_tab, self.conciliate_tab))
+                   (self.upscale_tab, self.tag_tab, self.conciliate_tab,
+                    self.video_tab))
 
     def _idle_telemetry_tick(self):
         """Sample while idle so the readout stays live between runs. Skips when a

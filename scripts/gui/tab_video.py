@@ -98,6 +98,7 @@ class VideoTab(ttk.Frame):
         self._cur_seg_done = 0
         self._run_start = None
         self._rate = None           # observed s/frame, refined from done segments
+        self._remote_rate = None    # pod's real billed $/h (RCOST); live cost readout
         self._run_tick_job = None
         self._build()
         self.after(200, self._check_readiness)
@@ -1283,8 +1284,17 @@ class VideoTab(ttk.Frame):
 
     def _handle_event(self, kind, data, payload):
         if kind == "POD":
-            self.active_pod_id = payload or None
+            # batch_video_upscale's gui_event JSON-encodes its payload, so the
+            # pod id arrives as `data` (the decoded string), not the raw payload.
+            self.active_pod_id = data or None
             self.app.notify_active_pods_changed()
+        elif kind == "RCOST" and data is not None:
+            # The deployed pod's real billed rate ($/h): arms the live accrued-cost
+            # readout in _run_tick so a paid, multi-hour run isn't flying blind.
+            try:
+                self._remote_rate = float(data)
+            except (TypeError, ValueError):
+                self._remote_rate = None
         elif kind == "VIDEO" and data:
             self._cur_rel = data.get("rel")
             self._cur_target = data.get("target")
@@ -1436,6 +1446,11 @@ class VideoTab(ttk.Frame):
         # isn't flying blind on an estimate. See worker _HeartbeatTee / SEGMENT events.
         if self._live_spf:
             tail += f" · {self._live_spf:.1f} s/frame (live)"
+        # Live accrued cost, once the pod's real billed rate is known (remote run):
+        # a paid, multi-hour video run shouldn't fly blind on the up-front estimate.
+        if self._remote_rate and self._run_start is not None:
+            spent = self._remote_rate * (now - self._run_start) / 3600.0
+            tail += f" · ${spent:.2f} so far"
         if base:
             self.status_var.set(base + tail)
         self._run_tick_job = self.after(1000, self._run_tick)
@@ -1458,6 +1473,13 @@ class VideoTab(ttk.Frame):
         self.proc = None
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        # The run is over: its pod (if any) is no longer protected from terminate.
+        # Cleared GUI-side (not via a runner event) so a hard-killed runner still
+        # releases the protection. Mirrors ToolTab.on_exit.
+        if self.active_pod_id is not None:
+            self.active_pod_id = None
+            self.app.notify_active_pods_changed()
+        self._remote_rate = None
         if self._run_tick_job is not None:
             self.after_cancel(self._run_tick_job)
             self._run_tick_job = None

@@ -542,7 +542,10 @@ class RemoteSession:
         raise rp.RunPodError("Ollama tunnel was not reachable within 60s.")
 
     def _arm_deadman(self):
-        max_min = int(self.cfg.get("max_runtime_minutes", 720))
+        # Default 0 = no hard ceiling (the idle timeout is the real switch); this
+        # matches config.json, the RunPod tab and docs. A missing key must not
+        # silently impose a 720-min cap that cuts a long batch off mid-run (item 8).
+        max_min = int(self.cfg.get("max_runtime_minutes", 0))
         idle_min = int(self.cfg.get("idle_timeout_minutes", 15))
         action = "--terminate" if self.terminate_when_done else ""
         self._emit(f"Arming dead-man's switch (max {max_min} min, idle {idle_min} min) …")

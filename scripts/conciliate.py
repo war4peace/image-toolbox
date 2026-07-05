@@ -54,6 +54,8 @@ except Exception:
     pass
 
 import db
+import config_store
+import notifications
 import runner_common
 
 # Make stdout/stderr non-ASCII-proof before any output (see runner_common).
@@ -70,6 +72,34 @@ _stdin_is_piped = runner_common.stdin_is_piped
 GUI_MODE        = runner_common.GUI_MODE
 GUI_MARKER      = runner_common.GUI_MARKER
 _gui_event      = runner_common.gui_event
+
+# Notification settings (Discord/Telegram/ntfy, see notifications.py). Loaded
+# fail-safe: config_store.load returns None on a missing/malformed config.json
+# (conciliate is otherwise config-free and must still run without one), and
+# resolve_settings({}) yields all-unconfigured backends, so send_notification is
+# then a no-op. This closes the gap where a long archive/delete finished silently
+# while upscale/tag/video all notified (item 9).
+NOTIFY = notifications.resolve_settings(config_store.load(APP_ROOT) or {})
+
+
+def send_notification(title, description, color, fields=None):
+    """Fan out an alert to every configured backend; no-op for any that isn't
+    configured, and fail-safe. Mirrors the other runners' wrapper.
+    color: integer (15548997 = red, 16776960 = yellow, 3066993 = green)."""
+    notifications.notify(NOTIFY, title, description, color, fields,
+                         username="Conciliate Bot")
+
+
+def _completion_notice(done, conflicts, errors, stopped):
+    """Pick (title, color) for the end-of-run notification from the outcome
+    (item 9). Green when the run finished clean; yellow when the user stopped it
+    or it finished with conflicts/errors. Pure, so it is unit-tested.
+    color: 16776960 = yellow, 3066993 = green."""
+    if stopped:
+        return "Conciliation -- Stopped by User", 16776960
+    if errors > 0 or conflicts > 0:
+        return "Conciliation -- Finished with Issues", 16776960
+    return "Conciliation -- Finished", 3066993
 
 
 def _norm(p):
@@ -545,6 +575,22 @@ def main():
         {"done": done, "conflicts": conflicts, "errors": errors,
          "removed_dirs": removed_dirs}))
     _gui_event("STATUS", f"Done — {done} image(s) replaced.")
+
+    # Notify: conciliation used to finish silently (item 9). Colour by outcome,
+    # matching the upscaler's palette (green clean, yellow stopped/with-issues).
+    n_title, n_color = _completion_notice(done, conflicts, errors, _quit_evt.is_set())
+    send_notification(
+        title       = n_title,
+        description = f"{done} replaced, {conflicts} skipped (conflict), {errors} error(s).",
+        color       = n_color,
+        fields      = [
+            {"name": "Original",  "value": original_root},
+            {"name": "Operation", "value": "Archive" if mode == "archive" else "Delete"},
+            {"name": "Elapsed",   "value": f"{elapsed:.1f}s"},
+            {"name": "Machine",   "value": os.environ.get("COMPUTERNAME", "unknown")},
+        ],
+    )
+
     log.close()
     sys.exit(0 if errors == 0 else 1)
 

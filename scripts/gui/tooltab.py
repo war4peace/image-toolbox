@@ -230,9 +230,10 @@ class ToolTab(ttk.Frame):
         self.gpu_combo.pack(side="left")
         Tooltip(self.gpu_combo,
                 "GPUs that can be rented in your volume's region right now, "
-                "cheapest first. Live availability and price from RunPod. If your "
-                "pick is unavailable, only cheaper in-stock cards under the price "
-                "ceiling (RunPod tab) are tried automatically.")
+                "cheapest first. Live availability and price from RunPod. The run "
+                "uses exactly the card you pick, with no automatic substitution: if "
+                "it has sold out by the time the pod deploys, the run stops cleanly "
+                "and you press ↻ to refresh stock and pick another.")
         self.gpu_refresh_btn = ttk.Button(
             rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
         self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
@@ -807,7 +808,7 @@ class ToolTab(ttk.Frame):
         Returns True to proceed."""
         rp = CFG.get("runpod", {})
         try:
-            max_run = int(rp.get("max_runtime_minutes", 720))
+            max_run = int(rp.get("max_runtime_minutes", 0))   # 0 = no limit (item 8)
             idle    = int(rp.get("idle_timeout_minutes", 15))
         except (TypeError, ValueError):
             return True

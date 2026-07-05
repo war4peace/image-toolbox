@@ -79,16 +79,14 @@ AUTO_TEMPORAL_OVERLAP = -1
 
 WORK_DIRNAME = ".imgtbx_video"        # per-output-tree work area for segments
 
-GUI_MARKER = "@@TBX@@"
-
-
-def _gui_mode():
-    try:
-        return sys.stdin is not None and not sys.stdin.isatty()
-    except Exception:
-        return False
-
-GUI_MODE = _gui_mode()
+# The @@TBX@@ event protocol + GUI-mode detection live in runner_common (0.4.3
+# item 5). Re-export them here exactly as the other three runners do, instead of
+# keeping private copies that could drift from the shared marker/atomic-write rule
+# (item 7). gui_event() below wraps the shared emitter with this runner's JSON
+# convenience (every video payload is a list/dict/scalar sent as JSON).
+GUI_MARKER      = runner_common.GUI_MARKER
+GUI_MODE        = runner_common.GUI_MODE
+_stdin_is_piped = runner_common.stdin_is_piped
 
 
 _LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
@@ -142,17 +140,19 @@ def log(msg):
 
 
 def gui_event(kind, payload):
-    """Machine-readable event line for the future GUI tab (phase 5); a no-op
-    headless. Mirrors batch_upscale's GUI_MARKER convention.
+    """Machine-readable event line for the GUI tab; a no-op headless. Every video
+    payload is a Python object (list/dict/scalar), so this JSON-encodes it and
+    hands the resulting string to runner_common.gui_event, which does the atomic,
+    tee-aware write of `<GUI_MARKER><KIND>|<payload>` (item 7). Event kinds:
       QUEUE|<json list of rel paths>
       VIDEO|<json>     – the video now being processed (rel, index, total, segments)
       SEGMENT|<json>   – per-segment progress (video_rel, seg_index, total, state)
       VRESULT|<json>   – [rel, "ok"|"fail"|"skip", output_path, warnings?]
       RTELEM|<json>    – a remote-pod telemetry sample (cpu/ram/gpu)
+      POD|<pod id>     – the live remote pod (empty on none); protects it from terminate
+      RCOST|<float>    – the pod's real billed $/h, for the live cost readout
     """
-    if GUI_MODE:
-        sys.stdout.write(f"{GUI_MARKER}{kind}|{json.dumps(payload)}\n")
-        sys.stdout.flush()
+    runner_common.gui_event(kind, json.dumps(payload))
 
 
 def _start_remote_telemetry(engine, stop, interval=10.0):
@@ -845,6 +845,16 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     return summary
 
 
+def _failure_notice(started, exc):
+    """(title, description) for the run-failure notification (item 9). `started`
+    True = the engine was up and the run crashed mid-flight; False = the pod/engine
+    never started (the path that used to be silent). Pure, so it is unit-tested."""
+    if started:
+        return "Video upscale failed", f"The run stopped on an error.\n{exc}"
+    return ("Video upscale failed to start",
+            f"Could not start the remote pod/engine.\n{exc}")
+
+
 def _notify_summary(notify_settings, summary, src_root):
     if not notify_settings:
         return
@@ -928,6 +938,15 @@ def main(argv=None):
                                     APP_ROOT, on_event=log, mode="video")
             engine = session.start()
             budget.cost_per_hr = session.cost_per_hr
+            # Tell the GUI which pod is live so the RunPod tab won't offer to
+            # terminate the pod this (paid, multi-hour) run depends on, and hand
+            # it the pod's real billed $/h for the live cost readout. Mirrors the
+            # image runners (batch_upscale / tag_and_rename). NOTE: this runner's
+            # gui_event() JSON-encodes its payload, so the Video tab reads the
+            # decoded value (data), not the raw payload string.
+            gui_event("POD", session.pod_id or "")
+            if session.cost_per_hr is not None:
+                gui_event("RCOST", session.cost_per_hr)
             # Stream the pod's CPU/RAM/GPU to the GUI's remote-telemetry row.
             _start_remote_telemetry(engine, tele_stop)
 
@@ -940,6 +959,19 @@ def main(argv=None):
         log("")
         log(f"Run failed: {exc}")
         log(traceback.format_exc())
+        # Notify: a failure BEFORE the engine started (pod couldn't be created /
+        # deployed) used to be silent, unlike the image runners' red "Engine Failed
+        # to Start" alert; a mid-run crash that escapes run_queue is likewise
+        # reported here (per-video failures are covered by the summary). Item 9.
+        title, desc = _failure_notice(engine is not None, exc)
+        try:
+            notifications.notify(
+                notify_settings, title, desc, 0xE74C3C,   # red
+                fields=[{"name": "Source",  "value": src_root},
+                        {"name": "Machine", "value": os.environ.get("COMPUTERNAME", "unknown")}],
+            )
+        except Exception:
+            pass
         return 1
     finally:
         tele_stop.set()
