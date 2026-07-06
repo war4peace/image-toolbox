@@ -474,11 +474,35 @@ def eligible_targets(width, height, skip_cutoff_pct=0):
     return out
 
 
-def _output_path(output_root, rel, target):
+def _tc(seconds):
+    """A filesystem-safe timecode for a clip filename: 161.0 -> '02m41s'."""
+    s = max(0, int(round(seconds or 0)))
+    return f"{s // 60:02d}m{s % 60:02d}s"
+
+
+def _clip_slug(label):
+    """A short filesystem-safe slug from a user clip label (letters/digits/-/_ only),
+    or '' when the label is empty/unusable."""
+    import re
+    s = re.sub(r"[^0-9A-Za-z_]+", "-", (label or "").strip()).strip("-")
+    return s[:40]
+
+
+def _output_path(output_root, rel, target, clip_id=0, clip_label=None,
+                 clip_start=None, clip_end=None):
     """Mirror the source tree under output_root, encoding the target in the name:
-    <output_root>/<rel_dir>/<base>_<target>.mp4 (15.1)."""
+    <output_root>/<rel_dir>/<base>_<target>.mp4 (15.1). For a CLIP (clip_id > 0,
+    section 16.6) the range is encoded too so two scenes of the same source+target
+    never collide: <base>_<label-or-mmss-mmss>_<target>.mp4, with clip_id as the
+    last-resort uniquifier when two clips share a label/range."""
     rel_dir = os.path.dirname(rel)
     base = os.path.splitext(os.path.basename(rel))[0]
+    if clip_id:
+        tag = _clip_slug(clip_label)
+        if not tag and clip_start is not None and clip_end is not None:
+            tag = f"{_tc(clip_start)}-{_tc(clip_end)}"
+        tag = tag or f"clip{clip_id}"
+        return os.path.join(output_root, rel_dir, f"{base}_{tag}_{target}.mp4")
     return os.path.join(output_root, rel_dir, f"{base}_{target}.mp4")
 
 
@@ -548,6 +572,50 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
             "width": info.width, "height": info.height}
 
 
+def prepare_clip(conn, root_id, source_root, output_root, rel, target,
+                 start, end, label, vcfg):
+    """Enqueue a VIRTUAL clip job (the segment extractor, section 16.6/16.7): a new
+    video_outputs row with a fresh clip_id and the marked [start, end) range. Unlike
+    prepare_job this does NOT extract or count frames here — the subclip is
+    materialised only at run time in the work area (source never touched), so
+    clip_frames is the CFR approximation `(end-start) * fps`; the exact count and the
+    drift reference come from the extracted clip's segments at run time. Caches the
+    source properties (fast metadata) so the queue list can show them. Returns a dict
+    with the assigned clip_id and the estimate inputs. Always adds a new clip (clip
+    ids are unique per source), so calling twice makes two clips."""
+    abs_path = os.path.join(source_root, rel)
+    start, end = float(start), float(end)
+    if end <= start:
+        raise ValueError(f"clip end {end:.3f}s must be after start {start:.3f}s")
+    info = vp.probe(abs_path)                      # metadata only (dims/fps/duration)
+    end = min(end, info.duration or end)           # clamp to the source length
+    try:
+        st = os.stat(abs_path)
+        db.upsert_video_file(conn, root_id, rel,
+                             width=info.width, height=info.height,
+                             vcodec=info.vcodec, acodec=info.acodec,
+                             fps=float(info.fps), duration=info.duration,
+                             mtime=round(st.st_mtime, 3), size=st.st_size,
+                             probe_version=db.VIDEO_PROBE_VERSION)
+    except OSError:
+        pass
+    fps = float(info.fps) or 0.0
+    clip_frames = max(1, round((end - start) * fps)) if fps else 0
+    clip_id = db.next_clip_id(conn, root_id, rel)
+    out_path = _output_path(output_root, rel, target, clip_id=clip_id,
+                            clip_label=label, clip_start=start, clip_end=end)
+    db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
+                           status="queued", output_path=out_path,
+                           queue_order=db.next_queue_order(conn, root_id),
+                           clip_start=start, clip_end=end,
+                           clip_label=(label or None), clip_frames=clip_frames)
+    seg_secs = vcfg["segment_seconds"]
+    approx_segments = max(1, math.ceil((end - start) / seg_secs)) if seg_secs else 1
+    return {"clip_id": clip_id, "nb_frames": clip_frames, "duration": end - start,
+            "segments": approx_segments,
+            "width": info.width, "height": info.height}
+
+
 def enqueue_folder(conn, root_id, source_root, output_root, target, vcfg):
     """Headless CLI helper: scan the tree and Prepare every ELIGIBLE video to
     `target` (the GUI does this per-file via prepare_job). Skips ineligible files
@@ -577,10 +645,18 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     StopInstallment when a cap is hit mid-job (the rest stays pending, the job is
     marked 'partial')."""
     rel, target = job["rel_path"], job["target"]
+    clip_id = job["clip_id"] or 0                  # 0 = whole file; >0 = a virtual clip
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
-        os.path.join(source_root, vcfg["output_subdir"]), rel, target)
-    info = vp.probe(src_abs, count=True)          # counted frames: CFR-mistag (14) + drift
+        os.path.join(source_root, vcfg["output_subdir"]), rel, target,
+        clip_id=clip_id,
+        clip_label=job["clip_label"] if clip_id else None,
+        clip_start=job["clip_start"] if clip_id else None,
+        clip_end=job["clip_end"] if clip_id else None)
+    # Whole file: count frames now (CFR-mistag/drift). Clip: only dims/fps are needed
+    # from the WHOLE source (a clip shares them); counting the whole 45-min source
+    # would be wasted work, so probe metadata-only and count the extracted clip below.
+    info = vp.probe(src_abs, count=not clip_id)
     # SeedVR2's --resolution is the output SHORT side. Compute it so the output FITS
     # the target's landscape box (max width OR max height) at the source aspect: for a
     # portrait clip the long side (height) hits the box cap, so the short side is < the
@@ -588,31 +664,54 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # short side if dims are unreadable.
     import video_estimate as ve
     resolution = ve.fit_short_side(info.width, info.height, target) or TARGET_RES.get(target, 1080)
-    gui_event("VIDEO", {"rel": rel, "target": target, "index": index, "total": total,
-                        "width": info.width, "height": info.height,
-                        "frames": info.nb_frames})
 
     os.makedirs(os.path.dirname(out_video), exist_ok=True)
     in_dir, up_dir, work_root = _work_dirs(out_video)
     os.makedirs(up_dir, exist_ok=True)
-    db.upsert_video_output(conn, root_id, rel, target, status="splitting",
-                           output_path=out_video, skip_reason=None)
+    db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
+                           status="splitting", output_path=out_video, skip_reason=None)
 
-    segs, mode = ensure_split(info, in_dir, vcfg)
+    # For a CLIP, materialise the marked [start, end) range into the work area and
+    # treat THAT as the source to split/upscale/mux (section 16.7). The extraction is
+    # virtual: it lives only in the hidden work dir (reused on resume, removed on
+    # completion), so the source tree is never touched. `job_info` (the clip's frames,
+    # duration and audio) drives the split, drift reference and audio mux; the whole-
+    # source `info` is used only for the output resolution (a clip shares its dims).
+    if clip_id:
+        os.makedirs(work_root, exist_ok=True)
+        clip_src = os.path.join(work_root, "clip" + vp.SEGMENT_EXT)
+        if not os.path.exists(clip_src):
+            vp.extract_clip(info, job["clip_start"], job["clip_end"], clip_src,
+                            log=lambda m: log("    " + str(m).strip()))
+        job_info = vp.probe(clip_src, count=True)
+        mux_source = clip_src
+        log(f"[{index}/{total}] {rel} clip #{clip_id} "
+            f"[{_tc(job['clip_start'])}-{_tc(job['clip_end'])}]"
+            + (f' "{job["clip_label"]}"' if job["clip_label"] else "")
+            + f": {job_info.nb_frames}f extracted")
+    else:
+        job_info = info
+        mux_source = src_abs
+
+    gui_event("VIDEO", {"rel": rel, "target": target, "index": index, "total": total,
+                        "width": info.width, "height": info.height,
+                        "frames": job_info.nb_frames, "clip_id": clip_id})
+
+    segs, mode = ensure_split(job_info, in_dir, vcfg)
     if not segs:
         raise vp.FFmpegError(f"split produced no segments for {rel}")
     log(f"[{index}/{total}] {rel} -> {target}: {info.width}x{info.height} "
-        f"{info.nb_frames}f; {len(segs)} segment(s) ({mode})")
+        f"{job_info.nb_frames}f; {len(segs)} segment(s) ({mode})")
 
-    recorded = db.get_video_segments(conn, root_id, rel, target)
+    recorded = db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
     if len(recorded) != len(segs):
-        db.clear_video_segments(conn, root_id, rel, target)
+        db.clear_video_segments(conn, root_id, rel, target, clip_id=clip_id)
         for s in segs:
-            db.upsert_video_segment(conn, root_id, rel, target, s.index,
+            db.upsert_video_segment(conn, root_id, rel, target, s.index, clip_id=clip_id,
                                     in_frames=s.frame_count, status="pending")
-        recorded = db.get_video_segments(conn, root_id, rel, target)
+        recorded = db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
 
-    db.upsert_video_output(conn, root_id, rel, target, status="streaming")
+    db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="streaming")
     # AUTO (batch 0 / overlap -1 / chunk 0) is resolved ON THE POD from its real VRAM
     # and the output resolution; an explicit value overrides. We pass the sentinels
     # through and log what the pod chose when it reports back (see _progress).
@@ -695,8 +794,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             use_10bit=vcfg["use_10bit"], on_progress=_progress,
             should_stop=_STOP.is_set)        # responsive Stop: abort the poll mid-segment
         secs = getattr(engine, "last_segment_seconds", None)
-        db.upsert_video_segment(conn, root_id, rel, target, s.index, status="done",
-                                out_frames=n, output_path=up_path, seconds=secs)
+        db.upsert_video_segment(conn, root_id, rel, target, s.index, clip_id=clip_id,
+                                status="done", out_frames=n, output_path=up_path,
+                                seconds=secs)
         total_secs += secs or 0
         budget.add(secs)
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
@@ -717,10 +817,10 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 pass
 
         cap = budget.exceeded() or ("stopped by user" if _STOP.is_set() else None)
-        remaining = [r for r in db.get_video_segments(conn, root_id, rel, target)
+        remaining = [r for r in db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
                      if r["status"] != "done"]
         if cap and remaining:
-            db.upsert_video_output(conn, root_id, rel, target, status="partial")
+            db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="partial")
             log(f"  PAUSED: {cap}; stopping after this segment "
                 f"({len(remaining)} segment(s) left — resume to continue).")
             raise StopInstallment(cap)
@@ -741,7 +841,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             joined = os.path.join(stage, "concat.mp4")
             vp.concat_segments(up_paths, joined)
         staged_out = os.path.join(stage, "final" + (os.path.splitext(out_video)[1] or ".mp4"))
-        vp.mux_audio(joined, src_abs, staged_out, log=lambda m: log("    " + m.strip()))
+        # Mux from the CLIP (its clipped audio range) for a clip job, else the source.
+        vp.mux_audio(joined, mux_source, staged_out, log=lambda m: log("    " + m.strip()))
         stage_info = vp.probe(staged_out, count=True)
         if not stage_info.nb_frames:              # fail loudly, never ship a dud
             raise vp.FFmpegError(f"reassembled output has no decodable frames: {rel}")
@@ -750,10 +851,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         shutil.rmtree(stage, ignore_errors=True)
     out_info = vp.probe(out_video, count=True)
 
-    seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel, target)]
+    seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)]
     reference = sum(s.frame_count for s in segs)   # SeedVR2 preserves per-segment frames (6.3)
-    report = vp.check_drift(info, out_info, seg_out, reference_frames=reference)
-    db.upsert_video_output(conn, root_id, rel, target, status="done",
+    # Drift is checked against the CLIP (job_info) for a clip job, not the whole source.
+    report = vp.check_drift(job_info, out_info, seg_out, reference_frames=reference)
+    db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="done",
                            output_path=out_video, out_frames=out_info.nb_frames)
     shutil.rmtree(work_root, ignore_errors=True)
     try:
@@ -766,8 +868,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             f"({out_info.nb_frames} frames)")
     else:
         log(f"[{index}/{total}] DONE (review) {rel}: " + "; ".join(report.warnings))
-    gui_event("VRESULT", {"rel": rel, "target": target, "outcome": "ok",
-                          "output_path": out_video, "warnings": report.warnings})
+    gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
+                          "outcome": "ok", "output_path": out_video,
+                          "warnings": report.warnings})
     return "done", total_secs
 
 
@@ -775,9 +878,13 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
 #  RUN THE QUEUE
 # ─────────────────────────────────────────────
 
-def _job_frames(conn, root_id, rel):
-    """Counted source frames for a job's video (0 if not yet probed)."""
-    vf = db.get_video_file(conn, root_id, rel)
+def _job_frames(conn, root_id, job):
+    """Frame count that a queued job contributes to the progress denominator. For a
+    CLIP that's its (approximate) clip_frames; for a whole-file job it's the source's
+    counted nb_frames. 0 if not yet probed."""
+    if job["clip_id"]:
+        return job["clip_frames"] or 0
+    vf = db.get_video_file(conn, root_id, job["rel_path"])
     return (vf["nb_frames"] if vf and vf["nb_frames"] else 0) or 0
 
 
@@ -798,42 +905,41 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     done = failed = 0
     done_frames = 0
     stopped = None
-    attempted = set()                  # (rel, target) tried this run
+    attempted = set()                  # (rel, target, clip_id) tried this run
     while not _STOP.is_set():
         pending = [j for j in db.get_video_queue(conn, root_id)
-                   if (j["rel_path"], j["target"]) not in attempted]
+                   if (j["rel_path"], j["target"], j["clip_id"]) not in attempted]
         # Keep the GUI's progress denominator honest as the live queue changes.
-        live_total = done_frames + sum(_job_frames(conn, root_id, j["rel_path"])
-                                       for j in pending)
+        live_total = done_frames + sum(_job_frames(conn, root_id, j) for j in pending)
         gui_event("VTOTAL", live_total)
         if not pending:
             break
         job = pending[0]
-        rel, target = job["rel_path"], job["target"]
-        attempted.add((rel, target))
+        rel, target, clip_id = job["rel_path"], job["target"], job["clip_id"]
+        attempted.add((rel, target, clip_id))
         idx = done + failed + 1
         total = idx + len(pending) - 1
         try:
             process_job(engine, conn, root_id, source_root, job, vcfg, budget,
                         idx, total)
             done += 1
-            done_frames += _job_frames(conn, root_id, rel)
+            done_frames += _job_frames(conn, root_id, job)
         except StopInstallment as exc:
             stopped = str(exc)
             break
         except _RemoteVideoStopped:                    # responsive Stop, mid-segment
-            db.upsert_video_output(conn, root_id, rel, target, status="partial")
+            db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="partial")
             log(f"[{idx}/{total}] STOPPED {rel} -> {target} "
                 f"(aborted mid-segment; pod will be torn down).")
             stopped = "stopped by user"
             break
         except Exception as exc:                       # noqa: BLE001 — log, keep going
             failed += 1
-            db.upsert_video_output(conn, root_id, rel, target, status="failed",
-                                   skip_reason=str(exc)[:300])
+            db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
+                                   status="failed", skip_reason=str(exc)[:300])
             log(f"[{idx}/{total}] FAILED {rel} -> {target}: {exc}")
-            gui_event("VRESULT", {"rel": rel, "target": target, "outcome": "fail",
-                                  "error": str(exc)[:300]})
+            gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
+                                  "outcome": "fail", "error": str(exc)[:300]})
     if _STOP.is_set() and stopped is None:
         stopped = "stopped by user"
 

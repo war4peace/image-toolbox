@@ -458,6 +458,56 @@ def split(info: VideoInfo, plan: SplitPlan, out_dir, segment_ext=SEGMENT_EXT):
 
 
 # ─────────────────────────────────────────────
+#  Clip extraction (segment extractor, section 16.7)
+# ─────────────────────────────────────────────
+
+def extract_clip(info: VideoInfo, start, end, out_path, log=None):
+    """Extract a FRAME-ACCURATE subclip [start, end) from info.path, WITH its audio
+    range, into out_path (a work-area file; the source is never touched). The whole
+    downstream pipeline (plan_split -> split -> upscale -> concat -> mux -> drift)
+    then runs on this subclip unchanged, so a clip is just a different *input*.
+
+    Accuracy vs speed: a fast keyframe input-seek to a few seconds BEFORE the cut,
+    then an accurate output-seek for the residual plus `-t` for the duration (the
+    standard ffmpeg accurate-cut idiom). So a clip near the end of a long source
+    does not decode the whole file, yet the first output frame is the marked one.
+
+    The video is re-encoded (pick_encoder: nvenc/CPU, `yuv420p`) and the audio is
+    re-encoded to AAC so both are trimmed to the exact range together (a `-c copy`
+    audio with an input seek can start on the wrong packet and desync the clip).
+    Quality is a non-issue: this is an intermediate that SeedVR2 re-decodes and
+    hallucinates detail over, the same reasoning as the split re-encode (6.4/14).
+    Returns out_path; raises FFmpegError on a bad range or an ffmpeg failure."""
+    ffmpeg, _ = find_ffmpeg()
+    start = max(0.0, float(start))
+    end = float(end)
+    if end <= start:
+        raise FFmpegError(f"clip end {end:.3f}s must be after start {start:.3f}s")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    # Fast input seek to a keyframe a little before the cut, accurate output trim after.
+    pad = min(start, 5.0)
+    left = start - pad                     # keyframe input-seek target (>= 0)
+    codec, enc_args, _hw = pick_encoder()
+    args = [ffmpeg, "-hide_banner", "-y",
+            "-ss", f"{left:.3f}", "-i", info.path,
+            "-ss", f"{pad:.3f}", "-t", f"{end - start:.3f}",
+            "-map", "0:v:0", "-c:v", codec, *enc_args, "-pix_fmt", "yuv420p"]
+    if info.has_audio:
+        # Optional audio stream (`0:a:0?`): some clips of a source may lose audio if
+        # the range falls outside an odd audio track, and `?` keeps that non-fatal.
+        args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "192k"]
+    else:
+        args += ["-an"]
+    args += [out_path]
+    if log:
+        log(f"clip: {os.path.basename(info.path)} [{start:.3f}s-{end:.3f}s] "
+            f"-> {os.path.basename(out_path)} ({codec})")
+    _run(args, capture=True)
+    return out_path
+
+
+# ─────────────────────────────────────────────
 #  Reassemble (concat + audio mux) — both -c copy (6.4)
 # ─────────────────────────────────────────────
 
