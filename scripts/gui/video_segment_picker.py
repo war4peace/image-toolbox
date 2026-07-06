@@ -22,7 +22,7 @@ from tkinter import ttk, messagebox
 
 from gui.common import APP_TITLE, CREATE_NO_WINDOW
 from gui.video_player import (VideoPlayer, VLC_AVAILABLE, load_vlc,
-                              nearest_keyframe, time_to_frame)
+                              prompt_install_libvlc, nearest_keyframe, time_to_frame)
 
 
 def validate_marks(start, end, duration):
@@ -123,6 +123,8 @@ class VideoSegmentPicker(tk.Toplevel):
         if not self._use_vlc:
             ttk.Button(tr, text="Open in player ▶", command=self._open_external).pack(
                 side="right")
+            ttk.Button(tr, text="Install libVLC…", command=self._install_vlc).pack(
+                side="right", padx=(0, 6))
         self.timeline = ttk.Scale(self, from_=0.0, to=1.0, orient="horizontal",
                                   command=self._on_slider)
         self.timeline.grid(row=3, column=0, sticky="ew", padx=10)
@@ -317,6 +319,16 @@ class VideoSegmentPicker(tk.Toplevel):
             os.startfile(self.src_abs)               # audio cue in the default player
         except Exception as exc:                     # noqa: BLE001
             messagebox.showerror(APP_TITLE, f"Could not open:\n{exc}")
+
+    def _install_vlc(self):
+        """Offer to install libVLC in-app (an install predating the feature). On
+        success, playback is available the next time this window is opened."""
+        def done(ok):
+            if ok:
+                messagebox.showinfo(
+                    APP_TITLE, "libVLC installed. Close and reopen 'Extract segment…' "
+                               "to play the video with audio.")
+        prompt_install_libvlc(self, on_done=done)
 
     # ── marks ────────────────────────────────────────────────────────────────
 

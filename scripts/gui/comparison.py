@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui.common import APP_TITLE, CREATE_NO_WINDOW, _geometry_on_screen, save_settings
-from gui.video_player import VideoPlayer, load_vlc
+from gui.video_player import VideoPlayer, load_vlc, prompt_install_libvlc
 
 
 # ─────────────────────────────────────────────
@@ -558,8 +558,14 @@ class VideoComparisonWindow(ComparisonWindow):
     def _toggle_play(self):
         if self._playing:
             self._exit_play()
-        else:
-            self._enter_play()
+            return
+        if not load_vlc():
+            # Offer the in-app install (bootstrap may predate the feature), then
+            # start playback if it succeeds.
+            prompt_install_libvlc(
+                self, on_done=lambda ok: self._enter_play() if ok else None)
+            return
+        self._enter_play()
 
     def _ensure_players(self):
         if self._players_frame is not None:
@@ -578,11 +584,10 @@ class VideoComparisonWindow(ComparisonWindow):
             return
         if not self._ensure_players():
             from tkinter import messagebox
-            messagebox.showinfo(
+            messagebox.showwarning(
                 APP_TITLE,
-                "In-app playback needs libVLC, which isn't installed. Re-run the "
-                "first-launch setup to enable it. You can still scrub frame by frame "
-                "and use the before/after wipe.")
+                "Video playback could not start (libVLC failed to initialise). You "
+                "can still scrub frame by frame and use the before/after wipe.")
             return
         # Swap the wipe canvas for the two players.
         self.canvas.pack_forget()

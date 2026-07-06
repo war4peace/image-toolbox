@@ -74,8 +74,10 @@ class SegmentsManager(tk.Toplevel):
         super().__init__(master)
         self.tab = tab
         self.title(f"{APP_TITLE} — Segments")
-        self.geometry("760x420")
-        self.minsize(560, 300)
+        # Min width matches the main window so the right-side action buttons are
+        # never clipped (bug: they were cut off at the old 560px min).
+        self.geometry("940x460")
+        self.minsize(900, 320)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         cols = ("label", "range", "dur", "target", "status")

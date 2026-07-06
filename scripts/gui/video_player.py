@@ -72,9 +72,90 @@ def load_vlc():
     return VLC_AVAILABLE
 
 
+def reload_vlc():
+    """Re-attempt the guarded import (after an in-app install). Clears the one-shot
+    cache so a fresh `import vlc` runs against the just-downloaded libVLC."""
+    global _LOAD_TRIED, _VLC_LOAD_ERROR, VLC_AVAILABLE
+    _LOAD_TRIED = False
+    _VLC_LOAD_ERROR = None
+    VLC_AVAILABLE = False
+    return load_vlc()
+
+
 def vlc_error():
     """The exception (if any) that prevented libVLC from loading, for a UI hint."""
     return _VLC_LOAD_ERROR
+
+
+def prompt_install_libvlc(parent, on_done=None):
+    """Offer to download + install libVLC (+ python-vlc) in-app, for an install made
+    before bootstrap fetched it (section 16.2). If already available, calls
+    on_done(True) at once. Otherwise asks, runs the install off the UI thread behind a
+    small progress dialog, reloads libVLC, and calls on_done(bool available). Fail-safe."""
+    import threading
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    from gui.common import APP_TITLE
+
+    if load_vlc():
+        if on_done:
+            on_done(True)
+        return
+    if not messagebox.askyesno(
+            APP_TITLE,
+            "In-app video playback needs libVLC (a ~40 MB download) plus the "
+            "python-vlc package.\n\nDownload and install it now?"):
+        if on_done:
+            on_done(False)
+        return
+
+    dlg = tk.Toplevel(parent)
+    dlg.title("Installing libVLC")
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    ttk.Label(dlg, text="Downloading and installing libVLC…",
+              padding=(14, 12, 14, 4)).pack()
+    pb = ttk.Progressbar(dlg, mode="indeterminate", length=300)
+    pb.pack(padx=14, pady=(0, 6))
+    pb.start(12)
+    status = tk.StringVar(value="Starting…")
+    ttk.Label(dlg, textvariable=status, foreground="#7f8a99",
+              padding=(14, 0, 14, 12)).pack()
+    try:
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+
+    def _set(msg):
+        try:
+            status.set(msg)
+        except tk.TclError:
+            pass
+
+    def _done(ok, msg):
+        try:
+            pb.stop()
+            dlg.grab_release()
+            dlg.destroy()
+        except tk.TclError:
+            pass
+        available = reload_vlc() if ok else False
+        if not ok:
+            messagebox.showerror(APP_TITLE, f"Could not install libVLC:\n{msg}\n\n"
+                                            "You can still scrub frame by frame.")
+        elif not available:
+            messagebox.showwarning(
+                APP_TITLE, "libVLC was installed but could not be loaded. A restart "
+                           "of the app may be needed.")
+        if on_done:
+            on_done(bool(available))
+
+    def work():
+        import vlc_setup
+        ok, msg = vlc_setup.install(progress=lambda m: parent.after(0, _set, m))
+        parent.after(0, _done, ok, msg)
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 # ── the widget ───────────────────────────────────────────────────────────────
