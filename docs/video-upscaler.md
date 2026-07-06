@@ -428,6 +428,51 @@ cheapest total, least exposure on a dropped connection. The big cards win wall-c
 time and longer windows, not cost. **1080p ->
 5090** is now confirmed.
 
+### KNOWN BUG (2026-07-07): the VRAM auto-fit collapses the batch to the floor on an offload card
+
+Found on a real GUI run: 7B fp16, `640x480 -> 1080p` (box-fit output `1440x1080`,
+1.556 MP), a 196-frame segment, on the RTX 5090. The pod resolved **`batch_size 5,
+temporal_overlap 4`**, i.e. stride `5 - 4 = 1` frame per pass, so **~192 passes over
+196 frames (~5x redundant compute)**. An explicit `video.batch_size = 73` in config
+was silently **clamped to 5**.
+
+Measured on that run: **peak 17.5 GB working set / 29.0 GB reserved** at bs5. The
+`_VRAM_PROFILES` model in `pod/worker.py` predicted **~41 GB** for bs5. It over-predicts
+by ~2.3x, and the 5090 table above is the ground truth it should reproduce (safe through
+**bs45** at 0.94 s/frame, continuity ceiling **bs61**, OOM **bs89**).
+
+Three compounding causes, all in `pod/worker.py` `_ws_gb` / `_max_vram_batch` /
+`_resolve_auto_params`:
+
+1. **It counts the 16 GB of weights that are NOT in VRAM.** A 32 GB card is below the
+   40 GB threshold, so the engine runs `resident=False` (DiT/VAE offloaded to CPU, see
+   the section header above), yet `_ws_gb` uses `FIXED=16.3` (the resident-weight floor)
+   regardless. The offloaded weights should drop out of the prediction.
+2. **It bounds the wrong metric.** The profile predicts torch WORKING SET, but the real
+   OOM/thrash limit is RESERVED (this run: 29 GB reserved at bs5; the benchmark's
+   "30.7 GB plateau" is also reserved, OOM at bs89). The clamp guards working set against
+   a card-size budget, which is neither the right number nor the right ceiling.
+3. **The budget is over-tight for a small card.** `budget = min(32 x 0.90, 32 - 6) = 26 GB`,
+   below the ~31 GB this card safely runs at bs61. The `_VRAM_HEADROOM_GB = 6` absolute
+   reserve, meant to protect small cards, is what strangles them here.
+
+Net: `_max_vram_batch` returns `_BATCH_FLOOR` (5) and any explicit batch clamps to 5.
+`_auto_overlap(5)` is then forced to `batch - 1 = 4`, giving the stride-1 disaster.
+
+**Safe to fix aggressively:** OOM auto-recovery already exists (`pod/worker.py`
+`_is_oom` + the retry-smaller loop, down to the floor), so an over-optimistic batch
+self-corrects instead of crashing.
+
+**Fix plan (not yet done, deferred behind a more urgent bug):**
+- **Step 1 (small, unblocks testing):** honor an EXPLICIT (Advanced-override) batch
+  WITHOUT the VRAM pre-clamp: keep `_fit_batch_to_frames` and let OOM-recovery backstop.
+  The AUTO path stays guarded. This alone lets `batch_size = 73` actually run (~3 windows
+  over 196 frames) and lets us gather real working-set/reserved anchors at larger batches
+  (the clamp currently blocks getting them: chicken-and-egg).
+- **Step 2 (with those anchors):** recalibrate the offload AUTO path to drop the resident-
+  weight term from `FIXED` when `resident=False` and to bound RESERVED, so AUTO picks
+  ~45-61 on the 5090 instead of 5.
+
 ### Measured results (fifth pass: A100 80 GB PCIe, 1440p) - the cheap card LOSES here
 
 The card expected to be the cheap 1440p pick (EU-RO-1, $1.39/h). Resident (80 GB > 40 GB).
