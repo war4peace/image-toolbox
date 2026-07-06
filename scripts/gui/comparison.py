@@ -704,7 +704,12 @@ class VideoPlaybackWindow(tk.Toplevel):
         self._play_btn.configure(text="⏸ Pause")
         self._src_player.play()
         self._up_player.play()
-        self.after(300, self._apply_audio)         # audio output exists only once playing
+        # libVLC creates the audio output only once playback truly starts, and the
+        # exact moment varies by host/aout, so a single set-mute right after play()
+        # can land BEFORE the output exists and be silently ignored (no sound). Apply
+        # the routing several times as it comes up.
+        for delay in (150, 400, 900, 1500):
+            self.after(delay, self._apply_audio)
         self._schedule_resync()
 
     def _pause(self):
@@ -766,10 +771,16 @@ class VideoPlaybackWindow(tk.Toplevel):
         carry the same muxed track, so this is the single reference stream; keeping it
         on the upscaled side lets the user check the upscaled video's sync. Re-applied
         after play() because libVLC creates the output only once playback starts."""
+        if not self.winfo_exists():
+            return
         if self._src_player is not None:
             self._src_player.set_mute(True)
             self._src_player.set_volume(0)
         if self._up_player is not None:
+            # Set an audible volume AND unmute (unmute last so it sticks): the default
+            # volume of a fresh player is not guaranteed to be 100, so unmuting alone
+            # could leave it silent.
+            self._up_player.set_volume(100)
             self._up_player.set_mute(False)
 
     # ── resync (upscaled is the clock, timestamp-aligned) ─────────────────────
