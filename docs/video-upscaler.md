@@ -1117,6 +1117,23 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > manager "Compare" opens whole-source vs clip-output, which are misaligned in time
 > (the clip starts at 0, the source at `clip_start`); a source time-offset for the
 > comparison window is the fix (deferred).
+>
+> **libVLC video output (crash fix):** the default `direct3d11` vout crashes with a
+> native access violation in `dxgi.dll` when the embedded HWND is resized during
+> playback (a C-level segfault Python cannot catch, so it kills the app with no
+> log). `gui.video_player` therefore creates the VLC instance with
+> `--vout=direct3d9 --avcodec-hw=none`, keeping DXGI (D3D11/12 + hardware decode)
+> out of the process entirely; software decode is fine for the modest clips this
+> window compares. If a resize crash ever recurs, the next lever is `--vout=gdi`
+> (pure-software, no DirectX at all).
+>
+> **Playback view = side-by-side / A-B flip, NOT a live wipe (by design, 16.3).** A
+> true pixel-wipe across two *moving* hardware video surfaces is not feasible (libVLC
+> scales each video to fill its own HWND, so a shared, aligned, moving divider can't
+> be clipped across both). Motion is compared side-by-side or by flipping A/B in a
+> single view; the exact before/after **wipe returns when paused** (decode-on-seek).
+> Motion artifacts (jitter/seams) actually read better side-by-side than under a
+> half-and-half wipe anyway.
 
 ### 16.1 Motivation
 

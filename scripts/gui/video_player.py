@@ -194,8 +194,17 @@ class VideoPlayer(ttk.Frame):
             self.ok = False
             return False
         try:
+            # Steer libVLC OFF DXGI (Direct3D 11/12). Its default direct3d11 vout
+            # crashes with a native access violation in dxgi.dll when the embedded
+            # HWND is resized during playback (a C-level segfault Python can't
+            # catch, so it takes the whole app down with no log). direct3d9 is a
+            # DXGI-free, still hardware-accelerated video output, and disabling
+            # D3D11 hardware DECODE (--avcodec-hw=none) keeps dxgi.dll out of the
+            # process entirely. Software decode is fine for the modest clips this
+            # window compares. See gui.video_player crash note.
             self._instance = _vlc.Instance(
-                "--intf", "dummy", "--no-video-title-show", "--quiet")
+                "--intf", "dummy", "--no-video-title-show", "--quiet",
+                "--vout=direct3d9", "--avcodec-hw=none")
             self._player = self._instance.media_player_new()
             self.update_idletasks()                 # realise the surface -> valid winfo_id
             handle = self.surface.winfo_id()
