@@ -154,20 +154,30 @@ CREATE TABLE IF NOT EXISTS video_files (
     updated_at TEXT,
     PRIMARY KEY (root_id, rel_path)
 );
--- Per-(source, target) job. THIS is the durable queue + resume state: the queue
--- is the rows with status not 'done', ordered by queue_order.
+-- Per-(source, target, clip) job. THIS is the durable queue + resume state: the
+-- queue is the rows with status not 'done', ordered by queue_order.
+-- clip_id (section 16.6) is the segment-extractor discriminator: 0 = the WHOLE
+-- file (all pre-clip behaviour), a positive id = a virtual time-range clip of the
+-- source (clip_start/clip_end seconds, optional label, clip_frames counted at
+-- Prepare). A source can carry several clips at one target, which is why clip_id
+-- is part of the primary key.
 CREATE TABLE IF NOT EXISTS video_outputs (
     root_id     INTEGER NOT NULL REFERENCES video_roots(id) ON DELETE CASCADE,
     rel_path    TEXT NOT NULL,
     target      TEXT NOT NULL,    -- 1080p | 1440p | 4K
+    clip_id     INTEGER NOT NULL DEFAULT 0,  -- 0 = whole file; >0 = a virtual clip
     status      TEXT NOT NULL DEFAULT 'queued',  -- queued|splitting|streaming|partial|done|failed|skipped
     skip_reason TEXT,
     output_path TEXT,
     out_frames  INTEGER,          -- frames in the reassembled output (drift check)
     queue_order INTEGER,          -- user-orderable position in the queue
+    clip_start  REAL,             -- clip range start (seconds); NULL for a whole-file job
+    clip_end    REAL,             -- clip range end (seconds); NULL for a whole-file job
+    clip_label  TEXT,             -- optional user label, used in the output filename
+    clip_frames INTEGER,          -- COUNTED frames of the extracted range (filled at Prepare)
     created_at  TEXT,
     updated_at  TEXT,
-    PRIMARY KEY (root_id, rel_path, target)
+    PRIMARY KEY (root_id, rel_path, target, clip_id)
 );
 CREATE INDEX IF NOT EXISTS idx_video_outputs_queue
     ON video_outputs(root_id, queue_order);
@@ -175,6 +185,7 @@ CREATE TABLE IF NOT EXISTS video_segments (
     root_id    INTEGER NOT NULL,
     rel_path   TEXT NOT NULL,
     target     TEXT NOT NULL,
+    clip_id    INTEGER NOT NULL DEFAULT 0,  -- matches the parent video_outputs job
     seg_index  INTEGER NOT NULL,
     in_frames  INTEGER,           -- source frames in this segment
     out_frames INTEGER,           -- upscaled frames returned by the worker
@@ -182,11 +193,11 @@ CREATE TABLE IF NOT EXISTS video_segments (
     seconds    REAL,              -- worker process time for this segment
     output_path TEXT,             -- the upscaled segment file (kept for reassembly)
     updated_at TEXT,
-    PRIMARY KEY (root_id, rel_path, target, seg_index),
+    PRIMARY KEY (root_id, rel_path, target, clip_id, seg_index),
     FOREIGN KEY (root_id) REFERENCES video_roots(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_video_seg_parent
-    ON video_segments(root_id, rel_path, target);
+    ON video_segments(root_id, rel_path, target, clip_id);
 
 -- Per-user GPU timing for the remote-pod cost estimator (0.3.9). Cumulative
 -- images + processing seconds per (task, gpu_id), accumulated from finished
@@ -256,6 +267,7 @@ def _open_conn():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate_video_tables(conn)
+    _migrate_video_clip_columns(conn)
     conn.executescript(SCHEMA)
     _ensure_video_columns(conn)
     conn.commit()
@@ -285,6 +297,47 @@ def _migrate_video_tables(conn):
             conn.commit()
     except Exception as exc:
         debug_log("db._migrate_video_tables", exc=exc)
+
+
+def _migrate_video_clip_columns(conn):
+    """Add the segment-extractor `clip_id` discriminator (section 16.6) to
+    video_outputs / video_segments. clip_id joins BOTH primary keys, and SQLite
+    can't add a PK column in place, so rebuild the two tables when an existing DB
+    still has the pre-clip shape. Data is preserved (every existing job/segment is
+    a whole-file row, copied with clip_id = 0), so an in-flight queue survives.
+
+    Runs BEFORE executescript(SCHEMA), so on a fresh DB (no video_outputs yet) it's
+    a no-op and SCHEMA creates the new shape directly; on an already-migrated DB the
+    clip_id column is present and it's a no-op too. Fail-safe (the cache is
+    regenerable, so a rebuild failure is logged, not fatal)."""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_outputs)")]
+        if not cols or "clip_id" in cols:
+            return                          # no table yet, or already migrated
+        # Rename the old tables aside, drop their indexes (the names are reused by
+        # SCHEMA below, and IF NOT EXISTS would otherwise skip the new indexes),
+        # let SCHEMA recreate both tables + indexes in the new shape, copy every
+        # row as a whole-file (clip_id = 0) job, then drop the old tables.
+        conn.executescript(
+            "ALTER TABLE video_outputs RENAME TO _vo_old;"
+            "ALTER TABLE video_segments RENAME TO _vs_old;"
+            "DROP INDEX IF EXISTS idx_video_outputs_queue;"
+            "DROP INDEX IF EXISTS idx_video_seg_parent;")
+        conn.executescript(SCHEMA)          # fresh new-shape tables + indexes
+        conn.execute(
+            "INSERT INTO video_outputs (root_id, rel_path, target, clip_id, status, "
+            "skip_reason, output_path, out_frames, queue_order, created_at, updated_at) "
+            "SELECT root_id, rel_path, target, 0, status, skip_reason, output_path, "
+            "out_frames, queue_order, created_at, updated_at FROM _vo_old")
+        conn.execute(
+            "INSERT INTO video_segments (root_id, rel_path, target, clip_id, seg_index, "
+            "in_frames, out_frames, status, seconds, output_path, updated_at) "
+            "SELECT root_id, rel_path, target, 0, seg_index, in_frames, out_frames, "
+            "status, seconds, output_path, updated_at FROM _vs_old")
+        conn.executescript("DROP TABLE _vo_old; DROP TABLE _vs_old;")
+        conn.commit()
+    except Exception as exc:
+        debug_log("db._migrate_video_clip_columns", exc=exc)
 
 
 def _ensure_video_columns(conn):
@@ -501,42 +554,71 @@ def video_file_is_fresh(conn, root_id, rel_path, mtime, size):
 # ── video_outputs (the per-target job = the durable queue) ───────────────────
 
 @_locked
-def upsert_video_output(conn, root_id, rel_path, target, **fields):
-    """Insert/update one (source, target) job row (status, skip_reason,
-    output_path, out_frames, queue_order). Sets created_at on first insert."""
+def upsert_video_output(conn, root_id, rel_path, target, clip_id=0, **fields):
+    """Insert/update one (source, target, clip) job row (status, skip_reason,
+    output_path, out_frames, queue_order, and for a clip the clip_start/clip_end/
+    clip_label/clip_frames). clip_id defaults to 0 (the whole-file job). Sets
+    created_at on first insert."""
     if conn.execute(
-            "SELECT 1 FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
-            (root_id, rel_path, target)).fetchone() is None:
+            "SELECT 1 FROM video_outputs WHERE root_id = ? AND rel_path = ? "
+            "AND target = ? AND clip_id = ?",
+            (root_id, rel_path, target, clip_id)).fetchone() is None:
         fields.setdefault("created_at",
                           datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
-    _upsert(conn, "video_outputs", ("root_id", "rel_path", "target"),
-            (root_id, rel_path, target), fields)
+    _upsert(conn, "video_outputs", ("root_id", "rel_path", "target", "clip_id"),
+            (root_id, rel_path, target, clip_id), fields)
 
 
 @_locked
-def get_video_output(conn, root_id, rel_path, target):
-    """Return the (source, target) job Row, or None."""
+def get_video_output(conn, root_id, rel_path, target, clip_id=0):
+    """Return the (source, target, clip) job Row, or None. clip_id defaults to 0
+    (the whole-file job)."""
     return conn.execute(
-        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
-        (root_id, rel_path, target)).fetchone()
+        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?",
+        (root_id, rel_path, target, clip_id)).fetchone()
 
 
 @_locked
-def get_video_outputs_for(conn, root_id, rel_path):
-    """All target jobs for one source (so the list can show every upscaled
-    counterpart)."""
+def get_video_outputs_for(conn, root_id, rel_path, clip_id=0):
+    """All target jobs for one source at the given clip_id (default 0 = the
+    whole-file counterparts the scan list shows). Clips are queried separately via
+    get_video_clips."""
     return conn.execute(
-        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? ORDER BY target",
-        (root_id, rel_path)).fetchall()
+        "SELECT * FROM video_outputs WHERE root_id = ? AND rel_path = ? "
+        "AND clip_id = ? ORDER BY target",
+        (root_id, rel_path, clip_id)).fetchall()
 
 
 @_locked
-def get_video_outputs_all(conn, root_id):
+def get_video_outputs_all(conn, root_id, clip_id=0):
     """Every output job for a root in ONE query, so the GUI can refresh a large
-    scan list without a query per file (which froze the UI thread)."""
+    scan list without a query per file (which froze the UI thread). Defaults to the
+    whole-file jobs (clip_id = 0); the scan list shows those, clips have their own
+    manager (get_video_clips)."""
     return conn.execute(
-        "SELECT rel_path, target, status, output_path FROM video_outputs "
-        "WHERE root_id = ?", (root_id,)).fetchall()
+        "SELECT rel_path, target, clip_id, status, output_path FROM video_outputs "
+        "WHERE root_id = ? AND clip_id = ?", (root_id, clip_id)).fetchall()
+
+
+@_locked
+def get_video_clips(conn, root_id):
+    """Every VIRTUAL clip job (clip_id > 0) for a root, for the Segments manager
+    (section 16.5). Ordered by source then clip start so a source's scenes read in
+    timeline order."""
+    return conn.execute(
+        "SELECT * FROM video_outputs WHERE root_id = ? AND clip_id > 0 "
+        "ORDER BY rel_path, clip_start, target", (root_id,)).fetchall()
+
+
+@_locked
+def next_clip_id(conn, root_id, rel_path):
+    """The next clip_id to assign for a source (max existing + 1, min 1 since 0 is
+    reserved for the whole-file job). Clip ids are per (root, source)."""
+    row = conn.execute(
+        "SELECT MAX(clip_id) AS m FROM video_outputs WHERE root_id = ? AND rel_path = ?",
+        (root_id, rel_path)).fetchone()
+    return (row["m"] + 1) if row and row["m"] else 1
 
 
 @_locked
@@ -559,51 +641,56 @@ def next_queue_order(conn, root_id):
 
 
 @_locked
-def set_queue_order(conn, root_id, rel_path, target, order):
-    """Reorder one queued job. Commits."""
+def set_queue_order(conn, root_id, rel_path, target, order, clip_id=0):
+    """Reorder one queued job. clip_id defaults to 0 (the whole-file job). Commits."""
     conn.execute(
         "UPDATE video_outputs SET queue_order = ? WHERE root_id = ? AND rel_path = ? "
-        "AND target = ?", (order, root_id, rel_path, target))
+        "AND target = ? AND clip_id = ?", (order, root_id, rel_path, target, clip_id))
     conn.commit()
 
 
 @_locked
-def delete_video_output(conn, root_id, rel_path, target):
-    """Remove a job from the queue (and its segment rows). Commits."""
+def delete_video_output(conn, root_id, rel_path, target, clip_id=0):
+    """Remove a job from the queue (and its segment rows). clip_id defaults to 0
+    (the whole-file job). Commits."""
     conn.execute(
-        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ?",
-        (root_id, rel_path, target))
+        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?", (root_id, rel_path, target, clip_id))
     conn.execute(
-        "DELETE FROM video_outputs WHERE root_id = ? AND rel_path = ? AND target = ?",
-        (root_id, rel_path, target))
+        "DELETE FROM video_outputs WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?", (root_id, rel_path, target, clip_id))
     conn.commit()
 
 
-# ── video_segments (per-target resume) ───────────────────────────────────────
+# ── video_segments (per-target/clip resume) ──────────────────────────────────
 
 @_locked
-def upsert_video_segment(conn, root_id, rel_path, target, seg_index, **fields):
+def upsert_video_segment(conn, root_id, rel_path, target, seg_index, clip_id=0, **fields):
     """Insert/update one segment row (in_frames, out_frames, status, seconds,
-    output_path). Stamps updated_at, commits."""
+    output_path). clip_id defaults to 0 (the whole-file job). Stamps updated_at,
+    commits."""
     _upsert(conn, "video_segments",
-            ("root_id", "rel_path", "target", "seg_index"),
-            (root_id, rel_path, target, seg_index), fields)
+            ("root_id", "rel_path", "target", "clip_id", "seg_index"),
+            (root_id, rel_path, target, clip_id, seg_index), fields)
 
 
 @_locked
-def get_video_segments(conn, root_id, rel_path, target):
-    """All segment rows for a (source, target) job, ordered by index."""
+def get_video_segments(conn, root_id, rel_path, target, clip_id=0):
+    """All segment rows for a (source, target, clip) job, ordered by index. clip_id
+    defaults to 0 (the whole-file job)."""
     return conn.execute(
-        "SELECT * FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ? "
-        "ORDER BY seg_index", (root_id, rel_path, target)).fetchall()
+        "SELECT * FROM video_segments WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ? ORDER BY seg_index",
+        (root_id, rel_path, target, clip_id)).fetchall()
 
 
 @_locked
-def clear_video_segments(conn, root_id, rel_path, target):
-    """Drop a job's segment rows (a fresh split supersedes the old plan). Commits."""
+def clear_video_segments(conn, root_id, rel_path, target, clip_id=0):
+    """Drop a job's segment rows (a fresh split supersedes the old plan). clip_id
+    defaults to 0 (the whole-file job). Commits."""
     conn.execute(
-        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? AND target = ?",
-        (root_id, rel_path, target))
+        "DELETE FROM video_segments WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?", (root_id, rel_path, target, clip_id))
     conn.commit()
 
 

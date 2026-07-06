@@ -72,6 +72,107 @@ def test_phase4_video_files_are_migrated_on_open(tmp_path, monkeypatch):
         monkeypatch.setattr(db, "_conn", None)
 
 
+# ── segment-extractor clip_id (section 16.6) ─────────────────────────────────
+
+def test_fresh_db_has_clip_columns(db_conn):
+    ocols = _columns(db_conn, "video_outputs")
+    for c in ("clip_id", "clip_start", "clip_end", "clip_label", "clip_frames"):
+        assert c in ocols, ocols
+    assert "clip_id" in _columns(db_conn, "video_segments")
+
+
+def test_clip_jobs_coexist_with_whole_file_job(db_conn):
+    root = db.get_video_root_id(db_conn, "/src", create=True)
+    # whole-file job (clip_id defaults to 0)
+    db.upsert_video_output(db_conn, root, "a.mp4", "1080p", status="queued", queue_order=0)
+    assert db.next_clip_id(db_conn, root, "a.mp4") == 1
+    c1 = db.next_clip_id(db_conn, root, "a.mp4")
+    db.upsert_video_output(db_conn, root, "a.mp4", "1080p", clip_id=c1, status="queued",
+                           queue_order=1, clip_start=151.0, clip_end=312.3,
+                           clip_label="cake", clip_frames=4830)
+    c2 = db.next_clip_id(db_conn, root, "a.mp4")
+    assert c2 == 2
+    db.upsert_video_output(db_conn, root, "a.mp4", "1080p", clip_id=c2, status="queued",
+                           queue_order=2, clip_start=660.0, clip_end=800.0,
+                           clip_label="speeches")
+    # whole-file getters ignore clips; the clip getter sees both in timeline order
+    assert len(db.get_video_outputs_for(db_conn, root, "a.mp4")) == 1
+    assert len(db.get_video_outputs_all(db_conn, root)) == 1
+    clips = db.get_video_clips(db_conn, root)
+    assert [c["clip_label"] for c in clips] == ["cake", "speeches"]
+    assert clips[0]["clip_id"] == c1 and clips[0]["clip_frames"] == 4830
+    # the durable queue includes the whole-file job and both clips
+    assert len(db.get_video_queue(db_conn, root)) == 3
+
+
+def test_segments_and_delete_are_clip_scoped(db_conn):
+    root = db.get_video_root_id(db_conn, "/src", create=True)
+    db.upsert_video_output(db_conn, root, "a.mp4", "4K", status="queued")
+    db.upsert_video_output(db_conn, root, "a.mp4", "4K", clip_id=1, status="queued",
+                           clip_start=1.0, clip_end=9.0, clip_label="x")
+    db.upsert_video_segment(db_conn, root, "a.mp4", "4K", 0, in_frames=100, status="pending")
+    db.upsert_video_segment(db_conn, root, "a.mp4", "4K", 0, clip_id=1,
+                            in_frames=50, status="pending")
+    assert len(db.get_video_segments(db_conn, root, "a.mp4", "4K")) == 1
+    assert len(db.get_video_segments(db_conn, root, "a.mp4", "4K", clip_id=1)) == 1
+    # deleting the clip leaves the whole-file job and its segment intact
+    db.delete_video_output(db_conn, root, "a.mp4", "4K", clip_id=1)
+    assert db.get_video_clips(db_conn, root) == []
+    assert len(db.get_video_segments(db_conn, root, "a.mp4", "4K", clip_id=1)) == 0
+    assert db.get_video_output(db_conn, root, "a.mp4", "4K") is not None
+    assert len(db.get_video_segments(db_conn, root, "a.mp4", "4K")) == 1
+
+
+def test_preclip_db_migrates_preserving_rows(tmp_path, monkeypatch):
+    # An existing (pre-clip) DB has the video tables WITHOUT clip_id in the PK. The
+    # migration must rebuild both tables, preserve every row as a whole-file
+    # (clip_id 0) job, and recreate the queue index — an in-flight queue survives.
+    dbfile = tmp_path / "cache.db"
+    old = sqlite3.connect(str(dbfile))
+    old.executescript(
+        "CREATE TABLE video_roots (id INTEGER PRIMARY KEY, source_root TEXT NOT NULL "
+        "UNIQUE, output_root TEXT, saved_at TEXT);"
+        "CREATE TABLE video_files (root_id INTEGER, rel_path TEXT, probe_version INTEGER,"
+        " PRIMARY KEY (root_id, rel_path));"
+        "CREATE TABLE video_outputs (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL, "
+        "target TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', skip_reason TEXT, "
+        "output_path TEXT, out_frames INTEGER, queue_order INTEGER, created_at TEXT, "
+        "updated_at TEXT, PRIMARY KEY (root_id, rel_path, target));"
+        "CREATE INDEX idx_video_outputs_queue ON video_outputs(root_id, queue_order);"
+        "CREATE TABLE video_segments (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL, "
+        "target TEXT NOT NULL, seg_index INTEGER NOT NULL, in_frames INTEGER, "
+        "out_frames INTEGER, status TEXT NOT NULL DEFAULT 'pending', seconds REAL, "
+        "output_path TEXT, updated_at TEXT, PRIMARY KEY (root_id, rel_path, target, seg_index));"
+        "CREATE INDEX idx_video_seg_parent ON video_segments(root_id, rel_path, target);"
+        "INSERT INTO video_roots (id, source_root, output_root) VALUES (1, '/src', '/out');"
+        "INSERT INTO video_outputs (root_id, rel_path, target, status, output_path, "
+        "queue_order, created_at) VALUES (1, 'v.mp4', '4K', 'partial', '/out/v_4K.mp4', 7, 't');"
+        "INSERT INTO video_segments (root_id, rel_path, target, seg_index, in_frames, status) "
+        "VALUES (1, 'v.mp4', '4K', 0, 500, 'done');")
+    old.commit()
+    old.close()
+
+    monkeypatch.setattr(db, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(db, "DB_PATH", str(dbfile))
+    monkeypatch.setattr(db, "_conn", None)
+    monkeypatch.setattr(db, "import_legacy_json", lambda conn: None)
+
+    conn = db.get_conn()
+    try:
+        assert "clip_id" in _columns(conn, "video_outputs")
+        row = db.get_video_output(conn, 1, "v.mp4", "4K")
+        assert row["clip_id"] == 0 and row["status"] == "partial" and row["queue_order"] == 7
+        segs = db.get_video_segments(conn, 1, "v.mp4", "4K")
+        assert len(segs) == 1 and segs[0]["in_frames"] == 500 and segs[0]["clip_id"] == 0
+        idx = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='video_outputs'")}
+        assert "idx_video_outputs_queue" in idx      # index recreated on the new table
+        assert "_vo_old" not in _tables(conn) and "_vs_old" not in _tables(conn)
+    finally:
+        conn.close()
+        monkeypatch.setattr(db, "_conn", None)
+
+
 # ── lineage round trip ──────────────────────────────────────────────────────
 
 def test_upscale_then_tag_lineage(db_conn):
