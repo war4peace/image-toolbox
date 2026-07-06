@@ -194,17 +194,20 @@ class VideoPlayer(ttk.Frame):
             self.ok = False
             return False
         try:
-            # Steer libVLC OFF DXGI (Direct3D 11/12). Its default direct3d11 vout
-            # crashes with a native access violation in dxgi.dll when the embedded
-            # HWND is resized during playback (a C-level segfault Python can't
-            # catch, so it takes the whole app down with no log). direct3d9 is a
-            # DXGI-free, still hardware-accelerated video output, and disabling
-            # D3D11 hardware DECODE (--avcodec-hw=none) keeps dxgi.dll out of the
-            # process entirely. Software decode is fine for the modest clips this
-            # window compares. See gui.video_player crash note.
+            # Use a PURE-SOFTWARE pipeline (GDI video output + software decode). Any
+            # GPU video output (Direct3D 11 -> dxgi.dll, or Direct3D 9 -> the driver)
+            # crashes with a native access violation (0xc0000005) across the embedded-
+            # HWND resize/pause lifecycle: the swapchain is recreated on resize and a
+            # following state change (pause) faults in it. This is a C-level segfault
+            # Python cannot catch, so it kills the whole app with no log. The `wingdi`
+            # vout has NO swapchain (it blits frames to the window DC), so resize is
+            # just a new blit rect -- nothing to mismanage. `--avcodec-hw=none` keeps
+            # decode off the GPU too (no DXVA2/D3D11VA surfaces). Software is plenty
+            # for the modest clips this window compares; stability wins here. See the
+            # crash note in this module's docstring / docs/video-upscaler.md 16.3.
             self._instance = _vlc.Instance(
                 "--intf", "dummy", "--no-video-title-show", "--quiet",
-                "--vout=direct3d9", "--avcodec-hw=none")
+                "--vout=wingdi", "--avcodec-hw=none")
             self._player = self._instance.media_player_new()
             self.update_idletasks()                 # realise the surface -> valid winfo_id
             handle = self.surface.winfo_id()

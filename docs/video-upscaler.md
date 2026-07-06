@@ -1118,14 +1118,16 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > (the clip starts at 0, the source at `clip_start`); a source time-offset for the
 > comparison window is the fix (deferred).
 >
-> **libVLC video output (crash fix):** the default `direct3d11` vout crashes with a
-> native access violation in `dxgi.dll` when the embedded HWND is resized during
-> playback (a C-level segfault Python cannot catch, so it kills the app with no
-> log). `gui.video_player` therefore creates the VLC instance with
-> `--vout=direct3d9 --avcodec-hw=none`, keeping DXGI (D3D11/12 + hardware decode)
-> out of the process entirely; software decode is fine for the modest clips this
-> window compares. If a resize crash ever recurs, the next lever is `--vout=gdi`
-> (pure-software, no DirectX at all).
+> **libVLC video output (crash fix): use a pure-software pipeline.** ANY GPU video
+> output crashes with a native access violation (0xc0000005) across the embedded-HWND
+> resize/pause lifecycle: the swapchain is recreated on resize and a following state
+> change faults in it (a C-level segfault Python cannot catch, so it kills the app
+> with no log). Observed on `direct3d11` (crash in `dxgi.dll` on resize) AND on
+> `direct3d9` (crash in the GPU driver on pause-after-resize). `gui.video_player`
+> therefore creates the VLC instance with `--vout=wingdi --avcodec-hw=none` — the GDI
+> vout has NO swapchain (it blits to the window DC, so a resize is just a new blit
+> rect, nothing to mismanage) and decode stays off the GPU. Software is plenty for
+> the modest clips this window compares; stability wins over GPU efficiency here.
 >
 > **Playback view = side-by-side / A-B flip, NOT a live wipe (by design, 16.3).** A
 > true pixel-wipe across two *moving* hardware video surfaces is not feasible (libVLC
