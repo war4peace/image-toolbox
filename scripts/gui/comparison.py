@@ -559,6 +559,11 @@ class VideoPlaybackWindow(tk.Toplevel):
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x520")
         self.minsize(640, 400)
         self._last_normal_geo = None
+        if app is not None and app.settings.get("video_playback_zoomed"):
+            try:
+                self.state("zoomed")               # restore maximised (like the main window)
+            except tk.TclError:
+                pass
         # Modal via grab_set (in _grab_modal), NOT transient(): transient() strips
         # the Maximize box on Windows; grab_set alone makes the window app-modal.
 
@@ -615,8 +620,13 @@ class VideoPlaybackWindow(tk.Toplevel):
 
     def save_geometry(self):
         if self._app is not None and self.winfo_exists():
+            try:
+                zoomed = (self.state() == "zoomed")
+            except tk.TclError:
+                zoomed = False
             self._app.settings["video_playback_geometry"] = \
                 self._last_normal_geo or self.geometry()
+            self._app.settings["video_playback_zoomed"] = zoomed
             save_settings(self._app.settings)
 
     # ── public API (shared single instance) ──────────────────────────────────
