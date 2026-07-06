@@ -16,7 +16,7 @@ from tkinter import ttk, filedialog, messagebox
 import runpod_client
 import ssh_setup
 import taskbar_progress
-from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE
+from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings
 from gui.widgets import ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
 from gui.tooltab import ToolTab
@@ -73,12 +73,26 @@ class SegmentsManager(tk.Toplevel):
     def __init__(self, master, tab):
         super().__init__(master)
         self.tab = tab
+        self._app = getattr(tab, "app", None)
         self.title(f"{APP_TITLE} — Segments")
         # Min width matches the main window so the right-side action buttons are
         # never clipped (bug: they were cut off at the old 560px min).
-        self.geometry("940x460")
+        geo = self._app.settings.get("segments_geometry") if self._app is not None else None
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "940x460")
         self.minsize(900, 320)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._last_normal_geo = None
+        if self._app is not None and self._app.settings.get("segments_zoomed"):
+            try:
+                self.state("zoomed")               # restore maximised (like the main window)
+            except tk.TclError:
+                pass
+        self.bind("<Configure>", self._track_geometry, add="+")
+        # Modal (grab_set), like the Compare windows. Re-grab on FocusIn so opening a
+        # child window from here (Compare / Play, themselves modal) and closing it
+        # hands the application grab back to this window instead of freeing it.
+        self.bind("<FocusIn>", lambda _e: self._grab_modal(), add="+")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.after(60, self._grab_modal)
 
         cols = ("label", "range", "dur", "target", "status")
         self.tree = ttk.Treeview(self, columns=cols, show="tree headings")
@@ -109,6 +123,46 @@ class SegmentsManager(tk.Toplevel):
 
         self._rows = {}          # iid -> clip Row
         self.refresh()
+
+    def _grab_modal(self):
+        """Take the application-modal grab, but never steal it from a child window or
+        dialog that currently holds it (a Compare / Play window, or the Rename dialog).
+        Called on open and on FocusIn, so the grab returns here once a child closes."""
+        try:
+            if not self.winfo_exists():
+                return
+            cur = self.grab_current()
+            if cur is not None and cur is not self:
+                return
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _track_geometry(self, event):
+        if event.widget is self:
+            try:
+                if self.state() == "normal":
+                    self._last_normal_geo = self.geometry()
+            except tk.TclError:
+                pass
+
+    def save_geometry(self):
+        if self._app is not None and self.winfo_exists():
+            try:
+                zoomed = (self.state() == "zoomed")
+            except tk.TclError:
+                zoomed = False
+            self._app.settings["segments_geometry"] = self._last_normal_geo or self.geometry()
+            self._app.settings["segments_zoomed"] = zoomed
+            save_settings(self._app.settings)
+
+    def _close(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.save_geometry()
+        self.destroy()
 
     def refresh(self):
         import batch_video_upscale as bv

@@ -799,6 +799,9 @@ class App(tk.Tk):
             self.comparison_window.save_geometry()
         if self.video_comparison_window is not None and self.video_comparison_window.winfo_exists():
             self.video_comparison_window.save_geometry()
+        seg = getattr(self.video_tab, "_segments_win", None)
+        if seg is not None and seg.winfo_exists():
+            seg.save_geometry()
         if self.video_playback_window is not None and self.video_playback_window.winfo_exists():
             self.video_playback_window.save_geometry()
             # Release the libVLC players before root.destroy() cascades into their
