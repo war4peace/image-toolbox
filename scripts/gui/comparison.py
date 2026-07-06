@@ -357,13 +357,12 @@ class VideoComparisonWindow(ComparisonWindow):
         self._new_lbl = ttk.Label(bar, foreground="#aab2bf")
         self._new_lbl.pack(side="right")
 
-        # Bottom transport: play/pause (motion, section 16.3), frame-step, a
-        # scrubber, and a time read-out. Play needs libVLC; without it the button is
-        # disabled and the window stays a scrub-only wipe (the v1 behaviour).
+        # Bottom transport: frame-step, a scrubber, and a time read-out. This window
+        # is FRAMES ONLY (the before/after wipe with zoom/pan); it has NO libVLC.
+        # Real-time playback with audio lives in the separate VideoPlaybackWindow
+        # (section 16.3), so the two comparison styles never swap layouts mid-use.
         tl = ttk.Frame(self, padding=(8, 4))
         tl.pack(side="bottom", fill="x")
-        self._play_btn = ttk.Button(tl, text="▶ Play", width=9, command=self._toggle_play)
-        self._play_btn.pack(side="left", padx=(0, 8))
         ttk.Button(tl, text="◀ frame", width=8,
                    command=lambda: self._step(-1)).pack(side="left")
         ttk.Button(tl, text="frame ▶", width=8,
@@ -371,25 +370,12 @@ class VideoComparisonWindow(ComparisonWindow):
         self.time_var = tk.StringVar(value="0:00.000 / 0:00.000")
         ttk.Label(tl, textvariable=self.time_var, width=20,
                   font=("Consolas", 9)).pack(side="left")
-        self._view_btn = ttk.Button(tl, text="Side-by-side", width=12,
-                                    command=self._cycle_view)
-        self._view_btn.pack(side="right")
         self.timeline = ttk.Scale(tl, from_=0.0, to=1.0, orient="horizontal",
                                   command=self._on_scrub)
         self.timeline.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self.canvas = tk.Canvas(self, highlightthickness=0, bg="#15181d")
         self.canvas.pack(fill="both", expand=True)
-
-        # Live-playback state (section 16.3). Two libVLC players, created lazily on
-        # first Play; paused view stays the decode-on-seek wipe (canvas). Modes:
-        # "sbs" (side-by-side), "a" (source only), "b" (upscaled only).
-        self._players_frame = None
-        self._src_player = self._up_player = None
-        self._playing = False
-        self._view_mode = "sbs"
-        self._resync_job = None
-        self._ui_updating = False
 
         # Shared view state (consumed by the inherited renderer).
         self._old = self._new = None
@@ -434,18 +420,6 @@ class VideoComparisonWindow(ComparisonWindow):
     def show_videos(self, source, upscaled):
         """Point the window at a new (source, upscaled) pair and reset the view."""
         import video_pipeline as vp
-        # A new pair supersedes any live playback: drop the old players so the next
-        # Play reloads the new files into fresh surfaces.
-        if getattr(self, "_playing", False):
-            self._exit_play()
-        if getattr(self, "_players_frame", None) is not None:
-            self._cancel_resync()
-            for p in (self._src_player, self._up_player):
-                if p is not None:
-                    p.close()
-            self._src_player = self._up_player = None
-            self._players_frame.destroy()
-            self._players_frame = None
         self._src_path, self._up_path = source, upscaled
         try:
             si, ui = vp.probe(source), vp.probe(upscaled)
@@ -480,20 +454,11 @@ class VideoComparisonWindow(ComparisonWindow):
         self.time_var.set(f"{self._fmt_t(t)} / {self._fmt_t(self._duration)}")
 
     def _on_scrub(self, val):
-        if self._ui_updating:
-            return                       # programmatic set from the resync loop
         try:
             t = float(val)
         except (TypeError, ValueError):
             return
         self._update_time_label(t)
-        if self._playing:
-            # Live playback: seek both players together (no frame decode).
-            self._cur_t = t
-            for p in (self._up_player, self._src_player):
-                if p is not None:
-                    p.seek(t)
-            return
         # Debounce: decode only after the scrub settles (decoding is ~hundreds of
         # ms per frame and we decode two), so dragging stays smooth.
         if self._scrub_after is not None:
@@ -553,86 +518,200 @@ class VideoComparisonWindow(ComparisonWindow):
         except Exception:
             return None
 
-    # ── live playback (section 16.3) ─────────────────────────────────────────
+    def _close(self):
+        self.save_geometry()
+        self.destroy()
+
+
+# ─────────────────────────────────────────────
+#  VIDEO PLAYBACK WINDOW  (side-by-side / A-B flip, libVLC — section 16.3)
+# ─────────────────────────────────────────────
+
+class VideoPlaybackWindow(tk.Toplevel):
+    """Real-time side-by-side (and A/B-flip) playback of source vs upscaled WITH
+    audio, via libVLC. Deliberately SEPARATE from the frame-wipe
+    VideoComparisonWindow so the two comparison styles never swap layouts mid-use,
+    and so ALL libVLC embedding lives in this one window (the frame window is
+    libVLC-free, hence crash-free). Audio is routed to the UPSCALED player ONLY
+    (both carry the same muxed track): the user hears one reference stream and can
+    watch each video track its sync against it. Aligns by TIMESTAMP (a CFR-normalize
+    can change the upscaled frame count, section 14)."""
+
+    def __init__(self, master, source, upscaled, app=None):
+        super().__init__(master)
+        self._app = app
+        geo = app.settings.get("video_playback_geometry") if app is not None else None
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x520")
+        self.minsize(640, 400)
+        self._last_normal_geo = None
+
+        bar = ttk.Frame(self, padding=(8, 4))
+        bar.pack(fill="x")
+        self._old_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._old_lbl.pack(side="left")
+        self._new_lbl = ttk.Label(bar, foreground="#aab2bf")
+        self._new_lbl.pack(side="right")
+
+        self._players_frame = tk.Frame(self, background="#15181d")
+        self._players_frame.pack(fill="both", expand=True)
+        self._src_player = self._up_player = None
+
+        tl = ttk.Frame(self, padding=(8, 4))
+        tl.pack(side="bottom", fill="x")
+        self._play_btn = ttk.Button(tl, text="▶ Play", width=9, command=self._toggle_play)
+        self._play_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(tl, text="◀ frame", width=8,
+                   command=lambda: self._step(-1)).pack(side="left")
+        ttk.Button(tl, text="frame ▶", width=8,
+                   command=lambda: self._step(1)).pack(side="left", padx=(4, 8))
+        self.time_var = tk.StringVar(value="0:00.000 / 0:00.000")
+        ttk.Label(tl, textvariable=self.time_var, width=20,
+                  font=("Consolas", 9)).pack(side="left")
+        self._view_btn = ttk.Button(tl, text="Side-by-side", width=13,
+                                    command=self._cycle_view)
+        self._view_btn.pack(side="right")
+        self.timeline = ttk.Scale(tl, from_=0.0, to=1.0, orient="horizontal",
+                                  command=self._on_slider)
+        self.timeline.pack(side="left", fill="x", expand=True, padx=(8, 0))
+
+        self._src_path = self._up_path = None
+        self._fps = 30.0
+        self._duration = 0.0
+        self._cur_t = 0.0
+        self._playing = False
+        self._view_mode = "sbs"          # sbs | a (source only) | b (upscaled only)
+        self._resync_job = None
+        self._ui_updating = False
+        self._started = False            # players created + primed
+
+        self.bind("<Configure>", self._track_geometry, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.show_videos(source, upscaled)
+
+    def _track_geometry(self, event):
+        if event.widget is self:
+            try:
+                if self.state() == "normal":
+                    self._last_normal_geo = self.geometry()
+            except tk.TclError:
+                pass
+
+    def save_geometry(self):
+        if self._app is not None and self.winfo_exists():
+            self._app.settings["video_playback_geometry"] = \
+                self._last_normal_geo or self.geometry()
+            save_settings(self._app.settings)
+
+    # ── public API (shared single instance) ──────────────────────────────────
+
+    def show_videos(self, source, upscaled):
+        import video_pipeline as vp
+        self._teardown_players_keep_window()       # a new pair replaces the old
+        self._src_path, self._up_path = source, upscaled
+        try:
+            si, ui = vp.probe(source), vp.probe(upscaled)
+        except Exception:
+            si = ui = None
+        sdim = f"{si.width}×{si.height}" if si else "?"
+        udim = f"{ui.width}×{ui.height}" if ui else "?"
+        self._duration = max((si.duration if si else 0) or 0,
+                             (ui.duration if ui else 0) or 0) or 0.01
+        self._fps = float((ui.fps if ui else None) or (si.fps if si else None) or 30)
+        self._old_lbl.configure(text=f"Original:  {os.path.basename(source)}  ·  {sdim}")
+        self._new_lbl.configure(text=f"Upscaled:  {os.path.basename(upscaled)}  ·  {udim}")
+        self.title(f"{APP_TITLE} — Play video — {os.path.basename(source)}")
+        self.timeline.configure(to=max(0.01, self._duration))
+        self._set_timeline(0.0)
+        self._cur_t = 0.0
+        self._playing = False
+        self._play_btn.configure(text="▶ Play")
+        self._update_time_label(0.0)
+        self.lift()
+        self.focus_set()
+        self.after(60, self._ensure_started)       # realise the window, then prime
+
+    def _ensure_started(self):
+        """Create + prime the two players (needs libVLC; offer the in-app install if
+        it is missing). Idempotent. Returns True when players are ready."""
+        if self._started:
+            return True
+        if not (self._src_path and self._up_path):
+            return False
+        if not load_vlc():
+            prompt_install_libvlc(
+                self, on_done=lambda ok: self._ensure_started() if ok else None)
+            return False
+        self._src_player = VideoPlayer(self._players_frame, fps=self._fps)
+        self._up_player = VideoPlayer(self._players_frame, fps=self._fps)
+        ok = self._src_player.load(self._src_path) and self._up_player.load(self._up_path)
+        if not ok:
+            from tkinter import messagebox
+            messagebox.showwarning(
+                APP_TITLE, "Video playback could not start (libVLC failed to "
+                           "initialise).")
+            self._teardown_players_keep_window()
+            return False
+        self._started = True
+        self._apply_view()
+        return True
+
+    # ── transport ────────────────────────────────────────────────────────────
 
     def _toggle_play(self):
         if self._playing:
-            self._exit_play()
+            self._pause()
             return
-        if not load_vlc():
-            # Offer the in-app install (bootstrap may predate the feature), then
-            # start playback if it succeeds.
-            prompt_install_libvlc(
-                self, on_done=lambda ok: self._enter_play() if ok else None)
+        if not self._ensure_started():
             return
-        self._enter_play()
-
-    def _ensure_players(self):
-        if self._players_frame is not None:
-            return self._src_player.ok and self._up_player.ok
-        if not load_vlc():
-            return False
-        self._players_frame = tk.Frame(self, background="#15181d")
-        self._src_player = VideoPlayer(self._players_frame, fps=self._fps)
-        self._up_player = VideoPlayer(self._players_frame, fps=self._fps)
-        ok_s = self._src_player.load(self._src_path)
-        ok_u = self._up_player.load(self._up_path)
-        return ok_s and ok_u
-
-    def _enter_play(self):
-        if not self._src_path or not self._up_path:
-            return
-        if not self._ensure_players():
-            from tkinter import messagebox
-            messagebox.showwarning(
-                APP_TITLE,
-                "Video playback could not start (libVLC failed to initialise). You "
-                "can still scrub frame by frame and use the before/after wipe.")
-            return
-        # Swap the wipe canvas for the two players.
-        self.canvas.pack_forget()
-        self._players_frame.pack(fill="both", expand=True)
         self._playing = True
         self._play_btn.configure(text="⏸ Pause")
-        for p in (self._src_player, self._up_player):
-            p.seek(self._cur_t)
-        self._apply_view()
         self._src_player.play()
         self._up_player.play()
-        # Re-assert the audio routing once the outputs exist (a mute set before
-        # play() doesn't stick), so playback has sound from the first press.
-        self.after(300, self._apply_audio)
+        self.after(300, self._apply_audio)         # audio output exists only once playing
         self._schedule_resync()
 
-    def _exit_play(self):
+    def _pause(self):
         self._cancel_resync()
-        t = self._cur_t
-        if self._up_player is not None:
-            self._up_player.pause()
-            t = self._up_player.get_time() or t
-        if self._src_player is not None:
-            self._src_player.pause()
+        for p in (self._up_player, self._src_player):
+            if p is not None:
+                p.pause()
         self._playing = False
         self._play_btn.configure(text="▶ Play")
-        if self._players_frame is not None:
-            self._players_frame.pack_forget()
-        self.canvas.pack(fill="both", expand=True)
-        # Land the paused wipe on the frame we stopped at.
+
+    def _step(self, frames):
+        if not self._ensure_started():
+            return
+        if self._playing:
+            self._pause()
+        for p in (self._up_player, self._src_player):
+            if p is not None:
+                p.step(frames)
+        if self._up_player is not None:
+            self._cur_t = self._up_player.get_time()
+        self._set_timeline(self._cur_t)
+        self._update_time_label(self._cur_t)
+
+    def _on_slider(self, val):
+        if self._ui_updating:
+            return                                 # programmatic set from resync
+        try:
+            t = float(val)
+        except (TypeError, ValueError):
+            return
         self._cur_t = t
-        self._set_timeline(t)
-        self._seek(t)
+        self._update_time_label(t)
+        for p in (self._up_player, self._src_player):
+            if p is not None:
+                p.seek(t)
 
     def _cycle_view(self):
         self._view_mode = {"sbs": "a", "a": "b", "b": "sbs"}[self._view_mode]
         self._view_btn.configure(text={"sbs": "Side-by-side", "a": "Original only",
                                        "b": "Upscaled only"}[self._view_mode])
-        if self._playing:
-            self._apply_view()
+        self._apply_view()
 
     def _apply_view(self):
-        """Arrange the two players for the current mode and route audio (see
-        _apply_audio)."""
-        if self._players_frame is None:
+        if not (self._src_player and self._up_player):
             return
         for p in (self._src_player, self._up_player):
             p.pack_forget()
@@ -645,20 +724,18 @@ class VideoComparisonWindow(ComparisonWindow):
             self._up_player.pack(side="right", fill="both", expand=True)
         self._apply_audio()
 
-    def _audible_player(self):
-        return self._src_player if self._view_mode == "a" else self._up_player
-
     def _apply_audio(self):
-        """Route audio to exactly ONE player (both carry the same muxed track, so
-        playing both = doubled sound). Re-applied shortly after play() because
-        libVLC only creates the audio output once playback has actually started, so
-        a mute set before then doesn't stick (the 'no sound until pause/play' bug)."""
-        if self._players_frame is None:
-            return
-        audible = self._audible_player()
-        for p in (self._src_player, self._up_player):
-            if p is not None:
-                p.set_mute(p is not audible)
+        """Audio = the UPSCALED player only (the source is muted + zero-volume). Both
+        carry the same muxed track, so this is the single reference stream; keeping it
+        on the upscaled side lets the user check the upscaled video's sync. Re-applied
+        after play() because libVLC creates the output only once playback starts."""
+        if self._src_player is not None:
+            self._src_player.set_mute(True)
+            self._src_player.set_volume(0)
+        if self._up_player is not None:
+            self._up_player.set_mute(False)
+
+    # ── resync (upscaled is the clock, timestamp-aligned) ─────────────────────
 
     def _schedule_resync(self):
         self._resync_job = self.after(300, self._resync)
@@ -672,22 +749,28 @@ class VideoComparisonWindow(ComparisonWindow):
             self._resync_job = None
 
     def _resync(self):
-        """Keep the two players locked (upscaled is the clock) and drive the shared
-        timeline/read-out off it. Aligns by TIMESTAMP, so a differing frame count
-        (CFR-normalize, section 14) never drifts the pair."""
         self._resync_job = None
         if not self._playing or self._up_player is None:
             return
         t = self._up_player.get_time()
-        # Nudge the source only if it has slipped past ~2 frames, to avoid stutter.
         if self._src_player is not None:
-            drift = abs(self._src_player.get_time() - t)
-            if drift > 2.0 / max(1e-6, self._fps):
+            if abs(self._src_player.get_time() - t) > 2.0 / max(1e-6, self._fps):
                 self._src_player.seek(t)
         self._cur_t = t
         self._set_timeline(t)
         self._update_time_label(t)
         self._schedule_resync()
+
+    # ── helpers / teardown ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_t(t):
+        t = max(0.0, t)
+        m, s = divmod(t, 60)
+        return f"{int(m)}:{s:06.3f}"
+
+    def _update_time_label(self, t):
+        self.time_var.set(f"{self._fmt_t(t)} / {self._fmt_t(self._duration)}")
 
     def _set_timeline(self, t):
         self._ui_updating = True
@@ -696,28 +779,24 @@ class VideoComparisonWindow(ComparisonWindow):
         finally:
             self._ui_updating = False
 
-    def _close(self):
-        # Stop + tear down the players (detaches their HWNDs) BEFORE the window is
-        # destroyed, then DEFER destroy() a tick so libVLC's native vout/event
-        # threads finish unwinding first. Destroying the surface HWND while those
-        # threads are mid-teardown is what crashed on close-while-playing.
+    def _teardown_players_keep_window(self):
         self._cancel_resync()
         self._playing = False
         for p in (self._src_player, self._up_player):
             if p is not None:
-                p.close()
+                p.close()                          # stop -> detach HWND -> release
         self._src_player = self._up_player = None
-        self.save_geometry()
-        self.after(120, self.destroy)
+        self._started = False
 
     def teardown_players(self):
-        """Stop + release the libVLC players WITHOUT destroying the window, for the
-        app-exit path (App._on_close): the root destroy() cascades and would kill the
-        surface HWND while libVLC's threads are still bound to it. Detaching first
-        makes that cascade safe. Idempotent."""
-        self._cancel_resync()
-        self._playing = False
-        for p in (self._src_player, self._up_player):
-            if p is not None:
-                p.close()
-        self._src_player = self._up_player = None
+        """For App exit: release players before root.destroy cascades into their
+        surfaces (else the vout thread faults on the destroyed HWND)."""
+        self._teardown_players_keep_window()
+
+    def _close(self):
+        # Detach + release players BEFORE the surface HWND dies, then defer destroy()
+        # a tick so libVLC's native threads unwind first (the close-while-playing
+        # crash). See VideoPlayer.close.
+        self.save_geometry()
+        self._teardown_players_keep_window()
+        self.after(120, self.destroy)

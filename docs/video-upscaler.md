@@ -1136,13 +1136,22 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > libVLC only creates the output once playback starts — otherwise there's no sound
 > until the first pause/play.)
 >
-> **Playback view = side-by-side / A-B flip, NOT a live wipe (by design, 16.3).** A
-> true pixel-wipe across two *moving* hardware video surfaces is not feasible (libVLC
-> scales each video to fill its own HWND, so a shared, aligned, moving divider can't
-> be clipped across both). Motion is compared side-by-side or by flipping A/B in a
-> single view; the exact before/after **wipe returns when paused** (decode-on-seek).
-> Motion artifacts (jitter/seams) actually read better side-by-side than under a
-> half-and-half wipe anyway.
+> **Two SEPARATE comparison windows (not one dual-mode window).** Playing side-by-side
+> then swapping to a full-frame wipe on pause was jarring (the layout jumped), so the
+> two styles are split into two windows, each opened from its own context-menu entry
+> ("Compare videos" / "Compare frames") and the Segments manager ("Play videos" /
+> "Compare frames"):
+> - **`VideoComparisonWindow` = frames only**: scrub + frame-step + the before/after
+>   **wipe** with shared zoom/pan, decoded through ffmpeg. It has **no libVLC at all**,
+>   so it is inherently crash-free. This is the pixel-peeping tool.
+> - **`VideoPlaybackWindow` = playback only**: real-time side-by-side (and A/B-flip
+>   via the view button) with audio, via libVLC. ALL libVLC embedding lives here.
+>   Audio is routed to the **upscaled** player only (both carry the same muxed track;
+>   the upscaled is the single reference so the user can watch each video track its
+>   sync). A true moving pixel-wipe across two live hardware video surfaces is not
+>   feasible (libVLC scales each video to fill its own HWND), which is the other
+>   reason the wipe stays in the frames window; motion artifacts read better
+>   side-by-side or via A/B-flip than under a half-and-half wipe anyway.
 
 ### 16.1 Motivation
 

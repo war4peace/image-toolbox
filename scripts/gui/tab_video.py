@@ -18,7 +18,7 @@ import ssh_setup
 import taskbar_progress
 from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE
 from gui.widgets import ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer
-from gui.comparison import VideoComparisonWindow
+from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
 from gui.tooltab import ToolTab
 
 
@@ -100,7 +100,8 @@ class SegmentsManager(tk.Toplevel):
         for txt, cmd in (("Rename…", self._rename), ("Delete", self._delete),
                          ("Open source", self._open_source),
                          ("Open upscaled", self._open_upscaled),
-                         ("Compare", self._compare), ("Refresh", self.refresh)):
+                         ("Compare frames", self._compare),
+                         ("Play videos", self._play), ("Refresh", self.refresh)):
             ttk.Button(btns, text=txt, width=14, command=cmd).pack(pady=2)
         self.status_var = tk.StringVar(value="")
         ttk.Label(btns, textvariable=self.status_var, foreground="#7f8a99",
@@ -184,6 +185,13 @@ class SegmentsManager(tk.Toplevel):
         c = self._selected()
         if c and c["status"] == "done" and c["output_path"]:
             self.tab._open_compare(self._abs(c), c["output_path"])
+        else:
+            self.status_var.set("Not upscaled yet.")
+
+    def _play(self):
+        c = self._selected()
+        if c and c["status"] == "done" and c["output_path"]:
+            self.tab._open_playback(self._abs(c), c["output_path"])
         else:
             self.status_var.set("Not upscaled yet.")
 
@@ -900,7 +908,9 @@ class VideoTab(ttk.Frame):
                       command=lambda: self._open_folder(row["abs"]))
         for t, s, p in row["outs"]:
             if s == "done" and p:
-                m.add_command(label=f"Compare ({t})",
+                m.add_command(label=f"Compare videos ({t})",
+                              command=lambda p=p: self._open_playback(row["abs"], p))
+                m.add_command(label=f"Compare frames ({t})",
                               command=lambda p=p: self._open_compare(row["abs"], p))
                 m.add_command(label=f"Open upscaled ({t})",
                               command=lambda p=p: self._open_path(p))
@@ -978,7 +988,8 @@ class VideoTab(ttk.Frame):
             self._open_path(os.path.dirname(p))
 
     def _open_compare(self, src, up):
-        """Open/reuse the shared original-vs-upscaled video comparison window."""
+        """Open/reuse the shared FRAME comparison window (scrub + before/after wipe,
+        libVLC-free)."""
         if not (up and os.path.exists(up)):
             self._open_path(src)
             return
@@ -989,6 +1000,21 @@ class VideoTab(ttk.Frame):
             win.lift()
         else:
             self.app.video_comparison_window = VideoComparisonWindow(
+                self.app, src, up, app=self.app)
+
+    def _open_playback(self, src, up):
+        """Open/reuse the shared VIDEO playback window (side-by-side / A-B flip, with
+        audio, via libVLC)."""
+        if not (up and os.path.exists(up)):
+            self._open_path(src)
+            return
+        win = getattr(self.app, "video_playback_window", None)
+        if win is not None and win.winfo_exists():
+            win.show_videos(src, up)
+            win.deiconify()
+            win.lift()
+        else:
+            self.app.video_playback_window = VideoPlaybackWindow(
                 self.app, src, up, app=self.app)
 
     # ── prepare / queue ──────────────────────────────────────────────────────

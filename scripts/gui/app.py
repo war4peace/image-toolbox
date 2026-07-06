@@ -82,7 +82,8 @@ class App(tk.Tk):
         self._last_normal_geo = None
         self.log_window = None          # single shared LogViewer for both tools
         self.comparison_window = None   # single shared ComparisonWindow (images)
-        self.video_comparison_window = None  # single shared VideoComparisonWindow
+        self.video_comparison_window = None  # single shared VideoComparisonWindow (frames)
+        self.video_playback_window = None    # single shared VideoPlaybackWindow (libVLC)
         self._migrate_default_folders()
         self._migrate_secrets_to_overlay()
         self._restore_geometry()
@@ -798,10 +799,12 @@ class App(tk.Tk):
             self.comparison_window.save_geometry()
         if self.video_comparison_window is not None and self.video_comparison_window.winfo_exists():
             self.video_comparison_window.save_geometry()
+        if self.video_playback_window is not None and self.video_playback_window.winfo_exists():
+            self.video_playback_window.save_geometry()
             # Release the libVLC players before root.destroy() cascades into their
             # surfaces (else the vout thread faults on the destroyed HWND at exit).
             try:
-                self.video_comparison_window.teardown_players()
+                self.video_playback_window.teardown_players()
             except Exception:
                 pass
         mark("save-geometry")
