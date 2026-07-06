@@ -402,7 +402,9 @@ class VideoComparisonWindow(ComparisonWindow):
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_motion)
         self.bind("<Configure>", self._track_geometry, add="+")
-        self.transient(master)                     # modal: block the main window
+        # Modal via grab_set (below), NOT transient(): transient() strips the
+        # Maximize box on Windows (tool-window style), and grab_set alone already
+        # makes the window application-modal.
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.show_videos(source, upscaled)
 
@@ -557,7 +559,8 @@ class VideoPlaybackWindow(tk.Toplevel):
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x520")
         self.minsize(640, 400)
         self._last_normal_geo = None
-        self.transient(master)                     # modal: block the main window
+        # Modal via grab_set (in _grab_modal), NOT transient(): transient() strips
+        # the Maximize box on Windows; grab_set alone makes the window app-modal.
 
         bar = ttk.Frame(self, padding=(8, 4))
         bar.pack(fill="x")
@@ -836,6 +839,10 @@ class VideoPlaybackWindow(tk.Toplevel):
         self._playing = False
         for p in (self._src_player, self._up_player):
             if p is not None:
+                try:
+                    p.pause()                      # quiet the vout before stop()
+                except Exception:                  # noqa: BLE001
+                    pass
                 p.close()                          # stop -> detach HWND -> release
         self._src_player = self._up_player = None
         self._started = False
@@ -845,14 +852,52 @@ class VideoPlaybackWindow(tk.Toplevel):
         surfaces (else the vout thread faults on the destroyed HWND)."""
         self._teardown_players_keep_window()
 
+    def _finish_destroy(self):
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
     def _close(self):
-        # Detach + release players BEFORE the surface HWND dies, then defer destroy()
-        # a tick so libVLC's native threads unwind first (the close-while-playing
-        # crash). See VideoPlayer.close.
+        # Release the players OFF the UI thread. stop() on a STILL-PLAYING embedded
+        # player blocks its caller until the vout thread unwinds, and that vout thread
+        # is itself blocked SendMessage-ing our HWND -- which only THIS (UI) thread's
+        # message pump can service. Doing it synchronously here deadlocks the app
+        # ("Not responding"). So: cancel the Tk poll on the UI thread, withdraw the
+        # window (but keep its HWND alive for the vout), release libVLC on a worker
+        # thread while the pump keeps running, then destroy. See VideoPlayer.release_native.
         try:
             self.grab_release()
         except tk.TclError:
             pass
         self.save_geometry()
-        self._teardown_players_keep_window()
-        self.after(120, self.destroy)
+        self._cancel_resync()
+        self._playing = False
+        players = [p for p in (self._src_player, self._up_player) if p is not None]
+        for p in players:
+            try:
+                p.stop_poll()                      # Tk call: must be on the UI thread
+            except Exception:                      # noqa: BLE001
+                pass
+        self._src_player = self._up_player = None
+        self._started = False
+        try:
+            self.withdraw()                        # hide now; HWND stays for the vout
+        except tk.TclError:
+            pass
+        if not players:
+            self.after(60, self.destroy)
+            return
+
+        def _work():
+            for p in players:
+                try:
+                    p.release_native()
+                except Exception:                  # noqa: BLE001
+                    pass
+            try:
+                self.after(0, self._finish_destroy)
+            except Exception:                      # noqa: BLE001
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()

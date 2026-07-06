@@ -298,15 +298,21 @@ class VideoPlayer(ttk.Frame):
         except Exception:                            # noqa: BLE001
             return False
 
-    def close(self):
-        """Tear the player down in the order that avoids the close-while-playing
-        crash: stop playback, DETACH the HWND (set_hwnd(0)) so libVLC's vout stops
-        drawing into a window that is about to be destroyed, drop the media, then
-        release. Destroying the Tk surface before this detaches is what faulted
-        (a native access violation from the vout thread). Callers should also defer
-        the window destroy() a tick (see the windows' _close) to let the native
-        threads unwind."""
+    def stop_poll(self):
+        """Cancel the time-poll callback. Uses Tk (after_cancel), so it MUST run on
+        the UI thread — call it before handing release_native() to a worker thread."""
         self._stop_poll()
+
+    def release_native(self):
+        """The libVLC half of close(): stop playback, DETACH the HWND (set_hwnd(0))
+        so the vout stops drawing into a window about to be destroyed, drop the media,
+        release. Free of any Tk call, so it is safe to run on a BACKGROUND thread —
+        which is what breaks the close-while-playing DEADLOCK: stop() on a playing
+        embedded player blocks its caller until the vout thread unwinds, and that vout
+        thread is itself blocked SendMessage-ing our HWND, which only the UI thread's
+        message pump can service. Run this off-thread and the pump stays alive, so
+        stop() completes instead of hanging the app. Call stop_poll() (UI thread)
+        first."""
         p = self._player
         if p is not None:
             for step in (
@@ -326,6 +332,15 @@ class VideoPlayer(ttk.Frame):
             pass
         self._instance = None
         self.ok = False
+
+    def close(self):
+        """Synchronous teardown (stop_poll + release_native) for UI-thread callers
+        that are NOT closing mid-playback (e.g. swapping to a new pair, app exit).
+        The close-WHILE-PLAYING path uses the split methods off-thread instead; see
+        VideoPlaybackWindow._close. Callers should also defer the window destroy() a
+        tick to let the native threads unwind."""
+        self.stop_poll()
+        self.release_native()
 
     # ── transport ────────────────────────────────────────────────────────────
 
