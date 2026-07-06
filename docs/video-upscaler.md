@@ -1094,4 +1094,224 @@ from Remote (#1).
 
 Per-target pod grouping for mixed-target queues (15.1); the h264/h265 deliverable if
 not done in v1 (14); real-time synchronised playback in the comparison window (it is
-scrub + frame-step in v1, section 11).
+scrub + frame-step in v1, section 11). **Playback is now specified in section 16**,
+which also adds the segment extractor.
+
+## 16. Segment extraction + real-time playback (0.4.7, planned)
+
+> Status: **DESIGN.** Two children of the Video Upscaler, specified together
+> because they share one new capability the app has never had: **playing video
+> (with audio) inside the GUI.** (1) turning the comparison window from a
+> still-frame comparator into a real motion comparator, and (2) a **segment
+> extractor** so a user can upscale one scene out of a long source instead of the
+> whole file. Settled with the user before building.
+
+### 16.1 Motivation
+
+- **The comparison window is a still-frame tool wearing a video costume.** Today
+  (section 11) it decodes one frame per side on a settled scrub and draws a
+  before/after wipe. That is fine for pixel-peeping sharpness, but the SeedVR2
+  limits that actually bite are **motion** artifacts: temporal jitter of fine
+  detail on slow pans (section 7, the causal temporal VAE) and the per-`batch_size`
+  seams `temporal_overlap` fixes (15.8). None of those are visible frame by frame.
+  Judging a *video* upscale honestly requires watching it move, with sound.
+- **Extracting a scene is the common real case.** "Grandma's 45-minute birthday,
+  640x480; upscale only the 2m41s where the cake comes in." Today that means a
+  third-party editor: cut the scene, save it, re-scan, upscale. Cost scales with
+  frames (section 5), so upscaling the whole 45 minutes to get 2m41s is both
+  wasteful and expensive. The extractor makes "cut and queue the scene" a
+  right-click.
+- **Finding the scene needs audio.** The motivating cue ("when they start
+  *singing*") is auditory. A silent frame-scrubber cannot find it without the user
+  reading timecodes off an external player by eye and re-entering them by hand,
+  which is the manual friction this feature exists to remove. So real playback with
+  sound is a requirement, not a nicety, and it is the same requirement the
+  comparison window has. One engine serves both.
+
+### 16.2 The playback engine (the dependency decision)
+
+Real-time playback with **synced audio** cannot be done in stdlib tkinter, and the
+bundled-ffmpeg frame-decode trick (section 11) has no audio and no real-time path.
+The chosen engine is **`python-vlc` + libVLC**, rendered into a Tk frame via
+`media_player.set_hwnd(frame.winfo_id())` (Windows), giving play/pause, seek,
+frame-step, volume, and rate for free.
+
+- **This is a deliberate break from "the GUI uses only the standard library"**
+  (CLAUDE.md), the same class of decision as adding paho-mqtt or the bundled
+  ffmpeg: taken knowingly because the value (motion comparison + scene selection
+  with audio) cannot be had otherwise, and because one engine pays for two
+  features.
+- **Delivery matches ffmpeg (6.4): `bootstrap.ps1` downloads a pinned libVLC**
+  into `APP_ROOT/vlc` and pip-installs `python-vlc` into `.venv`, rather than
+  bloating the installer. The libVLC instance is created with an explicit
+  `--plugin-path` (or `VLC_PLUGIN_PATH`) pointing at the bundled `plugins/` dir, so
+  it never depends on a system VLC install. **Needed in both install modes** (the
+  comparison window and picker run locally even for a Remote-only user), like
+  ffmpeg. Ship libVLC's **LGPL-2.1** license alongside the ffmpeg/SeedVR2 licenses.
+- **Main risk: Windows libVLC bundling is finicky** (the `plugins/` dir must be
+  discoverable; `libvlc.dll`/`libvlccore.dll` and `python-vlc` versions must
+  match). Pin all three together and smoke-test load on a clean box. This is the
+  single largest chunk of the work and it is plumbing, not the value.
+- **Fail-safe fallback (defensive, keep the old path).** If libVLC is absent (old
+  install, blocked download) the import is guarded and both surfaces **degrade to
+  today's behaviour**: the comparison window keeps its scrub + frame-step wipe, and
+  the segment picker still marks **frame-accurately** via the ffmpeg frame-decode,
+  offering an **"Open in system player"** button for the audio cue. The feature
+  never hard-requires the dependency; it is strictly better when present.
+
+A single shared widget, `gui/video_player.py` (`VideoPlayer`), wraps all of this:
+`play/pause`, `seek(t)`, `step(±frames)` (libVLC `next_frame` forward, `seek(t -
+1/fps)` back), `keyframe_step(±1)`, `get_time`/`get_length`, `set_volume`/`mute`.
+Both features embed it; neither talks to libVLC directly.
+
+### 16.3 Comparison window: real motion comparison (supersedes 15.10 / section 11)
+
+Two libVLC surfaces (source, upscaled) under **one transport**, aligned **by
+timestamp not frame index** (the CFR-normalize count change, section 14, makes
+index pairing drift). One player is the clock; a light timer nudges the other with
+`set_time` when they slip past a tolerance; play/pause/seek drive both.
+
+The old before/after **wipe across two independent moving, zoomable surfaces is not
+worth solving** (libVLC does not give pixel-shared pan/zoom). So the window has two
+modes, each honest about its job:
+
+- **Playing (new): synchronised motion.** Both streams play in lockstep. A toggle
+  offers **side-by-side** (see both move together) and **A/B flip** (both paused at
+  the same timestamp, a key flips the single view source<->upscaled in place, the
+  fastest way to see what changed). This is what reveals jitter/seams/detail-in-
+  motion, the whole point of a *video* comparison.
+- **Paused: precise pixel-peeping.** Falls back to the **existing** decode-on-seek
+  **wipe + shared zoom/pan** (section 11), which is pixel-perfect and already
+  built. So the wipe is kept for stills; motion gets real playback.
+
+Geometry stays persisted (`video_compare_geometry`); the entry point is unchanged
+(the Video tab's compare action / upscaled-cell double-click, `_open_compare`).
+
+### 16.4 Segment extractor: UI
+
+- **Entry:** right-click a scanned video, **"Extract segment…"** (added to
+  `VideoTab._on_scan_right`). Offered for any video; most useful past ~1 minute.
+- **Picker window** (`gui/video_segment_picker.py`): the shared `VideoPlayer`
+  (with audio) plus a transport row (**Play/Pause**, **|< frame**, **frame >|**,
+  **|<< keyframe**, **keyframe >>|**, a scrub slider, `mm:ss.mmm / total` +
+  current frame index), and a marking row (**Mark start**, **Mark end**, each
+  showing its timecode + frame; a **duration** readout; validation that end > start
+  and both in range).
+- **Marks are frame-accurate** (the user's choice): a mark is an exact frame, not a
+  keyframe. Keyframe buttons are a *navigation* aid (jump to the nearest cut), not a
+  constraint on where you can mark.
+- **Optional label per segment** (the user's choice): a text field ("cake"); used
+  in the output filename (16.6) and the manager list.
+- **Multiple segments before queueing** (the user's choice): **Add segment** pushes
+  the current (start, end, label) onto a small pending list shown in the window;
+  repeat to define several scenes from one source; **Queue** commits them all to the
+  DB queue and closes. So `birthday.avi -> {cake 02:31-05:12, speeches 11:00-13:20}`
+  is one session.
+
+### 16.5 Segment extractor: the "Segments" manager
+
+A new **"Segments"** button under **"Scan"** on the Video tab opens a manager over
+the clip jobs for the current root (the `video_outputs` rows with `clip_id > 0`,
+16.6): columns source / label / range / target / status. Actions: **Re-open picker**
+(edit marks/label while still `queued`), **Rename**, **Delete**, plus the queue
+reorder actions already present.
+
+Clips are **normal queue jobs**, so they also appear in the main Upscale queue and
+run through the exact same estimate/GPU-pick/stream/resume machinery (no parallel
+run path). The manager is a focused *view + editor* over clip jobs, distinguished in
+the queue by their label + range; it does not own a separate pipeline.
+
+### 16.6 Data model: the clip discriminator
+
+The queue's identity is `(root_id, rel_path, target)` across all three video
+tables, which allows exactly one job per source+target. A source can have **several
+clips at one target**, which breaks that key. Change:
+
+- **`video_outputs`** and **`video_segments`** gain **`clip_id INTEGER NOT NULL
+  DEFAULT 0`**, added to **both primary keys**. `clip_id = 0` is the whole-file job
+  (today's behaviour, unchanged); a clip gets a positive id (`next_clip_id` = max+1
+  per `(root_id, rel_path)`).
+- **`video_outputs`** gains clip metadata: **`clip_start REAL`**, **`clip_end
+  REAL`**, **`clip_label TEXT`**, **`clip_frames INTEGER`** (the extracted range's
+  COUNTED frames, filled at Prepare, section 14's header-lies rule applies). A whole-
+  file row leaves these NULL/0.
+- **`video_files` is unchanged.** The physical source is shared and probed once; a
+  clip references it and stores its own frames in `video_outputs`, not `video_files`.
+- **Migration:** SQLite cannot add a PK column in place, so this is a table rebuild
+  of `video_outputs`/`video_segments` (copy existing rows with `clip_id = 0`). There
+  is precedent in `db._migrate_video_tables`, and `cache.db` is regenerable with
+  nothing shipped (15.6), so a versioned rebuild is safe. Keep whole-file callers
+  working by defaulting `clip_id = 0` everywhere the current signatures are used.
+- **Output naming:** `_output_path` encodes the clip so two scenes of one
+  source+target never collide: `<base>_<label-or-mmss-mmss>_<target>.mp4` (label
+  slugified; timecode fallback when unlabelled; `clip_id` as the last-resort
+  uniquifier).
+
+### 16.7 Pipeline: clip = extract-then-run (source never touched)
+
+The split -> stream -> reassemble -> drift pipeline (section 4, `process_job`) is
+already subclip-agnostic, so a clip is just a different *input*:
+
+- **New `video_pipeline.extract_clip(info, start, end, out_path)`:** a
+  **frame-accurate** subclip **with its audio range**. Decode from the keyframe at
+  or before `start` and re-encode the `[start, end)` range (`-ss` after `-i` for
+  exactness), video via `pick_encoder` (nvenc/CPU, 6.4), audio `-c:a copy` or the
+  AAC fallback (6.4). The edge re-encode is harmless: SeedVR2 re-decodes and
+  hallucinates detail downstream, the same reasoning that makes the split re-encode
+  acceptable (14).
+- **`process_job` clip branch:** when `job.clip_id != 0`, first materialise the
+  subclip into the per-video work area (`_work_dirs`), then run the existing
+  `ensure_split` -> per-segment stream -> `concat_segments` -> `mux_audio` ->
+  `check_drift` on that subclip **verbatim**. The subclip becomes the effective
+  `info`, so: the drift reference is the **clip's** counted frames, and `mux_audio`
+  muxes from the **subclip** (which carries the clipped audio), not the full source.
+- **Virtual extraction (the user's choice):** the DB stores only `clip_start`/
+  `clip_end`; the subclip file is created **only at run time in the hidden work
+  area** and cleaned up on completion, so the source tree is never littered. This
+  keeps the "never touch / never pollute the source" promise (section 1).
+- **Prepare for a clip (`prepare_clip`):** extract once to count exact frames
+  (`clip_frames`) for a trustworthy cost + drift reference, then enqueue the
+  `video_outputs` clip row. Before that exact pass the estimate uses `(end - start)
+  * fps` as an approximation, mirroring how whole-file Prepare works (section 15.3
+  step 5).
+
+### 16.8 Estimator & eligibility
+
+A clip's target eligibility is the whole file's (same resolution, 15.5). Cost is
+driven by the **clip's** frames, not the source's, which is the entire point: a
+2m41s clip of a 45-minute source costs ~2m41s of upscaling. The queue estimate
+(15.7) sums clip frames like any other job; output megapixels (15.8's aspect fix)
+come from the source dimensions unchanged.
+
+### 16.9 Build pieces
+
+- **`gui/video_player.py`** (new): the shared libVLC `VideoPlayer` widget, guarded
+  import, fail-safe fallback flag.
+- **`gui/video_segment_picker.py`** (new): the picker window (player + transport +
+  marks + label + pending list + Queue).
+- **`gui/comparison.py`**: extend `VideoComparisonWindow` with the play/side-by-
+  side/A-B mode over two `VideoPlayer`s, keeping the paused wipe.
+- **`gui/tab_video.py`**: "Extract segment…" in `_on_scan_right`; the **"Segments"**
+  button + manager; clip label/range columns in the queue list; `prepare_clip` wiring.
+- **`db.py`**: the `clip_id` PK change + clip columns + migration, and helpers
+  (`next_clip_id`, `get_video_clips`, clip-aware `upsert_video_output`/segment).
+- **`video_pipeline.py`**: `extract_clip`, and expose `keyframe_times(path)` (the
+  keyframe timestamp list `max_keyframe_gap` already reads) for the picker's
+  keyframe nav.
+- **`batch_video_upscale.py`**: the `process_job` clip branch, clip-aware
+  `_output_path`, `prepare_clip`.
+- **`bootstrap.ps1`**: pip `python-vlc`, download + pin libVLC into `APP_ROOT/vlc`,
+  wire the plugin path; ship the LGPL license.
+- **Reused unchanged:** the whole run/estimate/GPU-pick/stream/resume path (clips
+  are ordinary `video_outputs` jobs), notifications, taskbar progress.
+
+### 16.10 Open questions for build time
+
+- **libVLC pin + size:** which portable libVLC build, and whether to ship only the
+  plugins actually needed (codec + video output + access) to keep the download
+  small.
+- **Dual-player sync tolerance:** the `set_time` correction cadence/threshold that
+  keeps two players locked without visible re-seeking (measure on real footage).
+- **Picker seek precision on old codecs:** libVLC seek granularity on AVI/mjpeg
+  sources vs the ffmpeg frame-decode; if libVLC seek is coarse, drive the mark
+  readout from an ffmpeg frame index at the settled time so the marks stay exact.
