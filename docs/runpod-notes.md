@@ -401,6 +401,55 @@ ssh -i <key> -p <port> -o StrictHostKeyChecking=no -o ServerAliveInterval=30 `
     -L 11434:localhost:11434 -N root@<host>
 ```
 
+## Running multiple runs in parallel (verified 2026-07-07)
+
+Two runs can be in flight at once. Three combinations, all confirmed by reading
+the wiring:
+
+- **Local Batch Upscaler (stills) + remote Video Upscaler.** No collision. The
+  local upscale owns the 3090 in-process; the video GPU work is on a rented pod,
+  so they never contend for silicon. The GUI does not gate these two tabs against
+  each other (a local upscale only greys out **Tag & Rename** and **Conciliation**
+  for GPU/folder reasons, `tab_upscale.py` `set_tag_tab_enabled` /
+  `refresh_conciliate_lock`, never the Video tab).
+- **Remote Batch Upscaler (images) + remote Video Upscaler.** Also works: the two
+  run on **separate pods**. The pod name is mode-aware (image upscale + Tag &
+  Rename share `image-toolbox-remote`; video gets `video-toolbox-remote`), and
+  `_find_existing_pod` matches on the per-mode prefix, so neither run adopts or
+  tears down the other's pod. Each run rents its own GPU, so no GPU contention.
+- The **SSH tunnels don't collide.** The local end of every `ssh -L` tunnel comes
+  from `_free_local_port()` (bind to port 0, OS-assigned):
+  `remote_upscale_engine.py` / `remote_video_engine.py` for the worker tunnel, and
+  `remote_run._open_ollama_tunnel` (also port 0) for the Ollama tunnel. The
+  pod-side worker port (8200) and Ollama (11434) live on each run's **own** pod.
+- The **shared `cache.db` is safe** across the two subprocesses: WAL mode +
+  `timeout=30.0` (a cross-process writer waits, doesn't error), and the tools write
+  mostly disjoint tables (`upscale_*` vs `video_*`); only `lineage` / `file_hashes`
+  are shared, and those are sub-second, infrequent writes.
+
+**Two caveats the app does NOT control (both remote):**
+
+- **Concurrent mount of the shared model volume.** Both remote runs mount the same
+  region-locked model network volume at `/workspace`. RunPod network volumes are
+  network-attached and generally allow multiple pods in the same data center to
+  mount one volume at once (the read-mostly model-sharing pattern they exist for),
+  and the app neither prevents nor guarantees it. If a DC ever refused the second
+  concurrent mount, the second pod's deploy fails cleanly at mount time (no
+  corruption). One real race: the volume is read-only in steady state EXCEPT when a
+  run writes a not-yet-cached asset (the video run auto-downloads `dit_model` on
+  first use; remote Tag & Rename can pull an Ollama model). Pre-provision /
+  pre-download the models so both runs only ever read, and this is a non-issue.
+- **Double billing.** Two concurrent remote runs bill **two GPUs at once**, and the
+  funds guard (`funds_guard.py`) polls the account balance **per session,
+  independently**, so both can pass the start-floor check individually while
+  together draining faster than either expects. Watch the combined burn rate.
+
+**Cosmetic-only overlaps** (never affect file safety, the DB, or run completion):
+the single **taskbar progress bar** (`App.taskbar_progress/state/clear`) and the
+single MQTT **`task/*`** state slot are both driven by whichever run updates last,
+so they flip-flop between the two runs and the first to finish clears/idles them
+while the other is still going. The in-app per-tab progress bars stay correct.
+
 ## Cost tracking + auto-stop safety
 
 The most valuable bit: never leave a billed pod idle.
