@@ -1161,6 +1161,16 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 >   feasible (libVLC scales each video to fill its own HWND), which is the other
 >   reason the wipe stays in the frames window; motion artifacts read better
 >   side-by-side or via A/B-flip than under a half-and-half wipe anyway.
+>
+> **End-of-media handling + modality (playback window).** libVLC leaves a player in
+> the **Ended** state at the end, from which `play()`/`seek()` silently no-op, so the
+> controls looked dead. On end (`VideoPlayer.on_end`, upscaled = clock) both players
+> are `restart()`ed — a fresh `set_media` re-primes them paused at frame 0 (the only
+> reliable revive; `play()` alone won't restart ended media in libVLC 3.x). The resync
+> loop also stops nudging the source **once it has ended** (a shorter source was being
+> seeked back to the master's time, replaying its last frames). Both compare windows
+> are **application-modal** (`transient` + `grab_set`, released on close) so the main
+> window can't be touched while comparing.
 
 ### 16.1 Motivation
 

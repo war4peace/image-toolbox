@@ -402,8 +402,16 @@ class VideoComparisonWindow(ComparisonWindow):
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_motion)
         self.bind("<Configure>", self._track_geometry, add="+")
+        self.transient(master)                     # modal: block the main window
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.show_videos(source, upscaled)
+
+    def _grab_modal(self):
+        try:
+            if self.winfo_exists():
+                self.grab_set()                    # application-modal (bug #3)
+        except tk.TclError:
+            pass
 
     def save_geometry(self):
         if self._app is not None and self.winfo_exists():
@@ -441,6 +449,7 @@ class VideoComparisonWindow(ComparisonWindow):
         self.lift()
         self.focus_set()
         self._seek(0.0)
+        self.after(80, self._grab_modal)
 
     # ── transport ─────────────────────────────────────────────────────────────
 
@@ -519,6 +528,10 @@ class VideoComparisonWindow(ComparisonWindow):
             return None
 
     def _close(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self.save_geometry()
         self.destroy()
 
@@ -544,6 +557,7 @@ class VideoPlaybackWindow(tk.Toplevel):
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1100x520")
         self.minsize(640, 400)
         self._last_normal_geo = None
+        self.transient(master)                     # modal: block the main window
 
         bar = ttk.Frame(self, padding=(8, 4))
         bar.pack(fill="x")
@@ -629,6 +643,14 @@ class VideoPlaybackWindow(tk.Toplevel):
         self.lift()
         self.focus_set()
         self.after(60, self._ensure_started)       # realise the window, then prime
+        self.after(80, self._grab_modal)
+
+    def _grab_modal(self):
+        try:
+            if self.winfo_exists():
+                self.grab_set()                    # application-modal (bug #3)
+        except tk.TclError:
+            pass
 
     def _ensure_started(self):
         """Create + prime the two players (needs libVLC; offer the in-app install if
@@ -642,7 +664,9 @@ class VideoPlaybackWindow(tk.Toplevel):
                 self, on_done=lambda ok: self._ensure_started() if ok else None)
             return False
         self._src_player = VideoPlayer(self._players_frame, fps=self._fps)
-        self._up_player = VideoPlayer(self._players_frame, fps=self._fps)
+        # The upscaled player is the clock; its end drives the finish handler.
+        self._up_player = VideoPlayer(self._players_frame, on_end=self._on_ended,
+                                      fps=self._fps)
         ok = self._src_player.load(self._src_path) and self._up_player.load(self._up_path)
         if not ok:
             from tkinter import messagebox
@@ -752,14 +776,42 @@ class VideoPlaybackWindow(tk.Toplevel):
         self._resync_job = None
         if not self._playing or self._up_player is None:
             return
+        # Master (upscaled) reached the end -> finish now (belt: on_end also fires
+        # from the player's poll a beat later).
+        if self._up_player.is_ended():
+            self._on_ended()
+            return
         t = self._up_player.get_time()
-        if self._src_player is not None:
+        # Only nudge the source while it is STILL PLAYING. Once the source has ended
+        # (it can be shorter than the upscaled), seeking it back to the master's time
+        # made libVLC replay its last few frames (bug #2) — leave it frozen instead.
+        if self._src_player is not None and not self._src_player.is_ended():
             if abs(self._src_player.get_time() - t) > 2.0 / max(1e-6, self._fps):
                 self._src_player.seek(t)
         self._cur_t = t
         self._set_timeline(t)
         self._update_time_label(t)
         self._schedule_resync()
+
+    def _on_ended(self):
+        """Playback reached the end. libVLC leaves the players in the Ended state,
+        from which play()/seek() silently do nothing (bug #1). Re-prime both to a
+        paused frame-0 state so every control works again; the user presses Play to
+        rewatch. Idempotent (a second trigger sees the players no longer ended)."""
+        if self._up_player is None or not self._up_player.is_ended():
+            # Already handled (restart moved it out of Ended); nothing to do.
+            if not self._playing:
+                return
+        self._cancel_resync()
+        self._playing = False
+        self._play_btn.configure(text="▶ Play")
+        for p in (self._up_player, self._src_player):
+            if p is not None:
+                p.restart()
+        self._cur_t = 0.0
+        self._set_timeline(0.0)
+        self._update_time_label(0.0)
+        self.after(300, self._apply_audio)          # re-mute source after the reload
 
     # ── helpers / teardown ────────────────────────────────────────────────────
 
@@ -797,6 +849,10 @@ class VideoPlaybackWindow(tk.Toplevel):
         # Detach + release players BEFORE the surface HWND dies, then defer destroy()
         # a tick so libVLC's native threads unwind first (the close-while-playing
         # crash). See VideoPlayer.close.
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
         self.save_geometry()
         self._teardown_players_keep_window()
         self.after(120, self.destroy)

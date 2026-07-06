@@ -355,6 +355,23 @@ class VideoPlayer(ttk.Frame):
         except Exception:                            # noqa: BLE001
             return False
 
+    def is_ended(self):
+        """True once the media reached its end. In this state libVLC will NOT play()
+        or seek() again until the media is reset (see restart), so callers must
+        detect it rather than silently no-op."""
+        try:
+            return bool(self._player is not None and _vlc is not None
+                        and self._player.get_state() == _vlc.State.Ended)
+        except Exception:                            # noqa: BLE001
+            return False
+
+    def restart(self):
+        """Re-prime to a paused frame-0 state. Reloads a FRESH media (load), which is
+        the reliable way to revive a player out of the Ended/Stopped state — play()
+        alone does not restart an ended media in libVLC 3.x."""
+        if self._path:
+            self.load(self._path)
+
     def seek(self, seconds):
         """Seek to `seconds` (clamped to [0, length])."""
         if self._player is None:
