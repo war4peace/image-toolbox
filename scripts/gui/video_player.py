@@ -87,6 +87,63 @@ def vlc_error():
     return _VLC_LOAD_ERROR
 
 
+# ── GPU-overlay hook detection (RivaTuner / MSI Afterburner) ──────────────────
+# RivaTuner Statistics Server injects an overlay hook DLL into processes it thinks
+# are rendering and crashes libVLC with a native access violation (0xc0000005 in an
+# "unknown"/injected module) at a random point during playback. This is an EXTERNAL
+# incompatibility, not an app bug, and it's uncatchable from Python. We can at least
+# DETECT the injected hook and warn, so a user doesn't lose hours to a mystery crash.
+_OVERLAY_HOOK_DLLS = {
+    "RTSSHooks64.dll": "RivaTuner Statistics Server (MSI Afterburner)",
+    "RTSSHooks.dll":   "RivaTuner Statistics Server (MSI Afterburner)",
+}
+_overlay_warned = False
+
+
+def overlay_hook_present():
+    """Name of a known GPU-overlay tool whose hook DLL is injected into THIS process,
+    or None. Detected via GetModuleHandleW (the DLL is loaded in our address space
+    only when the overlay has hooked us). Fail-safe: None on non-Windows / any error."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        k32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        for dll, name in _OVERLAY_HOOK_DLLS.items():
+            if k32.GetModuleHandleW(dll):
+                return name
+    except Exception:                                # noqa: BLE001
+        return None
+    return None
+
+
+def warn_overlay_once(parent):
+    """Once per session, if a GPU-overlay hook (RTSS/Afterburner) is injected, warn
+    that it can crash the video player and how to avoid it. Fail-safe."""
+    global _overlay_warned
+    if _overlay_warned:
+        return
+    name = overlay_hook_present()
+    if not name:
+        return
+    _overlay_warned = True
+    try:
+        from tkinter import messagebox
+        from gui.common import APP_TITLE
+        messagebox.showwarning(
+            APP_TITLE,
+            f"{name} is running and its overlay is injected into this app.\n\n"
+            "That overlay is known to crash the in-app video player (a driver-level "
+            "access violation that Windows reports against pythonw.exe). If the "
+            "player crashes, close it or add pythonw.exe to its exclusion / "
+            "\"Application detection level = None\" list, then try again.\n\n"
+            "The frame comparison (Compare frames) is unaffected.")
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 def prompt_install_libvlc(parent, on_done=None):
     """Offer to download + install libVLC (+ python-vlc) in-app, for an install made
     before bootstrap fetched it (section 16.2). If already available, calls
@@ -216,6 +273,7 @@ class VideoPlayer(ttk.Frame):
             else:                                   # not shipped, but keep it correct
                 self._player.set_xwindow(handle)
             self.ok = True
+            warn_overlay_once(self)                 # RTSS/overlay-hook crash warning
         except Exception:                            # noqa: BLE001
             self.ok = False
             self._player = None

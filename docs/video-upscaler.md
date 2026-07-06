@@ -1136,6 +1136,15 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > libVLC only creates the output once playback starts — otherwise there's no sound
 > until the first pause/play.)
 >
+> **External incompatibility (NOT an app bug): GPU-overlay injectors.** RivaTuner
+> Statistics Server (bundled with MSI Afterburner) injects its overlay hook
+> (`RTSSHooks64.dll`) into the app and crashes libVLC with a native access violation
+> (0xc0000005 in an "unknown"/injected module) at a random point during playback,
+> even with the software vout. Confirmed by a user: closing RTSS/Afterburner made the
+> player rock-solid. Uncatchable from Python, so `gui.video_player.warn_overlay_once`
+> DETECTS the injected hook (`GetModuleHandleW`) and warns once with the fix (close it,
+> or set its per-app detection level to None); the frames window is unaffected.
+>
 > **Two SEPARATE comparison windows (not one dual-mode window).** Playing side-by-side
 > then swapping to a full-frame wipe on pause was jarring (the layout jumped), so the
 > two styles are split into two windows, each opened from its own context-menu entry

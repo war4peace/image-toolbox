@@ -20,6 +20,12 @@ def test_load_vlc_is_fail_safe():
     assert vp.load_vlc() in (True, False)
 
 
+def test_overlay_hook_detection_is_fail_safe():
+    # Returns a tool name (str) if an overlay hook is injected, else None; never raises.
+    result = vp.overlay_hook_present()
+    assert result is None or isinstance(result, str)
+
+
 def test_time_frame_roundtrip():
     assert vp.time_to_frame(0.0, 30) == 0
     assert vp.time_to_frame(1.0, 30) == 30
