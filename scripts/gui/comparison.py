@@ -676,7 +676,9 @@ class VideoPlaybackWindow(tk.Toplevel):
             prompt_install_libvlc(
                 self, on_done=lambda ok: self._ensure_started() if ok else None)
             return False
-        self._src_player = VideoPlayer(self._players_frame, fps=self._fps)
+        # The source player is created SILENT (--no-audio); only the upscaled side is
+        # heard, so there is never an echo regardless of mute/volume timing.
+        self._src_player = VideoPlayer(self._players_frame, fps=self._fps, no_audio=True)
         # The upscaled player is the clock; its end drives the finish handler.
         self._up_player = VideoPlayer(self._players_frame, on_end=self._on_ended,
                                       fps=self._fps)
@@ -767,15 +769,13 @@ class VideoPlaybackWindow(tk.Toplevel):
         self._apply_audio()
 
     def _apply_audio(self):
-        """Audio = the UPSCALED player only (the source is muted + zero-volume). Both
-        carry the same muxed track, so this is the single reference stream; keeping it
-        on the upscaled side lets the user check the upscaled video's sync. Re-applied
-        after play() because libVLC creates the output only once playback starts."""
+        """Audio = the UPSCALED player only. The source player is created SILENT
+        (--no-audio at the instance level, in _ensure_started), so there is no echo
+        and nothing to mute here. This just makes sure the upscaled side is audible.
+        Re-applied after play() because libVLC creates the output only once playback
+        starts (and the moment varies by host)."""
         if not self.winfo_exists():
             return
-        if self._src_player is not None:
-            self._src_player.set_mute(True)
-            self._src_player.set_volume(0)
         if self._up_player is not None:
             # Set an audible volume AND unmute (unmute last so it sticks): the default
             # volume of a fresh player is not guaranteed to be 100, so unmuting alone

@@ -226,11 +226,12 @@ class VideoPlayer(ttk.Frame):
 
     POLL_MS = 90
 
-    def __init__(self, master, on_time=None, on_end=None, fps=30.0):
+    def __init__(self, master, on_time=None, on_end=None, fps=30.0, no_audio=False):
         super().__init__(master)
         self._on_time = on_time
         self._on_end = on_end
         self.fps = float(fps) or 30.0
+        self._no_audio = bool(no_audio)   # create the instance with --no-audio (silent)
         self.ok = False
         self._player = None
         self._instance = None
@@ -262,9 +263,15 @@ class VideoPlayer(ttk.Frame):
             # decode off the GPU too (no DXVA2/D3D11VA surfaces). Software is plenty
             # for the modest clips this window compares; stability wins here. See the
             # crash note in this module's docstring / docs/video-upscaler.md 16.3.
-            self._instance = _vlc.Instance(
-                "--intf", "dummy", "--no-video-title-show", "--quiet",
-                "--vout=wingdi", "--avcodec-hw=none")
+            args = ["--intf", "dummy", "--no-video-title-show", "--quiet",
+                    "--vout=wingdi", "--avcodec-hw=none"]
+            if self._no_audio:
+                # Kill audio at the instance level: reliable where audio_set_mute /
+                # volume-0 are not (libVLC mute is flaky across the Windows aouts, and
+                # a volume set can be ignored while the output is still coming up). Used
+                # for the source player so only the upscaled side is heard (no echo).
+                args.append("--no-audio")
+            self._instance = _vlc.Instance(*args)
             self._player = self._instance.media_player_new()
             self.update_idletasks()                 # realise the surface -> valid winfo_id
             handle = self.surface.winfo_id()
