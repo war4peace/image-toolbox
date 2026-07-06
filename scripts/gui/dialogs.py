@@ -9,7 +9,8 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 import updater
-from gui.common import APP_TITLE, APP_VERSION, set_update_skipped_version
+from gui.common import (APP_TITLE, APP_VERSION, set_update_skipped_version,
+                       ollama_pull)
 
 
 class UpdateDialog(tk.Toplevel):
@@ -171,6 +172,72 @@ class UpdateDialog(tk.Toplevel):
     def _later(self):
         if self._downloading:
             return
+        self.destroy()
+
+
+class OllamaPullDialog(tk.Toplevel):
+    """
+    Modal progress dialog that pulls one Ollama model (common.ollama_pull over
+    HTTP), for the Tag & Rename tab's "download the model before tagging" safety
+    net. Blocks the caller via wait_window; read `.ok` (and `.error`) afterwards.
+    Shared with the first-start Wizard's pull path only in spirit — both call the
+    same common.ollama_pull, but this one is a standalone modal.
+    """
+
+    def __init__(self, parent, url, model):
+        super().__init__(parent)
+        self.ok = False
+        self.error = None
+        self.model = model
+
+        self.title("Downloading model")
+        self.transient(parent)
+        self.resizable(False, False)
+        # No close button mid-pull: a stalled pull ends itself via ollama_pull's
+        # per-read timeout (surfaced as an error), so there is no way to get stuck.
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=f"Downloading {model} …",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self._var = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(outer, mode="determinate", maximum=100,
+                        variable=self._var, length=380).pack(fill="x", pady=(10, 4))
+        self._status = ttk.Label(outer, text="Starting …", foreground="#666")
+        self._status.pack(anchor="w")
+
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        self.grab_set()
+
+        threading.Thread(target=self._worker, args=(url, model), daemon=True).start()
+
+    def _worker(self, url, model):
+        def prog(status, completed, total):
+            self.after(0, lambda: self._on_progress(status, completed, total))
+        ok, err = ollama_pull(url, model, progress_cb=prog)
+        self.after(0, lambda: self._done(ok, err))
+
+    def _on_progress(self, status, completed, total):
+        if not self.winfo_exists():
+            return
+        if total:
+            self._var.set((completed or 0) / total * 100)
+            gb = 1024 ** 3
+            self._status.configure(
+                text=f"{status}  {(completed or 0) / gb:.1f} / {total / gb:.1f} GB".strip())
+        else:
+            self._status.configure(text=status or "Downloading …")
+
+    def _done(self, ok, err):
+        self.ok = ok
+        self.error = None if ok else str(err)
         self.destroy()
 
 

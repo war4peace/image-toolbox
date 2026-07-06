@@ -149,6 +149,11 @@ class App(tk.Tk):
             self.after(1500, lambda: threading.Thread(
                 target=self._startup_worker, daemon=True).start())
 
+        # First-start Wizard (0.4.6): one-time GPU-aware model setup. Shown just
+        # after the window is up (before the 1500 ms update worker even starts, so
+        # the two modal dialogs never fight for the grab on a fresh install).
+        self.after(600, self._maybe_show_wizard)
+
     def _install_picklist_wheel_guard(self):
         """Stop a mouse-wheel scroll over a ttk Combobox/Spinbox from silently
         changing its value — a Windows footgun that can flip a setting unnoticed
@@ -314,6 +319,26 @@ class App(tk.Tk):
                 save_config()   # partitions CFG into config.json + config.local.json
         except Exception:
             debug_log("App._migrate_secrets_to_overlay")
+
+    def _maybe_show_wizard(self):
+        """Show the one-time first-start Wizard (0.4.6) when it has not run before.
+        Fail-safe: a wizard that fails to build must never block the app from
+        launching, so any failure is logged and the flag is marked done (so it does
+        not retry, and nag, on every subsequent launch). See gui/wizard.py."""
+        try:
+            from gui.wizard import should_show, FirstStartWizard
+            if should_show(self):
+                FirstStartWizard(self)
+        except Exception:
+            debug_log("App._maybe_show_wizard", tb=True)
+            # Mark done through the SHARED settings dict (a geometry save would
+            # clobber a separate disk write), so a broken wizard doesn't nag every
+            # launch.
+            try:
+                self.settings["wizard_done"] = True
+                save_settings(self.settings)
+            except Exception:
+                pass
 
     def _migrate_default_folders(self):
         """Carry default folders saved by older builds in gui_settings.json over

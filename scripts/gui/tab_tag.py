@@ -9,9 +9,12 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import ssh_setup
-from gui.common import APP_TITLE, CFG, get_default_folder, set_default_folder, get_install_mode, _ollama_release_vram
+from gui.common import (APP_TITLE, CFG, get_default_folder, set_default_folder,
+                       get_install_mode, _ollama_release_vram,
+                       ollama_list_models, ollama_model_present)
 from gui.widgets import Tooltip
 from gui.tooltab import ToolTab
+from gui.dialogs import OllamaPullDialog
 
 
 LANGUAGES = [
@@ -214,6 +217,8 @@ class TagTab(ToolTab):
                     "Tick 'Run on remote pod (RunPod)' to tag on a rented GPU, or "
                     "reinstall and choose Local or Both to tag on this PC.")
                 return
+            if not self._ensure_ollama_model():
+                return
             if not self.confirm_gpu_overlap():
                 return
         args = [folder, "--no-prompt"]
@@ -236,6 +241,50 @@ class TagTab(ToolTab):
         if self.launch("tag_and_rename.py", args, extra_env=extra_env):
             self._remote_run = remote
             self._set_running(True)
+
+    def _ensure_ollama_model(self):
+        """Local tag runs need the configured Ollama vision model present, and
+        Ollama does NOT auto-pull on first use (a generate against a missing model
+        just fails). So before starting, check availability and, if the model is
+        missing, offer to download it (the first-start Wizard normally does this,
+        but it may have been skipped or its pull may have failed).
+
+        Returns True to proceed, False to abort the run. Fail-open when Ollama can't
+        be reached to check: the runner reports Ollama problems clearly on its own,
+        so don't block a run on a check we couldn't complete."""
+        o = CFG.get("ollama", {})
+        url = o.get("url", "http://127.0.0.1:11434")
+        model = o.get("model", "qwen2.5vl:7b")
+        if not model:
+            return True
+
+        ok, names = ollama_list_models(url)
+        if not ok:
+            return True                       # server unreachable — let the runner report
+        if ollama_model_present(names, model):
+            return True
+
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"The vision model '{model}' isn't installed yet.\n\n"
+                "Tag & Rename needs it. Download it now? This can be several GB and "
+                "may take a while."):
+            messagebox.showinfo(
+                APP_TITLE,
+                "Tagging was not started.\n\n"
+                f"You can download the model later with:  ollama pull {model}\n"
+                "or from Settings → Re-run first-start wizard.")
+            return False
+
+        dlg = OllamaPullDialog(self, url, model)
+        self.wait_window(dlg)
+        if not dlg.ok:
+            messagebox.showerror(
+                APP_TITLE,
+                f"The model '{model}' could not be downloaded:\n\n"
+                f"{dlg.error or 'unknown error'}\n\nTagging was not started.")
+            return False
+        return True
 
     def _undo(self):
         folder = self._valid_dir()

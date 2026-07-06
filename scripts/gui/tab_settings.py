@@ -517,6 +517,16 @@ class SettingsTab(ttk.Frame):
         self.mqtt_status = ttk.Label(sec, text="", foreground="#666")
         self.mqtt_status.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
 
+        # ── Setup ────────────────────────────────────────────────────────────────
+        sec = self._section(body, "Setup")
+        row = ttk.Frame(sec)
+        row.grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Button(row, text="Re-run first-start wizard",
+                   command=self._rerun_wizard).pack(side="left")
+        ttk.Label(row, foreground="#666",
+                  text="Re-detect your GPU and recommend upscaling / tagging models.").pack(
+            side="left", padx=(12, 0))
+
         # ── Updates (kept last: rarely changed, low priority) ────────────────────
         sec = self._section(body, "Updates")
         row = ttk.Frame(sec)
@@ -652,6 +662,17 @@ class SettingsTab(ttk.Frame):
         ok, msg = notifications.test_ntfy(
             self.ntfy_server_var.get(), self.ntfy_topic_var.get(), token)
         self.ntfy_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _rerun_wizard(self):
+        """Open the first-start Wizard on demand. Re-running is always allowed (the
+        wizard re-detects the GPU and re-recommends models); it re-sets wizard_done
+        on Finish/Skip. Lazy import + fail-safe so a wizard problem can't break the
+        Settings tab."""
+        try:
+            from gui.wizard import FirstStartWizard
+            FirstStartWizard(self.app)
+        except Exception:
+            messagebox.showerror(APP_TITLE, "Could not open the setup wizard.")
 
     def _check_updates(self):
         """Manual update check from Settings (always reports the outcome, and

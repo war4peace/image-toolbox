@@ -388,40 +388,14 @@ try {
     }
 
     if ($ollamaExe) {
-        # The vision model the toolbox is configured to use (config.json)
-        $model = "qwen2.5vl:7b"
-        try {
-            $cfg = Get-Content (Join-Path $root "config.json") -Raw | ConvertFrom-Json
-            if ($cfg.ollama.model) { $model = $cfg.ollama.model }
-        } catch {}
-
-        # Make sure the Ollama background service is running before talking to it
-        $list = cmd /c "`"$ollamaExe`" list 2>nul"
-        if ($LASTEXITCODE -ne 0) {
-            $app = Join-Path (Split-Path $ollamaExe) "ollama app.exe"
-            if (Test-Path $app) {
-                Start-Process $app | Out-Null
-                Start-Sleep -Seconds 8
-                $list = cmd /c "`"$ollamaExe`" list 2>nul"
-            }
-        }
-
-        $base = ($model -split ":")[0]
-        if ($LASTEXITCODE -eq 0 -and "$list" -match [regex]::Escape($base)) {
-            Write-Host "  Vision model '$model' is already available."
-        } else {
-            Write-Host "  The Tag & Rename feature uses the vision model '$model'."
-            Write-Host "  It is a large download (about 6 GB) and needs a capable GPU (~16 GB VRAM)."
-            if (Confirm-Yes "  Download '$model' now?") {
-                & $ollamaExe pull $model
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Host "  WARNING: the model download did not finish." -ForegroundColor Yellow
-                    Write-Host "  You can retry later with:  ollama pull $model" -ForegroundColor Yellow
-                }
-            } else {
-                Write-Host "  Skipped. You can download it later with:  ollama pull $model"
-            }
-        }
+        # The vision model is deliberately NOT pre-pulled here anymore: which model
+        # suits this PC depends on its GPU, so the app's first-start Wizard detects
+        # the card and recommends + downloads a fitting model (a weak GPU gets a
+        # lighter model than the old hardcoded 7B). If that download is skipped or
+        # fails, the Tag & Rename tab checks the model and offers to pull it when the
+        # user clicks Start.
+        Write-Host "  Ollama is ready. Image Toolbox recommends and downloads a"
+        Write-Host "  vision model that suits your GPU the first time it starts."
     }
     }
 

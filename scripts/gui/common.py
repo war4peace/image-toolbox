@@ -38,7 +38,7 @@ APP_ROOT   = os.path.dirname(SCRIPT_DIR)
 APP_TITLE  = "Image Toolbox"
 # Shown in the main window title bar. On a release, set this to the tag (e.g.
 # "0.1.3") and drop the "-experimental" suffix.
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.6-experimental"
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -276,6 +276,59 @@ def ollama_list_models(url, timeout=5):
         return False, str(exc)
 
 
+def _ollama_tag_matches(installed, wanted):
+    """True if an installed model name satisfies a wanted tag, treating a bare name
+    and its ':latest' as equivalent (Ollama stores `ollama pull minicpm-v` as
+    `minicpm-v:latest`). Otherwise an exact tag match (so `qwen2.5vl:7b` is not
+    satisfied by `qwen2.5vl:3b`)."""
+    def norm(n):
+        return n if ":" in n else n + ":latest"
+    return norm(installed) == norm(wanted)
+
+
+def ollama_model_present(installed_names, wanted):
+    """Whether `wanted` (e.g. 'minicpm-v:latest') is among the installed model
+    names returned by ollama_list_models. Pure, so the wizard's 'already installed?'
+    branch is unit-testable without a server."""
+    return any(_ollama_tag_matches(name, wanted) for name in installed_names)
+
+
+def ollama_pull(url, model, progress_cb=None, timeout=120):
+    """
+    Pull an Ollama model over HTTP (POST /api/pull, streamed). For each progress
+    update, calls progress_cb(status, completed, total) where completed/total are
+    byte counts (either may be None early on). Returns (ok, err): err is a short
+    string on failure, None on success. Meant to run on a background thread.
+
+    `timeout` is the per-read socket timeout, not a whole-download budget: progress
+    lines arrive steadily while data flows, so a stall (no line for `timeout` s)
+    surfaces as an error instead of hanging the wizard forever.
+    """
+    try:
+        payload = json.dumps({"model": model, "stream": True}).encode("utf-8")
+        req = urllib.request.Request(f"{url.rstrip('/')}/api/pull", data=payload,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw in resp:                       # NDJSON: one JSON object per line
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("error"):
+                    return False, str(msg["error"])
+                if progress_cb:
+                    progress_cb(msg.get("status", ""),
+                                msg.get("completed"), msg.get("total"))
+                if msg.get("status") == "success":
+                    return True, None
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
 # Discord/Telegram probes live in notifications.py (shared with the runners).
 # test_discord_webhook stays as a thin alias so existing callers keep working.
 test_discord_webhook = notifications.test_discord
@@ -337,6 +390,22 @@ def save_settings(settings):
             json.dump(settings, f, indent=2)
     except OSError:
         pass   # preferences are best-effort
+
+
+def wizard_completed():
+    """True once the first-start Wizard (0.4.6) has run (or been skipped). Stored
+    as `wizard_done` in gui_settings.json, so it survives an app restart but not a
+    fresh install. Missing / unreadable settings read as not-yet-completed."""
+    return bool(load_settings().get("wizard_done"))
+
+
+def mark_wizard_completed():
+    """Record that the first-start Wizard has run, so it never shows again. Reads
+    the current settings fresh before writing so it does not clobber geometry saved
+    by another code path. Best-effort (save_settings swallows I/O errors)."""
+    s = load_settings()
+    s["wizard_done"] = True
+    save_settings(s)
 
 
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")

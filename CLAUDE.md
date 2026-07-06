@@ -141,6 +141,26 @@ combobox/spinbox no longer silently cycles its value (which used to flip a
 setting unnoticed and trip the guard); the wheel is forwarded to the nearest
 scrollable canvas so the page still scrolls.
 
+**First-start Wizard** (0.4.6) — a one-time onboarding dialog shown on the first
+launch (guarded by `wizard_done` in `gui_settings.json`; re-runnable from Settings →
+"Re-run first-start wizard"). It detects the local GPU (`system_telemetry.sample_gpu`
+/ `gpu_name`) and **recommends the SeedVR2 upscale model + Ollama vision model that
+fit the card's VRAM**, so a non-technical user gets a fast, sane config without
+knowing what "7B fp16" means. Calibrated tiers (pure `gui/wizard_recommend.py`,
+unit-tested): 8-12 GB → 3B Q8 + `gemma3:4b`; 16 GB → 7B FP8-mixed + `minicpm-v`;
+24 GB+ → 7B FP16 + `qwen2.5vl:7b`. The recommendation is a **suggestion, not a gate**
+(SeedVR2 offloads, so any card can run any model, just slower): every option stays
+selectable. The chosen Ollama model is **checked and offered for one-click pull**
+(`common.ollama_pull`, streamed `/api/pull` with progress); SeedVR weights download
+lazily on first upscale, so no pull is needed there. **Remote-only** installs skip
+the GPU step and route to the RunPod tab (SSH key + volume); **both** installs get
+that as an optional final step, and their model config is left at the shipped
+defaults. As a safety net, a **local Tag & Rename run re-checks the model on Start**
+and offers to pull it if missing (`TagTab._ensure_ollama_model` + `OllamaPullDialog`),
+since Ollama never auto-pulls. The GPU-blind `ollama pull qwen2.5vl:7b` was removed
+from `bootstrap.ps1` (Ollama is still installed; the wizard now owns model choice).
+See `gui/wizard.py`, `gui/wizard_recommend.py`, and `docs/first-start-wizard.md`.
+
 **Performance watchdog** (0.3.0, experimental) — guards long upscale runs against
 the **degraded-GPU** failure mode: as a run accumulates GPU/driver state the
 pipeline can silently slow from seconds/image to minutes (the GPU thrashing VRAM
@@ -336,7 +356,7 @@ counts give a sense of weight:
 | File (`scripts/`) | Role |
 |------|------|
 | `toolbox_gui.py` (~65 lines) | GUI **entry point / thin shim** (0.4.3). Arms crash logging **before** importing the `gui/` package (so an import-time failure still logs + shows a dialog), then imports `App`/`main` from `gui.app` and re-exports the public API (`App`, `main`, `APP_VERSION`, `GUI_MARKER`, `ToolTab`, `funds_color`, `fmt_funds`, ...) so `import toolbox_gui` callers and the tests are unchanged. `Image Toolbox.cmd` / bootstrap / installer all run this file. |
-| **`gui/` package** (~8k lines across 14 modules, 0.4.3) | The tkinter GUI, split out of the former single `toolbox_gui.py`. Built bottom-up so imports never cycle: **`gui/common.py`** (foundation: paths/version, config.json + gui_settings.json helpers, funds/mqtt/ollama probes, `GUI_MARKER`, `CFG`); **`gui/widgets.py`** (Tooltip, ProgressBar, TelemetryRow, LogPane, ConsoleBuffer, LogViewer, `_ScrollFrame`, sanitize/_fmt_eta/_log_hms); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**) + **`gui/dialogs.py`** (UpdateDialog); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
+| **`gui/` package** (~8k lines across 16 modules, 0.4.3) | The tkinter GUI, split out of the former single `toolbox_gui.py`. Built bottom-up so imports never cycle: **`gui/common.py`** (foundation: paths/version, config.json + gui_settings.json helpers incl. the `wizard_done` flag, funds/mqtt/ollama probes incl. `ollama_model_present` + streaming `ollama_pull`, `GUI_MARKER`, `CFG`); **`gui/widgets.py`** (Tooltip, ProgressBar, TelemetryRow, LogPane, ConsoleBuffer, LogViewer, `_ScrollFrame`, sanitize/_fmt_eta/_log_hms); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**) + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |

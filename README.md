@@ -113,6 +113,11 @@ Windows GUI (pure Python standard-library tkinter, no extra packages) with six t
 
 ### Common features
 
+- **First-start wizard:** on the first launch it detects your GPU and recommends
+  the upscaling (SeedVR2) and tagging (Ollama) models that suit your VRAM, and
+  offers to download the vision model in one click. Every model stays selectable
+  (a smaller card can still run a bigger model, just slower). Re-run it any time
+  from **Settings → Re-run first-start wizard**.
 - **Update checker** makes sure you don't miss updates. Update straight from the app.
 - **Telemetry rows** (for local and/or remote machine): CPU / RAM / VRAM / GPU.
 - **Live feedback:** two-row status (current + previous file), a progress bar,
