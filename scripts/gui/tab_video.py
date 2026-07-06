@@ -55,6 +55,137 @@ def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
     return run_done
 
 
+def _clip_tc(seconds):
+    """A compact clip timecode for a queue/manager label: 161.0 -> '2:41'."""
+    s = max(0, int(round(seconds or 0)))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+# ─────────────────────────────────────────────
+#  SEGMENTS MANAGER (virtual clip jobs, section 16.5)
+# ─────────────────────────────────────────────
+
+class SegmentsManager(tk.Toplevel):
+    """A focused view + editor over this root's VIRTUAL clip jobs (clip_id > 0). The
+    clips are ordinary queue jobs (they run through the same pipeline), so this is
+    not a separate run flow — just a place to review, rename, delete or open them."""
+
+    def __init__(self, master, tab):
+        super().__init__(master)
+        self.tab = tab
+        self.title(f"{APP_TITLE} — Segments")
+        self.geometry("760x420")
+        self.minsize(560, 300)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        cols = ("label", "range", "dur", "target", "status")
+        self.tree = ttk.Treeview(self, columns=cols, show="tree headings")
+        self.tree.heading("#0", text="Source")
+        self.tree.column("#0", width=220)
+        for c, txt, w in (("label", "Label", 130), ("range", "Range", 130),
+                          ("dur", "Duration", 80), ("target", "Target", 70),
+                          ("status", "Status", 80)):
+            self.tree.heading(c, text=txt)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True, side="left", padx=(8, 0), pady=8)
+        self.tree.bind("<Double-1>", lambda _e: self._open_source())
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.pack(fill="y", side="left", pady=8)
+        self.tree.configure(yscrollcommand=sb.set)
+
+        btns = ttk.Frame(self, padding=8)
+        btns.pack(side="left", fill="y")
+        for txt, cmd in (("Rename…", self._rename), ("Delete", self._delete),
+                         ("Open source", self._open_source),
+                         ("Open upscaled", self._open_upscaled),
+                         ("Compare", self._compare), ("Refresh", self.refresh)):
+            ttk.Button(btns, text=txt, width=14, command=cmd).pack(pady=2)
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(btns, textvariable=self.status_var, foreground="#7f8a99",
+                  wraplength=120).pack(pady=(8, 0))
+
+        self._rows = {}          # iid -> clip Row
+        self.refresh()
+
+    def refresh(self):
+        import batch_video_upscale as bv
+        self.tree.delete(*self.tree.get_children())
+        self._rows = {}
+        if self.tab._root_id is None:
+            return
+        for c in bv.db.get_video_clips(self.tab._conn(), self.tab._root_id):
+            cdur = (c["clip_end"] or 0) - (c["clip_start"] or 0)
+            iid = self.tree.insert(
+                "", "end", text=c["rel_path"],
+                values=(c["clip_label"] or "(unlabelled)",
+                        f"{_clip_tc(c['clip_start'])} – {_clip_tc(c['clip_end'])}",
+                        f"{cdur:.0f}s", c["target"], c["status"]))
+            self._rows[iid] = c
+
+    def _selected(self):
+        sel = self.tree.selection()
+        return self._rows.get(sel[0]) if sel else None
+
+    def _abs(self, c):
+        root = self.tab._src_root or ""
+        return os.path.join(root, c["rel_path"])
+
+    def _rename(self):
+        c = self._selected()
+        if not c:
+            return
+        if c["status"] != "queued":
+            messagebox.showinfo(APP_TITLE, "Only a queued (not-yet-started) segment "
+                                           "can be renamed.")
+            return
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Rename segment", "New label:",
+                                     initialvalue=c["clip_label"] or "", parent=self)
+        if new is None:
+            return
+        import batch_video_upscale as bv
+        out = bv._output_path(self.tab._out_root, c["rel_path"], c["target"],
+                              clip_id=c["clip_id"], clip_label=new,
+                              clip_start=c["clip_start"], clip_end=c["clip_end"])
+        bv.db.upsert_video_output(self.tab._conn(), self.tab._root_id, c["rel_path"],
+                                  c["target"], clip_id=c["clip_id"],
+                                  clip_label=(new.strip() or None), output_path=out)
+        self.refresh()
+        self.tab._load_queue()
+
+    def _delete(self):
+        c = self._selected()
+        if not c:
+            return
+        if not messagebox.askyesno(APP_TITLE, f"Delete this segment"
+                                              f"{' and its output record' if c['status']=='done' else ''}?"):
+            return
+        import batch_video_upscale as bv
+        bv.db.delete_video_output(self.tab._conn(), self.tab._root_id, c["rel_path"],
+                                  c["target"], clip_id=c["clip_id"])
+        self.refresh()
+        self.tab._load_queue()
+
+    def _open_source(self):
+        c = self._selected()
+        if c:
+            self.tab._open_path(self._abs(c))
+
+    def _open_upscaled(self):
+        c = self._selected()
+        if c and c["status"] == "done" and c["output_path"]:
+            self.tab._open_path(c["output_path"])
+        else:
+            self.status_var.set("Not upscaled yet.")
+
+    def _compare(self):
+        c = self._selected()
+        if c and c["status"] == "done" and c["output_path"]:
+            self.tab._open_compare(self._abs(c), c["output_path"])
+        else:
+            self.status_var.set("Not upscaled yet.")
+
+
 # ─────────────────────────────────────────────
 #  APP WINDOW
 # ─────────────────────────────────────────────
@@ -141,6 +272,10 @@ class VideoTab(ttk.Frame):
                                                       padx=6, pady=(4, 0))
         ttk.Button(ff, text="Browse…", command=self._browse_output).grid(
             row=1, column=2, pady=(4, 0))
+        # Segments manager (extracted scenes = virtual clip jobs, section 16.5),
+        # directly below Scan.
+        self.segments_btn = ttk.Button(ff, text="Segments…", command=self._open_segments)
+        self.segments_btn.grid(row=1, column=3, padx=(6, 0), pady=(4, 0))
 
         # 3) Scan list.
         sf = ttk.LabelFrame(self, text=" Eligible videos ", padding=4)
@@ -754,6 +889,10 @@ class VideoTab(ttk.Frame):
         if not row:
             return
         m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Extract segment…",
+                      command=lambda: self._open_segment_picker(row),
+                      state="normal" if row.get("elig") else "disabled")
+        m.add_separator()
         m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
         m.add_command(label="Open source folder",
                       command=lambda: self._open_folder(row["abs"]))
@@ -767,6 +906,62 @@ class VideoTab(ttk.Frame):
             m.tk_popup(event.x_root, event.y_root)
         finally:
             m.grab_release()
+
+    # ── segment extractor (section 16.4/16.5) ─────────────────────────────────
+
+    def _open_segment_picker(self, row):
+        """Open the picker for one scanned video; its Queue commits virtual clip
+        jobs via _queue_clips."""
+        if not row.get("elig"):
+            messagebox.showinfo(APP_TITLE, "This video is already at/above the "
+                                           "largest target — nothing to upscale.")
+            return
+        from gui.video_segment_picker import VideoSegmentPicker
+        VideoSegmentPicker(self.app, self.app, row["abs"], row["rel"],
+                           row["elig"], on_queue=self._queue_clips)
+
+    def _queue_clips(self, rel, clips):
+        """Enqueue the picker's pending clips as virtual jobs (off the UI thread)."""
+        if self._root_id is None or not clips:
+            return
+
+        def work():
+            import batch_video_upscale as bv
+            conn = self._conn()
+            errs = []
+            for c in clips:
+                try:
+                    bv.prepare_clip(conn, self._root_id, self._src_root, self._out_root,
+                                    rel, c["target"], c["start"], c["end"],
+                                    c["label"], self._vcfg())
+                except Exception as exc:             # noqa: BLE001
+                    errs.append(str(exc))
+            self.after(0, lambda: self._after_queue_clips(len(clips) - len(errs), errs))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_queue_clips(self, n, errs):
+        self._load_queue()
+        self._update_estimate()
+        if errs:
+            self.status_var.set(f"Queued {n} segment(s); {len(errs)} failed: {errs[0]}")
+        else:
+            self.status_var.set(f"Queued {n} segment(s) to the upscale queue.")
+
+    def _open_segments(self):
+        """Open the Segments manager over this root's virtual clip jobs."""
+        if self._root_id is None:
+            self._load_queue()                       # try to bind a root from the fields
+        if self._root_id is None:
+            messagebox.showinfo(APP_TITLE, "Scan a video folder first.")
+            return
+        win = getattr(self, "_segments_win", None)
+        if win is not None and win.winfo_exists():
+            win.refresh()
+            win.deiconify()
+            win.lift()
+            return
+        self._segments_win = SegmentsManager(self.app, self)
 
     def _open_path(self, p):
         try:
@@ -843,25 +1038,39 @@ class VideoTab(ttk.Frame):
         self._queue_rows = {}
         for j in bv.db.get_video_queue(conn, self._root_id):
             vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
-            frames = (vf["nb_frames"] if vf else None) or "?"
-            segs = bv.db.get_video_segments(conn, self._root_id, j["rel_path"], j["target"])
+            clip_id = j["clip_id"] or 0
+            segs = bv.db.get_video_segments(conn, self._root_id, j["rel_path"],
+                                            j["target"], clip_id=clip_id)
             done = sum(1 for s in segs if s["status"] == "done")
             segtxt = f"{done}/{len(segs)}" if segs else "?"
             w = vf["width"] if vf else 0
             h = vf["height"] if vf else 0
             res = f"{w}x{h}" if w else "?"
-            dur = ve.fmt_duration(vf["duration"]) if (vf and vf["duration"]) else "?"
             codec = (vf["vcodec"] if vf else None) or "?"
             fps = f"{vf['fps']:.2f}" if (vf and vf["fps"]) else "?"
+            if clip_id:
+                # A virtual clip: show it as "<rel> ✂ label", its own (clipped)
+                # duration and its approximate frame count.
+                label = j["clip_label"] or f"{_clip_tc(j['clip_start'])}-{_clip_tc(j['clip_end'])}"
+                text = f"{j['rel_path']}  ✂ {label}"
+                cdur = (j["clip_end"] or 0) - (j["clip_start"] or 0)
+                dur = ve.fmt_duration(cdur) if cdur else "?"
+                frames = (j["clip_frames"] or None) or "?"
+                row_dur = cdur or 0.0
+            else:
+                text = j["rel_path"]
+                dur = ve.fmt_duration(vf["duration"]) if (vf and vf["duration"]) else "?"
+                frames = (vf["nb_frames"] if vf else None) or "?"
+                row_dur = (vf["duration"] if vf else 0) or 0.0
             abs_path = os.path.join(self._src_root, j["rel_path"]) if self._src_root else j["rel_path"]
             iid = self.queue_tree.insert(
-                "", "end", text=j["rel_path"],
+                "", "end", text=text,
                 values=(j["target"], j["status"], res, dur, codec, fps, frames, segtxt),
-                tags=(j["rel_path"], j["target"]))
+                tags=(j["rel_path"], j["target"], str(clip_id)))
             self._queue_rows[iid] = {
-                "rel": j["rel_path"], "target": j["target"], "abs": abs_path,
-                "w": w or 0, "h": h or 0,
-                "duration": (vf["duration"] if vf else 0) or 0.0,
+                "rel": j["rel_path"], "target": j["target"], "clip_id": clip_id,
+                "abs": abs_path, "w": w or 0, "h": h or 0,
+                "duration": row_dur,
                 "fps": (vf["fps"] if vf else 0) or 0.0,
                 "codec": codec}
         self._refresh_scan_outputs()
@@ -896,14 +1105,17 @@ class VideoTab(ttk.Frame):
         if not sel:
             return None
         tags = self.queue_tree.item(sel[0], "tags")
-        return (tags[0], tags[1]) if len(tags) >= 2 else None
+        if len(tags) < 2:
+            return None
+        clip_id = int(tags[2]) if len(tags) >= 3 else 0
+        return (tags[0], tags[1], clip_id)
 
     def _queue_remove(self):
         job = self._selected_queue_job()
         if not job:
             return
         import batch_video_upscale as bv
-        bv.db.delete_video_output(self._conn(), self._root_id, job[0], job[1])
+        bv.db.delete_video_output(self._conn(), self._root_id, job[0], job[1], clip_id=job[2])
         self._load_queue()
 
     def _queue_move(self, delta):
@@ -914,20 +1126,22 @@ class VideoTab(ttk.Frame):
         conn = self._conn()
         jobs = list(bv.db.get_video_queue(conn, self._root_id))
         idx = next((i for i, j in enumerate(jobs)
-                    if j["rel_path"] == job[0] and j["target"] == job[1]), -1)
+                    if j["rel_path"] == job[0] and j["target"] == job[1]
+                    and (j["clip_id"] or 0) == job[2]), -1)
         ni = idx + delta
         if idx < 0 or ni < 0 or ni >= len(jobs):
             return
         # Swap queue_order with the neighbour, then renormalise positions.
-        order = [(j["rel_path"], j["target"]) for j in jobs]
+        order = [(j["rel_path"], j["target"], j["clip_id"] or 0) for j in jobs]
         order[idx], order[ni] = order[ni], order[idx]
-        for pos, (rel, tgt) in enumerate(order):
-            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos)
+        for pos, (rel, tgt, cid) in enumerate(order):
+            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos, clip_id=cid)
         self._load_queue()
         # Re-select the moved row.
         for iid in self.queue_tree.get_children():
             t = self.queue_tree.item(iid, "tags")
-            if len(t) >= 2 and t[0] == job[0] and t[1] == job[1]:
+            if (len(t) >= 3 and t[0] == job[0] and t[1] == job[1]
+                    and int(t[2]) == job[2]):
                 self.queue_tree.selection_set(iid)
                 break
 
@@ -937,14 +1151,15 @@ class VideoTab(ttk.Frame):
             return
         import batch_video_upscale as bv
         conn = self._conn()
-        jobs = [(j["rel_path"], j["target"]) for j in bv.db.get_video_queue(conn, self._root_id)]
-        key = (row["rel"], row["target"])
+        jobs = [(j["rel_path"], j["target"], j["clip_id"] or 0)
+                for j in bv.db.get_video_queue(conn, self._root_id)]
+        key = (row["rel"], row["target"], row.get("clip_id", 0))
         if key not in jobs:
             return
         jobs.remove(key)
         jobs.insert(0, key)
-        for pos, (rel, tgt) in enumerate(jobs):
-            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos)
+        for pos, (rel, tgt, cid) in enumerate(jobs):
+            bv.db.set_queue_order(conn, self._root_id, rel, tgt, pos, clip_id=cid)
         self._load_queue()
 
     def _queue_sort_key(self, col):
@@ -1060,8 +1275,13 @@ class VideoTab(ttk.Frame):
         jobs = []
         for j in bv.db.get_video_queue(conn, self._root_id):
             vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
-            frames = (vf["nb_frames"] if vf else 0) or 0
-            dur = (vf["duration"] if vf else 0) or 0
+            if j["clip_id"]:
+                # A clip costs its OWN (clipped) frames/duration, not the source's.
+                frames = (j["clip_frames"] or 0)
+                dur = (j["clip_end"] or 0) - (j["clip_start"] or 0)
+            else:
+                frames = (vf["nb_frames"] if vf else 0) or 0
+                dur = (vf["duration"] if vf else 0) or 0
             seg_secs = self._vcfg()["segment_seconds"]
             import math as _m
             segs = max(1, _m.ceil(dur / seg_secs)) if seg_secs else 1

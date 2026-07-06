@@ -110,6 +110,22 @@ def test_prepare_clip_enqueues_a_virtual_job(db_conn, tmp_path):
     assert len(db.get_video_clips(db_conn, root)) == 2
 
 
+# ── keyframe_times (picker navigation) ───────────────────────────────────────
+
+@needs_ffmpeg
+def test_keyframe_times_are_sorted_and_start_at_zero(tmp_path):
+    src = os.path.join(str(tmp_path), "kf.avi")
+    _make_source(src, seconds=6)
+    times = vp.keyframe_times(src)
+    assert times, "expected at least one keyframe"
+    assert times == sorted(times)
+    assert times[0] == pytest.approx(0.0, abs=0.05)     # frame 0 is always a keyframe
+    # max_keyframe_gap must agree with the list it now derives from.
+    if len(times) >= 2:
+        assert vp.max_keyframe_gap(src) == pytest.approx(
+            max(b - a for a, b in zip(times, times[1:])))
+
+
 # ── full round trip (extract -> split -> passthrough -> reassemble) ──────────
 
 @needs_ffmpeg

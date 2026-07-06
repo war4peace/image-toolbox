@@ -5,6 +5,7 @@ db/
 .venv/
 seedvr2/
 ffmpeg/
+vlc/
 models/
 test_output/
 benchmark-videos/

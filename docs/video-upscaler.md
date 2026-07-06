@@ -1093,18 +1093,30 @@ from Remote (#1).
 ### 15.10 Deferred to v2 (documented, not built)
 
 Per-target pod grouping for mixed-target queues (15.1); the h264/h265 deliverable if
-not done in v1 (14); real-time synchronised playback in the comparison window (it is
-scrub + frame-step in v1, section 11). **Playback is now specified in section 16**,
-which also adds the segment extractor.
+not done in v1 (14). Real-time synchronised playback in the comparison window is **no
+longer deferred**: it is built in section 16 (which also adds the segment extractor).
 
-## 16. Segment extraction + real-time playback (0.4.7, planned)
+## 16. Segment extraction + real-time playback (0.4.7)
 
-> Status: **DESIGN.** Two children of the Video Upscaler, specified together
-> because they share one new capability the app has never had: **playing video
-> (with audio) inside the GUI.** (1) turning the comparison window from a
+> Status: **BUILT (experimental).** Two children of the Video Upscaler, specified
+> together because they share one new capability the app has never had: **playing
+> video (with audio) inside the GUI.** (1) turning the comparison window from a
 > still-frame comparator into a real motion comparator, and (2) a **segment
 > extractor** so a user can upscale one scene out of a long source instead of the
 > whole file. Settled with the user before building.
+>
+> As built (0.4.7): DB `clip_id` discriminator + migration (`db.py`); the
+> extract-then-run clip pipeline (`video_pipeline.extract_clip`, `keyframe_times`;
+> `batch_video_upscale.prepare_clip` + the `process_job` clip branch); the shared
+> libVLC player (`gui/video_player.py`, bootstrap-downloaded, fail-safe); the picker
+> (`gui/video_segment_picker.py`); the Segments manager + "Extract segment…" +
+> clip-aware queue (`gui/tab_video.py`); and real-time synced playback in the
+> comparison window (`gui/comparison.py`). Headless-testable parts are covered by
+> `tests/test_db.py`, `test_video_clip.py`, `test_video_player.py`; the interactive
+> playback needs a real Windows box with libVLC. **Known v1 gap:** the Segments-
+> manager "Compare" opens whole-source vs clip-output, which are misaligned in time
+> (the clip starts at 0, the source at `clip_start`); a source time-offset for the
+> comparison window is the fix (deferred).
 
 ### 16.1 Motivation
 

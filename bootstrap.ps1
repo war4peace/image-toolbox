@@ -68,6 +68,12 @@ $FFMPEG_LABEL    = "n8.1 win64-gpl"
 $FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
 $FFMPEG_GYAN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
+# libVLC for in-app video playback with audio (docs/video-upscaler.md 16.2): the
+# segment picker + the comparison window use python-vlc against this bundled build,
+# so no system VLC install is needed. Pinned to a VLC 3.0.x that matches python-vlc.
+$LIBVLC_LABEL = "VLC 3.0.21 win64 (libVLC)"
+$LIBVLC_URL   = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+
 function Step($msg) {
     Write-Host ""
     Write-Host "==> $msg" -ForegroundColor Cyan
@@ -196,6 +202,48 @@ function Install-Ffmpeg($appRoot) {
     Write-Host "  Installed: $(Join-Path $binDir 'ffmpeg.exe')"
 }
 
+function Install-LibVlc($appRoot) {
+    # Bundled libVLC for in-app video playback WITH audio (docs/video-upscaler.md
+    # 16.2): the segment picker and the comparison window drive python-vlc against
+    # this build, so no system VLC install is needed. Needed in BOTH install modes
+    # (playback is local). Only libvlc.dll + libvlccore.dll + plugins\ are kept
+    # (not vlc.exe or the UI), extracted to vlc\, where gui.video_player looks.
+    # OPTIONAL: on failure the app still runs and playback falls back to a silent
+    # frame-scrub, so the caller treats a failure as a warning, not fatal.
+    $vlcDir = Join-Path $appRoot "vlc"
+    if ((Test-Path (Join-Path $vlcDir "libvlc.dll")) -and (Test-Path (Join-Path $vlcDir "plugins"))) {
+        Write-Host "  Already present - keeping it."
+        return
+    }
+    $zip = Join-Path $env:TEMP "libvlc-imgtbx.zip"
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Write-Host "  Downloading libVLC ($LIBVLC_LABEL) from videolan.org (~40 MB) ..."
+    Get-Download $LIBVLC_URL $zip
+    $extract = Join-Path $env:TEMP "libvlc_extract"
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -Path $zip -DestinationPath $extract -Force
+    $pkg = Get-ChildItem $extract -Directory | Select-Object -First 1
+    if (-not $pkg) { throw "The VLC archive did not contain the expected build folder." }
+    New-Item -ItemType Directory -Force $vlcDir | Out-Null
+    foreach ($dll in @("libvlc.dll", "libvlccore.dll")) {
+        $srcDll = Join-Path $pkg.FullName $dll
+        if (-not (Test-Path $srcDll)) { throw "The VLC archive is missing $dll." }
+        Copy-Item $srcDll (Join-Path $vlcDir $dll) -Force
+    }
+    $srcPlugins = Join-Path $pkg.FullName "plugins"
+    if (-not (Test-Path $srcPlugins)) { throw "The VLC archive is missing plugins\." }
+    Copy-Item $srcPlugins (Join-Path $vlcDir "plugins") -Recurse -Force
+    # Ship VLC's license (LGPL for libVLC, GPL for the app parts we don't ship).
+    $lic = Get-ChildItem $pkg.FullName -Filter "COPYING*" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($lic) { Copy-Item $lic.FullName (Join-Path $vlcDir "COPYING.txt") -Force }
+    if (-not (Test-Path (Join-Path $vlcDir "libvlc.dll"))) {
+        throw "libvlc.dll was not extracted."
+    }
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "  Installed: $(Join-Path $vlcDir 'libvlc.dll')"
+}
+
 function Find-Ollama {
     $cmd = Get-Command ollama -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -315,20 +363,34 @@ try {
         Write-Host "  ffmpeg.exe + ffprobe.exe in $root\ffmpeg\bin (or on the PATH)."      -ForegroundColor Yellow
     }
 
+    # -- 4c. libVLC (in-app video playback with audio) ------------------------
+    # Runs in BOTH install modes: the segment picker and the comparison window
+    # play video locally. Optional - a failure only disables in-app playback
+    # (the app falls back to a silent frame-scrub), so never abort setup for it.
+    Step "Setting up libVLC (in-app video playback)"
+    try {
+        Install-LibVlc $root
+    } catch {
+        Write-Host "  WARNING: libVLC setup failed: $_" -ForegroundColor Yellow
+        Write-Host "  In-app video playback will be unavailable (the app still runs;"      -ForegroundColor Yellow
+        Write-Host "  segment marking falls back to a silent frame-scrub)."                 -ForegroundColor Yellow
+    }
+
     # -- 5. Python packages ---------------------------------------------------
     if ($remoteOnly) {
         # No local GPU stack: the GUI needs only Pillow (display/comparison),
-        # piexif and paho-mqtt. torch / SeedVR2 / timm all live on the pod.
+        # piexif, paho-mqtt and python-vlc (playback). torch / SeedVR2 / timm
+        # all live on the pod.
         Step "Installing the lightweight components (Remote mode - no local GPU stack)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
-        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt")
+        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc")
     } else {
         Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
         Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
         Step "Installing the remaining components"
-        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt")
+        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc")
     }
 
     # -- 5b. OpenSSH (Remote mode reaches the pod over SSH) -------------------

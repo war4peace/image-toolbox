@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui.common import APP_TITLE, CREATE_NO_WINDOW, _geometry_on_screen, save_settings
+from gui.video_player import VideoPlayer, load_vlc
 
 
 # ─────────────────────────────────────────────
@@ -356,9 +357,13 @@ class VideoComparisonWindow(ComparisonWindow):
         self._new_lbl = ttk.Label(bar, foreground="#aab2bf")
         self._new_lbl.pack(side="right")
 
-        # Bottom transport: frame-step, a scrubber, and a time read-out.
+        # Bottom transport: play/pause (motion, section 16.3), frame-step, a
+        # scrubber, and a time read-out. Play needs libVLC; without it the button is
+        # disabled and the window stays a scrub-only wipe (the v1 behaviour).
         tl = ttk.Frame(self, padding=(8, 4))
         tl.pack(side="bottom", fill="x")
+        self._play_btn = ttk.Button(tl, text="▶ Play", width=9, command=self._toggle_play)
+        self._play_btn.pack(side="left", padx=(0, 8))
         ttk.Button(tl, text="◀ frame", width=8,
                    command=lambda: self._step(-1)).pack(side="left")
         ttk.Button(tl, text="frame ▶", width=8,
@@ -366,12 +371,25 @@ class VideoComparisonWindow(ComparisonWindow):
         self.time_var = tk.StringVar(value="0:00.000 / 0:00.000")
         ttk.Label(tl, textvariable=self.time_var, width=20,
                   font=("Consolas", 9)).pack(side="left")
+        self._view_btn = ttk.Button(tl, text="Side-by-side", width=12,
+                                    command=self._cycle_view)
+        self._view_btn.pack(side="right")
         self.timeline = ttk.Scale(tl, from_=0.0, to=1.0, orient="horizontal",
                                   command=self._on_scrub)
         self.timeline.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self.canvas = tk.Canvas(self, highlightthickness=0, bg="#15181d")
         self.canvas.pack(fill="both", expand=True)
+
+        # Live-playback state (section 16.3). Two libVLC players, created lazily on
+        # first Play; paused view stays the decode-on-seek wipe (canvas). Modes:
+        # "sbs" (side-by-side), "a" (source only), "b" (upscaled only).
+        self._players_frame = None
+        self._src_player = self._up_player = None
+        self._playing = False
+        self._view_mode = "sbs"
+        self._resync_job = None
+        self._ui_updating = False
 
         # Shared view state (consumed by the inherited renderer).
         self._old = self._new = None
@@ -416,6 +434,18 @@ class VideoComparisonWindow(ComparisonWindow):
     def show_videos(self, source, upscaled):
         """Point the window at a new (source, upscaled) pair and reset the view."""
         import video_pipeline as vp
+        # A new pair supersedes any live playback: drop the old players so the next
+        # Play reloads the new files into fresh surfaces.
+        if getattr(self, "_playing", False):
+            self._exit_play()
+        if getattr(self, "_players_frame", None) is not None:
+            self._cancel_resync()
+            for p in (self._src_player, self._up_player):
+                if p is not None:
+                    p.close()
+            self._src_player = self._up_player = None
+            self._players_frame.destroy()
+            self._players_frame = None
         self._src_path, self._up_path = source, upscaled
         try:
             si, ui = vp.probe(source), vp.probe(upscaled)
@@ -450,11 +480,20 @@ class VideoComparisonWindow(ComparisonWindow):
         self.time_var.set(f"{self._fmt_t(t)} / {self._fmt_t(self._duration)}")
 
     def _on_scrub(self, val):
+        if self._ui_updating:
+            return                       # programmatic set from the resync loop
         try:
             t = float(val)
         except (TypeError, ValueError):
             return
         self._update_time_label(t)
+        if self._playing:
+            # Live playback: seek both players together (no frame decode).
+            self._cur_t = t
+            for p in (self._up_player, self._src_player):
+                if p is not None:
+                    p.seek(t)
+            return
         # Debounce: decode only after the scrub settles (decoding is ~hundreds of
         # ms per frame and we decode two), so dragging stays smooth.
         if self._scrub_after is not None:
@@ -513,3 +552,137 @@ class VideoComparisonWindow(ComparisonWindow):
             return Image.open(io.BytesIO(cp.stdout)).convert("RGB")
         except Exception:
             return None
+
+    # ── live playback (section 16.3) ─────────────────────────────────────────
+
+    def _toggle_play(self):
+        if self._playing:
+            self._exit_play()
+        else:
+            self._enter_play()
+
+    def _ensure_players(self):
+        if self._players_frame is not None:
+            return self._src_player.ok and self._up_player.ok
+        if not load_vlc():
+            return False
+        self._players_frame = tk.Frame(self, background="#15181d")
+        self._src_player = VideoPlayer(self._players_frame, fps=self._fps)
+        self._up_player = VideoPlayer(self._players_frame, fps=self._fps)
+        ok_s = self._src_player.load(self._src_path)
+        ok_u = self._up_player.load(self._up_path)
+        return ok_s and ok_u
+
+    def _enter_play(self):
+        if not self._src_path or not self._up_path:
+            return
+        if not self._ensure_players():
+            from tkinter import messagebox
+            messagebox.showinfo(
+                APP_TITLE,
+                "In-app playback needs libVLC, which isn't installed. Re-run the "
+                "first-launch setup to enable it. You can still scrub frame by frame "
+                "and use the before/after wipe.")
+            return
+        # Swap the wipe canvas for the two players.
+        self.canvas.pack_forget()
+        self._players_frame.pack(fill="both", expand=True)
+        self._playing = True
+        self._play_btn.configure(text="⏸ Pause")
+        for p in (self._src_player, self._up_player):
+            p.seek(self._cur_t)
+        self._apply_view()
+        self._src_player.play()
+        self._up_player.play()
+        self._schedule_resync()
+
+    def _exit_play(self):
+        self._cancel_resync()
+        t = self._cur_t
+        if self._up_player is not None:
+            self._up_player.pause()
+            t = self._up_player.get_time() or t
+        if self._src_player is not None:
+            self._src_player.pause()
+        self._playing = False
+        self._play_btn.configure(text="▶ Play")
+        if self._players_frame is not None:
+            self._players_frame.pack_forget()
+        self.canvas.pack(fill="both", expand=True)
+        # Land the paused wipe on the frame we stopped at.
+        self._cur_t = t
+        self._set_timeline(t)
+        self._seek(t)
+
+    def _cycle_view(self):
+        self._view_mode = {"sbs": "a", "a": "b", "b": "sbs"}[self._view_mode]
+        self._view_btn.configure(text={"sbs": "Side-by-side", "a": "Original only",
+                                       "b": "Upscaled only"}[self._view_mode])
+        if self._playing:
+            self._apply_view()
+
+    def _apply_view(self):
+        """Arrange the two players for the current mode and route audio to exactly
+        ONE of them (both carry the same muxed track, so playing both = doubled
+        sound)."""
+        if self._players_frame is None:
+            return
+        for p in (self._src_player, self._up_player):
+            p.pack_forget()
+        if self._view_mode == "a":
+            self._src_player.pack(fill="both", expand=True)
+            audible = self._src_player
+        elif self._view_mode == "b":
+            self._up_player.pack(fill="both", expand=True)
+            audible = self._up_player
+        else:
+            self._src_player.pack(side="left", fill="both", expand=True)
+            self._up_player.pack(side="right", fill="both", expand=True)
+            audible = self._up_player
+        for p in (self._src_player, self._up_player):
+            p.set_mute(p is not audible)
+
+    def _schedule_resync(self):
+        self._resync_job = self.after(300, self._resync)
+
+    def _cancel_resync(self):
+        if self._resync_job is not None:
+            try:
+                self.after_cancel(self._resync_job)
+            except Exception:
+                pass
+            self._resync_job = None
+
+    def _resync(self):
+        """Keep the two players locked (upscaled is the clock) and drive the shared
+        timeline/read-out off it. Aligns by TIMESTAMP, so a differing frame count
+        (CFR-normalize, section 14) never drifts the pair."""
+        self._resync_job = None
+        if not self._playing or self._up_player is None:
+            return
+        t = self._up_player.get_time()
+        # Nudge the source only if it has slipped past ~2 frames, to avoid stutter.
+        if self._src_player is not None:
+            drift = abs(self._src_player.get_time() - t)
+            if drift > 2.0 / max(1e-6, self._fps):
+                self._src_player.seek(t)
+        self._cur_t = t
+        self._set_timeline(t)
+        self._update_time_label(t)
+        self._schedule_resync()
+
+    def _set_timeline(self, t):
+        self._ui_updating = True
+        try:
+            self.timeline.set(t)
+        finally:
+            self._ui_updating = False
+
+    def _close(self):
+        self._cancel_resync()
+        for p in (self._src_player, self._up_player):
+            if p is not None:
+                p.close()
+        self._src_player = self._up_player = None
+        self.save_geometry()
+        self.destroy()

@@ -296,19 +296,22 @@ def count_frames(path) -> int:
         return 0
 
 
-def max_keyframe_gap(path) -> float:
+def keyframe_times(path) -> list:
     """
-    Largest gap (seconds) between consecutive keyframes — the minimum segment
-    length a `-c copy` split can achieve (6.1). Decodes keyframe timestamps only
-    (`-skip_frame nokey`), so it is cheap even on long files. Returns 0.0 if a
-    single keyframe / no timestamps (caller treats 0 as "no constraint").
+    Sorted list of keyframe timestamps (seconds). Decodes keyframe timestamps only
+    (`-skip_frame nokey`), so it is cheap even on long files. Used by the split
+    planner (max_keyframe_gap) and the segment picker's prev/next-keyframe
+    navigation (section 16.4). Returns [] on failure / no timestamps.
     """
     _, ffprobe = find_ffmpeg()
-    cp = _run([
-        ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
-        "-of", "csv=p=0", path,
-    ])
+    try:
+        cp = _run([
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
+            "-of", "csv=p=0", path,
+        ])
+    except Exception:
+        return []
     times = []
     for line in (cp.stdout or "").splitlines():
         line = line.strip().rstrip(",")
@@ -318,9 +321,19 @@ def max_keyframe_gap(path) -> float:
             times.append(float(line))
         except ValueError:
             continue
+    times.sort()
+    return times
+
+
+def max_keyframe_gap(path) -> float:
+    """
+    Largest gap (seconds) between consecutive keyframes — the minimum segment
+    length a `-c copy` split can achieve (6.1). Returns 0.0 if a single keyframe /
+    no timestamps (caller treats 0 as "no constraint").
+    """
+    times = keyframe_times(path)
     if len(times) < 2:
         return 0.0
-    times.sort()
     return max(b - a for a, b in zip(times, times[1:]))
 
 
