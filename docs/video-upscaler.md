@@ -1128,6 +1128,13 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > vout has NO swapchain (it blits to the window DC, so a resize is just a new blit
 > rect, nothing to mismanage) and decode stays off the GPU. Software is plenty for
 > the modest clips this window compares; stability wins over GPU efficiency here.
+> **Teardown order matters too:** closing while playing faulted because the surface
+> HWND was destroyed under libVLC's still-running vout thread. `VideoPlayer.close()`
+> now stops -> **detaches the HWND** (`set_hwnd(0)`) -> drops media -> releases, the
+> windows **defer `destroy()`** a tick, and App exit calls `teardown_players()` before
+> the root destroy cascades. (Audio is also re-asserted ~300 ms after `play()`, since
+> libVLC only creates the output once playback starts — otherwise there's no sound
+> until the first pause/play.)
 >
 > **Playback view = side-by-side / A-B flip, NOT a live wipe (by design, 16.3).** A
 > true pixel-wipe across two *moving* hardware video surfaces is not feasible (libVLC

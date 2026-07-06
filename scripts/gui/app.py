@@ -798,6 +798,12 @@ class App(tk.Tk):
             self.comparison_window.save_geometry()
         if self.video_comparison_window is not None and self.video_comparison_window.winfo_exists():
             self.video_comparison_window.save_geometry()
+            # Release the libVLC players before root.destroy() cascades into their
+            # surfaces (else the vout thread faults on the destroyed HWND at exit).
+            try:
+                self.video_comparison_window.teardown_players()
+            except Exception:
+                pass
         mark("save-geometry")
         # Record last-used time and announce going offline before we exit.
         self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))

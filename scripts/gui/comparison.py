@@ -599,6 +599,9 @@ class VideoComparisonWindow(ComparisonWindow):
         self._apply_view()
         self._src_player.play()
         self._up_player.play()
+        # Re-assert the audio routing once the outputs exist (a mute set before
+        # play() doesn't stick), so playback has sound from the first press.
+        self.after(300, self._apply_audio)
         self._schedule_resync()
 
     def _exit_play(self):
@@ -627,25 +630,35 @@ class VideoComparisonWindow(ComparisonWindow):
             self._apply_view()
 
     def _apply_view(self):
-        """Arrange the two players for the current mode and route audio to exactly
-        ONE of them (both carry the same muxed track, so playing both = doubled
-        sound)."""
+        """Arrange the two players for the current mode and route audio (see
+        _apply_audio)."""
         if self._players_frame is None:
             return
         for p in (self._src_player, self._up_player):
             p.pack_forget()
         if self._view_mode == "a":
             self._src_player.pack(fill="both", expand=True)
-            audible = self._src_player
         elif self._view_mode == "b":
             self._up_player.pack(fill="both", expand=True)
-            audible = self._up_player
         else:
             self._src_player.pack(side="left", fill="both", expand=True)
             self._up_player.pack(side="right", fill="both", expand=True)
-            audible = self._up_player
+        self._apply_audio()
+
+    def _audible_player(self):
+        return self._src_player if self._view_mode == "a" else self._up_player
+
+    def _apply_audio(self):
+        """Route audio to exactly ONE player (both carry the same muxed track, so
+        playing both = doubled sound). Re-applied shortly after play() because
+        libVLC only creates the audio output once playback has actually started, so
+        a mute set before then doesn't stick (the 'no sound until pause/play' bug)."""
+        if self._players_frame is None:
+            return
+        audible = self._audible_player()
         for p in (self._src_player, self._up_player):
-            p.set_mute(p is not audible)
+            if p is not None:
+                p.set_mute(p is not audible)
 
     def _schedule_resync(self):
         self._resync_job = self.after(300, self._resync)
@@ -684,10 +697,27 @@ class VideoComparisonWindow(ComparisonWindow):
             self._ui_updating = False
 
     def _close(self):
+        # Stop + tear down the players (detaches their HWNDs) BEFORE the window is
+        # destroyed, then DEFER destroy() a tick so libVLC's native vout/event
+        # threads finish unwinding first. Destroying the surface HWND while those
+        # threads are mid-teardown is what crashed on close-while-playing.
         self._cancel_resync()
+        self._playing = False
         for p in (self._src_player, self._up_player):
             if p is not None:
                 p.close()
         self._src_player = self._up_player = None
         self.save_geometry()
-        self.destroy()
+        self.after(120, self.destroy)
+
+    def teardown_players(self):
+        """Stop + release the libVLC players WITHOUT destroying the window, for the
+        app-exit path (App._on_close): the root destroy() cascades and would kill the
+        surface HWND while libVLC's threads are still bound to it. Detaching first
+        makes that cascade safe. Idempotent."""
+        self._cancel_resync()
+        self._playing = False
+        for p in (self._src_player, self._up_player):
+            if p is not None:
+                p.close()
+        self._src_player = self._up_player = None

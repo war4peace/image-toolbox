@@ -241,13 +241,25 @@ class VideoPlayer(ttk.Frame):
             return False
 
     def close(self):
+        """Tear the player down in the order that avoids the close-while-playing
+        crash: stop playback, DETACH the HWND (set_hwnd(0)) so libVLC's vout stops
+        drawing into a window that is about to be destroyed, drop the media, then
+        release. Destroying the Tk surface before this detaches is what faulted
+        (a native access violation from the vout thread). Callers should also defer
+        the window destroy() a tick (see the windows' _close) to let the native
+        threads unwind."""
         self._stop_poll()
-        try:
-            if self._player is not None:
-                self._player.stop()
-                self._player.release()
-        except Exception:                            # noqa: BLE001
-            pass
+        p = self._player
+        if p is not None:
+            for step in (
+                    lambda: p.stop(),
+                    lambda: (p.set_hwnd(0) if os.name == "nt" else p.set_xwindow(0)),
+                    lambda: p.set_media(None),
+                    lambda: p.release()):
+                try:
+                    step()
+                except Exception:                    # noqa: BLE001
+                    pass
         self._player = None
         try:
             if self._instance is not None:

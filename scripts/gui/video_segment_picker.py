@@ -398,6 +398,11 @@ class VideoSegmentPicker(tk.Toplevel):
                 save_settings(self.app.settings)
         except Exception:                            # noqa: BLE001
             pass
+        # Tear the player down (detaches its HWND), then defer destroy() a tick so
+        # libVLC's native threads unwind before the surface HWND is destroyed (the
+        # close-while-playing crash). See VideoPlayer.close / ComparisonWindow._close.
         if self.player is not None:
             self.player.close()
-        self.destroy()
+            self.after(120, self.destroy)
+        else:
+            self.destroy()
