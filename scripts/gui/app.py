@@ -67,10 +67,13 @@ class App(tk.Tk):
         self.title(f"{APP_TITLE} {APP_VERSION}")
         self.minsize(900, 560)
         # App icon for the title bar and taskbar button (app.ico at APP_ROOT, shipped
-        # to {app} by the installer). Fail-safe: a missing icon just falls back to the
-        # default tkinter feather, never blocks startup.
+        # to {app} by the installer). `default=` sets it as the interpreter default, so
+        # the root AND every Toplevel created afterwards (Compare, Segments, the log
+        # window, dialogs, the wizard) inherit it instead of the tkinter feather. Set on
+        # the root before any child window is created. Fail-safe: a missing icon just
+        # falls back to the default, never blocks startup.
         try:
-            self.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+            self.iconbitmap(default=os.path.join(APP_ROOT, "app.ico"))
         except Exception:
             pass
         try:
