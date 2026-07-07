@@ -110,6 +110,7 @@ class App(tk.Tk):
         self._funds_cache = None
         self._funds_cache_at = 0.0
         self._funds_fetching = False
+        self._funds_live_job = None
         # Bottom status bar with a right-aligned "Report an issue" link (Future
         # Feature #3). Packed before the notebook so it reserves the bottom strip;
         # always visible regardless of the active tab.
@@ -130,6 +131,14 @@ class App(tk.Tk):
         # sampling owns the readout during a run.
         self._idle_telemetry_job = None
         self.after(2000, self._idle_telemetry_tick)
+        # Keep the RunPod funds readout LIVE during a run: it otherwise only refreshed
+        # on a tab-switch / remote-toggle, so a long remote job left it frozen at the
+        # run-start balance (a ~$1 drift after an hour of billing). This slow tick
+        # re-queries the balance on a cadence; refresh_funds_readout self-gates (fetches
+        # only when a remote-capable tab is active + remote-enabled) and the ~30 s cache
+        # keeps rapid tab-switches from stacking on top of it, so it never hammers the API.
+        self._funds_live_job = None
+        self.after(self.FUNDS_LIVE_MS, self._funds_live_tick)
 
         # Guard against leaving the Settings tab with unsaved edits.
         self._suppress_tab_event = False
@@ -214,6 +223,19 @@ class App(tk.Tk):
                 "runs on a remote pod. 'Unknown' if it can't be read.")
 
     # ── RunPod funds readout (bottom bar) ────────────────────────────────────
+
+    FUNDS_LIVE_MS = 60000   # re-query the account balance at most this often
+
+    def _funds_live_tick(self):
+        """Periodic balance refresh so the bottom-bar funds readout stays live during a
+        remote run (not just on tab-switch). refresh_funds_readout self-gates: it only
+        fetches when a remote-capable tab is active and remote-enabled, so this is a
+        no-op cost otherwise. Fail-safe; reschedules itself for the app's lifetime."""
+        try:
+            self.refresh_funds_readout()
+        except Exception:
+            pass
+        self._funds_live_job = self.after(self.FUNDS_LIVE_MS, self._funds_live_tick)
     def _selected_widget(self):
         try:
             return self.nb.nametowidget(self.nb.select())
