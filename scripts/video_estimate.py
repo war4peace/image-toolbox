@@ -113,6 +113,23 @@ def fit_short_side(src_w, src_h, target):
     return min(d) if d else None
 
 
+# Fixed queue-guard threshold (a safety net, NOT the configurable skip-cutoff):
+# an upscale that enlarges by less than this factor is allowed but WARNED about.
+MARGINAL_UPSCALE = 1.5      # < 1.5x (< 50% larger) -> "marginal"
+
+
+def classify_upscale(src_w, src_h, target):
+    """Queue-guard verdict for a (source -> target) upscale, from the box-fit scale:
+      'downscale' — scale <= 1.0 (would shrink or not enlarge the frame): block it.
+      'marginal'  — 1.0 < scale < 1.5 (< 50% larger): allow, but warn.
+      None        — a healthy upscale (>= 50% larger), or the dims/target are unknown.
+    The thresholds are FIXED, independent of the user's skip-cutoff setting."""
+    s = fit_scale(src_w, src_h, target)
+    if s is None or s >= MARGINAL_UPSCALE:
+        return None
+    return "downscale" if s <= 1.0 else "marginal"
+
+
 def output_megapixels(src_w, src_h, target):
     """Output megapixels per frame for a (source, target) upscale. Falls back to
     the 4:3 BENCH_OUT_MP when the source size is unknown, so callers that lack

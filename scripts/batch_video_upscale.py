@@ -87,6 +87,7 @@ WORK_DIRNAME = ".imgtbx_video"        # per-output-tree work area for segments
 GUI_MARKER      = runner_common.GUI_MARKER
 GUI_MODE        = runner_common.GUI_MODE
 _stdin_is_piped = runner_common.stdin_is_piped
+fmt_hhmmss      = runner_common.fmt_hhmmss
 
 
 _LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
@@ -554,6 +555,13 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
     existing job leaves its queue position and any progress intact."""
     abs_path = os.path.join(source_root, rel)
     info = vp.probe(abs_path, count=True)         # exact frames for cost + drift
+    # Never enqueue a DOWNSCALE (target box smaller than the source): SeedVR2 is an
+    # upscaler and a shrink would just degrade the video. Backstop for every path
+    # (GUI + CLI); the GUI also blocks this up-front with a friendlier message.
+    import video_estimate as ve
+    if ve.classify_upscale(info.width, info.height, target) == "downscale":
+        raise ValueError(f"{rel} is already {info.width}x{info.height}; target {target} "
+                         f"would downscale it, not upscale.")
     db.upsert_video_file(conn, root_id, rel,
                          width=info.width, height=info.height,
                          vcodec=info.vcodec, acodec=info.acodec,
@@ -588,6 +596,10 @@ def prepare_clip(conn, root_id, source_root, output_root, rel, target,
     if end <= start:
         raise ValueError(f"clip end {end:.3f}s must be after start {start:.3f}s")
     info = vp.probe(abs_path)                      # metadata only (dims/fps/duration)
+    import video_estimate as ve
+    if ve.classify_upscale(info.width, info.height, target) == "downscale":
+        raise ValueError(f"{rel} is already {info.width}x{info.height}; target {target} "
+                         f"would downscale it, not upscale.")
     end = min(end, info.duration or end)           # clamp to the source length
     try:
         st = os.stat(abs_path)
@@ -730,8 +742,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'} "
         f"(auto values resolved on the pod)")
     _resolved_logged = [False]
-    _peak_logged = [False]
     _trace_logged = [False]
+    _initial_batch = [None]      # batch the pod first resolved (to flag a later OOM drop)
     total_secs = 0.0
 
     for s in segs:
@@ -739,8 +751,14 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         if recorded[s.index]["status"] == "done" and os.path.exists(up_path):
             continue                              # segment-level resume
 
-        def _progress(st, _i=s.index, _tot=s.frame_count):
+        _seg_stats = {}          # per-segment peak VRAM + resolved batch (filled by _progress)
+
+        def _progress(st, _i=s.index, _tot=s.frame_count, _stats=_seg_stats):
             rb = st.get("resolved_batch")
+            if rb:
+                _stats["batch"] = rb
+                if _initial_batch[0] is None:
+                    _initial_batch[0] = rb
             if rb and not _resolved_logged[0]:       # the pod reported its auto choices
                 _resolved_logged[0] = True
                 _noise = st.get("input_noise")
@@ -765,10 +783,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                     f"uniform {'on' if st.get('uniform_batch') else 'off'}, "
                     f"noise {_noise if _noise else 'off'})")
             pa = st.get("peak_alloc_gb")
-            if pa is not None and not _peak_logged[0]:
-                _peak_logged[0] = True
-                log(f"    (pod peak VRAM: {pa} GB working set, "
-                    f"{st.get('peak_reserved_gb')} GB reserved/pooled)")
+            if pa is not None:                       # capture per-segment (logged below)
+                _stats["alloc"] = pa
+                _stats["reserved"] = st.get("peak_reserved_gb")
             # Diagnostic (temporary): the real per-phase cadence, so we can fix the
             # live s/frame + progress bar from ground truth instead of guesswork.
             _tr = st.get("phase_trace")
@@ -799,8 +816,22 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                                 seconds=secs)
         total_secs += secs or 0
         budget.add(secs)
+        # Per-segment peak VRAM (working set + reserved/pool) on EVERY segment, not
+        # just the first: on a long many-segment run this exposes VRAM creep toward the
+        # card's wall and flags any OOM-recovery batch drop, so a thrash risk can be
+        # seen as a rate across segments (tune batch_size against it). The peak is
+        # per-segment (the pod resets the stats before each). See docs/video-upscaler.md.
+        vram_txt = ""
+        if _seg_stats.get("alloc") is not None:
+            vram_txt = (f"; peak VRAM {_seg_stats['alloc']} GB working set / "
+                        f"{_seg_stats.get('reserved')} GB reserved")
+        drop_txt = ""
+        b = _seg_stats.get("batch")
+        if b is not None and _initial_batch[0] is not None and b != _initial_batch[0]:
+            drop_txt = f"; batch dropped {_initial_batch[0]} -> {b} (OOM recovery)"
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
-            + (f" in {secs:.1f}s" if secs else ""))
+            + (f" in {fmt_hhmmss(secs)}" if secs else "")
+            + vram_txt + drop_txt)
 
         # Self-calibrate future estimates: record this segment's real OUTPUT
         # megapixels vs seconds against the GPU that ran it (IMGTBX_GPU_OVERRIDE,

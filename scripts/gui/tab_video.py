@@ -22,7 +22,11 @@ from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
 from gui.tooltab import ToolTab
 
 
-_PROGRESS_DEBUG_MODE = "window"
+# Where the per-bar-change progress diagnostics go: "window" = the tab's log pane,
+# "file" = logs/video_progress_debug.log only, "" / None = off. The bar is validated
+# now, so keep these OUT of the user-facing log (file-only), leaving the console to
+# the permanent per-minute "still working" heartbeat.
+_PROGRESS_DEBUG_MODE = "file"
 
 
 def _video_bar_done(run_done, seg_frames, seg_done, last_fp_time, now, live_spf,
@@ -94,8 +98,40 @@ class SegmentsManager(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(60, self._grab_modal)
 
+        # Filter bar (top): narrow the segment list by target or status. The Status
+        # filter is the key one, to hide "done" clips on a long list. Fed the DISTINCT
+        # values present (plus "All"); changing either re-renders the tree.
+        filt = ttk.Frame(self, padding=(8, 6, 8, 0))
+        filt.pack(side="top", fill="x")
+        ttk.Label(filt, text="Filter:").pack(side="left")
+        self.filter_target_var = tk.StringVar(value="All")
+        self.filter_status_var = tk.StringVar(value="All")
+        self._filter_combos = {}
+        for label, var, width in (("Target", self.filter_target_var, 10),
+                                  ("Status", self.filter_status_var, 12)):
+            ttk.Label(filt, text=label).pack(side="left", padx=(10, 2))
+            cb = ttk.Combobox(filt, textvariable=var, state="readonly",
+                              width=width, values=["All"])
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._render())
+            self._filter_combos[label] = cb
+        ttk.Button(filt, text="Reset", width=6,
+                   command=self._reset_filters).pack(side="left", padx=(10, 0))
+        # "Display Done" — a quick, non-destructive hide of finished clips (they're
+        # dead weight in the list once upscaled, but their record is what powers the
+        # Compare / Play buttons, so hiding beats removing by default). The Status
+        # combo can only pick ONE status; this composes as "everything, minus done".
+        # Persisted per-user (default on) so the choice survives reopening the window.
+        show_done = bool(self._app.settings.get("segments_show_done", True)) \
+            if self._app is not None else True
+        self.show_done_var = tk.BooleanVar(value=show_done)
+        ttk.Checkbutton(filt, text="Display Done", variable=self.show_done_var,
+                        command=self._toggle_show_done).pack(side="left", padx=(16, 0))
+
+        body = ttk.Frame(self)
+        body.pack(side="top", fill="both", expand=True)
         cols = ("label", "range", "dur", "target", "status")
-        self.tree = ttk.Treeview(self, columns=cols, show="tree headings")
+        self.tree = ttk.Treeview(body, columns=cols, show="tree headings")
         self.tree.heading("#0", text="Source")
         self.tree.column("#0", width=220)
         for c, txt, w in (("label", "Label", 130), ("range", "Range", 130),
@@ -105,13 +141,14 @@ class SegmentsManager(tk.Toplevel):
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True, side="left", padx=(8, 0), pady=8)
         self.tree.bind("<Double-1>", lambda _e: self._open_source())
-        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         sb.pack(fill="y", side="left", pady=8)
         self.tree.configure(yscrollcommand=sb.set)
 
-        btns = ttk.Frame(self, padding=8)
+        btns = ttk.Frame(body, padding=8)
         btns.pack(side="left", fill="y")
         for txt, cmd in (("Rename…", self._rename), ("Delete", self._delete),
+                         ("Remove Done", self._remove_done),
                          ("Open source", self._open_source),
                          ("Open upscaled", self._open_upscaled),
                          ("Compare frames", self._compare),
@@ -121,7 +158,8 @@ class SegmentsManager(tk.Toplevel):
         ttk.Label(btns, textvariable=self.status_var, foreground="#7f8a99",
                   wraplength=120).pack(pady=(8, 0))
 
-        self._rows = {}          # iid -> clip Row
+        self._rows = {}          # iid -> clip Row (only the currently rendered rows)
+        self._all_clips = []     # every clip Row for this root (pre-filter)
         self.refresh()
 
     def _grab_modal(self):
@@ -166,11 +204,75 @@ class SegmentsManager(tk.Toplevel):
 
     def refresh(self):
         import batch_video_upscale as bv
+        if self.tab._root_id is None:
+            self._all_clips = []
+        else:
+            self._all_clips = list(bv.db.get_video_clips(self.tab._conn(), self.tab._root_id))
+        self._populate_filters()
+        self._render()
+
+    def _populate_filters(self):
+        """Fill the filter combos with the DISTINCT targets/statuses now present (plus
+        'All'), keeping the current selection when it still occurs."""
+        targets = sorted({c["target"] for c in self._all_clips if c["target"]})
+        statuses = sorted({c["status"] for c in self._all_clips if c["status"]})
+        for label, values, var in (("Target", targets, self.filter_target_var),
+                                   ("Status", statuses, self.filter_status_var)):
+            self._filter_combos[label].configure(values=["All"] + list(values))
+            if var.get() != "All" and var.get() not in values:
+                var.set("All")
+
+    def _reset_filters(self):
+        self.filter_target_var.set("All")
+        self.filter_status_var.set("All")
+        self._render()
+
+    def _toggle_show_done(self):
+        """Persist the Display Done choice and re-render (view-only, touches nothing)."""
+        if self._app is not None:
+            self._app.settings["segments_show_done"] = bool(self.show_done_var.get())
+            save_settings(self._app.settings)
+        self._render()
+
+    def _remove_done(self):
+        """Bulk-clear finished clips from the list. Removes only their queue/output
+        RECORDS (like Delete, but for every done clip at once); the upscaled video
+        files on disk are kept. Undone segments are never touched."""
+        done = [c for c in self._all_clips if (c["status"] or "").lower() == "done"]
+        if not done:
+            self.status_var.set("No done segments to remove.")
+            return
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Remove {len(done)} finished segment(s) from the list?\n\n"
+                f"This clears their list entries only — the upscaled video files on "
+                f"disk are kept.",
+                parent=self):
+            return
+        import batch_video_upscale as bv
+        conn = self.tab._conn()
+        for c in done:
+            bv.db.delete_video_output(conn, self.tab._root_id, c["rel_path"],
+                                      c["target"], clip_id=c["clip_id"])
+        self.refresh()
+        self.tab._load_queue()
+        self.status_var.set(f"Removed {len(done)} finished segment(s).")
+
+    def _render(self):
+        """(Re)draw the tree from _all_clips, applying the target/status filters and
+        the Display Done toggle (hides finished clips when unchecked)."""
         self.tree.delete(*self.tree.get_children())
         self._rows = {}
-        if self.tab._root_id is None:
-            return
-        for c in bv.db.get_video_clips(self.tab._conn(), self.tab._root_id):
+        tf = self.filter_target_var.get()
+        sf = self.filter_status_var.get()
+        show_done = self.show_done_var.get()
+        for c in self._all_clips:
+            if tf not in ("All", "") and c["target"] != tf:
+                continue
+            if sf not in ("All", "") and c["status"] != sf:
+                continue
+            if not show_done and (c["status"] or "").lower() == "done":
+                continue
             cdur = (c["clip_end"] or 0) - (c["clip_start"] or 0)
             iid = self.tree.insert(
                 "", "end", text=c["rel_path"],
@@ -422,35 +524,61 @@ class VideoTab(ttk.Frame):
         qf = ttk.LabelFrame(self, text=" Upscale queue ", padding=4)
         qf.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         self.rowconfigure(4, weight=2)
-        qf.rowconfigure(0, weight=1)
+        qf.rowconfigure(1, weight=1)          # the tree row (row 0 is the filter bar)
         qf.columnconfigure(0, weight=1)
-        qcols = ("target", "status", "res", "dur", "codec", "fps", "frames", "segs")
+
+        # Filter bar: narrow the queue by target or status (fed the DISTINCT values
+        # present, plus "All"). Handy to hide "done" jobs on a long queue. Same
+        # detach/reattach approach as the Eligible-videos filter.
+        qfilt = ttk.Frame(qf)
+        qfilt.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Label(qfilt, text="Filter:").pack(side="left")
+        self.qfilter_target_var = tk.StringVar(value="All")
+        self.qfilter_status_var = tk.StringVar(value="All")
+        self._qfilter_combos = {}
+        for label, var, width in (("Target", self.qfilter_target_var, 10),
+                                  ("Status", self.qfilter_status_var, 12)):
+            ttk.Label(qfilt, text=label).pack(side="left", padx=(10, 2))
+            cb = ttk.Combobox(qfilt, textvariable=var, state="readonly",
+                              width=width, values=["All"])
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_queue_filters())
+            self._qfilter_combos[label] = cb
+        ttk.Button(qfilt, text="Reset", width=6,
+                   command=self._reset_queue_filters).pack(side="left", padx=(10, 0))
+
+        # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
+        # (a view-only sort) never hides where a job actually sits in the queue.
+        qcols = ("place", "target", "status", "res", "dur", "codec", "fps", "frames", "segs")
         self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
         self._queue_sort = {}
         self._queue_rows = {}            # iid -> {rel, target, props} for sort/actions
+        self._queue_order = []           # iids in true (unfiltered) queue order
         _q_titles = {"#0": "File"}
         self.queue_tree.column("#0", width=200, stretch=True)
-        for c, txt, w in (("target", "Target", 60), ("status", "Status", 80),
+        for c, txt, w in (("place", "#", 36), ("target", "Target", 60),
+                          ("status", "Status", 80),
                           ("res", "Resolution", 90), ("dur", "Duration", 70),
                           ("codec", "Codec", 60), ("fps", "FPS", 50),
                           ("frames", "Frames", 70), ("segs", "Segments", 70)):
             _q_titles[c] = txt
-            self.queue_tree.column(c, width=w, stretch=False, anchor="w")
+            self.queue_tree.column(c, width=w, stretch=False,
+                                   anchor="e" if c == "place" else "w")
         self._queue_sort["_titles"] = _q_titles
         for c, txt in _q_titles.items():
             self.queue_tree.heading(
                 c, text=txt,
                 command=lambda c=c: self._sort_tree(
                     self.queue_tree, c, self._queue_sort_key(c), self._queue_sort))
-        self.queue_tree.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self.queue_tree.grid(row=1, column=0, rowspan=4, sticky="nsew")
         qsb = ttk.Scrollbar(qf, orient="vertical", command=self.queue_tree.yview)
-        qsb.grid(row=0, column=1, rowspan=4, sticky="ns")
+        qsb.grid(row=1, column=1, rowspan=4, sticky="ns")
         self.queue_tree.configure(yscrollcommand=qsb.set)
         self.queue_tree.bind("<Double-1>", self._on_queue_double)
         self.queue_tree.bind("<Button-3>", self._on_queue_right)
-        ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1)).grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1)).grid(row=1, column=2, padx=(4, 0))
-        ttk.Button(qf, text="Remove", command=self._queue_remove).grid(row=2, column=2, padx=(4, 0), pady=(4, 0))
+        ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1)).grid(row=1, column=2, padx=(4, 0))
+        ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1)).grid(row=2, column=2, padx=(4, 0))
+        ttk.Button(qf, text="Remove", command=self._queue_remove).grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
 
         # 6) GPU picker + estimate.
         gf = ttk.Frame(self)
@@ -990,6 +1118,32 @@ class VideoTab(ttk.Frame):
         """Enqueue the picker's pending clips as virtual jobs (off the UI thread)."""
         if self._root_id is None or not clips:
             return
+        # Same queue-add guard as Prepare, per distinct target (all clips share the
+        # source, so one verdict per target covers its clips). Drop downscale targets
+        # and confirm marginal (< 50 %) ones ONCE, before committing anything.
+        import video_estimate as ve
+        srow = next((v for v in self._scan_rows.values() if v.get("rel") == rel), None)
+        r = (srow or {}).get("r") or {}
+        sw, sh = r.get("width"), r.get("height")
+        if sw and sh:
+            verdicts = {t: ve.classify_upscale(sw, sh, t) for t in {c["target"] for c in clips}}
+            blocked = {t for t, v in verdicts.items() if v == "downscale"}
+            marginal = {t for t, v in verdicts.items() if v == "marginal"}
+            if blocked:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"This video is {sw}x{sh}; target(s) {', '.join(sorted(blocked))} "
+                    f"would downscale it. Clip(s) for those target(s) were skipped.",
+                    parent=self)
+            if marginal and not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Target(s) {', '.join(sorted(marginal))} enlarge this {sw}x{sh} "
+                    f"video by less than 50%. Add those clip(s) to the queue anyway?",
+                    parent=self):
+                blocked |= marginal
+            clips = [c for c in clips if c["target"] not in blocked]
+            if not clips:
+                return
 
         def work():
             import batch_video_upscale as bv
@@ -1073,11 +1227,41 @@ class VideoTab(ttk.Frame):
 
     # ── prepare / queue ──────────────────────────────────────────────────────
 
+    def _upscale_add_ok(self, src_w, src_h, target):
+        """Queue-add guard shared by the Prepare and clip paths. Blocks a DOWNSCALE
+        outright and asks for confirmation on a MARGINAL (< 50 % larger) upscale.
+        Returns True when the caller may proceed. See video_estimate.classify_upscale."""
+        import video_estimate as ve
+        verdict = ve.classify_upscale(src_w, src_h, target)
+        if verdict is None:
+            return True
+        out = ve.output_dims(src_w, src_h, target)
+        out_txt = f"{out[0]}x{out[1]}" if out else target
+        if verdict == "downscale":
+            messagebox.showwarning(
+                APP_TITLE,
+                f"This video is already {src_w}x{src_h}. Upscaling to {target} "
+                f"({out_txt}) would DOWNSCALE it, not enlarge it.\n\n"
+                f"It was not added to the queue. Pick a larger target.",
+                parent=self)
+            return False
+        s = ve.fit_scale(src_w, src_h, target) or 1.0
+        return messagebox.askyesno(
+            APP_TITLE,
+            f"This video is {src_w}x{src_h}; target {target} ({out_txt}) enlarges it "
+            f"by only {round((s - 1) * 100)}% (less than 50%).\n\n"
+            f"A small upscale gains little quality for the GPU time / cost. "
+            f"Add it to the queue anyway?",
+            parent=self)
+
     def _prepare(self):
         sel = self.scan_tree.selection()
         row = self._scan_rows.get(sel[0]) if sel else None
         target = self.target_var.get()
         if not row or not target:
+            return
+        r = row.get("r") or {}
+        if not self._upscale_add_ok(r.get("width"), r.get("height"), target):
             return
         # No status-bar chatter for queue edits: the queue list is the source of
         # truth and shows the add/remove directly. Only a failure (below) is worth
@@ -1118,7 +1302,8 @@ class VideoTab(ttk.Frame):
         import video_estimate as ve
         self.queue_tree.delete(*self.queue_tree.get_children())
         self._queue_rows = {}
-        for j in bv.db.get_video_queue(conn, self._root_id):
+        self._queue_order = []
+        for place, j in enumerate(bv.db.get_video_queue(conn, self._root_id), start=1):
             vf = bv.db.get_video_file(conn, self._root_id, j["rel_path"])
             clip_id = j["clip_id"] or 0
             segs = bv.db.get_video_segments(conn, self._root_id, j["rel_path"],
@@ -1147,16 +1332,55 @@ class VideoTab(ttk.Frame):
             abs_path = os.path.join(self._src_root, j["rel_path"]) if self._src_root else j["rel_path"]
             iid = self.queue_tree.insert(
                 "", "end", text=text,
-                values=(j["target"], j["status"], res, dur, codec, fps, frames, segtxt),
+                values=(place, j["target"], j["status"], res, dur, codec, fps, frames, segtxt),
                 tags=(j["rel_path"], j["target"], str(clip_id)))
+            self._queue_order.append(iid)
             self._queue_rows[iid] = {
                 "rel": j["rel_path"], "target": j["target"], "clip_id": clip_id,
-                "abs": abs_path, "w": w or 0, "h": h or 0,
+                "abs": abs_path, "w": w or 0, "h": h or 0, "place": place,
+                "status": j["status"],
                 "duration": row_dur,
                 "fps": (vf["fps"] if vf else 0) or 0.0,
                 "codec": codec}
+        self._populate_queue_filters()
+        self._apply_queue_filters()
         self._refresh_scan_outputs()
         self._update_estimate()
+
+    def _populate_queue_filters(self):
+        """Fill the queue filter combos with the DISTINCT targets/statuses now queued
+        (each prefixed 'All'). Preserves the current selection if it still occurs."""
+        rows = self._queue_rows.values()
+        targets = sorted({r["target"] for r in rows if r.get("target")})
+        statuses = sorted({r["status"] for r in rows if r.get("status")})
+        for label, values, var in (("Target", targets, self.qfilter_target_var),
+                                   ("Status", statuses, self.qfilter_status_var)):
+            self._qfilter_combos[label].configure(values=["All"] + list(values))
+            if var.get() != "All" and var.get() not in values:
+                var.set("All")
+
+    def _reset_queue_filters(self):
+        self.qfilter_target_var.set("All")
+        self.qfilter_status_var.set("All")
+        self._apply_queue_filters()
+
+    def _apply_queue_filters(self):
+        """Show only queue rows matching the target/status filters, by detaching the
+        rest and reattaching matches in true queue order (so 'Place' stays meaningful)."""
+        tf = self.qfilter_target_var.get()
+        sf = self.qfilter_status_var.get()
+        idx = 0
+        for iid in self._queue_order:
+            row = self._queue_rows.get(iid)
+            if not row:
+                continue
+            ok = ((tf in ("All", "") or row.get("target") == tf)
+                  and (sf in ("All", "") or row.get("status") == sf))
+            if ok:
+                self.queue_tree.reattach(iid, "", idx)
+                idx += 1
+            else:
+                self.queue_tree.detach(iid)
 
     def _refresh_scan_outputs(self):
         """Re-read the scan rows' upscaled counterparts so the 'Upscaled' columns
@@ -1250,6 +1474,8 @@ class VideoTab(ttk.Frame):
             row = self._queue_rows.get(iid) or {}
             if col == "#0":
                 return (row.get("rel") or "").lower()
+            if col == "place":
+                return row.get("place") or 0
             if col == "res":
                 return (row.get("w") or 0) * (row.get("h") or 0)
             if col == "dur":
@@ -1458,6 +1684,7 @@ class VideoTab(ttk.Frame):
         self._bar_frac = 0.0          # last painted bar fraction (kept MONOTONIC)
         self._eta_finish = None       # projected finish time; refreshed only when progress advances
         self._eta_done = 0            # done_now at the last ETA refresh (so a stall can't inflate it)
+        self._last_hb = time.time()   # last console liveness heartbeat (see _run_tick)
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -1672,7 +1899,13 @@ class VideoTab(ttk.Frame):
             self._last_fp_time, time.time(), self._live_spf,
             self._seg_start, self._seg_expected, self._seg_total_chunks,
             self._seg_has_frames)
-        raw = min(1.0, done / self._run_total)
+        # Cap BELOW 100 % while the run is live: the frame count can saturate (or the
+        # denominator can undershoot) well before the pod finishes decoding/encoding the
+        # last segment and the local reassemble/mux/drift tail runs — a 19-min stretch
+        # on a big segment. Pinning at 100 % then reads as "done but frozen" (a
+        # non-technical user may think it locked and Stop it). Reserve the top ~1 % for
+        # that tail; on_exit(0) snaps it to a true 100 % only when the run actually ends.
+        raw = min(0.99, done / self._run_total)
         prev = getattr(self, "_bar_frac", 0.0)
         self._bar_frac = max(prev, raw)
         self.progress.set(100.0 * self._bar_frac)
@@ -1732,8 +1965,14 @@ class VideoTab(ttk.Frame):
         self._paint_bar("tick")
         base = getattr(self, "_cur_status", "") or ""
         tail = ""
-        if self._eta_finish is not None and done_now > 0:
-            tail = f" · ETA {ve.fmt_duration(max(0.0, self._eta_finish - now))}"
+        if self._eta_finish is not None and done_now > 0 and self._eta_finish - now > 1:
+            tail = f" · ETA {ve.fmt_duration(self._eta_finish - now)}"
+        elif self._seg_start is not None and done_now > 0:
+            # ETA elapsed but the segment is still running: the frame count has
+            # saturated while the pod decodes/encodes the tail (and the local
+            # reassemble/mux/drift step follows). Show a LIVE "finishing up" counter
+            # instead of a frozen "ETA 0s" so the run never looks stuck.
+            tail = f" · finishing up ({ve.fmt_duration(now - self._seg_start)} on this segment)"
         elif self._seg_start is not None and self._seg_expected and self._run_total > 0:
             # No real frames yet: a rough estimate from the benchmark, counted off the bar.
             per_frame = self._seg_expected / self._cur_seg_frames if self._cur_seg_frames else 0
@@ -1755,6 +1994,21 @@ class VideoTab(ttk.Frame):
             tail += f" · ${spent:.2f} so far"
         if base:
             self.status_var.set(base + tail)
+        # Permanent console heartbeat: during a long segment the runner logs nothing
+        # between "streaming" and the final "segment N: X frames", so the log pane can
+        # sit silent for many minutes (a big segment's decode/encode tail). Feed one
+        # concise liveness line a minute so an unattended run never looks locked. Unlike
+        # _dbg_progress (temporary, gated on a bar CHANGE) this survives even when the
+        # frame count has saturated.
+        if self._seg_start is not None and now - self._last_hb >= 60:
+            self._last_hb = now
+            spf = f" · {self._live_spf:.1f} s/frame" if self._live_spf else ""
+            # ConsoleBuffer.feed stamps each line with [HH:MM:SS] already, so no
+            # inner timestamp here (that was doubling it).
+            self.console.feed(
+                f"Processing: {self._cur_seg_done}/{self._cur_seg_frames} "
+                f"frames this segment{spf} "
+                f"(runtime {ve.fmt_duration(now - self._seg_start)})\n")
         self._run_tick_job = self.after(1000, self._run_tick)
 
     def on_exit(self, code):
@@ -1763,6 +2017,10 @@ class VideoTab(ttk.Frame):
         self.app.flash_attention()
         self._load_queue()
         if code == 0:
+            # The bar is held at <=99 % during the run (see _paint_bar); a clean finish
+            # is the only place it reaches a true 100 %.
+            self._bar_frac = 1.0
+            self.progress.set(100.0)
             self.status_var.set("Run finished.")
         else:
             # A common cause is the picked GPU selling out between picker-refresh
