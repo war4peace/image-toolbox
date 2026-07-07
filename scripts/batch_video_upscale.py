@@ -882,7 +882,17 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         shutil.rmtree(stage, ignore_errors=True)
     out_info = vp.probe(out_video, count=True)
 
-    seg_out = [r["out_frames"] for r in db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)]
+    seg_rows = db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
+    seg_out = [r["out_frames"] for r in seg_rows]
+    # Whole-video upscale runtime, summed from every segment's recorded seconds so it
+    # stays correct across a RESUMED run (not just this session's segments). Flagged
+    # approximate if any segment has no recorded time (e.g. resumed from older data).
+    seg_secs = [r["seconds"] for r in seg_rows]
+    runtime = sum(s for s in seg_secs if s)
+    runtime_txt = ""
+    if runtime > 0:
+        partial = " (timed segments only)" if any(not s for s in seg_secs) else ""
+        runtime_txt = f" in {fmt_hhmmss(runtime)}{partial}"
     reference = sum(s.frame_count for s in segs)   # SeedVR2 preserves per-segment frames (6.3)
     # Drift is checked against the CLIP (job_info) for a clip job, not the whole source.
     report = vp.check_drift(job_info, out_info, seg_out, reference_frames=reference)
@@ -896,9 +906,10 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
 
     if report.ok:
         log(f"[{index}/{total}] DONE {rel} -> {os.path.basename(out_video)} "
-            f"({out_info.nb_frames} frames)")
+            f"({out_info.nb_frames} frames){runtime_txt}")
     else:
-        log(f"[{index}/{total}] DONE (review) {rel}: " + "; ".join(report.warnings))
+        log(f"[{index}/{total}] DONE (review) {rel}{runtime_txt}: "
+            + "; ".join(report.warnings))
     gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
                           "outcome": "ok", "output_path": out_video,
                           "warnings": report.warnings})
