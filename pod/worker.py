@@ -356,10 +356,24 @@ def _fit_batch_to_frames(batch, frames, overlap):
 # SAFETY 0.80 leaves ~20% free for the allocator to breathe (7B 4K bs33 ran clean at 85%, and
 # 3B bs117 thrashed at 98%). The model sizes the AUTO batch AND clamps a too-big explicit pick;
 # OOM-recovery backstops any remaining miss.
-_VRAM_PROFILES = {       # model family -> (FIXED, A, B, C)
+_VRAM_PROFILES = {       # model family -> (FIXED, A, B, C)  -- RESIDENT (weights in VRAM)
     "7b":      (16.3, 15.98, 0.01096, 0.000111),
     "3b":      (6.40,  8.55, 0.0932,  0.0),
     "3b_fp16": (9.40,  8.55, 0.0932,  0.0),
+}
+# OFFLOAD regime (resident=False: DiT/VAE streamed from CPU on a <40 GB card). A genuinely
+# different VRAM curve, so it needs its own coefficients: the RESIDENT profile counts the
+# ~16 GB of weights that are NOT in VRAM here, over-predicting ~2.4x at low batch and
+# collapsing the auto-fit to the floor (batch 5 / overlap 4 / stride 1 -- the documented
+# KNOWN BUG). The batch term is also far STEEPER offloaded (activations dominate once the
+# weights leave VRAM): resident 7B is ~0.03 GB/batch, measured offload is ~0.215. Calibrated
+# on two clean RTX 5090 1080p anchors (1.556 MP, 7B fp16): bs5 = 17.5 GB, bs65 = 30.4 GB
+# working set. As a cross-check the fit predicts bs89 = 35.6 GB > 32, matching the benchmark's
+# observed OOM at bs89. Only the 7B family offloads in practice (3B-Q8 fits resident on any
+# >=~10 GB card), so only it is calibrated; other models fall back to the (conservative)
+# resident profile when offloaded.
+_VRAM_PROFILES_OFFLOAD = {
+    "7b": (2.0, 9.27, 0.1382, 0.0),
 }
 _VRAM_SAFETY = 0.80          # max working-set fraction of the card (allocator thrashes near 1.0)
 _VRAM_HEADROOM_GB = 6.0      # absolute breathing room reserved on top of the fraction, so a
@@ -372,23 +386,28 @@ _BATCH_CAP = 33              # AUTO-path ceiling only: a safe default for unknow
 _BATCH_FLOOR = 5             # below this a temporal window barely helps
 
 
-def _vram_profile(model):
-    """The (FIXED, A, B, C) VRAM coefficients for a dit_model, by name. 3B splits into the
-    unquantised fp16 (heavier weights) and the Q8 GGUF; the 7B family and any UNKNOWN model
-    fall back to the heavier 7B profile, which over-estimates safely rather than risking a
-    thrash."""
+def _vram_profile(model, resident=True):
+    """The (FIXED, A, B, C) VRAM coefficients for a dit_model, in the given residency regime.
+    OFFLOAD (resident=False) has its own, much lighter and steeper-in-batch curve (weights
+    stream from CPU). 3B splits into unquantised fp16 (heavier weights) and Q8 GGUF; the 7B
+    family and any UNKNOWN model use the 7B profile (over-estimates safely). Only the 7B
+    offload profile is calibrated -- only the 7B family offloads in practice -- so a 3B /
+    unknown model in offload falls back to its conservative resident profile."""
     m = (model or "").lower()
-    if "3b" in m:
+    is_3b = "3b" in m
+    if not resident and not is_3b:
+        return _VRAM_PROFILES_OFFLOAD["7b"]
+    if is_3b:
         if "fp16" in m and "gguf" not in m:     # unquantised 3B (~3 GB heavier than Q8)
             return _VRAM_PROFILES["3b_fp16"]
         return _VRAM_PROFILES["3b"]
     return _VRAM_PROFILES["7b"]
 
 
-def _ws_gb(mp, batch, model=None):
+def _ws_gb(mp, batch, model=None, resident=True):
     """Predicted working set (GB) for an output of `mp` megapixels at `batch` frames, using
-    the VRAM profile for `model`."""
-    f, a, b, c = _vram_profile(model)
+    the VRAM profile for `model` in the given residency regime (offload has its own curve)."""
+    f, a, b, c = _vram_profile(model, resident)
     return f + mp * (a + b * batch + c * batch * batch)
 
 
@@ -408,7 +427,7 @@ def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
     budget = min(vram_gb * frac, vram_gb - _VRAM_HEADROOM_GB)
     best, b = _BATCH_FLOOR, _BATCH_FLOOR
     while b <= 997:
-        if _ws_gb(mp, b, model) <= budget:
+        if _ws_gb(mp, b, model, resident) <= budget:
             best = b
             b += 4
         else:

@@ -428,7 +428,7 @@ cheapest total, least exposure on a dropped connection. The big cards win wall-c
 time and longer windows, not cost. **1080p ->
 5090** is now confirmed.
 
-### KNOWN BUG (2026-07-07): the VRAM auto-fit collapses the batch to the floor on an offload card
+### FIXED (2026-07-07): the VRAM auto-fit was collapsing the batch to the floor on an offload card
 
 Found on a real GUI run: 7B fp16, `640x480 -> 1080p` (box-fit output `1440x1080`,
 1.556 MP), a 196-frame segment, on the RTX 5090. The pod resolved **`batch_size 5,
@@ -463,15 +463,22 @@ Net: `_max_vram_batch` returns `_BATCH_FLOOR` (5) and any explicit batch clamps 
 `_is_oom` + the retry-smaller loop, down to the floor), so an over-optimistic batch
 self-corrects instead of crashing.
 
-**Fix plan (not yet done, deferred behind a more urgent bug):**
-- **Step 1 (small, unblocks testing):** honor an EXPLICIT (Advanced-override) batch
-  WITHOUT the VRAM pre-clamp: keep `_fit_batch_to_frames` and let OOM-recovery backstop.
-  The AUTO path stays guarded. This alone lets `batch_size = 73` actually run (~3 windows
-  over 196 frames) and lets us gather real working-set/reserved anchors at larger batches
-  (the clamp currently blocks getting them: chicken-and-egg).
-- **Step 2 (with those anchors):** recalibrate the offload AUTO path to drop the resident-
-  weight term from `FIXED` when `resident=False` and to bound RESERVED, so AUTO picks
-  ~45-61 on the 5090 instead of 5.
+**Fix (BOTH steps DONE, 2026-07-07, commits 9ba8d3d + the offload-profile commit):**
+- **Step 1 (DONE):** honor an EXPLICIT (Advanced-override) batch WITHOUT the VRAM
+  pre-clamp: `_fit_batch_to_frames` still snaps it and OOM-recovery backstops. The AUTO
+  path stays guarded. Verified: `batch_size = 73` on a 283-frame clip resolves to batch
+  65 / overlap 6 / ~5 passes (was 5 / 4 / ~279). This also let us gather the anchors
+  Step 2 needed (the clamp had blocked getting them: chicken-and-egg).
+- **Step 2 (DONE):** a resident-aware VRAM profile. `resident=False` now uses a separate
+  OFFLOAD curve (`_VRAM_PROFILES_OFFLOAD`), calibrated on two clean RTX 5090 1080p anchors
+  (1.556 MP, 7B fp16): **bs5 = 17.5 GB, bs65 = 30.4 GB working set** (and as a cross-check
+  it predicts bs89 = 35.6 GB > 32, matching the benchmark's OOM at bs89). The offload curve
+  is lighter (drops the ~16 GB resident-weight term) and much steeper in batch (~0.215 vs
+  ~0.03 GB/batch, since activations dominate once weights are on CPU). Result: AUTO on the
+  5090 now picks **33** (the `_BATCH_CAP`, WS ~23.5 GB) instead of 5. The RESIDENT big-card
+  profile is untouched (regression-checked: 1440p bs33 still predicts 77.0 GB). Only the 7B
+  family is offload-calibrated (only it offloads in practice); 3B/unknown offload falls back
+  to the conservative resident profile.
 
 ### Measured results (fifth pass: A100 80 GB PCIe, 1440p) - the cheap card LOSES here
 
