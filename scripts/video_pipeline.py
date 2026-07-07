@@ -34,7 +34,9 @@ find_ffmpeg). Fail-safe, never touches the source, Windows-aware
 import os
 import sys
 import json
+import time
 import shutil
+import threading
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -124,15 +126,15 @@ def find_ffmpeg():
     return ffmpeg, ffprobe
 
 
-def _run(args, capture=True, check=True):
-    """Run an ffmpeg/ffprobe command, no console window, return CompletedProcess."""
-    cp = subprocess.run(
-        args,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        creationflags=_CREATE_NO_WINDOW,
-        text=True,
-    )
+# Bounds so a transient stall (an AV scan holding a freshly-written file, a momentary
+# I/O hiccup, a wedged child) can NEVER hang the pipeline forever the way a plain
+# subprocess.run does. NOT about the network link: the SMB mount is fast/stable, this
+# is defence against a local process that stops making progress.
+_ENCODE_STALL_S = 120.0    # kill an ffmpeg ENCODE emitting no output for this long
+_PROBE_HARD_S   = 300.0    # absolute cap for the near-silent ffprobe / '-c copy' commands
+
+
+def _check(cp, args, check):
     if check and cp.returncode != 0:
         tail = (cp.stderr or "").strip().splitlines()[-12:]
         raise FFmpegError(
@@ -140,6 +142,97 @@ def _run(args, capture=True, check=True):
             + "\n".join(tail)
         )
     return cp
+
+
+def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
+    """Run an ffmpeg/ffprobe command (no console window) and return a CompletedProcess.
+
+    Bounded so a stalled child can't hang the whole pipeline indefinitely:
+      * stall_timeout - kill if the process emits NO output for this many seconds. For the
+        ffmpeg ENCODE commands, which print continuous progress, so a real stall goes
+        silent while a slow-but-working encode keeps ticking (progress is \\r-updated, so
+        this path reads raw chunks, not lines, to see those ticks).
+      * hard_timeout  - absolute wall-clock cap, for the near-silent ffprobe / '-c copy'
+        commands where 'no new output' is normal.
+    On either limit the child is killed and FFmpegError is raised, so the caller
+    (run_queue) fails the job cleanly and tears the pod down instead of idling forever.
+    With neither set, behaviour is the original unbounded subprocess.run."""
+    if stall_timeout is None and hard_timeout is None:
+        cp = subprocess.run(
+            args,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            creationflags=_CREATE_NO_WINDOW,
+            text=True,
+        )
+        return _check(cp, args, check)
+
+    # Bounded path: binary Popen + reader threads that reset a stall clock on any output.
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        creationflags=_CREATE_NO_WINDOW,
+    )
+    out_buf, err_buf = [], []
+    last = [time.monotonic()]
+
+    def _drain(stream, sink):
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read1(65536)      # raw chunks: catches \r progress ticks
+                if not chunk:
+                    break
+                sink.append(chunk)
+                last[0] = time.monotonic()
+        except Exception:                        # noqa: BLE001 — reader is best-effort
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:                    # noqa: BLE001
+                pass
+
+    readers = [threading.Thread(target=_drain, args=(proc.stdout, out_buf), daemon=True),
+               threading.Thread(target=_drain, args=(proc.stderr, err_buf), daemon=True)]
+    for r in readers:
+        r.start()
+
+    start = time.monotonic()
+    reason = None
+    while True:
+        try:
+            proc.wait(timeout=1.0)
+            break
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            if hard_timeout and now - start > hard_timeout:
+                reason = f"exceeded its {hard_timeout:.0f}s time limit"
+                break
+            if stall_timeout and now - last[0] > stall_timeout:
+                reason = f"stalled (no output for {now - last[0]:.0f}s > {stall_timeout:.0f}s)"
+                break
+
+    if reason is not None:
+        try:
+            proc.kill()
+        except Exception:                        # noqa: BLE001
+            pass
+        for r in readers:
+            r.join(timeout=2.0)
+        raise FFmpegError(
+            f"command {reason}: {os.path.basename(args[0])} … "
+            "(killed to avoid an indefinite hang; the job is failed and can be retried)")
+
+    for r in readers:
+        r.join(timeout=2.0)
+    cp = subprocess.CompletedProcess(
+        args, proc.returncode,
+        b"".join(out_buf).decode("utf-8", "replace") if capture else None,
+        b"".join(err_buf).decode("utf-8", "replace") if capture else None)
+    return _check(cp, args, check)
 
 
 # ─────────────────────────────────────────────
@@ -223,7 +316,7 @@ def probe(path, count=False) -> VideoInfo:
     cp = _run([
         ffprobe, "-v", "error", "-print_format", "json",
         "-show_streams", "-show_format", path,
-    ])
+    ], hard_timeout=_PROBE_HARD_S)
     data = json.loads(cp.stdout or "{}")
     streams = data.get("streams", [])
     fmt = data.get("format", {})
@@ -290,7 +383,7 @@ def count_frames(path) -> int:
             ffprobe, "-v", "error", "-select_streams", "v:0",
             "-count_packets", "-show_entries", "stream=nb_read_packets",
             "-of", "csv=p=0", path,
-        ])
+        ], hard_timeout=_PROBE_HARD_S)
         return int((cp.stdout or "0").strip() or 0)
     except Exception:
         return 0
@@ -309,7 +402,7 @@ def keyframe_times(path) -> list:
             ffprobe, "-v", "error", "-select_streams", "v:0",
             "-skip_frame", "nokey", "-show_entries", "frame=pts_time",
             "-of", "csv=p=0", path,
-        ])
+        ], hard_timeout=_PROBE_HARD_S)
     except Exception:
         return []
     times = []
@@ -360,7 +453,8 @@ def pick_encoder(prefer_hw=True):
     ffmpeg, _ = find_ffmpeg()
     encoders = ""
     try:
-        encoders = _run([ffmpeg, "-hide_banner", "-encoders"], check=False).stdout or ""
+        encoders = _run([ffmpeg, "-hide_banner", "-encoders"],
+                        check=False, hard_timeout=60).stdout or ""
     except Exception:
         encoders = ""
     if prefer_hw:
@@ -459,7 +553,7 @@ def split(info: VideoInfo, plan: SplitPlan, out_dir, segment_ext=SEGMENT_EXT):
              "-reset_timestamps", "1", "-segment_format",
              segment_ext.lstrip("."), pattern]
 
-    _run(args, capture=True)
+    _run(args, capture=True, stall_timeout=_ENCODE_STALL_S)
 
     segments = []
     for i, name in enumerate(sorted(os.listdir(out_dir))):
@@ -502,6 +596,13 @@ def extract_clip(info: VideoInfo, start, end, out_path, log=None):
     pad = min(start, 5.0)
     left = start - pad                     # keyframe input-seek target (>= 0)
     codec, enc_args, _hw = pick_encoder()
+    # Write to a `.part` sibling and os.replace() on success, so a killed or failed
+    # extract (e.g. the stall watchdog killing a hung ffmpeg) never leaves a TRUNCATED
+    # clip that a resume would trust: the runner's `if not os.path.exists(clip_src)`
+    # check would otherwise skip re-extraction and upscale a partial clip. Same volume,
+    # same extension (ffmpeg picks the muxer by extension), so the replace is atomic.
+    root, ext = os.path.splitext(out_path)
+    tmp_out = root + ".part" + (ext or SEGMENT_EXT)
     args = [ffmpeg, "-hide_banner", "-y",
             "-ss", f"{left:.3f}", "-i", info.path,
             "-ss", f"{pad:.3f}", "-t", f"{end - start:.3f}",
@@ -512,11 +613,19 @@ def extract_clip(info: VideoInfo, start, end, out_path, log=None):
         args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "192k"]
     else:
         args += ["-an"]
-    args += [out_path]
+    args += [tmp_out]
     if log:
         log(f"clip: {os.path.basename(info.path)} [{start:.3f}s-{end:.3f}s] "
             f"-> {os.path.basename(out_path)} ({codec})")
-    _run(args, capture=True)
+    try:
+        _run(args, capture=True, stall_timeout=_ENCODE_STALL_S)
+    except Exception:
+        try:
+            os.remove(tmp_out)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_out, out_path)
     return out_path
 
 
@@ -542,7 +651,7 @@ def concat_segments(segment_paths, out_path):
                 f.write(f"file '{safe}'\n")
         _run([ffmpeg, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
               "-i", list_path, "-map", "0", "-c", "copy",
-              "-fflags", "+genpts", out_path])
+              "-fflags", "+genpts", out_path], hard_timeout=_PROBE_HARD_S)
     finally:
         try:
             os.remove(list_path)
@@ -585,10 +694,11 @@ def mux_audio(video_path, source_path, out_path, log=None):
     if not audio_args:
         # Nothing to mux; still normalize to the output container with a copy.
         _run([ffmpeg, "-hide_banner", "-y", "-i", video_path,
-              "-map", "0:v:0", "-c", "copy", out_path])
+              "-map", "0:v:0", "-c", "copy", out_path], hard_timeout=_PROBE_HARD_S)
         return out_path
     _run([ffmpeg, "-hide_banner", "-y", "-i", video_path, "-i", source_path,
-          "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args, out_path])
+          "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args, out_path],
+         hard_timeout=_PROBE_HARD_S)
     return out_path
 
 
