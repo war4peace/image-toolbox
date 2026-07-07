@@ -618,10 +618,16 @@ def _resolve_auto_params(job, params):
         _log(f"auto batch -> {params['batch_size']} (out {out_w}x{out_h}, "
              f"vram {vram:.0f}GB, vmax {vmax}, resident={resident}, model={model})")
     elif params["batch_size"] > vmax:
-        _log(f"batch {params['batch_size']} exceeds the VRAM budget (out {out_w}x{out_h}, "
-             f"vram {vram:.0f}GB) -> clamped to {vmax} (~{_ws_gb((out_w*out_h)/1e6, vmax, model):.0f}GB "
-             f"working set); avoids the near-full allocator thrash.")
-        params["batch_size"] = vmax
+        # HONOR an explicit (Advanced) override -- do NOT pre-clamp it to the VRAM
+        # profile. That profile OVER-predicts on an OFFLOAD card (it counts the ~16 GB
+        # of DiT/VAE weights that are on CPU, not in VRAM, when resident=False), which
+        # collapsed a valid batch to the floor: batch 5 / overlap 4 / stride 1, ~1 pass
+        # per frame (see docs/video-upscaler.md "KNOWN BUG"). OOM auto-recovery
+        # (retry-smaller, see _is_oom + the retry loop) is the real backstop for a pick
+        # that truly does not fit; fit_batch_to_frames below still snaps it to the clip.
+        _log(f"explicit batch {params['batch_size']} is above the VRAM estimate "
+             f"(vmax {vmax}, out {out_w}x{out_h}, vram {vram:.0f}GB, resident={resident}, "
+             f"model={model}); honoring it -- OOM-recovery backs off if it does not fit.")
     if params["temporal_overlap"] < 0:
         params["temporal_overlap"] = _auto_overlap(params["batch_size"])
         _log(f"auto temporal_overlap -> {params['temporal_overlap']}")
