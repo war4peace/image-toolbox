@@ -479,6 +479,13 @@ self-corrects instead of crashing.
   profile is untouched (regression-checked: 1440p bs33 still predicts 77.0 GB). Only the 7B
   family is offload-calibrated (only it offloads in practice); 3B/unknown offload falls back
   to the conservative resident profile.
+  - **Validation (third anchor, bs73 = 30.6 GB WS):** a later real run confirmed the fit is
+    safely CONSERVATIVE at high batch. Working set **plateaus** at ~30.7 GB from bs65 on
+    (bs65 = 30.4, bs73 = 30.6) while the linear fit keeps climbing (predicts 32.1 at bs73), so
+    the model over-predicts above the anchors, which only makes AUTO more cautious, never less.
+    AUTO caps at 33 where the fit is accurate (bs33 ~23.5 GB), so the plateau mismatch is moot.
+    Perf note: the FIRST job of a pod pays the torch.compile warmup (283f/bs65 = 3.65 s/frame),
+    the SECOND runs warm (451f/bs73 = 1.44 s/frame total, ~0.44 s/frame DiT).
 
 ### Measured results (fifth pass: A100 80 GB PCIe, 1440p) - the cheap card LOSES here
 
