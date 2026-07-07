@@ -157,9 +157,16 @@ def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
     On either limit the child is killed and FFmpegError is raised, so the caller
     (run_queue) fails the job cleanly and tears the pod down instead of idling forever.
     With neither set, behaviour is the original unbounded subprocess.run."""
+    # stdin=DEVNULL is mandatory: this runner is launched by the GUI with a control
+    # stdin PIPE (it reads 'q' to stop). A child ffmpeg/ffprobe INHERITS that pipe as
+    # its own stdin and — ffmpeg reads stdin for interactive keys — can block on it or
+    # swallow the runner's stop byte, hanging the mux/encode indefinitely (a fast
+    # `-c copy` finished before it bit; a slower `-c:a aac` re-encode hung to the cap).
+    # Giving every child its own empty stdin makes ffmpeg see immediate EOF instead.
     if stall_timeout is None and hard_timeout is None:
         cp = subprocess.run(
             args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
             creationflags=_CREATE_NO_WINDOW,
@@ -170,6 +177,7 @@ def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
     # Bounded path: binary Popen + reader threads that reset a stall clock on any output.
     proc = subprocess.Popen(
         args,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         creationflags=_CREATE_NO_WINDOW,
@@ -696,9 +704,14 @@ def mux_audio(video_path, source_path, out_path, log=None):
         _run([ffmpeg, "-hide_banner", "-y", "-i", video_path,
               "-map", "0:v:0", "-c", "copy", out_path], hard_timeout=_PROBE_HARD_S)
         return out_path
+    # Bound by STALL, not an absolute cap: an audio re-encode (`-c:a aac`) emits ffmpeg
+    # progress, and a long movie's audio can legitimately take minutes, so a 300s hard
+    # cap would kill a healthy encode. A genuine hang goes silent and trips the stall.
+    is_reencode = audio_args[:2] == ["-c:a", "aac"]
     _run([ffmpeg, "-hide_banner", "-y", "-i", video_path, "-i", source_path,
           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *audio_args, out_path],
-         hard_timeout=_PROBE_HARD_S)
+         stall_timeout=_ENCODE_STALL_S if is_reencode else None,
+         hard_timeout=None if is_reencode else _PROBE_HARD_S)
     return out_path
 
 
