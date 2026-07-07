@@ -433,8 +433,8 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `future-features.md` (roadmap: open milestones #3/#4 + the "decided
-  against" record; shipped #1/#2 are brief pointers), `runpod-notes.md` (remote-pod
+- `docs/` — `future-features.md` (roadmap: open milestones #3/#4/#5/#6 + the "decided
+  against" record; shipped #1/#2 kept only as a numbering legend), `runpod-notes.md` (remote-pod
   upscaling notes), `video-upscaler.md` (design + as-built notes for the RunPod-only
   Video Upscaler, future-features #2, now shipped/experimental), `Benchmarks.csv`
   (author benchmark data, read by `benchmarks.py`).

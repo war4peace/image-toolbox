@@ -5,30 +5,23 @@ Candidate features that are **not yet implemented**, sorted by difficulty
 dependencies" for the threads that drive ordering, and "Decided against /
 constraints" at the bottom for ideas investigated and dropped.
 
-Both remote-pod milestones have shipped: **#1 (remote upscaling)** and **#2 (video
-upscaling)** are done and live in the app (see `CLAUDE.md` for the built feature
-set). They are kept below as one-line pointers only, because code and other docs
-cite them by number. What actually remains is two much-lower-priority milestones
-(HTTP interface #3, Unraid #4), each of which introduces a new process model,
-networking, or packaging.
+What actually remains is two much-lower-priority milestones (HTTP interface #3,
+Unraid #4), each of which introduces a new process model, networking, or
+packaging, plus one smaller candidate (video conciliation #5).
+
+**Shipped milestones (kept only as a numbering legend).** Roadmap **#1 (remote
+upscaling)** and **#2 (video upscaling)** are done and live; they are no longer
+described here (their design of record moved to `CLAUDE.md`,
+`docs/runpod-notes.md` and `docs/video-upscaler.md`). The numbers survive only
+because code and other docs cite the roadmap by them (`remote #1`, `Video
+Upscaler #2`):
+
+- **#1 — Remote upscaling (RunPod).** Shipped 0.3.1–0.4.2. See `CLAUDE.md` +
+  `docs/runpod-notes.md`.
+- **#2 — Video upscaling (RunPod-only, experimental).** Shipped. See
+  `docs/video-upscaler.md`.
 
 ---
-
-## 1. Remote upscaling (RunPod) — SHIPPED (0.3.1–0.4.2)
-
-Done and live. A disposable pod streams one image at a time to a resident on-pod
-worker (straighten-on-pod, pod telemetry, dead-man's switch, zero-config SSH, the
-install-mode wizard, one-click model-volume provisioning, remote Tag & Rename, the
-Region/DC + live cheapest-first GPU pickers, live cost tracking), with the
-**funds-floor safety-net + auto-stop** (`scripts/funds_guard.py`) landing in 0.4.2.
-Design of record: `CLAUDE.md` + `docs/runpod-notes.md`.
-
-## 2. Video upscaling (RunPod-only) — SHIPPED (experimental)
-
-Done and live behind the **Video Upscaler** tab: split each source into segments
-locally with ffmpeg, stream each segment through #1's remote path, reassemble +
-mux audio locally, with segment-level resume/installments. Design + as-built
-source of truth: **[`docs/video-upscaler.md`](video-upscaler.md)**.
 
 ## 3. HTTP interface — Hard (low priority)
 Spin up a small HTTP server with a UI that mirrors the application UI.
@@ -63,6 +56,97 @@ The user installs and runs the application on their Unraid server.
 - **What helps:** the heavy lifting (PyTorch/CUDA, SeedVR2, Ollama-over-URL) is
   already cross-platform; only the shell/GUI/packaging layers are Windows-only.
 
+## 5. Video conciliation — Moderate (candidate)
+Extend Conciliation to videos: match each upscaled video output back into the
+source tree and archive (or replace) the original, exactly as the image
+Conciliation does today. (Lower-effort than #3/#4; listed after them only to keep
+the roadmap numbers stable.)
+
+- **Reuse:** the `lineage` table (`db.py`) already records source->processed
+  content-hash links, and `conciliate.py`'s scan/run phases are format-agnostic
+  file I/O. The design extends naturally, so this is a feature, not debt.
+- **Work needed:** record video-output lineage as the Video Upscaler produces
+  files, teach the conciliate scan to include video extensions, and surface
+  videos in the Conciliation preview/plan.
+- **Risk:** low. No GPU, no new dependency; the "never touch originals /
+  archive-first" guarantees carry over unchanged.
+
+## 6. Self-healing remote runs (auto-recover a lost pod) — Moderate (candidate)
+Make a long remote run (video especially) survive **losing its pod mid-run** without
+the user babysitting it. Today the run uses one contiguous pod; if that pod dies
+involuntarily (RunPod reclaims the host, a spot eviction, the SSH tunnel drops, the
+internet drops), `run_queue` catches the engine error, marks the remaining jobs
+`failed`, and ends. Finished videos are safe (`done` on disk), but the rest need a
+**manual** restart to resume. This closes that gap.
+
+- **Desired behaviour (user request, 2026-07-07):**
+  1. **Detect** a mid-run failure and classify it: transient connectivity blip
+     (pod still alive) vs. real pod loss.
+  2. **Connectivity blip** — monitor and **reconnect / reuse the existing pod**
+     (re-establish the ssh tunnel, re-probe `/health`) before giving up on it.
+  3. **Pod loss** — poll GPU availability (`runpod_client.available_gpus`) **every
+     ~30 s** until the **IDENTICAL** card (the one originally picked) is back in
+     stock, then **deploy a replacement of that exact type** and **continue from the
+     first unfinished segment** (the resume already exists). Never substitute a
+     different card; if the identical one is unavailable, **keep waiting
+     indefinitely** — there is **no time cap** (see the guardrail note below).
+  4. **Log every step** to both the terminal/log pane and the on-disk run log
+     (deploy attempts, waits, reconnects, the card chosen, the segment resumed at).
+
+- **Reuse (most of the machinery already exists):** segment-level resume is done
+  (`db.py` `video_*` tables + `process_job`'s per-segment skip); `available_gpus`
+  already lists deployable-now stock cheapest-first; `_find_existing_pod` can
+  re-attach to a surviving pod by its mode-aware name; the dead-man's switch caps a
+  pod the healer might otherwise orphan; `debug_log` + the run log give the logging
+  sink. So the new part is an **orchestration/retry loop around the session**, not
+  new pipeline code.
+
+- **UI gate (decided 2026-07-07): an "Auto-resume" checkbox to the right of the
+  Start button, default UNCHECKED.** Per-run and visible at the point of action (not
+  a hidden global Setting), so the behaviour is opt-in and unsurprising. When
+  unchecked, an interruption behaves exactly as today (mark remaining `failed`, end,
+  manual restart resumes). When checked, the supervisor is armed for that run.
+  (Naming note: this is distinct from the existing segment-level resume, which is a
+  *manual* restart; "Auto-resume" means auto-recover the pod and continue.)
+
+- **Work needed:** a supervisor that wraps `session.start()` + `run_queue` in a
+  retry loop with backoff; a health/liveness probe to distinguish blip from loss; an
+  **unbounded** "wait for stock" poll (backoff to avoid hammering, but no time cap —
+  see guardrail note); and a redeploy path that re-uses the resume state. Gated by
+  the Auto-resume checkbox.
+
+- **Design tensions to resolve first (why this isn't a quick bolt-on):**
+  - **No-GPU-substitution rule (0.4.0) — honoured unconditionally (decided
+    2026-07-07).** Recovery redeploys the **IDENTICAL** card the user picked and
+    nothing else: there is **no substitution at all**, ticked or not, so 0.4.0's rule
+    holds without exception. If the identical card is out of stock the healer just
+    keeps polling for it **indefinitely**; it never falls back to a different card.
+    The Auto-resume checkbox therefore gates only *whether to auto-recover* (and the
+    associated unattended spend), not *which card* — the card is always the same one.
+  - **Double-billing / orphans:** a redeploy while the old pod is only *unreachable*
+    (not dead) can leave two billed pods. The healer must confirm the old pod is
+    terminated (or reclaim it) before/while deploying a new one, and the dead-man's
+    switch is the backstop.
+  - **Guardrail is MONEY, not time (decided 2026-07-07).** No time cap on the wait,
+    ever. Rationale: a 24 h batch is exactly the case this feature exists for; if the
+    user opted in and left the machine running, "I gave up after 3 h" betrays the
+    trust the checkbox asked for. And while *waiting* for stock **no pod runs, so
+    nothing is billed** — a time cap protects against nothing. The only automatic
+    stops are: (a) the queue finishes, (b) the user presses Stop, (c) `funds_guard`
+    trips (balance floor / session cost cap) — a real-money bound, which only applies
+    once a pod is actually redeployed and running, or (d) a genuinely unrecoverable
+    error that is not a stock-out. Notify when the run enters wait-for-stock (so a
+    check-in shows "waiting for RTX PRO 6000, retrying every 30 s, N h elapsed, $0
+    spent while waiting") and again when it recovers.
+  - **Model reload cost:** each new pod re-loads SeedVR2 (~2–3 min cold start), so
+    thrashing redeploys on flapping stock is wasteful — back off the poll interval,
+    don't hammer. (Backoff, not a cap: it slows retries, it never stops them.)
+
+- **Risk:** moderate. The resume foundation is solid, but the failure-mode matrix
+  (blip vs. loss vs. stock-out vs. funds-exhausted) and the billing-safety around
+  redeploy are where the care goes. Scope it to the **video** run first (long,
+  most exposed), then generalise to the image runners if it proves out.
+
 ---
 
 ## Sequencing & dependencies
@@ -73,6 +157,13 @@ The user installs and runs the application on their Unraid server.
   With Home Assistant already done over MQTT, the old telemetry coupling no longer
   drives sequencing.
 - **#4 depends on #3** (headless Unraid needs a web UI).
+- **#5 (video conciliation) is independent and lower-effort** — no new process
+  model or dependency, just lineage recording on the video path plus scan/plan
+  wiring; it can land whenever the Video Upscaler is exercised enough to want it.
+- **#6 (self-healing remote runs) is independent** and builds only on the shipped
+  remote/video stack (segment resume, `available_gpus`, `_find_existing_pod`,
+  `funds_guard`). No new process model; the effort is orchestration + billing safety,
+  not pipeline code. Worth doing once unattended overnight video runs become routine.
 - **Architectural watch-item:** the app is dependency-light and Windows-only. #3
   and #4 each push toward extra packages, a long-running server, and
   cross-platform support, so adopt those deliberately.

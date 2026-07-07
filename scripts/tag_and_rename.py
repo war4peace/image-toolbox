@@ -678,7 +678,6 @@ def _load_exif_safe(path):
 # undo couldn't strip it), and although WebP round-trips it's left out to keep one
 # simple rule. Non-JPEG files are still RENAMED (format-agnostic) and their
 # skip-on-rerun marker lives in the cache ("processed" status) instead of EXIF.
-# See item 2 in docs/improvement-recommendations.md.
 _EXIF_WRITABLE_FORMATS = {"JPEG", "MPO"}
 
 
@@ -719,7 +718,6 @@ def _save_with_exif(path, exif_dict):
     JPEG-ONLY BY CONTRACT: callers gate on _exif_writable(). The guard below makes
     it impossible to ever save "jpeg" bytes over a .png/.webp/.tif (which would
     corrupt the file or raise on an RGBA image) even if a future caller forgets.
-    See items 2 and 6 in docs/improvement-recommendations.md.
     """
     import piexif
     from PIL import Image
