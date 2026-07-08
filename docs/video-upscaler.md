@@ -1076,24 +1076,29 @@ also adds ~`overlap/(batch-overlap)` to the time, which self-calibration then ab
 
 #### Two remaining estimator blind spots (documented 2026-07-08, not yet fixed)
 
-**Input resolution DOES cost extra per output-MP (corrects the aspect-ratio note above).**
-That note claimed "the input resolution barely matters: cost follows output size." Real
-footage disproves it at the small-source end. Measured on the RTX 5090, 7B offload, all
-to 1080p (`1440x1080` output, 1.556 MP), same content family:
-- 320x240 source (0.077 MP in): ~0.94 s/frame (the benchmark clip).
-- 640x480 source (0.307 MP in, 4x the input pixels): ~1.2 to ~2.0 s/frame across runs,
-  i.e. ~1.3-2.2x the 320x240 rate at the SAME output.
-The extra is VAE-**encode** work, which scales with INPUT pixels (the DiT and VAE-decode
-scale with output). So `s/output-MP` is not input-independent: a heavily-upscaled small
-source costs more per output-MP than a lightly-upscaled larger one. The static `RATES`
-are measured at 320x240 input, so they UNDER-predict any larger source. Two things blunt
-it already: (1) `record_run` seasons `gpu_perf` with the real s/MP, so after a few runs
-the estimate self-corrects, but keyed by target only it AVERAGES over whatever input
-sizes the user feeds (a mixed-resolution queue is right on average, not per-clip); (2)
-treat the static table as a floor. A precise input coefficient is low-value until the
-run-to-run host-contention noise (the 1.2-vs-2.0 spread above is the same shared-infra
-variance in section 7 / runpod-notes) is characterised: the noise is currently as big as
-the effect, so any single-run coefficient would fit contention as much as input size.
+**Input resolution costs a little extra per output-MP, and it's mostly an OFFLOAD effect
+(corrects the aspect-ratio note above).** That note claimed "the input resolution barely
+matters: cost follows output size." It's directionally right on a resident card and wrong
+on an offload one. Warm 640x480->1080p (`1440x1080` output, 1.556 MP) vs each card's own
+320x240 benchmark at the SAME output:
+- **RTX 5090, 7B OFFLOAD:** benchmark 0.94 s/frame -> ~1.18 s/frame warm = **~1.26x** (a
+  bad run hit ~2.0, but that spread was host contention, not input size).
+- **RTX PRO 6000, 7B RESIDENT (96 GB):** benchmark 0.74 s/frame -> 0.805 s/frame warm =
+  **~1.09x** (measured 2026-07-08, 2929-frame clip; cold first segment 1.058 s/frame is
+  the torch.compile warmup, the warm second segment 0.805 is the real rate).
+The extra is VAE-**encode** work, which scales with INPUT pixels (DiT + VAE-decode scale
+with output). On OFFLOAD the encode activations also add PCIe traffic (weights are
+streaming from CPU anyway), which is why 4x the input pixels costs ~26% there but only
+~9% resident. So `s/output-MP` is weakly input-dependent, most on small offload cards.
+The static `RATES` are measured at 320x240 input, so they UNDER-predict a larger source,
+most on the 5090. Two things blunt it already: (1) `record_run` seasons `gpu_perf` with
+the real s/MP, so after a few runs the estimate self-corrects, but keyed by target only
+it AVERAGES over whatever input sizes the user feeds (a mixed-resolution queue is right
+on average, not per-clip); (2) treat the static table as a floor. A precise input
+coefficient stays low-value: the true effect is 9-26% and the run-to-run host-contention
+noise (section 7 / runpod-notes) is as big, so a single-run coefficient would fit
+contention as much as input size. The scary "3x / 15-min-per-segment" figure that first
+raised this was ENTIRELY OOM-retry waste + contention, never input cost.
 
 *Deferred (decided 2026-07-08): an input-resolution term in the AUTO-batch VRAM model
 (`pod/worker.py` `_ws_gb`) and/or the estimator rate is HELD until a calibration run,
