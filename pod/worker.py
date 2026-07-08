@@ -724,8 +724,13 @@ def _run_video_job(job, params):
                     torch.cuda.reset_peak_memory_stats()
                 except Exception:
                     pass
+                # t0 is set BEFORE the retry loop on purpose: an OOM at a too-big batch
+                # burns real (billed) GPU time before it fails, so the reported `seconds`
+                # must include every failed higher-batch attempt, not just the final
+                # successful one. Resetting t0 per attempt (the old bug) hid that waste,
+                # making a segment that OOM-recovered look far cheaper than it was billed.
+                t0 = time.time()
                 while True:
-                    t0 = time.time()
                     try:
                         n = _ENGINE.process_video(
                             job["input"], job["output"],

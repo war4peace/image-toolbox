@@ -1074,6 +1074,56 @@ on that card uses ~2.08), but the static table should be treated as a floor, not
 prediction, until a few real runs season `gpu_perf`. Enabling `temporal_overlap` (below)
 also adds ~`overlap/(batch-overlap)` to the time, which self-calibration then absorbs.
 
+#### Two remaining estimator blind spots (documented 2026-07-08, not yet fixed)
+
+**Input resolution DOES cost extra per output-MP (corrects the aspect-ratio note above).**
+That note claimed "the input resolution barely matters: cost follows output size." Real
+footage disproves it at the small-source end. Measured on the RTX 5090, 7B offload, all
+to 1080p (`1440x1080` output, 1.556 MP), same content family:
+- 320x240 source (0.077 MP in): ~0.94 s/frame (the benchmark clip).
+- 640x480 source (0.307 MP in, 4x the input pixels): ~1.2 to ~2.0 s/frame across runs,
+  i.e. ~1.3-2.2x the 320x240 rate at the SAME output.
+The extra is VAE-**encode** work, which scales with INPUT pixels (the DiT and VAE-decode
+scale with output). So `s/output-MP` is not input-independent: a heavily-upscaled small
+source costs more per output-MP than a lightly-upscaled larger one. The static `RATES`
+are measured at 320x240 input, so they UNDER-predict any larger source. Two things blunt
+it already: (1) `record_run` seasons `gpu_perf` with the real s/MP, so after a few runs
+the estimate self-corrects, but keyed by target only it AVERAGES over whatever input
+sizes the user feeds (a mixed-resolution queue is right on average, not per-clip); (2)
+treat the static table as a floor. A precise input coefficient is low-value until the
+run-to-run host-contention noise (the 1.2-vs-2.0 spread above is the same shared-infra
+variance in section 7 / runpod-notes) is characterised: the noise is currently as big as
+the effect, so any single-run coefficient would fit contention as much as input size.
+
+*Deferred (decided 2026-07-08): an input-resolution term in the AUTO-batch VRAM model
+(`pod/worker.py` `_ws_gb`) and/or the estimator rate is HELD until a calibration run,
+rather than guessed.* The offload model's anchors are 640x480 input, so AUTO is already
+correct there; the unmodeled region is inputs LARGER than 640x480 (sources run up to
+~1280x800), where we have no data. **Calibration protocol when picked up:** on one card
+(the 5090), take ONE clip, upscale it at a FIXED explicit batch that fits, to a FIXED
+target, from several source resolutions (e.g. 320x240 / 640x480 / 960x720 / 1280x800 by
+pre-scaling the same content), 2-3 runs each to average out contention; log peak working
+set + s/frame per run. That isolates the input-pixel term (VRAM and time) from the output
+and batch terms, giving a real coefficient for both `_ws_gb` (batch safety) and the rate
+(cost estimate). Until then OOM-recovery backstops an optimistic AUTO batch and
+`record_run` seasons the estimate.
+
+**Local + OOM-retry overhead is not in the estimate.** The queue estimate is
+`spin_up + sum(frames x s/MP)`: GPU time plus one boot. It omits (a) the local
+per-segment pipeline (split / upload / download / reassemble / audio-mux / drift probe),
+seconds-to-minutes on a fast link and usually negligible; and (b) OOM-retry waste, which
+is **not** negligible. When an EXPLICIT `batch_size` is too big for the card (honored
+without a pre-clamp, by design), the pod OOMs, steps the batch down, and RE-RUNS,
+burning real billed GPU time on the doomed attempts. A 5-file `1440x1080 -> 1080p` batch
+estimated ~9h15m ran ~12h44m pod time / ~15h12m wall, the bulk of the excess being
+OOM-retry from an explicit `bs61` that OOMs on a 32 GB 5090 (AUTO picks the safe bs33).
+This is now surfaced honestly (2026-07-08): the pod times its WHOLE retry loop, so the
+reported segment `seconds` include the failed attempts (they previously counted only the
+final success and hid ~11 min/segment); the segment log carries a `batch dropped X -> Y
+(OOM recovery)` flag; and the DONE line prints `wall (GPU on the GPU)` so the residual
+LOCAL overhead is visible. Right-sizing the batch (AUTO, or an explicit value that fits
+first-try) removes the retry waste entirely.
+
 #### Quality fixes from the first real run (0.4.0)
 
 **Seams every `batch_size` frames = `temporal_overlap` defaulted to 0 (FIXED).** SeedVR2

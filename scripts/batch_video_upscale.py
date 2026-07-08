@@ -850,10 +850,13 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         b = _seg_stats.get("batch")
         if b is not None and _initial_batch[0] is not None and b != _initial_batch[0]:
             drop_txt = f"; batch dropped {_initial_batch[0]} -> {b} (OOM recovery)"
-        # Phase breakdown (troubleshooting the per-segment overhead beyond the pod time):
-        # submit=upload, wait=submit->pod-done (~= the reported pod seconds + any idle),
-        # fetch=download, finalize=local write. `wait - reported` is the untimed pod-side
-        # gap; a large fetch resurrects the download theory with a hard MB/s number.
+        # Phase breakdown (per-segment overhead beyond the pod time): submit=upload,
+        # wait=submit->pod-done, fetch=download, finalize=local write. Since the pod now
+        # times its whole retry loop (worker.py t0 before the loop), the reported `secs`
+        # already includes any OOM-retry waste, so `gap = wait - secs` is just the small
+        # pod-side scheduling/poll slop (near zero) -- the OOM-recovery tell is the
+        # "batch dropped" flag above, not the gap. A large fetch would resurrect the
+        # download theory with a hard MB/s number (it stays a few seconds / tens of MB).
         phase_txt = ""
         ph = getattr(engine, "last_phase", None)
         if ph:
@@ -919,12 +922,12 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     seg_out = [r["out_frames"] for r in seg_rows]
     # Two numbers: the TRUE wall-clock elapsed for this file (upload + GPU upscale +
     # download + reassemble/mux + drift check) and the GPU-only portion (sum of the
-    # segments' recorded seconds). When the batch fits first-try these are nearly equal
-    # (submit/fetch/finalize are only seconds each: see the segment phase trace). They
-    # diverge when the pod hits OOM-recovery: the pod resets its per-attempt timer, so the
-    # recorded 'seconds' count only the final SUCCESSFUL attempt, while `wall` also includes
-    # the failed higher-batch attempts. So `wall - pod_secs` surfaces that otherwise-
-    # uncounted retry waste (right-size the batch to a value that fits first-try to remove it).
+    # segments' recorded seconds). The pod times its whole retry loop, so `pod_secs`
+    # honestly includes any OOM-retry waste (real billed GPU time); `wall - pod_secs`
+    # is then just the LOCAL pipeline overhead (upload/download over the tunnel, the
+    # ffmpeg reassemble/mux, the drift probe), normally seconds to a couple of minutes.
+    # An OOM-recovered segment shows up as the higher pod_secs plus its "batch dropped"
+    # flag, not as a gap here (right-size the batch to fit first-try to avoid the waste).
     seg_secs = [r["seconds"] for r in seg_rows]
     pod_secs = sum(s for s in seg_secs if s)       # GPU time, correct across a resume (DB)
     wall = time.time() - job_start                 # this run's real elapsed for the file
