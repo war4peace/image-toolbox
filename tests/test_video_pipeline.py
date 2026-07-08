@@ -66,6 +66,32 @@ def test_plan_carries_the_nominal_fps():
     assert plan.fps == Fraction(30)
 
 
+def test_undetectable_keyframes_long_video_triggers_reencode(monkeypatch):
+    # MEASURED: a VC-1/WMV3 .wmv (ASF) reports ZERO keyframes to ffprobe, so a
+    # `-c copy` split can't cut and the whole video collapsed to one segment. A long
+    # such video must re-encode with forced keyframes instead. 5850f/195s = clean 30
+    # fps, so the mistagged-fps branch does not pre-empt the keyframe check.
+    monkeypatch.setattr(vp, "keyframe_times", lambda _p: [])
+    plan = vp.plan_split(make_info(nb_frames=5850, duration=195.0))
+    assert plan.mode == "reencode"
+    assert "keyframe" in plan.reason.lower()
+
+
+def test_undetectable_keyframes_short_video_stays_copy(monkeypatch):
+    # A clip shorter than the max segment length is one segment anyway, so no need to
+    # re-encode even when keyframes can't be enumerated.
+    monkeypatch.setattr(vp, "keyframe_times", lambda _p: [])
+    plan = vp.plan_split(make_info(nb_frames=900, duration=30.0))
+    assert plan.mode == "copy"
+
+
+def test_dense_keyframes_stays_copy(monkeypatch):
+    # Keyframes ~2 s apart over a 2-minute clip: well under the cap -> lossless copy.
+    monkeypatch.setattr(vp, "keyframe_times", lambda _p: [i * 2.0 for i in range(60)])
+    plan = vp.plan_split(make_info(nb_frames=3600, duration=120.0))
+    assert plan.mode == "copy"
+
+
 # ── check_drift ─────────────────────────────────────────────────────────────
 
 def test_clean_roundtrip_has_no_warnings():

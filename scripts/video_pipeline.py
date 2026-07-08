@@ -509,14 +509,30 @@ def plan_split(info: VideoInfo, segment_seconds=60.0, max_segment_seconds=120.0,
                              f"tagged {float(info.r_fps):.3f}fps but real "
                              f"{eff:.3f}fps (counted/duration): CFR-normalize",
                              segment_seconds, info.fps)
-    gap = max_keyframe_gap(info.path)
+    # Keyframe spacing decides whether a `-c copy` split can hit the target segment
+    # length. keyframe_times() returns [] for containers whose keyframes ffprobe can't
+    # enumerate: MEASURED on a VC-1/WMV3 .wmv (ASF), which reports ZERO keyframes via
+    # `-skip_frame nokey`. A `-c copy` split then has no interior cut point, so the
+    # WHOLE video collapses to a single segment (losing resume / installment / cost-cap
+    # granularity) — the OPPOSITE of what max_keyframe_gap()'s 0.0 ("no constraint")
+    # naively implies. Treat 0-or-1 detected keyframes as an effective gap of the whole
+    # DURATION, so the sparse-GOP branch re-encodes with forced keyframes whenever the
+    # video is long enough to actually need splitting (a short clip is one segment
+    # anyway, so it still stream-copies).
+    times = keyframe_times(info.path)
+    if len(times) >= 2:
+        gap = max(b - a for a, b in zip(times, times[1:]))
+        detail = f"keyframe gap {gap:.2f}s"
+    else:
+        gap = info.duration or 0.0
+        detail = f"{len(times)} enumerable keyframe(s), can't stream-cut"
     if gap > max_segment_seconds:
         return SplitPlan("reencode",
-                         f"sparse GOP (keyframe gap {gap:.1f}s > "
+                         f"sparse/undetectable GOP ({detail}; effective {gap:.1f}s > "
                          f"{max_segment_seconds:.0f}s cap): forced keyframes",
                          segment_seconds, info.fps)
     return SplitPlan("copy",
-                     f"clean CFR, keyframe gap {gap:.2f}s — lossless stream copy",
+                     f"clean CFR, {detail} — lossless stream copy",
                      segment_seconds, info.fps)
 
 

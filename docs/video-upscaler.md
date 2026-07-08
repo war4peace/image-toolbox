@@ -169,11 +169,22 @@ segments done so far. To make that deliberate:
 **Decision:** rounding segment length up to the next keyframe is acceptable. Only
 when keyframes are **extremely sparse** does the re-encode fallback kick in.
 
-- Every decodable video has frame 0 as a keyframe, so "no keyframes at all" means a
-  *corrupt* file: skip + log, exactly as the image path handles a corrupt image.
 - `-c copy` can only cut on keyframes, so a long GOP forces a long minimum segment
   (a 2-min GOP forces 2-min segments; an hour-long single GOP yields one
   un-splittable segment).
+- **"Zero keyframes" does NOT mean corrupt (MEASURED 2026-07-08, WMV fix).** The
+  original design assumed every decodable video exposes frame 0 as a keyframe, so an
+  empty keyframe list meant a corrupt file. False: a healthy **VC-1/WMV3 `.wmv`
+  (ASF)** reports **zero** keyframes to `ffprobe -skip_frame nokey` (it can't
+  enumerate their `pts_time`), yet decodes and upscales fine. The bug this caused:
+  `max_keyframe_gap()` returned `0.0` for `<2` keyframes, and `plan_split` read `0.0`
+  as "tiny gap, safe to `-c copy`" — the OPPOSITE of the truth — so a 3m15s WMV
+  collapsed to **one** whole-video segment (`1 segment(s) (copy)`), losing
+  resume/installment/cost-cap granularity (the upscale itself was still correct).
+  **Fix:** `plan_split` now treats `0-or-1` enumerable keyframes as an effective gap
+  of the whole **duration**, so a video longer than `max_segment_seconds` re-encodes
+  with forced keyframes (a short clip is one segment anyway and still stream-copies).
+  Covered by `tests/test_video_pipeline.py`.
 - **Implementation:** `ffprobe` the keyframe interval first. If the resulting
   segment length would exceed a threshold (`video.max_segment_seconds`, default
   e.g. 120 s = 2x the 60 s target), fall back to a **forced-keyframe re-encode**
