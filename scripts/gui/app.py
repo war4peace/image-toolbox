@@ -105,6 +105,16 @@ class App(tk.Tk):
         self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.add(self.runpod_tab,     text="  RunPod  ")
+        # Tabs whose selection is remembered across restarts (gui_settings.json
+        # "last_tab", item 3). Settings and RunPod are deliberately excluded, so the
+        # app never reopens on a config screen: the app reopens on the last TOOL tab
+        # the user was on (or the default first tab if that was Settings/RunPod).
+        self._savable_tabs = [
+            ("upscale",    self.upscale_tab),
+            ("tag",        self.tag_tab),
+            ("conciliate", self.conciliate_tab),
+            ("video",      self.video_tab),
+        ]
         # RunPod funds readout state (bottom bar). Cached briefly so switching tabs
         # doesn't hammer the balance API.
         self._funds_cache = None
@@ -144,6 +154,9 @@ class App(tk.Tk):
         self._suppress_tab_event = False
         self._prev_tab_widget    = self.nb.nametowidget(self.nb.select())
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # Reopen on the tab the user last left (item 3). AFTER the binding, so the
+        # restored tab gets the same on-enter / funds-readout treatment as a click.
+        self._restore_last_tab()
 
         self.bind("<Configure>", self._track_geometry)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -422,6 +435,28 @@ class App(tk.Tk):
             return "RunPod"
         return None
 
+    # ── Last-used tab persistence (item 3) ───────────────────────────────────
+
+    def _savable_tab_key(self, widget):
+        """Stable key for a remembered tool tab, or None for Settings/RunPod (never
+        recorded) and anything unknown."""
+        for key, w in self._savable_tabs:
+            if w is widget:
+                return key
+        return None
+
+    def _restore_last_tab(self):
+        """Select the tool tab the user last left (gui_settings.json 'last_tab').
+        Fail-safe: an unknown/missing key just keeps the default first tab."""
+        key = self.settings.get("last_tab")
+        for k, w in self._savable_tabs:
+            if k == key and w is not self._prev_tab_widget:
+                try:
+                    self.nb.select(w)
+                except Exception:
+                    pass
+                return
+
     def _on_tab_changed(self, event=None):
         """When leaving a settings-style tab (Settings or RunPod) with unsaved
         edits, prompt to save."""
@@ -443,6 +478,12 @@ class App(tk.Tk):
                     self._suppress_tab_event = False
                 return   # _prev_tab_widget stays on the settings tab
         self._prev_tab_widget = new_widget
+        # Remember the last TOOL tab (item 3): record + persist immediately (crash-safe)
+        # only for savable tabs, so Settings/RunPod never become the reopen target.
+        key = self._savable_tab_key(new_widget)
+        if key is not None:
+            self.settings["last_tab"] = key
+            save_settings(self.settings)
         # Entering a tool tab: fill any empty folder field from the pinned
         # default, so a default set in Settings after startup takes effect.
         if isinstance(new_widget, ToolTab):

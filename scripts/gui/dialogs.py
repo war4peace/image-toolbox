@@ -4,12 +4,13 @@ gui/dialogs.py
 Standalone dialogs (the in-app update dialog).
 """
 
+import os
 import threading
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 import updater
-from gui.common import (APP_TITLE, APP_VERSION, set_update_skipped_version,
+from gui.common import (APP_ROOT, APP_TITLE, APP_VERSION, set_update_skipped_version,
                        ollama_pull)
 
 
@@ -27,21 +28,37 @@ class UpdateDialog(tk.Toplevel):
         self._downloading = False
 
         self.title("Update available")
+        # Own the app icon explicitly. iconbitmap(default=...) on the root already
+        # registers it for Toplevels (0.4.7), but be explicit here: this is the one
+        # window a user sees while updating FROM an older build whose root never set
+        # the default. Fail-safe (a missing icon just keeps the tk feather).
+        try:
+            self.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+        except Exception:
+            pass
         self.transient(app)
         self.resizable(True, True)
-        self.minsize(520, 420)
+        self.minsize(800, 420)          # min width 800px (requested)
         self.protocol("WM_DELETE_WINDOW", self._later)
         self._build()
 
-        # Center on the parent and grab focus.
+        # Center over the main window at a minimum 800px width.
         self.update_idletasks()
         try:
-            x = app.winfo_rootx() + (app.winfo_width()  - self.winfo_width())  // 2
-            y = app.winfo_rooty() + (app.winfo_height() - self.winfo_height()) // 2
-            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+            w = max(self.winfo_width(), 800)
+            h = self.winfo_height()
+            x = app.winfo_rootx() + (app.winfo_width()  - w) // 2
+            y = app.winfo_rooty() + (app.winfo_height() - h) // 2
+            self.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
         except Exception:
             pass
-        self.grab_set()
+        # Modal: block the main window until dismissed. wait_visibility first, since
+        # grab_set can silently fail on a not-yet-mapped window.
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except Exception:
+            pass
         self.focus_set()
 
     def _build(self):
