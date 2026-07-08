@@ -797,8 +797,9 @@ class RunPodTab(ttk.Frame):
             return
         size = simpledialog.askinteger(
             "Create network volume",
-            "Size in GB (SeedVR2 ~16 GB + Ollama model ~6 GB; 40 leaves headroom):",
-            parent=self, initialvalue=40, minvalue=1, maxvalue=4000)
+            "Size in GB (SeedVR2 ~16 GB + Ollama runtime & model ~10 GB + video "
+            "scratch; 50 leaves headroom, 40 has run 94% full):",
+            parent=self, initialvalue=50, minvalue=1, maxvalue=4000)
         if not size:
             return
         est = size * 0.07
