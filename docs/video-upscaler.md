@@ -12,6 +12,9 @@ Upscaler"**.
 > estimator (`video_estimate.py`) are all in place. This doc remains the design +
 > as-built source of truth (`docs/future-features.md` #2 is just a pointer here);
 > the sections below marked with a phase or a decision reflect what was built.
+> **0.4.7** adds the **segment extractor** (upscale one scene out of a long source)
+> and **in-app video playback with audio** (a real-motion comparison window), both
+> on a bundled **libVLC** downloaded at first launch: see section 16.
 >
 > **Benchmark status:** a first-pass temporal-batch benchmark has been run
 > (`pod/bench_video.py`), so the estimator no longer relies purely on the carried-

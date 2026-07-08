@@ -107,6 +107,8 @@ Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\seedvr2"
 ; The bundled ffmpeg build downloaded by bootstrap.ps1 (Video Upscaler)
 Type: filesandordirs; Name: "{app}\ffmpeg"
+; The bundled libVLC build downloaded by bootstrap.ps1 / vlc_setup.py (in-app playback)
+Type: filesandordirs; Name: "{app}\vlc"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\scans"
 Type: filesandordirs; Name: "{app}\trcache"

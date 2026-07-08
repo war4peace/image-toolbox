@@ -40,7 +40,8 @@ or on a remote machine using RunPod.io infrastructure.
 The first launch opens a setup window that downloads the required components:
 Python, PyTorch with CUDA, the SeedVR2 engine (about 3 GB, if you also picked 
 the option to use local resources), a GPL ffmpeg build (~160 MB, used by the
-Video Upscaler) and then starts the app. It also offers to install
+Video Upscaler), a bundled libVLC (~40 MB, for in-app video playback with sound)
+and then starts the app. It also offers to install
 [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works 
 without it, and you can decline). The first upscale process you run additionally downloads
 the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved 
@@ -84,9 +85,11 @@ git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
 # 2. Create the Python environment (Python 3.12, NVIDIA GPU required).
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm paho-mqtt
+.venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm paho-mqtt python-vlc
 
 # 3. Launch the GUI (model weights ~16 GB download automatically on first use).
+#    (In-app video playback also needs a libVLC 3.0.x build in a "vlc\" folder next
+#     to the app; the GUI offers a one-click "Install libVLC now" if it's missing.)
 .venv\Scripts\pythonw.exe scripts\toolbox_gui.py
 ```
 
@@ -207,6 +210,10 @@ Your source videos are never modified.
   duration or FPS), pick a target per video (1080p / 1440p / 4K; only targets
   the source is actually below are offered), build a queue, pick a GPU from the
   live price list, press Start.
+- **Extract a scene:** for a long source you don't want to upscale in full, mark
+  an in/out range on a live preview and queue just that clip. The source is never
+  touched (the clip is cut to a temp file, upscaled, then reassembled), and each
+  clip resumes independently like a whole video.
 - **Cost estimate + confirm-before-rent:** the estimated duration and cost for
   the whole queue is shown *before* any pod is rented, and the estimator
   improves itself from your own finished runs.
@@ -218,8 +225,11 @@ Your source videos are never modified.
   drift check warns if the output timing ever diverges from the source.
 - **High-quality deliverable:** H.265 10-bit by default (selectable in
   Settings), written to a mirrored `__upscaled__` output tree.
-- **Compare:** a before/after wipe comparison window for videos, with shared
-  zoom/pan, timestamp-aligned scrubbing and frame stepping.
+- **Compare, two ways:** a **Compare frames** window (before/after wipe with
+  shared zoom/pan, timestamp-aligned scrubbing and frame stepping) for
+  pixel-peeping, and a **Play videos** window that plays the original and the
+  upscaled result **side by side, in real time, with sound** (via a bundled
+  libVLC), so you can judge motion and temporal quality, not just single frames.
 - **Auto-tuned:** you pick the target and the GPU; batch size, temporal overlap
   and the remaining SeedVR2 knobs are resolved on the pod for the rented card's
   actual VRAM, with automatic out-of-memory recovery. A choice of SeedVR2
