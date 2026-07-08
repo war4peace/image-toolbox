@@ -24,8 +24,8 @@ from gui.tooltab import ToolTab
 
 # Where the per-bar-change progress diagnostics go: "window" = the tab's log pane,
 # "file" = logs/video_progress_debug.log only, "" / None = off. The bar is validated
-# now, so keep these OUT of the user-facing log (file-only), leaving the console to
-# the permanent per-minute "still working" heartbeat.
+# now, so keep these OUT of the user-facing log (file-only). The per-minute "Processing"
+# heartbeat now comes from the runner (console + on-disk log), not from here.
 _PROGRESS_DEBUG_MODE = "file"
 
 
@@ -1684,7 +1684,6 @@ class VideoTab(ttk.Frame):
         self._bar_frac = 0.0          # last painted bar fraction (kept MONOTONIC)
         self._eta_finish = None       # projected finish time; refreshed only when progress advances
         self._eta_done = 0            # done_now at the last ETA refresh (so a stall can't inflate it)
-        self._last_hb = time.time()   # last console liveness heartbeat (see _run_tick)
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -1994,21 +1993,10 @@ class VideoTab(ttk.Frame):
             tail += f" · ${spent:.2f} so far"
         if base:
             self.status_var.set(base + tail)
-        # Permanent console heartbeat: during a long segment the runner logs nothing
-        # between "streaming" and the final "segment N: X frames", so the log pane can
-        # sit silent for many minutes (a big segment's decode/encode tail). Feed one
-        # concise liveness line a minute so an unattended run never looks locked. Unlike
-        # _dbg_progress (temporary, gated on a bar CHANGE) this survives even when the
-        # frame count has saturated.
-        if self._seg_start is not None and now - self._last_hb >= 60:
-            self._last_hb = now
-            spf = f" · {self._live_spf:.1f} s/frame" if self._live_spf else ""
-            # ConsoleBuffer.feed stamps each line with [HH:MM:SS] already, so no
-            # inner timestamp here (that was doubling it).
-            self.console.feed(
-                f"Processing: {self._cur_seg_done}/{self._cur_seg_frames} "
-                f"frames this segment{spf} "
-                f"(runtime {ve.fmt_duration(now - self._seg_start)})\n")
+        # NOTE: the per-minute "Processing" heartbeat now lives in the RUNNER
+        # (batch_video_upscale._progress), so it reaches BOTH the console and the
+        # on-disk log file. It used to be fed here (console only), which left a long
+        # segment with no on-disk trace. See that runner code.
         self._run_tick_job = self.after(1000, self._run_tick)
 
     def on_exit(self, code):

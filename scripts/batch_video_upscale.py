@@ -658,6 +658,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     marked 'partial')."""
     rel, target = job["rel_path"], job["target"]
     clip_id = job["clip_id"] or 0                  # 0 = whole file; >0 = a virtual clip
+    job_start = time.time()                        # wall-clock, for the true per-file elapsed
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
         os.path.join(source_root, vcfg["output_subdir"]), rel, target,
@@ -752,8 +753,28 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             continue                              # segment-level resume
 
         _seg_stats = {}          # per-segment peak VRAM + resolved batch (filled by _progress)
+        _hb = [None]             # last "Processing" heartbeat wall time
+        _seg_wall = [None]       # first 'running' wall time (segment runtime clock)
 
-        def _progress(st, _i=s.index, _tot=s.frame_count, _stats=_seg_stats):
+        def _progress(st, _i=s.index, _tot=s.frame_count, _stats=_seg_stats,
+                      _hb=_hb, _sw=_seg_wall):
+            # Periodic "Processing" heartbeat, emitted from the RUNNER (not the GUI) so it
+            # lands in BOTH the console AND the on-disk log file (the GUI-side heartbeat
+            # only reached the console, so a long segment left no on-disk trace). Every
+            # ~60s while the pod reports 'running'.
+            if st.get("state") == "running":
+                now = time.time()
+                if _sw[0] is None:
+                    _sw[0] = now
+                if _hb[0] is None:
+                    _hb[0] = now
+                elif now - _hb[0] >= 60:
+                    _hb[0] = now
+                    _fp = st.get("frames_processed") or 0
+                    _spf = st.get("live_spf")
+                    _spf_txt = f" · {_spf:.1f} s/frame" if _spf else ""
+                    log(f"    Processing: {_fp}/{_tot} frames{_spf_txt} "
+                        f"(runtime {fmt_hhmmss(now - _sw[0])})")
             rb = st.get("resolved_batch")
             if rb:
                 _stats["batch"] = rb
@@ -829,9 +850,21 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         b = _seg_stats.get("batch")
         if b is not None and _initial_batch[0] is not None and b != _initial_batch[0]:
             drop_txt = f"; batch dropped {_initial_batch[0]} -> {b} (OOM recovery)"
+        # Phase breakdown (troubleshooting the per-segment overhead beyond the pod time):
+        # submit=upload, wait=submit->pod-done (~= the reported pod seconds + any idle),
+        # fetch=download, finalize=local write. `wait - reported` is the untimed pod-side
+        # gap; a large fetch resurrects the download theory with a hard MB/s number.
+        phase_txt = ""
+        ph = getattr(engine, "last_phase", None)
+        if ph:
+            mb = (ph.get("bytes") or 0) / 1e6
+            gap = ph.get("wait", 0) - (secs or 0)     # pod-side time NOT in the reported total
+            phase_txt = (f" [submit {ph.get('submit', 0):.0f}s · wait {ph.get('wait', 0):.0f}s"
+                         f" (gap {gap:+.0f}s) · fetch {ph.get('fetch', 0):.0f}s ({mb:.0f}MB)"
+                         f" · finalize {ph.get('finalize', 0):.1f}s]")
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
             + (f" in {fmt_hhmmss(secs)}" if secs else "")
-            + vram_txt + drop_txt)
+            + vram_txt + drop_txt + phase_txt)
 
         # Self-calibrate future estimates: record this segment's real OUTPUT
         # megapixels vs seconds against the GPU that ran it (IMGTBX_GPU_OVERRIDE,
@@ -884,15 +917,24 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
 
     seg_rows = db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
     seg_out = [r["out_frames"] for r in seg_rows]
-    # Whole-video upscale runtime, summed from every segment's recorded seconds so it
-    # stays correct across a RESUMED run (not just this session's segments). Flagged
-    # approximate if any segment has no recorded time (e.g. resumed from older data).
+    # Two numbers: the TRUE wall-clock elapsed for this file (upload + GPU upscale +
+    # download + reassemble/mux + drift check) and the GPU-only portion (sum of the
+    # segments' recorded seconds). When the batch fits first-try these are nearly equal
+    # (submit/fetch/finalize are only seconds each: see the segment phase trace). They
+    # diverge when the pod hits OOM-recovery: the pod resets its per-attempt timer, so the
+    # recorded 'seconds' count only the final SUCCESSFUL attempt, while `wall` also includes
+    # the failed higher-batch attempts. So `wall - pod_secs` surfaces that otherwise-
+    # uncounted retry waste (right-size the batch to a value that fits first-try to remove it).
     seg_secs = [r["seconds"] for r in seg_rows]
-    runtime = sum(s for s in seg_secs if s)
-    runtime_txt = ""
-    if runtime > 0:
-        partial = " (timed segments only)" if any(not s for s in seg_secs) else ""
-        runtime_txt = f" in {fmt_hhmmss(runtime)}{partial}"
+    pod_secs = sum(s for s in seg_secs if s)       # GPU time, correct across a resume (DB)
+    wall = time.time() - job_start                 # this run's real elapsed for the file
+    partial = ", timed only" if any(not s for s in seg_secs) else ""
+    if pod_secs <= 0:
+        runtime_txt = f" in {fmt_hhmmss(wall)}"
+    elif wall >= pod_secs:                          # normal single-run: wall = GPU + overhead
+        runtime_txt = f" in {fmt_hhmmss(wall)} ({fmt_hhmmss(pod_secs)} on the GPU{partial})"
+    else:                                           # resumed: this run's wall covers only part
+        runtime_txt = f" in {fmt_hhmmss(pod_secs)} on the GPU (resumed{partial})"
     reference = sum(s.frame_count for s in segs)   # SeedVR2 preserves per-segment frames (6.3)
     # Drift is checked against the CLIP (job_info) for a clip job, not the whole source.
     report = vp.check_drift(job_info, out_info, seg_out, reference_frames=reference)

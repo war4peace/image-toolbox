@@ -71,11 +71,20 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
             data = f.read()
         ext = os.path.splitext(src_path)[1] or ".mkv"
 
+        # Phase timing (troubleshooting): submit (upload) / wait (submit->done, incl. the
+        # pod's own process_video 'seconds') / fetch (download) / finalize (local write).
+        # The runner logs these so the per-segment overhead beyond the reported pod time
+        # (wait - last_segment_seconds) can be localised. See process_job's segment line.
         self.last_segment_seconds = None
+        self.last_phase = {}
+        t0 = time.monotonic()
         job_id = self._submit(data, ext, resolution, batch_size, chunk_size,
                               temporal_overlap, seed, video_backend, use_10bit)
+        t_submit = time.monotonic()
         frames = self._await(job_id, poll_interval, on_progress, should_stop)
+        t_await = time.monotonic()
         out = self._fetch(job_id)
+        t_fetch = time.monotonic()
 
         ext_out = ".mp4"
         tmp = dest_path + ".tmp" + ext_out
@@ -90,6 +99,13 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
                 except OSError:
                     pass
             raise
+        self.last_phase = {
+            "submit":   t_submit - t0,
+            "wait":     t_await - t_submit,
+            "fetch":    t_fetch - t_await,
+            "finalize": time.monotonic() - t_fetch,
+            "bytes":    len(out),
+        }
         return frames
 
     # ── protocol steps ──────────────────────────────────────────────────────
