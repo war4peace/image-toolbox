@@ -21,6 +21,7 @@ inherited image `upscale()` / `analyse()`. Pure standard library.
 import os
 import time
 import json
+import shutil
 import urllib.request
 import urllib.error
 
@@ -66,31 +67,34 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         `on_progress(status_dict)` (optional) is called after each status poll so
         the caller can surface live segment progress. `should_stop` (optional) is a
         predicate polled each iteration; when it returns True the wait aborts with
-        RemoteVideoStopped so a Stop is responsive even mid-segment."""
-        with open(src_path, "rb") as f:
-            data = f.read()
+        RemoteVideoStopped so a Stop is responsive even mid-segment.
+
+        Both the upload and the download are STREAMED (item 8): a 4K segment is commonly
+        hundreds of MB, and the old code held the whole input AND the whole output in RAM
+        at once. Now the input is sent straight from the file (Content-Length set) and the
+        result is written straight to disk (copyfileobj), so peak RAM is one block, not
+        two whole segments."""
         ext = os.path.splitext(src_path)[1] or ".mkv"
 
         # Phase timing (troubleshooting): submit (upload) / wait (submit->done, incl. the
-        # pod's own process_video 'seconds') / fetch (download) / finalize (local write).
-        # The runner logs these so the per-segment overhead beyond the reported pod time
-        # (wait - last_segment_seconds) can be localised. See process_job's segment line.
+        # pod's own process_video 'seconds') / fetch (stream download to disk) / finalize
+        # (the atomic rename). The runner logs these so the per-segment overhead beyond
+        # the reported pod time (wait - last_segment_seconds) can be localised. See
+        # process_job's segment line.
         self.last_segment_seconds = None
         self.last_phase = {}
         t0 = time.monotonic()
-        job_id = self._submit(data, ext, resolution, batch_size, chunk_size,
+        job_id = self._submit(src_path, ext, resolution, batch_size, chunk_size,
                               temporal_overlap, seed, video_backend, use_10bit)
         t_submit = time.monotonic()
         frames = self._await(job_id, poll_interval, on_progress, should_stop)
         t_await = time.monotonic()
-        out = self._fetch(job_id)
-        t_fetch = time.monotonic()
 
         ext_out = ".mp4"
         tmp = dest_path + ".tmp" + ext_out
         try:
-            with open(tmp, "wb") as f:
-                f.write(out)
+            nbytes = self._fetch(job_id, tmp)         # streams the result straight to tmp
+            t_fetch = time.monotonic()
             os.replace(tmp, dest_path)
         except Exception:
             if os.path.exists(tmp):
@@ -102,15 +106,15 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         self.last_phase = {
             "submit":   t_submit - t0,
             "wait":     t_await - t_submit,
-            "fetch":    t_fetch - t_await,
-            "finalize": time.monotonic() - t_fetch,
-            "bytes":    len(out),
+            "fetch":    t_fetch - t_await,            # download now includes the disk write
+            "finalize": time.monotonic() - t_fetch,   # just the atomic rename
+            "bytes":    nbytes,
         }
         return frames
 
     # ── protocol steps ──────────────────────────────────────────────────────
 
-    def _submit(self, data, ext, resolution, batch_size, chunk_size,
+    def _submit(self, src_path, ext, resolution, batch_size, chunk_size,
                 temporal_overlap, seed, video_backend, use_10bit):
         q = (f"?resolution={int(resolution)}&batch_size={int(batch_size)}"
              f"&chunk_size={int(chunk_size)}&temporal_overlap={int(temporal_overlap)}"
@@ -118,12 +122,18 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
              f"&ext={ext}")
         if seed is not None:
             q += f"&seed={int(seed)}"
-        req = urllib.request.Request(self._url("/video/submit" + q), data=data,
-                                     method="POST",
-                                     headers={"Content-Type": "application/octet-stream"})
+        # Stream the segment straight from the file: an explicit Content-Length lets
+        # http.client send the open file object in blocks (no chunked encoding, so the
+        # worker still reads a normal Content-Length body) WITHOUT us buffering it in RAM.
+        size = os.path.getsize(src_path)
         try:
-            with urllib.request.urlopen(req, timeout=self.SUBMIT_TIMEOUT) as resp:
-                info = json.loads(resp.read().decode("utf-8", "replace"))
+            with open(src_path, "rb") as body:
+                req = urllib.request.Request(
+                    self._url("/video/submit" + q), data=body, method="POST",
+                    headers={"Content-Type": "application/octet-stream",
+                             "Content-Length": str(size)})
+                with urllib.request.urlopen(req, timeout=self.SUBMIT_TIMEOUT) as resp:
+                    info = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             raise RemoteVideoError(f"submit failed HTTP {exc.code}: {detail}") from exc
@@ -171,11 +181,16 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
                 raise RemoteVideoError("worker lost the job (it may have restarted).")
             time.sleep(poll_interval)
 
-    def _fetch(self, job_id):
+    def _fetch(self, job_id, dest_tmp):
+        """Stream the upscaled segment straight to `dest_tmp`, returning the byte count.
+        copyfileobj (1 MB blocks) so a hundreds-of-MB 4K segment never sits whole in RAM;
+        the caller does the atomic os.replace onto the final path."""
         url = self._url(f"/video/fetch?id={job_id}")
         try:
-            with urllib.request.urlopen(url, timeout=self.FETCH_TIMEOUT) as resp:
-                return resp.read()
+            with urllib.request.urlopen(url, timeout=self.FETCH_TIMEOUT) as resp, \
+                    open(dest_tmp, "wb") as f:
+                shutil.copyfileobj(resp, f, 1 << 20)
+            return os.path.getsize(dest_tmp)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
             raise RemoteVideoError(f"fetch failed HTTP {exc.code}: {detail}") from exc

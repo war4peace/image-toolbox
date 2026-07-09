@@ -432,12 +432,19 @@ class RemoteSession:
             # Guarantee ffmpeg for the H.265 10-bit writer: a system one is fine,
             # else the volume cache (provision.sh), else fetch a static build to the
             # volume once (best-effort; the worker fails loudly if it's truly absent).
+            # The build has no strong published hash, so gate it FUNCTIONALLY: run
+            # `ffmpeg -version` on the extracted binary and cache it to the PERSISTENT
+            # volume only if it runs. Otherwise a truncated/corrupt download would be
+            # cached once and break every future run on this volume (same rationale as
+            # bootstrap's ffprobe version check).
             "if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /workspace/ffmpeg/ffmpeg ]; then "
             "echo 'caching static ffmpeg to the volume...'; mkdir -p /workspace/ffmpeg; "
             "curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz "
             "-o /tmp/ff.txz && tar -xJf /tmp/ff.txz -C /tmp && "
+            "if /tmp/ffmpeg-*-amd64-static/ffmpeg -version >/dev/null 2>&1; then "
             "cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /workspace/ffmpeg/ && "
             "chmod +x /workspace/ffmpeg/ffmpeg /workspace/ffmpeg/ffprobe; "
+            "else echo 'ffmpeg failed its sanity check - not caching a bad build'; fi; "
             "rm -rf /tmp/ff.txz /tmp/ffmpeg-*-amd64-static; fi; "
             "rm -f /root/worker.pid; "
             f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
@@ -675,9 +682,18 @@ class RemoteSession:
             return
         do_stop = (not self._attach) if stop_pod is None else stop_pod
         if do_stop:
-            ok, msg = rp.ensure_stopped(self.api_key, self.pod_id,
-                                        terminate=self.terminate_when_done)
-            self._emit(msg)
+            # Guarded like every other step above: close() runs from the runners'
+            # finally block, so an API/network error here must not replace the run's
+            # real outcome with a secondary traceback (and skip _close_log). The on-pod
+            # dead-man's switch stops the pod on the idle timeout regardless.
+            try:
+                _ok, msg = rp.ensure_stopped(self.api_key, self.pod_id,
+                                             terminate=self.terminate_when_done)
+                self._emit(msg)
+            except Exception as exc:                     # noqa: BLE001 (fail-safe)
+                self._emit(f"Could not stop the pod ({exc}); the dead-man's switch "
+                           f"will stop it on the idle timeout.")
+                debug_log("RemoteSession.close: ensure_stopped", exc=exc)
         else:
             self._emit("Leaving the remote pod running — the dead-man's switch "
                        "will stop it after the idle timeout.")

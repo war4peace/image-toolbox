@@ -82,3 +82,67 @@ def test_video_failure_notice_midrun_is_distinct():
     assert title == "Video upscale failed"
     assert "stopped on an error" in desc
     assert "boom" in desc
+
+
+# ── video runner: early-stop label branches on the reason (item 2) ───────────
+
+def test_stop_notice_per_run_cap():
+    title, color, resume = bv._stop_notice("per-run cap of 30 min reached")
+    assert title == "Video upscale paused (per-run cap)"
+    assert color == 0xF1C40F and resume is True
+
+
+def test_stop_notice_per_run_cost_cap():
+    # the cost-cap message also starts with "per-run " -> same cap label
+    title, color, resume = bv._stop_notice("per-run cost cap of $5 reached (~$4.80)")
+    assert title == "Video upscale paused (per-run cap)"
+    assert resume is True
+
+
+def test_stop_notice_user_stop_is_not_a_cap():
+    # the bug: a user Stop used to be labeled "paused (per-run cap)"
+    title, color, resume = bv._stop_notice("stopped by user")
+    assert title == "Video upscale stopped"
+    assert "cap" not in title.lower()
+    assert resume is True
+
+
+def test_stop_notice_work_root_refusal_did_not_start():
+    reason = ("the staging work folder is inside the source folder being scanned "
+              "(X:\\stage): the scanner would re-read its own segments")
+    title, color, resume = bv._stop_notice(reason)
+    assert title == "Video upscale did not start"
+    assert color == 0xE74C3C and resume is False
+
+
+def test_stop_notice_unknown_reason_is_not_mislabeled_a_cap():
+    title, color, resume = bv._stop_notice("some new reason we didn't foresee")
+    assert "cap" not in title.lower()
+    assert title == "Video upscale stopped early"
+
+
+def test_notify_summary_user_stop_does_not_say_cap(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(bv.notifications, "notify",
+                        lambda settings, title, desc, color, fields=None:
+                        sent.update(title=title, desc=desc, color=color))
+    bv._notify_summary({"any": "settings"},
+                       {"done": 2, "failed": 0, "stopped": "stopped by user", "total": 2},
+                       "X:\\src")
+    assert sent["title"] == "Video upscale stopped"
+    assert "cap" not in sent["title"].lower()
+    assert "stopped by user" in sent["desc"]
+    assert "re-run to continue" in sent["desc"]
+
+
+def test_notify_summary_startup_refusal_has_no_resume_hint(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(bv.notifications, "notify",
+                        lambda settings, title, desc, color, fields=None:
+                        sent.update(title=title, desc=desc))
+    reason = "the staging work folder is inside the source folder being scanned (X:\\s)"
+    bv._notify_summary({"any": "settings"},
+                       {"done": 0, "failed": 0, "stopped": reason, "total": 0},
+                       "X:\\src")
+    assert sent["title"] == "Video upscale did not start"
+    assert "re-run to continue" not in sent["desc"]

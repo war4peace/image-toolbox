@@ -411,6 +411,17 @@ def _ws_gb(mp, batch, model=None, resident=True):
     return f + mp * (a + b * batch + c * batch * batch)
 
 
+def _vram_budget_gb(vram_gb, resident):
+    """The working-set budget (GB) a batch must fit under. The fraction alone is calibrated
+    for big cards: 10% of an 80 GB card is ~8 GB of allocator breathing room, but 10% of a
+    32 GB card is only ~3 GB, so the same 0.90 let a 3B-fp16 auto-fit clamp scrape 92% and
+    thrash the decode tail. Also reserve an ABSOLUTE headroom (_VRAM_HEADROOM_GB): it only
+    bites small cards (the fraction still dominates on big ones), keeping a 32 GB card
+    usable but out of the thrash zone."""
+    frac = _VRAM_SAFETY if resident else 0.90
+    return min(vram_gb * frac, vram_gb - _VRAM_HEADROOM_GB)
+
+
 def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
     """Largest 4n+1 batch whose predicted working set (for this card + output + MODEL) fits
     the SAFETY budget. Returns a big sentinel when dims/VRAM are unknown (can't measure ->
@@ -418,16 +429,35 @@ def _max_vram_batch(out_w, out_h, vram_gb, resident, model=None):
     mp = (out_w * out_h) / 1_000_000.0
     if mp <= 0 or vram_gb <= 0:
         return 997
-    # The fraction alone is calibrated for big cards: 10% of an 80 GB card is ~8 GB of
-    # allocator breathing room, but 10% of a 32 GB card is only ~3 GB, so the same 0.90
-    # let a 3B-fp16 auto-fit clamp scrape 92% and thrash the decode tail. Also reserve an
-    # ABSOLUTE headroom (_VRAM_HEADROOM_GB): it only bites small cards (the fraction still
-    # dominates on big ones), keeping a 32 GB card usable but out of the thrash zone.
-    frac = _VRAM_SAFETY if resident else 0.90
-    budget = min(vram_gb * frac, vram_gb - _VRAM_HEADROOM_GB)
+    budget = _vram_budget_gb(vram_gb, resident)
     best, b = _BATCH_FLOOR, _BATCH_FLOOR
     while b <= 997:
         if _ws_gb(mp, b, model, resident) <= budget:
+            best = b
+            b += 4
+        else:
+            break
+    return best
+
+
+def _suggested_batch(out_w, out_h, vram_gb, resident, model, ran_batch, measured_gb):
+    """Largest 4n+1 batch that should fit NEXT time for this output+card, with the VRAM
+    curve ANCHORED to the real working set (`measured_gb`) measured at `ran_batch` this
+    segment. Anchoring beats the cold prediction (which overshot to 33 then OOM-stepped
+    down): the curve's batch SHAPE is trusted but shifted by the measured offset, so the
+    suggestion reflects reality and can go UP (recover from a stale-low seed) or DOWN
+    (a too-high one). Capped at _BATCH_CAP like the auto path. Returns a 4n+1 in
+    [_BATCH_FLOOR, _BATCH_CAP], or None when it can't be computed."""
+    if not (out_w and out_h) or ran_batch <= 0 or not measured_gb or vram_gb <= 0:
+        return None
+    mp = (out_w * out_h) / 1_000_000.0
+    if mp <= 0:
+        return None
+    budget = _vram_budget_gb(vram_gb, resident)
+    offset = measured_gb - _ws_gb(mp, ran_batch, model, resident)   # calibrate to reality
+    best, b = _BATCH_FLOOR, _BATCH_FLOOR
+    while b <= _BATCH_CAP:
+        if _ws_gb(mp, b, model, resident) + offset <= budget:
             best = b
             b += 4
         else:
@@ -631,6 +661,12 @@ def _resolve_auto_params(job, params):
     model = getattr(getattr(_ENGINE, "args", None), "dit_model", "") or ""
     vram = _vram_total_gb()
     vmax = _max_vram_batch(out_w, out_h, vram, resident, model)  # VRAM ceiling for this card+output+model
+    # Stash the sizing inputs so the post-segment measured-anchored suggested_batch
+    # (auto-tune, item 9) can be computed after the run, and remember whether overlap was
+    # AUTO so an OOM down-step re-derives it (not keeps a too-large inherited stride).
+    job["out_w"], job["out_h"] = out_w, out_h
+    job["vram_gb"], job["resident_regime"], job["model_id"] = vram, resident, model
+    job["overlap_auto"] = params["temporal_overlap"] < 0
     if params["batch_size"] <= 0:
         params["batch_size"] = _auto_batch(out_w, out_h, vram, resident, model)
         job["auto_batch"] = True
@@ -751,8 +787,16 @@ def _run_video_job(job, params):
                         _log(f"video job {job['id'][:8]} OOM at batch "
                              f"{params['batch_size']}; retrying at {smaller}")
                         params["batch_size"] = smaller
-                        params["temporal_overlap"] = min(
-                            params["temporal_overlap"], max(0, smaller - 1))
+                        # Re-derive the overlap for the smaller batch when it was AUTO:
+                        # merely clamping the inherited (larger-batch) overlap to
+                        # smaller-1 left e.g. batch 9 with overlap 6 -> stride 3, ~3x
+                        # recompute. An explicit overlap is still only clamped (respect
+                        # the user's pick as far as it fits).
+                        if job.get("overlap_auto"):
+                            params["temporal_overlap"] = _auto_overlap(smaller)
+                        else:
+                            params["temporal_overlap"] = min(
+                                params["temporal_overlap"], max(0, smaller - 1))
                         job["resolved_batch"] = smaller
                         job["resolved_overlap"] = params["temporal_overlap"]
         try:
@@ -765,6 +809,16 @@ def _run_video_job(job, params):
             job["peak_alloc_gb"] = round(torch.cuda.max_memory_allocated() / gb, 1)
             job["peak_reserved_gb"] = round(torch.cuda.max_memory_reserved() / gb, 1)
         except Exception:
+            pass
+        # Measured-anchored batch suggestion for the runner's auto-tuner (item 9): what
+        # SHOULD fit next time for this output+card, from the real working set just seen.
+        # Anchored to peak_alloc (working set, what _ws_gb models), so it can go up or down.
+        try:
+            job["suggested_batch"] = _suggested_batch(
+                job.get("out_w"), job.get("out_h"), job.get("vram_gb"),
+                job.get("resident_regime"), job.get("model_id"),
+                params["batch_size"], job.get("peak_alloc_gb"))
+        except Exception:                     # noqa: BLE001 (best-effort telemetry)
             pass
         job["frames_written"] = n
         # Only real completion fills the bar to 100% (the running estimate is capped one frame
@@ -1047,6 +1101,8 @@ class Handler(BaseHTTPRequestHandler):
             "live_spf":         job.get("live_spf"),
             "peak_alloc_gb":    job.get("peak_alloc_gb"),
             "peak_reserved_gb": job.get("peak_reserved_gb"),
+            "vram_total_gb":    job.get("vram_gb"),          # auto-tuner budget (item 9)
+            "suggested_batch":  job.get("suggested_batch"),  # measured-anchored next batch
             "phase_trace":      job.get("phase_trace"),     # diagnostic: real phase cadence
             "phase_count":      job.get("phase_count"),
         }).encode()

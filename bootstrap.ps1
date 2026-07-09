@@ -71,8 +71,12 @@ $FFMPEG_GYAN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials
 # libVLC for in-app video playback with audio (docs/video-upscaler.md 16.2): the
 # segment picker + the comparison window use python-vlc against this bundled build,
 # so no system VLC install is needed. Pinned to a VLC 3.0.x that matches python-vlc.
-$LIBVLC_LABEL = "VLC 3.0.21 win64 (libVLC)"
-$LIBVLC_URL   = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+$LIBVLC_LABEL  = "VLC 3.0.21 win64 (libVLC)"
+$LIBVLC_URL    = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+# SHA-256 of that immutable artifact (VideoLAN's published sum, verified against the real
+# download). Baked in so a later-compromised mirror can't swap the zip. Keep in sync with
+# scripts/vlc_setup.py's VLC_SHA256 if the pin is bumped.
+$LIBVLC_SHA256 = "a0b7ec02b50adf6417eed014fb8df50af39690505a4225b85b3dc2ed17d14843"
 
 function Step($msg) {
     Write-Host ""
@@ -219,6 +223,15 @@ function Install-LibVlc($appRoot) {
     Remove-Item $zip -ErrorAction SilentlyContinue
     Write-Host "  Downloading libVLC ($LIBVLC_LABEL) from videolan.org (~40 MB) ..."
     Get-Download $LIBVLC_URL $zip
+    # Integrity gate: a fixed, immutable artifact, so verify against the baked-in SHA-256
+    # (mirrors the Python + gyan.dev ffmpeg checks). A mismatch = corrupt/tampered -> stop
+    # this (OPTIONAL) install step; the caller treats the throw as a warning, not fatal.
+    $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $LIBVLC_SHA256) {
+        Remove-Item $zip -ErrorAction SilentlyContinue
+        throw "libVLC download failed its SHA-256 check (got $actual, expected $LIBVLC_SHA256)."
+    }
+    Write-Host "  SHA-256 verified."
     $extract = Join-Path $env:TEMP "libvlc_extract"
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $zip -DestinationPath $extract -Force

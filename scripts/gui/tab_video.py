@@ -322,6 +322,7 @@ class SegmentsManager(tk.Toplevel):
         import batch_video_upscale as bv
         bv.db.delete_video_output(self.tab._conn(), self.tab._root_id, c["rel_path"],
                                   c["target"], clip_id=c["clip_id"])
+        bv._remove_job_staging(c["output_path"], self.tab._vcfg().get("work_root"))
         self.refresh()
         self.tab._load_queue()
 
@@ -498,6 +499,7 @@ class VideoTab(ttk.Frame):
                 command=lambda c=c: self._sort_tree(
                     self.scan_tree, c, self._scan_sort_key(c), self._scan_sort))
         self.scan_tree.tag_configure("haveup", foreground="#2f6f3f")
+        self.scan_tree.tag_configure("failedup", foreground="#a04030")   # failed / gave-up output
         self.scan_tree.grid(row=1, column=0, sticky="nsew")
         sb = ttk.Scrollbar(sf, orient="vertical", command=self.scan_tree.yview)
         sb.grid(row=1, column=1, sticky="ns")
@@ -891,6 +893,16 @@ class VideoTab(ttk.Frame):
             return (self.scan_tree.set(iid, col) or "").lower()
         return key
 
+    @staticmethod
+    def _scan_row_tags(outs):
+        """Colour tag for a scan row: green when it has a done upscale, else a muted
+        red when it has a failed / gave-up output the user may want to retry (item 4)."""
+        if any(o[1] == "done" for o in outs):
+            return ("haveup",)
+        if any(o[1] in ("failed", "skipped") for o in outs):
+            return ("failedup",)
+        return ()
+
     def _insert_scan_row(self, rel, abs_path, r, elig, outs):
         import video_estimate as ve
         res = f"{r['width']}x{r['height']}" if r["width"] else "?"
@@ -901,7 +913,7 @@ class VideoTab(ttk.Frame):
         iid = self.scan_tree.insert(
             "", "end", text=rel,
             values=(res, dur, r["vcodec"] or "?", fps, up, up, ""),
-            tags=("haveup",) if done else ())
+            tags=self._scan_row_tags(outs))
         self._scan_rows[iid] = {"rel": rel, "abs": abs_path, "elig": elig,
                                 "outs": outs, "r": dict(r)}
         self._scan_order.append(iid)
@@ -1158,6 +1170,16 @@ class VideoTab(ttk.Frame):
                               command=lambda p=p: self._open_path(p))
                 m.add_command(label=f"Open upscaled folder ({t})",
                               command=lambda p=p: self._open_folder(p))
+        # A failed / gave-up (skipped) output leaves the run queue, so the scan list is
+        # where the user retries or inspects it (item 4).
+        for t, s, _p in row["outs"]:
+            if s in ("failed", "skipped"):
+                verb = "gave up" if s == "skipped" else "failed"
+                m.add_separator()
+                m.add_command(label=f"Retry ({t}, {verb})",
+                              command=lambda t=t: self._retry_job(row["rel"], t))
+                m.add_command(label=f"Show reason ({t})",
+                              command=lambda t=t: self._show_job_reason(row["rel"], t))
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1400,7 +1422,7 @@ class VideoTab(ttk.Frame):
             self._queue_rows[iid] = {
                 "rel": j["rel_path"], "target": j["target"], "clip_id": clip_id,
                 "abs": abs_path, "w": w or 0, "h": h or 0, "place": place,
-                "status": j["status"],
+                "status": j["status"], "skip_reason": j["skip_reason"],
                 "duration": row_dur,
                 "fps": (vf["fps"] if vf else 0) or 0.0,
                 "codec": codec}
@@ -1466,7 +1488,7 @@ class VideoTab(ttk.Frame):
             vals = list(self.scan_tree.item(iid, "values"))
             vals[4] = up           # Upscaled
             vals[5] = up           # Up res (target == short side, shown as the target)
-            self.scan_tree.item(iid, values=vals, tags=("haveup",) if done else ())
+            self.scan_tree.item(iid, values=vals, tags=self._scan_row_tags(outs))
 
     def _selected_queue_job(self):
         sel = self.queue_tree.selection()
@@ -1483,8 +1505,36 @@ class VideoTab(ttk.Frame):
         if not job:
             return
         import batch_video_upscale as bv
-        bv.db.delete_video_output(self._conn(), self._root_id, job[0], job[1], clip_id=job[2])
+        conn = self._conn()
+        # Reclaim the removed job's staging dir (its segments are gigabytes and only got
+        # cleaned on success before). Look up its output_path before deleting the rows.
+        row = bv.db.get_video_output(conn, self._root_id, job[0], job[1], clip_id=job[2])
+        bv.db.delete_video_output(conn, self._root_id, job[0], job[1], clip_id=job[2])
+        if row is not None:
+            bv._remove_job_staging(row["output_path"], self._vcfg().get("work_root"))
         self._load_queue()
+
+    def _retry_job(self, rel, target, clip_id=0):
+        """Re-queue a failed / gave-up job (item 4): zero its fail_count and set it
+        back to 'queued', clearing the old reason, so the next run tries it fresh."""
+        if self._root_id is None:
+            return
+        import batch_video_upscale as bv
+        conn = self._conn()
+        bv.db.reset_video_fail_count(conn, self._root_id, rel, target, clip_id=clip_id)
+        bv.db.upsert_video_output(conn, self._root_id, rel, target, clip_id=clip_id,
+                                  status="queued", skip_reason=None)
+        self._load_queue()
+        self.status_var.set(f"Re-queued {rel} -> {target}.")
+
+    def _show_job_reason(self, rel, target, clip_id=0):
+        """Show why a job failed / gave up (the recorded skip_reason)."""
+        if self._root_id is None:
+            return
+        import batch_video_upscale as bv
+        job = bv.db.get_video_output(self._conn(), self._root_id, rel, target, clip_id=clip_id)
+        reason = (job["skip_reason"] if job else None) or "No reason recorded."
+        messagebox.showinfo(APP_TITLE, f"{rel} -> {target}\n\n{reason}", parent=self)
 
     def _queue_move(self, delta):
         job = self._selected_queue_job()
@@ -1574,6 +1624,14 @@ class VideoTab(ttk.Frame):
         m.add_command(label="Move up", command=lambda: self._queue_move(-1))
         m.add_command(label="Move down", command=lambda: self._queue_move(1))
         m.add_command(label="Remove from queue", command=self._queue_remove)
+        if row.get("status") == "failed":
+            m.add_separator()
+            m.add_command(label="Retry (reset & re-queue)",
+                          command=lambda: self._retry_job(row["rel"], row["target"],
+                                                          row.get("clip_id", 0)))
+            m.add_command(label="Show failure reason",
+                          command=lambda: self._show_job_reason(row["rel"], row["target"],
+                                                                row.get("clip_id", 0)))
         m.add_separator()
         m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
         m.add_command(label="Open source folder",

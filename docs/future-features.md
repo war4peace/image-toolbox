@@ -101,6 +101,18 @@ internet drops), `run_queue` catches the engine error, marks the remaining jobs
   sink. So the new part is an **orchestration/retry loop around the session**, not
   new pipeline code.
 
+- **Resume-path prerequisites landed in 0.4.9 (load-bearing, not optional).** The
+  healer resumes unattended and *repeatedly* (every redeploy), so it amplifies exactly
+  the resume-path failure modes the 0.4.9 review hardened: a blindly-reused partial
+  split (item 1, now validated via a `split.done` marker + gapless/frame-sum check
+  before reuse) would otherwise ship a truncated deliverable silently on every
+  recovery; a deterministically-failing job (item 4, now `fail_count` give-up ->
+  `skipped`) would be re-attempted forever across every redeploy, not just every manual
+  run; and leaked staging (item 5, now a run-start orphan sweep + remove-on-give-up)
+  compounds per abandoned pod. These are therefore prerequisites for #6, not parallel
+  work: build the healer on top of the 0.4.9 baseline, and treat "resumes cleanly by
+  hand" as the gate that must pass before automating the resume.
+
 - **UI gate (decided 2026-07-07): an "Auto-resume" checkbox to the right of the
   Start button, default UNCHECKED.** Per-run and visible at the point of action (not
   a hidden global Setting), so the behaviour is opt-in and unsurprising. When
@@ -160,10 +172,12 @@ internet drops), `run_queue` catches the engine error, marks the remaining jobs
 - **#5 (video conciliation) is independent and lower-effort** — no new process
   model or dependency, just lineage recording on the video path plus scan/plan
   wiring; it can land whenever the Video Upscaler is exercised enough to want it.
-- **#6 (self-healing remote runs) is independent** and builds only on the shipped
-  remote/video stack (segment resume, `available_gpus`, `_find_existing_pod`,
-  `funds_guard`). No new process model; the effort is orchestration + billing safety,
-  not pipeline code. Worth doing once unattended overnight video runs become routine.
+- **#6 (self-healing remote runs)** builds on the shipped remote/video stack (segment
+  resume, `available_gpus`, `_find_existing_pod`, `funds_guard`) plus the 0.4.9
+  resume-path hardening (items 1/4/5 above): those are load-bearing prerequisites, not
+  parallel work, because the healer resumes unattended and repeatedly (see the note under
+  #6). No new process model; the effort is orchestration + billing safety, not pipeline
+  code. Worth doing once unattended overnight video runs become routine.
 - **Architectural watch-item:** the app is dependency-light and Windows-only. #3
   and #4 each push toward extra packages, a long-running server, and
   cross-platform support, so adopt those deliberately.

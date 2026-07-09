@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS video_outputs (
     clip_id     INTEGER NOT NULL DEFAULT 0,  -- 0 = whole file; >0 = a virtual clip
     status      TEXT NOT NULL DEFAULT 'queued',  -- queued|splitting|streaming|partial|done|failed|skipped
     skip_reason TEXT,
+    fail_count  INTEGER NOT NULL DEFAULT 0,  -- consecutive failed attempts; give-up drops the job (item 4)
     output_path TEXT,
     out_frames  INTEGER,          -- frames in the reassembled output (drift check)
     queue_order INTEGER,          -- user-orderable position in the queue
@@ -214,6 +215,13 @@ CREATE TABLE IF NOT EXISTS gpu_perf (
     seconds REAL    NOT NULL DEFAULT 0,
     updated TEXT,
     PRIMARY KEY (task, gpu_id)
+);
+CREATE TABLE IF NOT EXISTS video_batch_learn (
+    gpu_id    TEXT    NOT NULL,       -- IMGTBX_GPU_OVERRIDE (the card the run deployed)
+    mp_bucket INTEGER NOT NULL,       -- per-frame OUTPUT megapixels, bucketed (item 9)
+    batch     INTEGER NOT NULL,       -- converged safe 4n+1 batch for this card+output size
+    updated_at TEXT,
+    PRIMARY KEY (gpu_id, mp_bucket)
 );
 """
 
@@ -341,14 +349,21 @@ def _migrate_video_clip_columns(conn):
 
 
 def _ensure_video_columns(conn):
-    """Add columns introduced after a DB already had video_files (CREATE IF NOT EXISTS
-    won't alter an existing table). Fail-safe; runs every open, cheap."""
+    """Add columns introduced after a DB already had the video_* tables (CREATE IF NOT
+    EXISTS won't alter an existing table). Fail-safe; runs every open, cheap."""
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(video_files)")]
         if cols and "probe_version" not in cols:
             conn.execute("ALTER TABLE video_files ADD COLUMN probe_version INTEGER")
     except Exception as exc:
-        debug_log("db._ensure_video_columns", exc=exc)
+        debug_log("db._ensure_video_columns(video_files)", exc=exc)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_outputs)")]
+        if cols and "fail_count" not in cols:      # item 4: give up on a job that keeps failing
+            conn.execute("ALTER TABLE video_outputs "
+                         "ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+    except Exception as exc:
+        debug_log("db._ensure_video_columns(video_outputs)", exc=exc)
 
 
 def _norm(p):
@@ -400,6 +415,49 @@ def get_gpu_perf(conn, task, gpu_id, min_images=100):
     if not images or images < min_images or not seconds or seconds <= 0:
         return None
     return seconds / images * 100.0
+
+
+# ─────────────────────────────────────────────
+#  VIDEO BATCH LEARNING (auto-tune seed, item 9)
+# ─────────────────────────────────────────────
+
+@_locked
+def get_learned_batch(conn, gpu_id, mp_bucket, max_age_days=90):
+    """The converged safe batch previously learned for (gpu_id, output-MP bucket), or None
+    when there is no entry or it is stale (> max_age_days old: drivers + worker code change,
+    so an old value may no longer be optimal). Seeds the auto-tuner's first segment; the
+    first segment's real measurement then refines it up or down."""
+    if not gpu_id or mp_bucket is None:
+        return None
+    row = conn.execute(
+        "SELECT batch, updated_at FROM video_batch_learn WHERE gpu_id = ? AND mp_bucket = ?",
+        (gpu_id, int(mp_bucket))).fetchone()
+    if not row or not row["batch"]:
+        return None
+    if max_age_days and row["updated_at"]:
+        try:
+            age = datetime.datetime.now() - datetime.datetime.strptime(
+                row["updated_at"], "%Y-%m-%dT%H:%M:%S")
+            if age.days > max_age_days:
+                return None
+        except (ValueError, TypeError):
+            pass
+    return int(row["batch"])
+
+
+@_locked
+def put_learned_batch(conn, gpu_id, mp_bucket, batch):
+    """Record the converged safe batch for (gpu_id, output-MP bucket). Overwrites any prior
+    value (the newest measurement wins, so a driver/code change self-corrects). Commits."""
+    if not gpu_id or mp_bucket is None or not batch or batch <= 0:
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "INSERT INTO video_batch_learn (gpu_id, mp_bucket, batch, updated_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(gpu_id, mp_bucket) DO UPDATE SET "
+        "batch = excluded.batch, updated_at = excluded.updated_at",
+        (gpu_id, int(mp_bucket), int(batch), now))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────
@@ -632,6 +690,17 @@ def get_video_queue(conn, root_id):
 
 
 @_locked
+def get_active_video_output_paths(conn):
+    """Every non-terminal job's output_path across ALL roots. The staging-dir sweep
+    (item 5) uses this to know which staging folders are still owned: a done/skipped
+    job, or one with no output_path yet, owns no folder to protect. Cross-root because
+    the staging base is shared, so a sweep for one root must not delete another's dirs."""
+    return [r["output_path"] for r in conn.execute(
+        "SELECT output_path FROM video_outputs "
+        "WHERE status NOT IN ('done', 'skipped') AND output_path IS NOT NULL").fetchall()]
+
+
+@_locked
 def next_queue_order(conn, root_id):
     """The next queue_order to append at the end of the queue."""
     row = conn.execute(
@@ -646,6 +715,34 @@ def set_queue_order(conn, root_id, rel_path, target, order, clip_id=0):
     conn.execute(
         "UPDATE video_outputs SET queue_order = ? WHERE root_id = ? AND rel_path = ? "
         "AND target = ? AND clip_id = ?", (order, root_id, rel_path, target, clip_id))
+    conn.commit()
+
+
+@_locked
+def bump_video_fail_count(conn, root_id, rel_path, target, clip_id=0):
+    """Increment and return a job's consecutive fail_count (0 -> 1 on the first
+    failure). Atomic under the shared-connection lock. The runner uses the returned
+    count to decide when a deterministically-failing job should be dropped from the
+    queue (item 4). Returns 0 if the row is somehow gone."""
+    conn.execute(
+        "UPDATE video_outputs SET fail_count = COALESCE(fail_count, 0) + 1 "
+        "WHERE root_id = ? AND rel_path = ? AND target = ? AND clip_id = ?",
+        (root_id, rel_path, target, clip_id))
+    conn.commit()
+    row = conn.execute(
+        "SELECT fail_count FROM video_outputs WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?",
+        (root_id, rel_path, target, clip_id)).fetchone()
+    return (row["fail_count"] if row else 0) or 0
+
+
+@_locked
+def reset_video_fail_count(conn, root_id, rel_path, target, clip_id=0):
+    """Zero a job's fail_count (the GUI 'Retry' path: the user re-queues a job that
+    gave up, so its attempt counter must start fresh). Commits."""
+    conn.execute(
+        "UPDATE video_outputs SET fail_count = 0 WHERE root_id = ? AND rel_path = ? "
+        "AND target = ? AND clip_id = ?", (root_id, rel_path, target, clip_id))
     conn.commit()
 
 

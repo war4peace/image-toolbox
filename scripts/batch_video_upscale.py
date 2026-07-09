@@ -59,6 +59,14 @@ import db
 import notifications
 import video_pipeline as vp
 
+# Fail-safe diagnostic trail for the swallowed-error handlers (guarded import so an old
+# install missing debug_log.py still runs). Same pattern the other runners use.
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(*_a, **_k):
+        pass
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_ROOT = os.path.dirname(_SCRIPT_DIR)
 
@@ -201,6 +209,69 @@ def _start_remote_telemetry(engine, stop, interval=10.0):
 _load_config = runner_common.load_config
 
 
+# A job that keeps failing (permanent cause: black-output guard, corrupt source, an
+# unreadable codec) used to sit `failed` in the queue and be re-attempted at the top of
+# EVERY run — re-probe, re-split, sometimes pod time — forever. After this many
+# consecutive failed attempts the runner drops it from the queue (status 'skipped'); the
+# GUI's Retry resets the counter. Item 4.
+GIVE_UP_AFTER = 3
+
+
+def _failure_disposition(fail_count, reason, give_up_after=GIVE_UP_AFTER):
+    """(status, skip_reason) for a job that just failed for the fail_count-th time.
+    At/after give_up_after the job is 'skipped' (leaves the queue) with the reason
+    prefixed so the user sees why it stopped being retried; before that it stays
+    'failed' and is retried next run. Pure, so it is unit-tested."""
+    if fail_count >= give_up_after:
+        return "skipped", f"gave up after {fail_count} attempts: {reason}"
+    return "failed", reason
+
+
+class VideoSlowWatch:
+    """Notify-only slow-segment health signal for a video run (item 6). Anchors to the
+    run's BEST (minimum) seconds-per-output-megapixel across completed segments, the same
+    anchor-to-the-minimum reasoning as the image watchdog: only a genuinely fast segment
+    can lower the baseline, so a slow creep can't drift it up and hide. Per-megapixel
+    normalisation keeps it fair across mixed resolutions/targets. A segment at
+    >= factor x the baseline is 'slow' (in the field: rare shared-infra/host contention
+    on the pod, invisible from the guest).
+
+    Deliberately NOTIFY-ONLY, never auto-stop: contention usually clears, and killing a
+    half-done segment wastes its cost, so the user decides (unlike the image watchdog,
+    which auto-stops a degraded LOCAL GPU that only a reboot cures). Edge-triggered: one
+    warning per slow episode, re-armed once a segment returns to healthy. Pure (seconds
+    are passed in), so it is unit-tested like funds_guard."""
+
+    def __init__(self, factor=3.0, min_samples=2):
+        self.factor = max(1.0, float(factor))
+        self.min_samples = max(1, int(min_samples))
+        self.min_spmp = None
+        self.samples = 0
+        self._in_episode = False          # inside a slow streak we've already warned on
+
+    def observe(self, seconds, out_megapixels):
+        """Feed one completed segment. Returns (warn, ratio): warn=True ONLY on the
+        leading edge of a slow episode (emit exactly once); ratio = this segment's rate
+        vs the healthy baseline (for the message). Non-positive inputs are ignored so a
+        timing-less passthrough/local segment never trips it."""
+        if not seconds or not out_megapixels or seconds <= 0 or out_megapixels <= 0:
+            return False, 0.0
+        spmp = seconds / out_megapixels
+        self.samples += 1
+        if self.min_spmp is None or spmp < self.min_spmp:
+            self.min_spmp = spmp
+        ratio = spmp / self.min_spmp if self.min_spmp else 1.0
+        if self.samples < self.min_samples:          # need a trusted baseline first
+            return False, ratio
+        slow = spmp >= self.min_spmp * self.factor
+        if slow and not self._in_episode:
+            self._in_episode = True
+            return True, ratio
+        if not slow:
+            self._in_episode = False                 # healthy again: re-arm the edge
+        return False, ratio
+
+
 class StopInstallment(Exception):
     """Raised to end a run cleanly when a per-run cap is reached OR the user pressed
     Stop; the rest stays `pending`/`partial` and resumes next run."""
@@ -242,6 +313,7 @@ def resolve_video_cfg(cfg, overrides=None):
     """Merge the config.json `video` section with sane defaults and any CLI
     overrides, returning a plain dict the runner reads."""
     v = dict(cfg.get("video", {}) or {})
+    u = dict(cfg.get("upscale", {}) or {})
     out = {
         "target":              v.get("target", "1080p"),
         "output_subdir":       v.get("output_subdir", "__upscaled__"),
@@ -288,6 +360,24 @@ def resolve_video_cfg(cfg, overrides=None):
         # switching needs no reprovision. NOTE: the VRAM auto-batch model is 7B-calibrated;
         # 3B uses far less, so on 3B the auto/clamp is conservative (safe, not optimal).
         "dit_model":           v.get("dit_model", "seedvr2_ema_7b_fp16.safetensors"),
+        # Slow-segment health signal (item 6): NOTIFY-ONLY. Reuses the image watchdog's
+        # enable/factor keys (upscale.watchdog_*) as defaults so a user who tuned the
+        # watchdog once gets consistent behaviour, overridable under video.* if wanted.
+        "watchdog_enabled":    bool(v.get("watchdog_enabled", u.get("watchdog_enabled", True))),
+        "watchdog_factor":     float(v.get("watchdog_factor",
+                                           u.get("watchdog_factor", 3.0)) or 3.0),
+        # Adaptive batch tuning (item 9): on a multi-segment video, seed the batch from the
+        # DB (or the pod's auto-pick), let the FIRST segment's real VRAM measurement refine
+        # it up or down, then freeze + persist it (keyed by output-MP + card). Only active
+        # for AUTO batch (an explicit batch_size override disables it). Default on.
+        "auto_tune_batch":     bool(v.get("auto_tune_batch", True)),
+        # Content-hash lineage (item 10): after a whole-video job completes, link the
+        # source to its output by blake2b hash so a future video conciliation (roadmap
+        # #5) can re-match them after a move/rename, exactly as the image runners do.
+        # Hashing a multi-GB source over a network share costs a full read, so it is
+        # gated here (default on) for the rare case a user wants it off. Clips are never
+        # linked (their "source" is a virtual sub-range, not a replaceable file).
+        "record_lineage":      bool(v.get("record_lineage", True)),
     }
     if out["use_10bit"]:
         out["video_backend"] = "ffmpeg"
@@ -320,6 +410,17 @@ def log_video_settings(vcfg):
     log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
         f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
         f"input noise {noise if noise > 0 else 'off'}")
+    if vcfg.get("watchdog_enabled", True):
+        log(f"    slow-segment watchdog on (warn at >={vcfg.get('watchdog_factor', 3.0):g}x "
+            f"the run's healthy rate; notify-only, no auto-stop)")
+    else:
+        log("    slow-segment watchdog off")
+    log(f"    auto-tune batch {'on' if vcfg.get('auto_tune_batch', True) else 'off'}"
+        + (" (multi-segment auto-batch videos; seeds + freezes per card+output size)"
+           if vcfg.get("auto_tune_batch", True) else ""))
+    log(f"    record lineage {'on' if vcfg.get('record_lineage', True) else 'off'}"
+        + (" (link source <-> output by content hash on completion)"
+           if vcfg.get("record_lineage", True) else ""))
 
 
 def resolve_batch(vcfg, target):
@@ -346,6 +447,29 @@ def per_video_seed(vcfg, rel):
         return int(vcfg["seed"])
     h = hashlib.blake2b(rel.encode("utf-8", "replace"), digest_size=8).hexdigest()
     return int(h, 16) % (2 ** 31 - 1)
+
+
+# Adaptive batch tuning (item 9). A video must have at least this many segments before
+# tuning engages: a 1-2 segment clip has nothing to amortise (and _fit_batch_to_frames
+# already collapses a short clip to one batch), so it keeps the plain auto path.
+MIN_TUNE_SEGMENTS = 2
+# Output-megapixel bucket for the learned-batch DB key. 0.5 MP groups near-identical
+# output sizes (so history is reused across similar videos) while keeping portrait vs
+# landscape vs target tiers distinct (VRAM scales with output MP, which box-fit makes
+# aspect-dependent, so keying by target name alone would be wrong).
+_MP_BUCKET_MP = 0.5
+
+
+def _mp_bucket(mp):
+    """Stable integer DB-key bucket for a per-frame output-megapixel value (0.5 MP grid)."""
+    return int(round(max(0.0, float(mp or 0)) / _MP_BUCKET_MP))
+
+
+def _request_batch(explicit_batch, tuned, learned):
+    """The batch to REQUEST for a segment, by precedence: an explicit config batch wins
+    (auto-tune is off then), else the frozen tuned value (auto-tuner), else an OOM-down-
+    carried value (within-video recovery), else 0 = AUTO (the pod sizes it). Pure."""
+    return explicit_batch or tuned or learned or 0
 
 
 def updated_learned_batch(learned, first, final):
@@ -440,6 +564,55 @@ def walk_videos(src_root, skip_roots=None):
     return out
 
 
+# Written into the split input dir the moment a split RUNS TO COMPLETION, so a
+# resumed run can tell a finished split from one killed mid-write. Its absence (or a
+# count/frame-sum that no longer matches the files on disk) means the split was
+# interrupted (app closed, crash, power loss, the stall watchdog killing ffmpeg) and
+# left a partial, often truncated segment set that must never be reused. See
+# extract_clip's .part+os.replace guard (video_pipeline) for the same interrupted-write
+# bug class, solved there but never on the split path until now.
+_SPLIT_MARKER = "split.done"
+
+
+def _write_split_marker(in_dir, segs, mode):
+    """Record that a split completed: the segment count + total frame sum it produced
+    (the ground truth a later reuse is validated against). Best-effort — a failed write
+    only means the next run re-splits (safe, merely wasteful), never a wrong reuse."""
+    try:
+        with open(os.path.join(in_dir, _SPLIT_MARKER), "w", encoding="utf-8") as f:
+            json.dump({"segment_count": len(segs),
+                       "frame_sum": sum(s.frame_count for s in segs),
+                       "mode": mode}, f)
+    except OSError:
+        pass
+
+
+def _read_split_marker(in_dir):
+    """The split.done marker dict, or None when absent/unreadable (an interrupted split,
+    or a pre-marker resume dir from before this guard existed)."""
+    try:
+        with open(os.path.join(in_dir, _SPLIT_MARKER), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _clear_split_dir(in_dir):
+    """Delete the seg_* files + split.done marker of an incomplete split so a fresh
+    split can't inherit a stale/extra file (a re-split with FEWER segments would
+    otherwise leave the old tail behind). Best-effort."""
+    try:
+        names = os.listdir(in_dir)
+    except OSError:
+        return
+    for name in names:
+        if (name.startswith("seg_") and name.endswith(vp.SEGMENT_EXT)) or name == _SPLIT_MARKER:
+            try:
+                os.remove(os.path.join(in_dir, name))
+            except OSError:
+                pass
+
+
 def _enumerate_segments(in_dir):
     """Return [vp.Segment] for the seg_*.mkv already present in in_dir (a resumed
     split), each with its counted frame count."""
@@ -453,16 +626,51 @@ def _enumerate_segments(in_dir):
     return segs
 
 
+def split_is_complete(in_dir, segs):
+    """(ok, reason) — is the split already in in_dir a COMPLETE, uncorrupted set a
+    resume can trust? All three must hold, else the dir holds a partial/interrupted
+    split that must be discarded and re-split (never streamed to the pod as a truncated
+    deliverable):
+      1. a split.done marker is present (the split ran to completion),
+      2. the seg_NNNNN files are a gapless 0..N-1 sequence matching the marker's count,
+      3. the counted frames on disk still sum to the marker's frame_sum (no segment
+         truncated/lost since the split, which count_frames would under-count).
+    Pure (no ffmpeg here; `segs` already carry counted frames), so it is unit-testable."""
+    marker = _read_split_marker(in_dir)
+    if marker is None:
+        return False, "no split.done marker (the split did not finish)"
+    for i, s in enumerate(segs):
+        if os.path.basename(s.path) != f"seg_{i:05d}{vp.SEGMENT_EXT}":
+            return False, f"segment files are not a gapless sequence (hole at index {i})"
+    if len(segs) != marker.get("segment_count"):
+        return False, (f"{len(segs)} segment file(s) on disk but the split recorded "
+                       f"{marker.get('segment_count')}")
+    frame_sum = sum(s.frame_count for s in segs)
+    if frame_sum != marker.get("frame_sum"):
+        return False, (f"segment frames sum to {frame_sum} but the split recorded "
+                       f"{marker.get('frame_sum')} (a segment is truncated/corrupt)")
+    return True, "ok"
+
+
 def ensure_split(info, in_dir, vcfg):
-    """Return ([vp.Segment], split_mode). Reuses an existing split (segment input
-    files already present, e.g. a resumed run) so a `-c copy` re-split is skipped;
-    otherwise plans and splits. Splitting is deterministic, so reuse keeps the
-    upscaled outputs index-aligned."""
+    """Return ([vp.Segment], split_mode). Reuses an existing split (segment input files
+    already present, e.g. a resumed run) so a `-c copy` re-split is skipped — but ONLY
+    when that split is COMPLETE (split_is_complete: a split.done marker plus a matching
+    segment count and frame sum on disk). A split killed mid-write leaves a partial,
+    often truncated set; reusing it blindly upscales a truncated deliverable at real pod
+    cost, caught only by the soft end-of-run drift warning. So an incomplete split is
+    discarded and re-split. Splitting is deterministic, so a fresh split keeps any
+    already-upscaled segments index-aligned."""
     existing = _enumerate_segments(in_dir)
     if existing:
-        return existing, "reused"
+        ok, why = split_is_complete(in_dir, existing)
+        if ok:
+            return existing, "reused"
+        log(f"    discarding an incomplete split in the work area ({why}); re-splitting.")
+        _clear_split_dir(in_dir)
     plan = vp.plan_split(info, vcfg["segment_seconds"], vcfg["max_segment_seconds"])
     segs = vp.split(info, plan, in_dir)
+    _write_split_marker(in_dir, segs, plan.mode)
     return segs, plan.mode
 
 
@@ -531,6 +739,69 @@ def _work_dirs(out_video, work_base=None):
     return os.path.join(root, "in"), os.path.join(root, "up"), root
 
 
+def _dir_size(path):
+    """Best-effort total size (bytes) of a directory tree; 0 on any error. Used only
+    for the sweep's 'freed X GB' log, so it must never raise."""
+    total = 0
+    try:
+        for dirpath, _dirs, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+    except Exception:                                   # noqa: BLE001
+        pass
+    return total
+
+
+def _remove_job_staging(out_video, work_base):
+    """Delete one job's staging dir (item 5). Called when a job leaves the queue for
+    good (gave up, or a GUI remove) so its gigabytes of segments don't leak forever
+    (cleanup otherwise only happened on success). Guarded to only ever delete a folder
+    INSIDE the resolved staging base. Fail-safe: any error is logged, never raised."""
+    try:
+        if not out_video or not work_base:
+            return
+        root = _work_dirs(out_video, work_base)[2]
+        if _path_within(root, work_base) and os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+    except Exception as exc:                            # noqa: BLE001
+        debug_log("batch_video_upscale._remove_job_staging", exc=exc)
+
+
+def _sweep_orphan_staging(conn, work_base):
+    """Delete staging dirs under `work_base` that no active (non-terminal) job owns.
+    A job's dir is intentionally kept for failed/partial jobs (resume needs it), so it
+    is orphaned forever when a job is removed, gives up, or its output path changes (the
+    hash-keyed dir is never revisited). The base is SHARED across source roots, so the
+    keep-set is every active job's output path in the whole DB, never just this run's
+    queue. Returns (count_removed, bytes_freed). Fail-safe: any error skips the sweep."""
+    try:
+        if not work_base or not os.path.isdir(work_base):
+            return 0, 0
+        keep = set()
+        for out_path in db.get_active_video_output_paths(conn):
+            if out_path:
+                keep.add(os.path.normcase(os.path.abspath(_work_dirs(out_path, work_base)[2])))
+        removed = freed = 0
+        for name in os.listdir(work_base):
+            root = os.path.join(work_base, name)
+            if not os.path.isdir(root):
+                continue                                # leave stray files alone
+            if os.path.normcase(os.path.abspath(root)) in keep:
+                continue                                # an active job owns this dir
+            if not _path_within(root, work_base):       # belt-and-suspenders
+                continue
+            freed += _dir_size(root)
+            shutil.rmtree(root, ignore_errors=True)
+            removed += 1
+        return removed, freed
+    except Exception as exc:                            # noqa: BLE001
+        debug_log("batch_video_upscale._sweep_orphan_staging", exc=exc)
+        return 0, 0
+
+
 def _path_within(child, parent):
     """True if `child` is `parent` or nested under it. Pure path math (no disk),
     case-insensitive on Windows via normcase, fail-safe False on bad input."""
@@ -542,6 +813,27 @@ def _path_within(child, parent):
     except Exception:                                   # noqa: BLE001
         return False
     return c == p or c.startswith(p + os.sep)
+
+
+def _record_video_lineage(conn, src_path, out_path, log=None):
+    """Link a finished whole-video output to its source by content hash (item 10), so
+    a future video conciliation (roadmap #5) can re-match the pair after a move/rename,
+    exactly as the image runners do. Reuses the shared `lineage` table (src_hash ->
+    upscaled_hash); the video has no tag stage, so tagged_hash stays NULL. Best-effort:
+    a missing source, an unreadable file or any DB error only costs a fallback to name
+    matching later, never the run. Skips a source path that no longer exists."""
+    try:
+        if not src_path or not out_path or not os.path.exists(src_path):
+            return
+        src_hash = db.hash_file_cached(conn, src_path)
+        out_hash = db.hash_file_cached(conn, out_path)
+        if not src_hash or not out_hash:
+            return
+        db.record_upscale_lineage(conn, src_hash, out_hash, src_path, out_path)
+        if log:
+            log("    lineage recorded (source <-> output linked by content hash)")
+    except Exception as exc:                                # noqa: BLE001
+        debug_log("batch_video_upscale._record_video_lineage", exc=exc)
 
 
 def work_root_conflict(work_root, source_root):
@@ -781,10 +1073,12 @@ def enqueue_folder(conn, root_id, source_root, output_root, target, vcfg):
 #  PER-JOB PROCESSING (one queued (source, target))
 # ─────────────────────────────────────────────
 
-def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, total):
+def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, total,
+                notify_settings=None, slow_watch=None):
     """Process one queued (source, target) job. Returns ('done', seconds). Raises
     StopInstallment when a cap is hit mid-job (the rest stays pending, the job is
-    marked 'partial')."""
+    marked 'partial'). `slow_watch` (a run-wide VideoSlowWatch) gets each completed
+    segment's rate for the notify-only slow-segment signal (item 6)."""
     rel, target = job["rel_path"], job["target"]
     clip_id = job["clip_id"] or 0                  # 0 = whole file; >0 = a virtual clip
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
@@ -891,6 +1185,25 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     _trace_logged = [False]
     _learned_batch = [None]      # OOM-corrected batch carried to this video's later segments
     _learn_logged = [False]      # log the carry-forward once per video, not per segment
+    # Adaptive batch tuning (item 9): AUTO batch on a multi-segment video only. Seed from
+    # the DB for this card + output-MP bucket; the first completed segment's measured
+    # suggestion then refines + freezes it (all segments share one output size, so one
+    # converged value serves the whole video AND respects torch.compile's single shape).
+    gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+    seg_out_mp = ve.output_megapixels(info.width, info.height, target)
+    mp_bucket = _mp_bucket(seg_out_mp)
+    tuning = bool(vcfg.get("auto_tune_batch", True) and gpu_id and not batch
+                  and len(segs) >= MIN_TUNE_SEGMENTS)
+    tuned = [None]               # frozen tuned batch (seed, then the converged measurement)
+    converged = [False]
+    if tuning:
+        try:
+            tuned[0] = db.get_learned_batch(conn, gpu_id, mp_bucket)
+        except Exception as exc:                       # noqa: BLE001 (fail-safe)
+            debug_log("batch_video_upscale get_learned_batch", exc=exc)
+        if tuned[0]:
+            log(f"    auto-tune: seeding batch {tuned[0]} (learned for ~{seg_out_mp:.1f}MP "
+                f"output on this card); the first segment refines it.")
     total_secs = 0.0
 
     for s in segs:
@@ -952,6 +1265,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             if pa is not None:                       # capture per-segment (logged below)
                 _stats["alloc"] = pa
                 _stats["reserved"] = st.get("peak_reserved_gb")
+            sb = st.get("suggested_batch")           # auto-tuner: measured-anchored next batch
+            if sb:
+                _stats["suggested"] = sb
             # Diagnostic (temporary): the real per-phase cadence, so we can fix the
             # live s/frame + progress bar from ground truth instead of guesswork.
             _tr = st.get("phase_trace")
@@ -972,13 +1288,12 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                                   "total_chunks": st.get("total_chunks"),
                                   "output_bytes": st.get("output_bytes")})
 
-        # Carry a batch the pod already OOM-corrected on an earlier segment of THIS
-        # video: same resolution across segments, so the safe batch is the same. This
-        # skips the per-segment re-discovery (a failed forward pass + VRAM churn) that
-        # otherwise repeats on every segment. An explicit config batch is still honoured
-        # as the ceiling; the learned value only ever lowers it.
-        req_batch = _learned_batch[0] or batch
-        if _learned_batch[0] and not _learn_logged[0]:
+        # The batch to request: an explicit config batch (auto-tune off then) > the frozen
+        # tuned/seeded value > a batch the pod already OOM-corrected on an earlier segment
+        # of THIS video (same resolution, so the safe batch is the same; skips the per-
+        # segment re-discovery) > 0 = AUTO (the pod sizes it).
+        req_batch = _request_batch(batch, tuned[0], _learned_batch[0])
+        if _learned_batch[0] and not tuned[0] and not _learn_logged[0]:
             _learn_logged[0] = True
             log(f"    reusing batch_size {req_batch} for the remaining segments "
                 f"(OOM-corrected earlier in this video; skips re-discovery)")
@@ -1012,6 +1327,21 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         # Learn the smallest safe batch so this video's later segments start there (a
         # forced batch that survives shows first == b, so it never re-learns).
         _learned_batch[0] = updated_learned_batch(_learned_batch[0], first, b)
+        # Auto-tune convergence: after the FIRST completed segment, adopt the pod's
+        # measured-anchored suggestion (up from a low seed, or down from a high one), FREEZE
+        # it for the rest of this video (so torch.compile recompiles at most once), and
+        # persist it for future videos of the same output size on this card.
+        if tuning and not converged[0]:
+            converged[0] = True
+            sug = _seg_stats.get("suggested") or b or tuned[0]
+            if sug and sug != tuned[0]:
+                log(f"    auto-tune: batch {tuned[0] or 'auto'} -> {sug} (measured on this "
+                    f"card for ~{seg_out_mp:.1f}MP output); frozen for this video.")
+            tuned[0] = sug or tuned[0]
+            try:
+                db.put_learned_batch(conn, gpu_id, mp_bucket, tuned[0])
+            except Exception as exc:                   # noqa: BLE001 (fail-safe)
+                debug_log("batch_video_upscale put_learned_batch", exc=exc)
         # Phase breakdown (per-segment overhead beyond the pod time): submit=upload,
         # wait=submit->pod-done, fetch=download, finalize=local write. Since the pod now
         # times its whole retry loop (worker.py t0 before the loop), the reported `secs`
@@ -1044,6 +1374,29 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 ve.record_run(conn, gpu_id, target, out_mp, secs)
             except Exception:                          # noqa: BLE001 (best-effort)
                 pass
+
+        # Slow-segment health signal (item 6): compare this segment's seconds-per-output-
+        # megapixel to the run's healthy baseline; warn (once per episode) if far slower.
+        # Notify-only, fail-safe: a warning misfire must never break a paid run.
+        if slow_watch is not None and n and secs:
+            try:
+                import video_estimate as ve
+                seg_out_mp = n * ve.output_megapixels(info.width, info.height, target)
+                warn, ratio = slow_watch.observe(secs, seg_out_mp)
+                if warn:
+                    msg = (f"segment {s.index + 1}/{len(segs)} of {rel} ran ~{ratio:.1f}x "
+                           f"slower than this run's baseline ({fmt_hhmmss(secs)} for {n} "
+                           f"frames). Likely pod host contention; cost is accruing. The "
+                           f"run continues (no auto-stop).")
+                    log(f"    WATCHDOG: {msg}")
+                    try:
+                        notifications.notify(
+                            notify_settings, "Video upscale: slow segment", msg, 0xF1C40F,
+                            fields=[{"name": "Source", "value": rel}])
+                    except Exception:                  # noqa: BLE001
+                        pass
+            except Exception as exc:                   # noqa: BLE001 (best-effort)
+                debug_log("batch_video_upscale slow_watch", exc=exc)
 
         cap = budget.exceeded() or ("stopped by user" if _STOP.is_set() else None)
         remaining = [r for r in db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
@@ -1105,6 +1458,12 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     report = vp.check_drift(job_info, out_info, seg_out, reference_frames=reference)
     db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="done",
                            output_path=out_video, out_frames=out_info.nb_frames)
+    # Record source <-> output lineage for a WHOLE-video job (item 10). Skipped for a
+    # clip: its "source" is a virtual sub-range of a longer file, not a replaceable
+    # whole, so a src->clip link would be wrong for conciliation. src_abs is the untouched
+    # source (never mux_source, which is the temp clip for a clip job).
+    if not clip_id and vcfg.get("record_lineage", True):
+        _record_video_lineage(conn, src_abs, out_video, log=log)
     shutil.rmtree(work_root, ignore_errors=True)
     try:
         os.rmdir(os.path.dirname(work_root))      # tidy the empty work parent
@@ -1158,6 +1517,13 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
             f"(leave it empty to use the default local folder).")
         return {"done": 0, "failed": 0, "stopped": conflict, "total": 0}
 
+    # Reclaim staging dirs no active job owns anymore (removed / gave-up / re-targeted
+    # jobs) before renting a pod: a long 4K video's segments are gigabytes and the base
+    # is on the app drive by default. Item 5. Fail-safe.
+    swept, freed = _sweep_orphan_staging(conn, vcfg.get("work_root"))
+    if swept:
+        log(f"Cleaned {swept} orphaned staging folder(s), {freed / 1024**3:.1f} GB freed.")
+
     initial = db.get_video_queue(conn, root_id)
     gui_event("QUEUE", [{"rel": j["rel_path"], "target": j["target"]} for j in initial])
     log(f"Queue: {len(initial)} job(s) under {source_root}.")
@@ -1166,6 +1532,10 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     done_frames = 0
     stopped = None
     attempted = set()                  # (rel, target, clip_id) tried this run
+    # Run-wide slow-segment health signal (item 6): one baseline across every segment of
+    # every job this run (the pod is shared), notify-only.
+    slow_watch = (VideoSlowWatch(factor=vcfg.get("watchdog_factor", 3.0))
+                  if vcfg.get("watchdog_enabled", True) else None)
     while not _STOP.is_set():
         pending = [j for j in db.get_video_queue(conn, root_id)
                    if (j["rel_path"], j["target"], j["clip_id"]) not in attempted]
@@ -1181,7 +1551,7 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         total = idx + len(pending) - 1
         try:
             process_job(engine, conn, root_id, source_root, job, vcfg, budget,
-                        idx, total)
+                        idx, total, notify_settings=notify_settings, slow_watch=slow_watch)
             done += 1
             done_frames += _job_frames(conn, root_id, job)
         except StopInstallment as exc:
@@ -1195,11 +1565,19 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
             break
         except Exception as exc:                       # noqa: BLE001 — log, keep going
             failed += 1
+            reason = str(exc)[:300]
+            n = db.bump_video_fail_count(conn, root_id, rel, target, clip_id=clip_id)
+            status, skip_reason = _failure_disposition(n, reason)
             db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
-                                   status="failed", skip_reason=str(exc)[:300])
+                                   status=status, skip_reason=skip_reason)
             log(f"[{idx}/{total}] FAILED {rel} -> {target}: {exc}")
+            if status == "skipped":
+                log(f"    Gave up on {rel} -> {target} after {n} failed attempts; "
+                    f"removed from the queue. Fix the source, then use Retry to re-queue it.")
+                # It won't be resumed, so its staging segments are dead weight now.
+                _remove_job_staging(job["output_path"], vcfg.get("work_root"))
             gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
-                                  "outcome": "fail", "error": str(exc)[:300]})
+                                  "outcome": "fail", "error": reason})
     if _STOP.is_set() and stopped is None:
         stopped = "stopped by user"
 
@@ -1221,20 +1599,42 @@ def _failure_notice(started, exc):
             f"Could not start the remote pod/engine.\n{exc}")
 
 
+def _stop_notice(stopped):
+    """(title, color, resume_hint) for a run that ended early, branched on the reason
+    string in `stopped`. The old code hard-coded "paused (per-run cap)" for every early
+    stop, so a user Stop or the work-root refusal was mislabeled as a cost cap. `stopped`
+    is the raw reason from run_queue: "stopped by user", a per-run cap message
+    ("per-run cap of ..."/"per-run cost cap of ..."), or the work-root-conflict refusal.
+    Pure, so it is unit-tested. resume_hint True = the rest of the queue stayed pending
+    and re-running continues it; False = nothing was staged (the startup refusal)."""
+    reason = (stopped or "").lower()
+    if reason.startswith("per-run "):                 # covers cap AND cost-cap messages
+        return "Video upscale paused (per-run cap)", 0xF1C40F, True
+    if "staging work folder" in reason:               # work_root_conflict refusal
+        return "Video upscale did not start", 0xE74C3C, False
+    if reason == "stopped by user":
+        return "Video upscale stopped", 0xF1C40F, True
+    return "Video upscale stopped early", 0xF1C40F, True   # unknown reason: report plainly
+
+
 def _notify_summary(notify_settings, summary, src_root):
     if not notify_settings:
         return
     try:
-        if summary["failed"]:
+        stopped = summary["stopped"]
+        resume_hint = False
+        if summary["failed"]:                         # errors outrank an early stop
             color, title = 0xE74C3C, "Video upscale finished with errors"
-        elif summary["stopped"]:
-            color, title = 0xF1C40F, "Video upscale paused (per-run cap)"
+            if stopped:
+                resume_hint = _stop_notice(stopped)[2]
+        elif stopped:
+            title, color, resume_hint = _stop_notice(stopped)
         else:
             color, title = 0x2ECC71, "Video upscale complete"
         desc = (f"{summary['done']} done, {summary['failed']} failed of "
                 f"{summary['total']} job(s).")
-        if summary["stopped"]:
-            desc += f"\n{summary['stopped']} — re-run to continue."
+        if stopped:
+            desc += f"\n{stopped}" + (", re-run to continue." if resume_hint else ".")
         notifications.notify(notify_settings, title, desc, color,
                              fields=[{"name": "Source", "value": src_root}])
     except Exception:

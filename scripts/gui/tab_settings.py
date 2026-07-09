@@ -413,19 +413,28 @@ class SettingsTab(ttk.Frame):
         uni_cb.grid(row=8, column=0, columnspan=2, sticky="w")
         Tooltip(uni_cb, "Pads the last (ragged) batch so it matches the rest, preventing a "
                         "flicker at the end of each chunk. Tiny extra compute, recommended on.")
-        ttk.Label(sec, text="4K input noise:").grid(row=9, column=0, sticky="w", pady=3)
+        self.video_autotune_var = tk.BooleanVar(value=bool(vid.get("auto_tune_batch", True)))
+        at_cb = ttk.Checkbutton(sec, text="Auto-tune batch size (long videos)",
+                                variable=self.video_autotune_var)
+        at_cb.grid(row=9, column=0, columnspan=2, sticky="w")
+        Tooltip(at_cb, "On a multi-segment video, learns the largest batch size that fits "
+                       "this card at this output size from the first segment's real VRAM use, "
+                       "then reuses it (and remembers it for next time). Speeds up long runs "
+                       "and avoids repeated out-of-memory back-offs. Only affects the AUTO "
+                       "batch size (an explicit Advanced batch overrides it).")
+        ttk.Label(sec, text="4K input noise:").grid(row=10, column=0, sticky="w", pady=3)
         _ns = float(vid.get("input_noise_scale", 0.0) or 0.0)
         self.video_noise_var = tk.StringVar(value=("Off" if _ns <= 0 else f"{_ns:g}"))
         ns_cb = ttk.Combobox(sec, textvariable=self.video_noise_var, state="readonly",
                              width=10, values=["Off", "0.02", "0.03", "0.05"])
-        ns_cb.grid(row=9, column=1, sticky="w", padx=6, pady=3)
+        ns_cb.grid(row=10, column=1, sticky="w", padx=6, pady=3)
         Tooltip(ns_cb, "Injects a little noise into the input to counter the soft, "
                        "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
                        "try 0.02 if your 4K output looks plasticky.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
                      "output subfolder mirrors the source tree (like Batch Upscaler).")
 
@@ -864,6 +873,7 @@ class SettingsTab(ttk.Frame):
             "temporal_overlap":    overlap,
             "compile":             bool(self.video_compile_var.get()),
             "uniform_batch_size":  bool(self.video_uniform_var.get()),
+            "auto_tune_batch":     bool(self.video_autotune_var.get()),
             "input_noise_scale":   noise,
             "confirm_before_rent": bool(self.video_confirm_var.get()),
         }
@@ -1078,6 +1088,7 @@ class SettingsTab(ttk.Frame):
         self.video_overlap_var.set("Auto" if _vov < 0 else str(_vov))
         self.video_compile_var.set(bool(vid.get("compile", True)))
         self.video_uniform_var.set(bool(vid.get("uniform_batch_size", True)))
+        self.video_autotune_var.set(bool(vid.get("auto_tune_batch", True)))
         _vns = float(vid.get("input_noise_scale", 0.0) or 0.0)
         self.video_noise_var.set("Off" if _vns <= 0 else f"{_vns:g}")
         self.video_confirm_var.set(bool(vid.get("confirm_before_rent", True)))

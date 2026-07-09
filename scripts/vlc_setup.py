@@ -15,6 +15,7 @@ sys.executable).
 
 import os
 import sys
+import hashlib
 import zipfile
 import tempfile
 import subprocess
@@ -28,6 +29,11 @@ APP_ROOT = os.path.dirname(_SCRIPT_DIR)
 # non-browser client. A browser-like User-Agent gets an HTML mirror-CHOOSER page
 # instead of the zip, so we send urllib's default UA (do NOT spoof a browser here).
 VLC_URL = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip"
+# SHA-256 of that immutable versioned artifact (VideoLAN's published sum; verified
+# against the real download). Baked in so a later-compromised mirror can't swap the zip
+# under us. MUST change in lockstep with VLC_URL if the pin is ever bumped. Keep this in
+# sync with bootstrap.ps1's $LIBVLC_SHA256.
+VLC_SHA256 = "a0b7ec02b50adf6417eed014fb8df50af39690505a4225b85b3dc2ed17d14843"
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
@@ -91,6 +97,14 @@ def _download(url, dest, progress=None):
                 progress(f"Downloading libVLC… {got * 100 // total}%")
 
 
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _install_libvlc(progress=None):
     """Download the pinned VLC win64 zip and copy libvlc.dll + libvlccore.dll +
     plugins/ into <APP_ROOT>/vlc (only what libVLC needs, not vlc.exe / the UI)."""
@@ -100,6 +114,14 @@ def _install_libvlc(progress=None):
     try:
         zip_path = os.path.join(tmp, "vlc.zip")
         _download(VLC_URL, zip_path, progress)
+        # Integrity gate: the zip is a fixed, immutable artifact, so a mismatch means a
+        # corrupt or tampered download -> refuse it (the temp dir, incl. this zip, is
+        # removed in `finally`). Mirrors bootstrap.ps1's Python/ffmpeg hash checks.
+        actual = _sha256(zip_path)
+        if actual != VLC_SHA256:
+            raise RuntimeError(
+                f"libVLC download failed its SHA-256 check (got {actual}, expected "
+                f"{VLC_SHA256}). The download may be corrupt or tampered.")
         if progress:
             progress("Extracting libVLC…")
         with zipfile.ZipFile(zip_path) as zf:
