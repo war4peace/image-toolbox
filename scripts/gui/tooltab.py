@@ -450,8 +450,10 @@ class ToolTab(ttk.Frame):
         above' pointed at nothing — this surfaces the actual cause instead and
         points at 'View log'."""
         # The common remote case — no rentable GPU — gets a plain-language line.
+        # "Pod failed to deploy on" matches both the single-card wording (0.4.0: "on
+        # <gpu> (N attempts)") and the multi-card "on any of [...]".
         if self.console.find_last(
-                r"no instances currently available|Pod failed to deploy on any of"
+                r"no instances currently available|Pod failed to deploy on"
                 r"|Gave up creating a pod"):
             return ("Couldn't start a remote pod: no matching GPU was available "
                     "just now. Re-check the GPU picker (↻), try another region, or "

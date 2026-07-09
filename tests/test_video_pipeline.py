@@ -27,6 +27,91 @@ def make_info(**over):
     return vp.VideoInfo(**base)
 
 
+# ── detect_interlaced ─────────────────────────────────────────────────────────
+
+def test_field_order_interlaced_is_detected_without_ffmpeg():
+    # A definitive container field_order needs no pixel analysis (no ffmpeg shell-out).
+    for fo in ("tt", "bb", "tb", "bt"):
+        assert vp.detect_interlaced(make_info(field_order=fo)) is True
+
+
+def test_field_order_progressive_short_circuits_to_false():
+    assert vp.detect_interlaced(make_info(field_order="progressive")) is False
+
+
+def test_unknown_field_order_missing_file_is_fail_safe_false():
+    # 'unknown' (the VC-1/WMV ASF case) would idet-probe, but a nonexistent path must
+    # fail safe to False rather than shelling out or raising.
+    assert vp.detect_interlaced(make_info(field_order="", path="does-not-exist.wmv")) is False
+
+
+def test_unknown_field_order_uses_idet_and_flags_interlaced(monkeypatch):
+    # Simulate idet reporting a clear BFF majority (the measured MiniDV 576i case).
+    class _CP:
+        stderr = ("[Parsed_idet_0] Multi frame detection: "
+                  "TFF:     0 BFF:   201 Progressive:     0 Undetermined:     0")
+    monkeypatch.setattr(vp.os.path, "isfile", lambda _p: True)
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(vp, "_run", lambda *a, **k: _CP())
+    assert vp.detect_interlaced(make_info(field_order="unknown")) is True
+
+
+def test_unknown_field_order_idet_progressive_is_false(monkeypatch):
+    class _CP:
+        stderr = ("Multi frame detection: "
+                  "TFF:     0 BFF:     0 Progressive:   399 Undetermined:     1")
+    monkeypatch.setattr(vp.os.path, "isfile", lambda _p: True)
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(vp, "_run", lambda *a, **k: _CP())
+    assert vp.detect_interlaced(make_info(field_order="unknown")) is False
+
+
+# ── plan_split: interlaced -> deinterlacing re-encode ────────────────────────
+
+def test_interlaced_source_forces_deinterlacing_reencode(monkeypatch):
+    monkeypatch.setattr(vp, "detect_interlaced", lambda _i: True)
+    plan = vp.plan_split(make_info())
+    assert plan.mode == "reencode"
+    assert plan.deinterlace is True
+    assert "interlaced" in plan.reason.lower()
+
+
+def test_interlaced_wins_even_over_force_reencode(monkeypatch):
+    # A forced re-encode of an interlaced source must still deinterlace.
+    monkeypatch.setattr(vp, "detect_interlaced", lambda _i: True)
+    plan = vp.plan_split(make_info(), force_reencode=True)
+    assert plan.deinterlace is True
+
+
+def test_progressive_source_does_not_deinterlace(monkeypatch):
+    monkeypatch.setattr(vp, "detect_interlaced", lambda _i: False)
+    plan = vp.plan_split(make_info(), force_reencode=True)
+    assert plan.deinterlace is False
+
+
+# ── is_black_reencode (the black-output guard decision) ──────────────────────
+
+def test_black_reencode_trips_when_bright_source_goes_black():
+    # The measured failure: a ~95-luma source whose segment came back tv-range black (~16).
+    assert vp.is_black_reencode(seg_luma=16.0, src_luma=95.0) is True
+    assert vp.is_black_reencode(seg_luma=0.0, src_luma=90.0) is True
+
+
+def test_black_reencode_does_not_trip_on_a_healthy_reencode():
+    # seg ~= src (the deinterlaced WMV: 95.6 vs 95.5) must not trip.
+    assert vp.is_black_reencode(seg_luma=95.6, src_luma=95.5) is False
+
+
+def test_black_reencode_does_not_trip_on_a_genuinely_dark_clip():
+    # A legitimately dark / fade-from-black clip: source is ALSO dark, so no false alarm.
+    assert vp.is_black_reencode(seg_luma=15.0, src_luma=18.0) is False
+
+
+def test_black_reencode_is_fail_safe_on_unreadable_luma():
+    assert vp.is_black_reencode(seg_luma=None, src_luma=95.0) is False
+    assert vp.is_black_reencode(seg_luma=16.0, src_luma=None) is False
+
+
 # ── plan_split ──────────────────────────────────────────────────────────────
 
 def test_force_reencode_wins():

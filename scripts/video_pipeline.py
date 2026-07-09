@@ -32,6 +32,7 @@ find_ffmpeg). Fail-safe, never touches the source, Windows-aware
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -261,6 +262,7 @@ class VideoInfo:
     has_audio: bool
     acodec: Optional[str]
     is_vfr: bool
+    field_order: str = ""    # container's field order: 'progressive'/'tt'/'bb'/… or '' (unknown)
     raw: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -374,6 +376,7 @@ def probe(path, count=False) -> VideoInfo:
         has_audio=a is not None,
         acodec=(a or {}).get("codec_name"),
         is_vfr=is_vfr,
+        field_order=(v.get("field_order") or "").strip().lower(),
         raw=data,
     )
 
@@ -438,6 +441,81 @@ def max_keyframe_gap(path) -> float:
     return max(b - a for a, b in zip(times, times[1:]))
 
 
+_INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
+
+
+def detect_interlaced(info: VideoInfo, sample_frames=400) -> bool:
+    """Is this an interlaced source (e.g. MiniDV/DV 576i camcorder footage)?
+
+    Interlaced content MUST be deinterlaced before the SeedVR2 upscale: the model is
+    trained on progressive frames, so combed fields upscale to garbage; worse, NVENC
+    has NO interlaced-HEVC encode path, so the split's `hevc_nvenc` re-encode of
+    interlaced input can emit ALL-BLACK frames (measured: a VC-1/WMV 576i .wmv upscaled
+    to a black, audio-only deliverable). See split()'s bwdif branch.
+
+    Detection: trust the container's `field_order` when it is definitive; otherwise
+    (ASF/VC-1 reports 'unknown') ask ffmpeg's `idet` filter to analyse actual pixels
+    over a bounded sample. Fail-safe: any error (a missing file in unit tests, an ffmpeg
+    hiccup) returns False, so detection never breaks or falsely re-encodes a run.
+    """
+    fo = (info.field_order or "").strip().lower()
+    if fo in _INTERLACED_FIELD_ORDERS:
+        return True
+    if fo == "progressive":
+        return False
+    if not info.path or not os.path.isfile(info.path):
+        return False
+    try:
+        ffmpeg, _ = find_ffmpeg()
+        cp = _run([ffmpeg, "-hide_banner", "-nostats", "-i", info.path,
+                   "-vf", "idet", "-frames:v", str(int(sample_frames)),
+                   "-an", "-f", "null", "-"], check=False, hard_timeout=_PROBE_HARD_S)
+    except Exception:
+        return False
+    tff = bff = prog = 0
+    for line in (cp.stderr or "").splitlines():
+        if "Multi frame detection" in line:
+            m = re.search(r"TFF:\s*(\d+).*?BFF:\s*(\d+).*?Progressive:\s*(\d+)", line)
+            if m:
+                tff, bff, prog = (int(m.group(i)) for i in (1, 2, 3))
+    interlaced = tff + bff
+    # Require a clear majority AND a minimum count, so a handful of misdetected frames
+    # on a genuinely progressive clip can't force an unnecessary (softening) deinterlace.
+    return interlaced >= 10 and interlaced > prog
+
+
+def mean_luma_head(path, frames=30):
+    """Average luma (YAVG, 0..255) over the first `frames` decoded frames, via ffmpeg
+    signalstats. Cheap and bounded. Used by the runner's black-output guard to catch a
+    degenerate re-encode before it is streamed to the pod. Returns None on failure.
+
+    Note: TV-range black reads ~16, full-range black ~0, normal footage tens-to-hundreds;
+    the guard compares this against the SOURCE's own head luma (a relative test), so a
+    legitimately dark or fade-from-black clip is never mistaken for a broken re-encode.
+    """
+    try:
+        ffmpeg, _ = find_ffmpeg()
+        cp = _run([ffmpeg, "-hide_banner", "-nostats", "-i", path,
+                   "-frames:v", str(int(frames)),
+                   "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG",
+                   "-an", "-f", "null", "-"], check=False, hard_timeout=_PROBE_HARD_S)
+    except Exception:
+        return None
+    vals = [float(x) for x in re.findall(r"YAVG=([0-9.]+)", cp.stderr or "")]
+    return sum(vals) / len(vals) if vals else None
+
+
+def is_black_reencode(seg_luma, src_luma) -> bool:
+    """Decision for the runner's black-output guard: did the split re-encode collapse a
+    non-black source to black frames? True only when the source is clearly not black
+    (>= 40) yet the segment is (< 20 AND under 35% of the source's luma). The relative
+    test means a legitimately dark or fade-from-black clip (source also dark) can't
+    false-trip; a None luma (unreadable) is treated as 'can't tell' -> False."""
+    if seg_luma is None or src_luma is None:
+        return False
+    return src_luma >= 40.0 and seg_luma < 20.0 and seg_luma < src_luma * 0.35
+
+
 # ─────────────────────────────────────────────
 #  Plan + split
 # ─────────────────────────────────────────────
@@ -448,6 +526,7 @@ class SplitPlan:
     reason: str              # human-readable why
     segment_seconds: float
     fps: Fraction            # the CFR rate the segments will carry
+    deinterlace: bool = False  # apply bwdif in the re-encode (interlaced source)
 
 
 def pick_encoder(prefer_hw=True):
@@ -484,8 +563,18 @@ def plan_split(info: VideoInfo, segment_seconds=60.0, max_segment_seconds=120.0,
       * VFR source            -> -vsync cfr kills progressive lip-sync drift (6.3)
       * sparse GOP            -> keyframes so far apart that a `-c copy` segment
                                  would exceed max_segment_seconds (6.1)
+      * interlaced source     -> deinterlace (bwdif), which needs a re-encode; also
+                                 dodges NVENC's black-frame interlaced-HEVC failure
       * force_reencode        -> caller override (e.g. an undecodable codec)
     """
+    # Interlaced (MiniDV 576i, etc.) must be deinterlaced, which requires a re-encode —
+    # take it first so it applies even when force_reencode / VFR / sparse-GOP would also
+    # fire (deinterlace is orthogonal to *why* we re-encode). See detect_interlaced.
+    if detect_interlaced(info):
+        return SplitPlan("reencode",
+                         "interlaced source (e.g. MiniDV/DV 576i): deinterlace + "
+                         "forced keyframes",
+                         segment_seconds, info.fps, deinterlace=True)
     if force_reencode:
         return SplitPlan("reencode", "caller forced re-encode",
                          segment_seconds, info.fps)
@@ -563,13 +652,18 @@ def split(info: VideoInfo, plan: SplitPlan, out_dir, segment_ext=SEGMENT_EXT):
     if plan.mode == "reencode":
         codec, enc_args, _hw = pick_encoder()
         fps = plan.fps if plan.fps and plan.fps > 0 else Fraction(30)
+        args += ["-vsync", "cfr", "-r", f"{fps.numerator}/{fps.denominator}"]
+        if plan.deinterlace:
+            # bwdif=mode=0: one progressive frame per input frame, so the frame count
+            # (and thus audio sync) is preserved; mode=1 would double the rate. Runs
+            # before the format/encoder so NVENC sees progressive input.
+            args += ["-vf", "bwdif=mode=0"]
         # Normalize to yuv420p: NVENC rejects 4:2:2 (measured: a yuvj422p mjpeg
         # source 400s hevc_nvenc with "YUV422P not supported"), and yuv420p is the
         # universally-accepted delivery format for x264/x265/nvenc. Acceptable
         # because this re-encode is only an intermediate (its output is upscaled
         # downstream by a detail-hallucinating model), never the deliverable.
-        args += ["-vsync", "cfr", "-r", f"{fps.numerator}/{fps.denominator}",
-                 "-c:v", codec, *enc_args, "-pix_fmt", "yuv420p",
+        args += ["-c:v", codec, *enc_args, "-pix_fmt", "yuv420p",
                  "-force_key_frames", f"expr:gte(t,n_forced*{seg})"]
     else:
         args += ["-c", "copy"]
@@ -630,7 +724,12 @@ def extract_clip(info: VideoInfo, start, end, out_path, log=None):
     args = [ffmpeg, "-hide_banner", "-y",
             "-ss", f"{left:.3f}", "-i", info.path,
             "-ss", f"{pad:.3f}", "-t", f"{end - start:.3f}",
-            "-map", "0:v:0", "-c:v", codec, *enc_args, "-pix_fmt", "yuv420p"]
+            "-map", "0:v:0"]
+    # Deinterlace an interlaced source here too (same reason as split): a clip cut from
+    # MiniDV 576i must go to the pod progressive, or it upscales combed / comes back black.
+    if detect_interlaced(info):
+        args += ["-vf", "bwdif=mode=0"]
+    args += ["-c:v", codec, *enc_args, "-pix_fmt", "yuv420p"]
     if info.has_audio:
         # Optional audio stream (`0:a:0?`): some clips of a source may lose audio if
         # the range falls outside an odd audio track, and `?` keeps that non-fatal.

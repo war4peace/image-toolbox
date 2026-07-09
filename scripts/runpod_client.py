@@ -513,9 +513,12 @@ def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
     """
     gpu_chain = list(spec.get("gpuTypeIds") or [None])
     last_err = None
+    attempts_made = 0                  # real count across the chain (may be < attempts:
+                                       # a capacity error breaks a GPU's retries early)
     for gpu in gpu_chain:
         gspec = spec if gpu is None else {**spec, "gpuTypeIds": [gpu]}
         for attempt in range(1, attempts + 1):
+            attempts_made += 1
             try:
                 # GraphQL deploy (not REST create): accepts the full GPU catalog,
                 # so a card from the live picker never 400s at create time.
@@ -547,10 +550,15 @@ def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
                 # Tear the bad pod down before trying again (don't leave it billing).
                 ensure_stopped(api_key, pod_id, terminate=True)
     if on_event:
-        on_event("giveup", attempts, None, last_err)
-    raise RunPodError(
-        f"Pod failed to deploy on any of {gpu_chain} after {attempts} attempt(s) "
-        f"each. Last error: {last_err}")
+        on_event("giveup", attempts_made, None, last_err)
+    tries = f"{attempts_made} attempt" + ("" if attempts_made == 1 else "s")
+    if len(gpu_chain) == 1:
+        # No GPU-type substitution (0.4.0): a run uses only the picked card, so report
+        # it plainly instead of the multi-card "on any of [...] N attempts each" wording.
+        where = f"on {gpu_chain[0]} ({tries})"
+    else:
+        where = f"on any of {gpu_chain} ({tries} total)"
+    raise RunPodError(f"Pod failed to deploy {where}. Last error: {last_err}")
 
 
 def volume_region(api_key, vol_id, timeout=30):

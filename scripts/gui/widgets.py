@@ -18,6 +18,10 @@ from tkinter import ttk
 
 from gui.common import _geometry_on_screen, save_settings, PROGRESS_RE
 
+# The per-minute video heartbeat ("... Processing: 4482/4874 frames ..."). Optionally
+# collapsed to a single refreshing line in the log window (LogPane.set_collapse).
+COLLAPSE_PROCESSING_RE = re.compile(r"Processing:\s+\d+/\d+\s+frames")
+
 
 # ─────────────────────────────────────────────
 #  TOOLTIP
@@ -294,6 +298,13 @@ class LogPane(ttk.Frame):
         # True when the next real token starts a fresh line (so a timestamp is
         # due). Tracked across chunks; a \r-overwrite restarts the line too.
         self._at_line_start = True
+        # Optional "collapse a run of matching lines to just the latest" (e.g. the
+        # per-minute "Processing:" heartbeat): when the line just completed matches
+        # AND the one before it also matched, the earlier one is deleted so only the
+        # newest stays. Display-only (the on-disk log + ConsoleBuffer keep every line).
+        self._collapse = False
+        self._collapse_re = None
+        self._prev_collapsible = False
 
     def feed(self, data, stamp=True):
         """Render a chunk. `stamp=True` prefixes a '[HH:MM:SS]' to each new line
@@ -310,6 +321,7 @@ class LogPane(ttk.Frame):
             if token == "\n":
                 self._pending_cr = False
                 self._at_line_start = True
+                self._collapse_completed_line(t)   # may drop the previous heartbeat
                 t.insert("end", "\n")
             elif token == "\r":
                 self._pending_cr = True
@@ -329,12 +341,59 @@ class LogPane(ttk.Frame):
             t.see("end")
         t.configure(state="disabled")
 
+    def set_collapse(self, enabled, pattern=None):
+        """Enable/disable collapsing a run of matching lines to just the latest.
+        `pattern` is a compiled regex tested against each completed line. Forward
+        -looking: it only affects lines drawn after it is set (re-feed the backlog
+        to collapse existing content)."""
+        self._collapse = bool(enabled)
+        if pattern is not None:
+            self._collapse_re = pattern
+        self._prev_collapsible = False
+
+    def _collapse_completed_line(self, t):
+        """Called when the line at 'end' is about to be terminated by a newline. If
+        collapsing is on and both this line and the one before it match the pattern,
+        delete the earlier line so only the newest of the run remains."""
+        if not self._collapse or self._collapse_re is None:
+            self._prev_collapsible = False
+            return
+        line_text = t.get("end-1c linestart", "end-1c")
+        matches = bool(self._collapse_re.search(line_text))
+        if matches and self._prev_collapsible:
+            cur_start = t.index("end-1c linestart")
+            if not cur_start.startswith("1."):          # there IS a previous line
+                prev_start = t.index(f"{cur_start} -1c linestart")
+                t.delete(prev_start, cur_start)          # removes "prev line\n"
+        self._prev_collapsible = matches
+
+    def flush_collapse(self):
+        """Collapse a trailing run whose final line has no terminating newline yet
+        (the case after re-feeding a backlog, which ends mid-line). The live path needs
+        no flush since every heartbeat arrives newline-terminated. Safe to call anytime."""
+        if not self._collapse or self._collapse_re is None:
+            return
+        t = self.text
+        t.configure(state="normal")
+        while True:
+            last = t.get("end-1c linestart", "end-1c")
+            cur_start = t.index("end-1c linestart")
+            if cur_start.startswith("1.") or not self._collapse_re.search(last):
+                break
+            prev_start = t.index(f"{cur_start} -1c linestart")
+            prev = t.get(prev_start, f"{cur_start} -1c")
+            if not self._collapse_re.search(prev):
+                break
+            t.delete(prev_start, cur_start)             # drop the earlier of the run
+        t.configure(state="disabled")
+
     def clear(self):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
         self._pending_cr    = False
         self._at_line_start = True
+        self._prev_collapsible = False
 
 
 # ─────────────────────────────────────────────
@@ -456,8 +515,8 @@ class LogViewer(tk.Toplevel):
         self.title(title)
         self._app = app
         geo = app.settings.get("log_geometry") if app is not None else None
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "860x520")
-        self.minsize(480, 280)
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "900x520")
+        self.minsize(900, 280)
         self._console = console
 
         top = ttk.Frame(self, padding=(8, 6))
@@ -465,6 +524,15 @@ class LogViewer(tk.Toplevel):
         self.autoscroll = tk.BooleanVar(value=True)
         ttk.Checkbutton(top, text="Auto-scroll to newest entries",
                         variable=self.autoscroll).pack(side="left")
+        collapse_on = bool(app.settings.get("log_collapse_processing", True)) \
+            if app is not None else True
+        self.collapse = tk.BooleanVar(value=collapse_on)
+        cb = ttk.Checkbutton(top, text="Collapse repeating progress lines",
+                             variable=self.collapse, command=self._on_collapse_toggle)
+        cb.pack(side="left", padx=(16, 0))
+        Tooltip(cb, "Show only the latest of the per-minute \"Processing:\" heartbeat "
+                    "lines instead of one every minute. The full history is always kept "
+                    "in the on-disk log file.")
         ttk.Label(top, text="Program output (no engine diagnostics)",
                   foreground="#666").pack(side="right")
 
@@ -473,10 +541,24 @@ class LogViewer(tk.Toplevel):
         self.pane = LogPane(body)
         self.pane.pack(fill="both", expand=True)
 
+        self.pane.set_collapse(self.collapse.get(), COLLAPSE_PROCESSING_RE)
         self.pane.feed(console.text_timestamped(), stamp=False)
+        self.pane.flush_collapse()
         self.pane.text.see("end")
         console.add_observer(self._on_console)
         self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _on_collapse_toggle(self):
+        """Apply the collapse toggle and persist it. Re-render the current backlog so
+        the change is retroactive (collapsing an existing run, or re-expanding it)."""
+        self.pane.set_collapse(self.collapse.get(), COLLAPSE_PROCESSING_RE)
+        self.pane.clear()
+        self.pane.feed(self._console.text_timestamped(), stamp=False)
+        self.pane.flush_collapse()
+        self.pane.text.see("end")
+        if self._app is not None:
+            self._app.settings["log_collapse_processing"] = bool(self.collapse.get())
+            save_settings(self._app.settings)
 
     def bind_console(self, console, title=None):
         """Point this window at a different tab's output stream, redrawing its
@@ -489,6 +571,7 @@ class LogViewer(tk.Toplevel):
         self._console = console
         self.pane.clear()
         self.pane.feed(console.text_timestamped(), stamp=False)
+        self.pane.flush_collapse()
         self.pane.text.see("end")
         console.add_observer(self._on_console)
 

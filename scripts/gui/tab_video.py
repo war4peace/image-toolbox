@@ -451,9 +451,13 @@ class VideoTab(ttk.Frame):
         sf.columnconfigure(0, weight=1)
 
         # Filter bar: narrow the list by folder path, resolution, duration bucket or
-        # FPS. Each combo is fed the DISTINCT values actually present after a scan (plus
-        # "All"); changing any re-applies the combined (AND) filter by detaching the
-        # non-matching rows. See _populate_scan_filters / _apply_scan_filters.
+        # FPS. The combos CASCADE (faceted): each is fed only the DISTINCT values that
+        # remain reachable given the OTHER active filters (plus "All"), so no
+        # zero-result combination can be picked — selecting FPS 60 shrinks the
+        # Resolution list to the resolutions that 60 fps videos actually have. A stale
+        # selection that the other filters just excluded snaps back to "All". Changing
+        # any re-applies the combined (AND) filter by detaching the non-matching rows.
+        # See _refresh_filter_options / _populate_scan_filters / _apply_scan_filters.
         filt = ttk.Frame(sf)
         filt.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         ttk.Label(filt, text="Filter:").pack(side="left")
@@ -470,7 +474,7 @@ class VideoTab(ttk.Frame):
             cb = ttk.Combobox(filt, textvariable=var, state="readonly",
                               width=width, values=["All"])
             cb.pack(side="left")
-            cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_scan_filters())
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._on_scan_filter_change())
             self._filter_combos[label] = cb
         ttk.Button(filt, text="Reset", width=6,
                    command=self._reset_scan_filters).pack(side="left", padx=(10, 0))
@@ -758,7 +762,10 @@ class VideoTab(ttk.Frame):
             if removed:
                 self._scan_q.put(("reconciled", removed))
             files = []
-            for abs_path, rel in bv.iter_videos(self._src_root):
+            # Prune the output tree: when "Save upscaled to" lives inside the source
+            # folder (the default <source>/__upscaled__), the walk must NOT re-read the
+            # finished upscales as if they were new source videos.
+            for abs_path, rel in bv.iter_videos(self._src_root, skip_roots=[self._out_root]):
                 if seq != self._scan_seq:
                     return
                 files.append((abs_path, rel))
@@ -958,28 +965,80 @@ class VideoTab(ttk.Frame):
         """The FPS-filter value for a probed fps (2 decimals; None if unknown)."""
         return f"{fps:.2f}" if fps else None
 
-    def _populate_scan_filters(self):
-        """Fill the filter combos with the DISTINCT values present in the current scan
-        (each list prefixed with 'All'). Called at scan end. Duration is fed only the
-        buckets that actually occur, in canonical order."""
+    def _scan_filter_vars(self):
+        """label -> StringVar for the four Eligible-videos filters, in bar order."""
+        return {"Path": self.filter_path_var, "Resolution": self.filter_res_var,
+                "Duration": self.filter_dur_var, "FPS": self.filter_fps_var}
+
+    def _row_facet(self, row, label):
+        """The value `row` contributes to the `label` filter (None if unknown)."""
+        r = row.get("r") or {}
+        if label == "Path":
+            return os.path.dirname(row["rel"]) or "(root)"
+        if label == "Resolution":
+            return f"{r['width']}x{r['height']}" if r.get("width") else None
+        if label == "Duration":
+            return self._dur_bucket(r.get("duration"))
+        if label == "FPS":
+            return self._fps_label(r.get("fps"))
+        return None
+
+    def _sort_facet(self, label, values):
+        """Order a facet's distinct values the way its combo should present them."""
+        vals = [v for v in values if v is not None]
+        if label == "Resolution":
+            return sorted(vals, key=lambda s: [int(x) for x in s.split("x")])
+        if label == "Duration":
+            return [lbl for lbl, _hi in self._DUR_BUCKETS if lbl in vals]
+        if label == "FPS":
+            return sorted(vals, key=float)
+        return sorted(vals, key=str.lower)
+
+    def _row_matches_except(self, row, skip):
+        """True if `row` satisfies every active filter other than `skip`'s. Used to
+        compute the values still reachable in the `skip` combo (faceted narrowing)."""
+        for label, var in self._scan_filter_vars().items():
+            if label == skip:
+                continue
+            val = var.get()
+            if val and val != "All" and self._row_facet(row, label) != val:
+                return False
+        return True
+
+    def _refresh_filter_options(self):
+        """Repopulate every filter combo with only the values still reachable given the
+        OTHER active filters, so a zero-result combination can't be selected. A current
+        selection the other filters just excluded is snapped back to 'All'. Iterated to a
+        fixed point because such a reset can widen what the remaining combos may offer."""
         rows = list(self._scan_rows.values())
-        paths = sorted({(os.path.dirname(row["rel"]) or "(root)") for row in rows},
-                       key=str.lower)
-        res = sorted({f"{row['r']['width']}x{row['r']['height']}"
-                      for row in rows if row["r"].get("width")},
-                     key=lambda s: [int(x) for x in s.split("x")])
-        durs = [lbl for lbl, _hi in self._DUR_BUCKETS
-                if any(self._dur_bucket(row["r"].get("duration")) == lbl for row in rows)]
-        fpss = sorted({self._fps_label(row["r"].get("fps")) for row in rows
-                       if self._fps_label(row["r"].get("fps"))}, key=float)
-        for label, values in (("Path", paths), ("Resolution", res),
-                              ("Duration", durs), ("FPS", fpss)):
-            self._filter_combos[label].configure(values=["All"] + list(values))
+        vars_ = self._scan_filter_vars()
+        for _ in range(len(vars_)):
+            changed = False
+            for label, var in vars_.items():
+                reachable = {self._row_facet(row, label) for row in rows
+                             if self._row_matches_except(row, label)}
+                ordered = self._sort_facet(label, reachable)
+                self._filter_combos[label].configure(values=["All"] + ordered)
+                if var.get() != "All" and var.get() not in ordered:
+                    var.set("All")
+                    changed = True
+            if not changed:
+                break
+
+    # Called at scan end; the initial fill (all filters at 'All') is just the full
+    # distinct set of each facet, which _refresh_filter_options computes.
+    _populate_scan_filters = _refresh_filter_options
+
+    def _on_scan_filter_change(self):
+        """A combo changed: recompute the reachable option lists, then re-apply."""
+        self._refresh_filter_options()
+        self._apply_scan_filters()
 
     def _reset_scan_filters(self, apply=True):
-        """Set every filter back to 'All' (keeps the populated value lists). The Reset
-        button (apply=True) also re-shows all rows; a new scan calls it with apply=False,
-        which additionally empties the stale value lists (repopulated at scan end)."""
+        """Set every filter back to 'All'. The Reset button (apply=True) repopulates the
+        combos to their full reachable lists and re-shows all rows; a new scan calls it
+        with apply=False, which additionally empties the stale value lists (repopulated
+        at scan end)."""
         for var in (self.filter_path_var, self.filter_res_var,
                     self.filter_dur_var, self.filter_fps_var):
             var.set("All")
@@ -987,6 +1046,7 @@ class VideoTab(ttk.Frame):
             for cb in self._filter_combos.values():
                 cb.configure(values=["All"])
         if apply:
+            self._refresh_filter_options()
             self._apply_scan_filters()
 
     def _apply_scan_filters(self):

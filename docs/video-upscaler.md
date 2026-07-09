@@ -195,6 +195,35 @@ when keyframes are **extremely sparse** does the re-encode fallback kick in.
   re-encode only when forced. The re-encode runs **locally** with the encoder chosen
   per 6.4 (nvenc if available, else CPU).
 
+### 6.1a Interlaced sources must be deinterlaced (MEASURED 2026-07-09, black-output bug)
+
+**Symptom:** the same VC-1/WMV `.wmv` (a JVC MiniDV camcorder, 720x576) upscaled to a
+**completely black, audio-only** deliverable. ~2 hours and real pod money for garbage,
+with nothing in the pipeline noticing.
+
+**Root cause:** the source is **interlaced 576i** (BFF). The container reports
+`field_order=unknown` (ASF hides it), so only `ffmpeg idet` on the pixels reveals it
+(all frames BFF). The split's forced-keyframe re-encode used `hevc_nvenc`, and **NVENC
+has no interlaced-HEVC encode path** — fed interlaced-flagged frames it emitted black
+(and even where it survives, an interlaced intermediate upscales combed and can decode
+to black in the pod's OpenCV). Interlaced fields are also simply wrong input for a model
+trained on progressive frames.
+
+**Fix (two layers):**
+- **Deinterlace at the source of the problem.** `detect_interlaced(info)` trusts a
+  definitive `field_order` and otherwise runs `idet` over a bounded sample; when true,
+  `plan_split` forces a re-encode with `deinterlace=True` and `split()` inserts
+  `bwdif=mode=0` (one progressive frame per input frame, so the frame count and audio
+  sync are preserved). Output is genuinely `progressive`, NVENC encodes it fine, and the
+  segment is non-black. The clip extractor (`extract_clip`, 16.7) deinterlaces the same
+  way. Detection is fail-safe (any error -> treat as progressive, never falsely
+  re-encode).
+- **Guard against paying for black anyway.** After the split, the runner samples the
+  first segment's mean luma vs the **source's** (`mean_luma_head` + `is_black_reencode`):
+  a bright source whose first segment came back black aborts that video **before** it is
+  streamed to the pod. The relative test means a legitimately dark / fade-from-black clip
+  never false-trips. All covered by `tests/test_video_pipeline.py`.
+
 ### 6.2 Segment edges: fixed seed per video (v1), revisit only if visible
 
 **Decision:** start with a **single fixed seed for the whole source video** (not
@@ -625,6 +654,10 @@ dead-man's-switch limits, SSH) is reused unchanged. Draft keys:
 ```jsonc
 "video": {
     "target": "1080p",              // 1080p | 1440p | 4K (own target, not upscale's)
+    "output_subdir": "__upscaled__",// mirror of the source tree for outputs
+    "work_root": "",                // "" = local {app}/.imgtbx_video staging (0.4.8);
+                                    //   set a path to stage segments elsewhere (keep
+                                    //   it OFF the network output drive + outside src)
     "skip_cutoff_pct": 0,           // same meaning as upscale's skip-cutoff
     "segment_seconds": 60,          // nominal segment length
     "max_segment_seconds": 120,     // sparse-keyframe re-encode trigger (6.1)
@@ -758,6 +791,39 @@ numbering is kept so `section 14`/`section 15` references elsewhere stay valid.)
 - **nvenc availability is checked at runtime:** NVIDIA GPU/driver present **and**
   `ffmpeg -hide_banner -encoders` lists `h264_nvenc`/`hevc_nvenc`; else the CPU
   libx265/libx264 fallback (6.4).
+- **Staging is LOCAL by default, so a network output drive can't strand a run
+  (0.4.8).** Per-video segments (input split, fetched upscaled segments, the virtual
+  clip extraction, and the segment-level resume state) are staged under
+  `_work_dirs(out_video, vcfg["work_root"])`. `work_root` defaults to a folder on the
+  **app drive** (`_default_work_base()` = `{app}/.imgtbx_video`), **not** beside the
+  (possibly network) output. Rationale: the only steps that truly need the source/output
+  drive are the **first read** of the source (at split) and the **final write** of the
+  assembled file. Everything between (upload to pod, the multi-hour GPU compute, fetch,
+  concat/mux) runs off local disk, so a mid-run SMB blip on the output share no longer
+  fails the segment or corrupts resume. The per-video dir is keyed by a stable hash of
+  the absolute output path (so a later run's segment resume finds the same folder, and
+  two sources sharing a basename never collide) and is removed on completion. The final
+  mp4 was already assembled on a local `mkdtemp` and then `shutil.move`d across (an SMB
+  share can leave the seek-back `moov` atom unwritten -> an unplayable file); local
+  staging extends that safety to the whole per-segment lifecycle. Overridable in Settings
+  -> Video -> "Work folder (staging)" (empty = the local default); a custom path should
+  live **outside** the source tree or the scanner could re-read its own `.mp4` segments
+  (the walk only skips dirs literally named `.imgtbx_video`).
+- **Guards on a custom staging folder (0.4.8).** Two layers, since the field lives in
+  Settings but the real source is chosen per-run on the Video tab:
+  - **Run-time (authoritative, hard):** `run_queue` calls `work_root_conflict(work_root,
+    source_root)` before renting any pod and **refuses the run** with a clear message if
+    the staging folder is inside the scanned source tree (this also covers an
+    `__upscaled__` output subfolder under the source) or is a parent of it. Pure path
+    math (`_path_within`, normcase); an empty `work_root` (the local default) always
+    passes.
+  - **Settings-time (best-effort, warn-not-block):** picking or typing the folder warns
+    (yes/no confirm) if it sits inside the configured default video **source** or
+    **output** folder, or if `is_network_path` flags it as a **network location** (UNC or
+    a mapped remote drive via `GetDriveTypeW == DRIVE_REMOTE`) - staging on the network
+    reintroduces the very stall/strand risk local staging removes. Network is a warning
+    not a block (a user may deliberately have a fast NAS scratch); the inside-source case
+    is caught for real at run time regardless of how `work_root` was set.
 
 ## 14. As built: `scripts/video_pipeline.py` (local container pipeline)
 
@@ -934,6 +1000,16 @@ as the other tools); it adds no pipeline logic.
    tear the pod down). Resume is automatic next Start (the queue is DB-backed).
 
 ### 15.4 Scanning: two tiers
+
+**The scan excludes the output tree (0.4.8 bugfix).** `iter_videos`/`walk_videos` prune
+both the `.imgtbx_video` work dir **and** the run's output root (passed as `skip_roots`
+from the GUI's "Save upscaled to" / the runner's `output_root`). When the output lives
+inside the source folder (the default `<source>/__upscaled__`), the walk would otherwise
+re-read finished upscales as if they were fresh source videos: they showed up in the
+Eligible list (still eligible for a *higher* target than they were made at) with empty
+"upscaled"/"Up res" columns, since an output has no further upscaled counterpart. Pruning
+by absolute path handles a renamed `output_subdir` and an output root at any depth; an
+output root *outside* the source tree is simply never walked.
 
 - **Fast scan (every file, on folder open):** `ffprobe` stream metadata only
   (resolution, codec, framerate, duration, HEADER frame count). No demux, no decode,
@@ -1213,10 +1289,11 @@ clamped below the batch on the pod.
 
 ### 15.9 Settings additions (Settings -> Video)
 
-`confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`), the
-deliverable codec/quality (opencv mpeg4 vs ffmpeg h264/h265), plus the existing
-`video` knobs (section 9). Region/DC + GPU pickers and the price ceilings are reused
-from Remote (#1).
+`confirm_before_rent` (default true), `output_subdir` (default `__upscaled__`),
+**`work_root`** ("Work folder (staging)", empty = the local `{app}/.imgtbx_video`
+default; Browse button; see section 13's local-staging note), the deliverable
+codec/quality (opencv mpeg4 vs ffmpeg h264/h265), plus the existing `video` knobs
+(section 9). Region/DC + GPU pickers and the price ceilings are reused from Remote (#1).
 
 ### 15.10 Deferred to v2 (documented, not built)
 
@@ -1270,8 +1347,17 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > (0xc0000005 in an "unknown"/injected module) at a random point during playback,
 > even with the software vout. Confirmed by a user: closing RTSS/Afterburner made the
 > player rock-solid. Uncatchable from Python, so `gui.video_player.warn_overlay_once`
-> DETECTS the injected hook (`GetModuleHandleW`) and warns once with the fix (close it,
-> or set its per-app detection level to None); the frames window is unaffected.
+> DETECTS the injected hook (`GetModuleHandleW`) and warns once with the fix; the frames
+> window is unaffected.
+>
+> **The recommended fix (no need to close RTSS):** add an RTSS *application profile* for
+> **`pythonw.exe`** and set its **Application detection level = None** (older RTSS builds:
+> tick "Stealth mode" / on-screen display Off for that profile). That excludes the app
+> from hook injection while leaving your games overlaid. RTSS matches its profiles by
+> executable **name**, not full path (a user confirmed it collapses two different-pathed
+> `pythonw.exe` entries into one), so a single `pythonw.exe` profile covers the app no
+> matter where it is installed (`{app}\.venv\Scripts\pythonw.exe`) or which Python
+> launched it. `warn_overlay_once` names this fix in its one-time warning.
 >
 > **Two SEPARATE comparison windows (not one dual-mode window).** Playing side-by-side
 > then swapping to a full-frame wipe on pause was jarring (the layout jumped), so the

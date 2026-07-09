@@ -329,9 +329,14 @@ class RemoteSession:
                 self.pod_id = pod_id
                 self._emit(f"Pod {pod_id} created on {info} (attempt {attempt}); waiting for deploy …")
             elif kind == "bad":
-                self._emit(f"Pod start failed ({info}); trying the next option …")
-            elif kind == "giveup":
-                self._emit(f"Gave up creating a pod: {info}")
+                # No "trying the next option": a capacity error stops here (an
+                # upscale/video run uses only the picked card, 0.4.0), and even where a
+                # retry does follow (deploy timeout, or tag mode's fallback chain) the
+                # next "Pod … created" line shows it — so we never promise a retry that
+                # won't happen.
+                self._emit(f"Pod start failed ({info}).")
+            # "giveup" is intentionally not surfaced here: main() prints one clean
+            # "Run failed: …" line with the same cause, so a second line is just noise.
 
         pod = rp.create_pod_resilient(self.api_key, spec, attempts=3,
                                       deploy_timeout=240, poll=8, on_event=ev)

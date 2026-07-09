@@ -338,6 +338,22 @@ class SettingsTab(ttk.Frame):
         self.video_outsub_var = tk.StringVar(value=vid.get("output_subdir", "__upscaled__"))
         ttk.Entry(sec, textvariable=self.video_outsub_var, width=20).grid(
             row=1, column=1, sticky="w", padx=6, pady=3)
+        ttk.Label(sec, text="Work folder (staging):").grid(row=11, column=0, sticky="w", pady=3)
+        self.video_workroot_var = tk.StringVar(value=vid.get("work_root", ""))
+        wr = ttk.Frame(sec)
+        wr.grid(row=11, column=1, sticky="ew", padx=6, pady=3)
+        wr.columnconfigure(0, weight=1)
+        wr_entry = ttk.Entry(wr, textvariable=self.video_workroot_var)
+        wr_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(wr, text="Browse", width=8,
+                   command=self._pick_video_workroot).grid(row=0, column=1, padx=(6, 0))
+        Tooltip(wr_entry,
+                "Where segments are staged during a run. Leave EMPTY to use a fast "
+                "local folder on the app drive (recommended). Staging locally means a "
+                "network hiccup on the OUTPUT drive can't strand a run in progress: only "
+                "the first read of the source and the final write of the output touch "
+                "the network. If you set a custom path, keep it OUTSIDE your source "
+                "folder or the scanner may re-read its own segments.")
         ttk.Label(sec, text="Output quality:").grid(row=2, column=0, sticky="w", pady=3)
         self.video_codec_var = tk.StringVar(value=self._video_codec_label(vid))
         ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
@@ -754,6 +770,43 @@ class SettingsTab(ttk.Frame):
         if folder:
             var.set(os.path.normpath(folder))
 
+    def _pick_video_workroot(self):
+        """Browse for the video staging folder, warning (but not blocking) if the pick
+        is a poor one. The authoritative check against the ACTUAL run source is the
+        run-time guard in batch_video_upscale; this is early, best-effort feedback."""
+        folder = filedialog.askdirectory(title="Choose a staging work folder")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        warn = self._video_workroot_warning(folder)
+        if warn and not messagebox.askyesno(APP_TITLE, warn + "\n\nUse this folder anyway?"):
+            return
+        self.video_workroot_var.set(folder)
+
+    def _video_workroot_warning(self, path):
+        """A human warning if `path` is a poor staging choice (a network location, or
+        inside the configured default video source/output folder), else None. Checked
+        against the DEFAULT folders since the real run source is chosen per-run on the
+        Video tab; batch_video_upscale.work_root_conflict is the hard run-time guard."""
+        if not path:
+            return None
+        import batch_video_upscale as bv
+        src = self.default_vsrc_var.get().strip()
+        out = self.default_vout_var.get().strip()
+        sub = self.video_outsub_var.get().strip() or "__upscaled__"
+        if src and (bv._path_within(path, src) or bv._path_within(path, os.path.join(src, sub))):
+            return ("That folder is inside your default video SOURCE folder. The scanner "
+                    "would try to re-read the run's own segments as new videos. Pick a "
+                    "folder outside the source tree.")
+        if out and bv._path_within(path, out):
+            return ("That folder is inside your default video OUTPUT folder. Staging there "
+                    "mixes work files in with your results; a separate folder is cleaner.")
+        if bv.is_network_path(path):
+            return ("That folder is on a network drive. Local staging exists precisely so a "
+                    "network hiccup can't stall or strand a run: staging on the network "
+                    "reintroduces that risk. A folder on a local disk is strongly recommended.")
+        return None
+
     def load_defaults(self):
         """Refresh the default-folder fields from config (called when a tab's
         Save-as-Default button updates them, so both views stay in sync)."""
@@ -803,6 +856,7 @@ class SettingsTab(ttk.Frame):
         return {
             "target":              self.video_target_var.get(),
             "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
+            "work_root":           self.video_workroot_var.get().strip(),
             "video_backend":       backend,
             "use_10bit":           ten,
             "dit_model":           model,
@@ -924,6 +978,15 @@ class SettingsTab(ttk.Frame):
                 APP_TITLE, "These fields need a whole number:\n  • " + "\n  • ".join(errors))
             return False
 
+        # A poor staging folder (network / inside the source tree) is allowed but warned
+        # once, only when the value actually changed (so re-saving other settings doesn't
+        # re-prompt). Also catches a hand-typed path the Browse dialog never validated.
+        wr = self.video_workroot_var.get().strip()
+        if wr != (CFG.get("video", {}) or {}).get("work_root", ""):
+            warn = self._video_workroot_warning(wr)
+            if warn and not messagebox.askyesno(APP_TITLE, warn + "\n\nSave this setting anyway?"):
+                return False
+
         for name, values in sections.items():
             target = CFG.setdefault(name, {})
             if name == "mqtt":
@@ -1006,6 +1069,7 @@ class SettingsTab(ttk.Frame):
         vid = CFG.get("video", {})
         self.video_target_var.set(vid.get("target", "1080p"))
         self.video_outsub_var.set(vid.get("output_subdir", "__upscaled__"))
+        self.video_workroot_var.set(vid.get("work_root", ""))
         self.video_codec_var.set(self._video_codec_label(vid))
         self.video_model_var.set(self._video_model_label(vid))
         _vbs = int(vid.get("batch_size", 0) or 0)

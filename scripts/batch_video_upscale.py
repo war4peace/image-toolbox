@@ -79,6 +79,14 @@ AUTO_TEMPORAL_OVERLAP = -1
 
 WORK_DIRNAME = ".imgtbx_video"        # per-output-tree work area for segments
 
+
+def _default_work_base():
+    """Default LOCAL staging base: <app>/.imgtbx_video. Local (not beside the
+    possibly-network OUTPUT) so a dropped share mid-run can't strand in-progress
+    segments; only the source read (at split) and the final output write ever touch
+    the network. Overridable via the `video.work_root` setting."""
+    return os.path.join(APP_ROOT, WORK_DIRNAME)
+
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common (0.4.3
 # item 5). Re-export them here exactly as the other three runners do, instead of
 # keeping private copies that could drift from the shared marker/atomic-write rule
@@ -132,6 +140,19 @@ def log(msg):
     the on-disk log reconstructs timing on its own."""
     sys.stdout.write(f"{msg}\n")
     sys.stdout.flush()
+    if _LOG_FH is not None:
+        try:
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+            _LOG_FH.write(f"{stamp} | {msg}\n")
+        except Exception:                          # noqa: BLE001
+            pass
+
+
+def log_file_only(msg):
+    """Write ONLY to logs/video_<hash>.log, never to stdout (the GUI terminal / console).
+    For developer detail that a non-technical user shouldn't see in the log pane — chiefly
+    a Python traceback: the terminal gets the clean 'Run failed: …' one-liner, while the
+    full trace is preserved on disk for troubleshooting."""
     if _LOG_FH is not None:
         try:
             stamp = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
@@ -224,6 +245,12 @@ def resolve_video_cfg(cfg, overrides=None):
     out = {
         "target":              v.get("target", "1080p"),
         "output_subdir":       v.get("output_subdir", "__upscaled__"),
+        # Local scratch base for per-segment staging (0.4.8). Empty = a folder on the
+        # app drive (_default_work_base). Staging locally keeps the multi-hour pod
+        # compute + fetch off the (possibly network) output drive, so a mid-run share
+        # drop can't strand segments. Keep it OUTSIDE the source tree (the default is)
+        # or the walk could rescan its own .mp4 intermediates.
+        "work_root":           (str(v.get("work_root") or "").strip() or _default_work_base()),
         "skip_cutoff_pct":     float(v.get("skip_cutoff_pct", 0) or 0),
         "segment_seconds":     float(v.get("segment_seconds", 60) or 60),
         "max_segment_seconds": float(v.get("max_segment_seconds", 120) or 120),
@@ -287,6 +314,7 @@ def log_video_settings(vcfg):
     log(f"    backend {vcfg['video_backend']}, "
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'}, "
         f"output subdir '{vcfg['output_subdir']}'")
+    log(f"    staging '{vcfg.get('work_root') or '(beside output)'}'")
     noise = float(vcfg.get("input_noise_scale", 0.0) or 0.0)
     log(f"    model {vcfg.get('dit_model', 'seedvr2_ema_7b_fp16.safetensors')}")
     log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
@@ -353,25 +381,46 @@ class RunBudget:
 #  WALK + SPLIT helpers
 # ─────────────────────────────────────────────
 
-def iter_videos(src_root):
+def iter_videos(src_root, skip_roots=None):
     """Yield (abs_path, rel_path) for every video under src_root **as they are
     discovered**, skipping the work area. Unsorted (discovery order): walking a
     large tree on a network drive can take many seconds, so a caller that wants
     live feedback iterates this and counts/streams while the walk is still
     running, then sorts the collected list itself. `walk_videos` is the sorted,
-    fully-materialised convenience wrapper used by the headless runner."""
+    fully-materialised convenience wrapper used by the headless runner.
+
+    `skip_roots` prunes whole subtrees by absolute path (in addition to the always
+    -pruned `.imgtbx_video` work dir). The caller passes the OUTPUT root here: when
+    it lives inside the source tree (the default `<source>/__upscaled__`), the walk
+    would otherwise re-read finished upscales as if they were fresh source videos.
+    A skip_root outside src_root is simply never encountered (harmless)."""
+    skip = set()
+    for r in (skip_roots or ()):
+        if r:
+            try:
+                skip.add(os.path.normcase(os.path.abspath(r)))
+            except Exception:                            # noqa: BLE001
+                pass
     for dirpath, dirnames, filenames in os.walk(src_root):
-        dirnames[:] = [d for d in dirnames if d != WORK_DIRNAME]
+        keep = []
+        for d in dirnames:
+            if d == WORK_DIRNAME:
+                continue
+            if skip and os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) in skip:
+                continue                                 # the output subtree, don't rescan it
+            keep.append(d)
+        dirnames[:] = keep
         for name in filenames:
             if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
                 ap = os.path.join(dirpath, name)
                 yield ap, os.path.relpath(ap, src_root)
 
 
-def walk_videos(src_root):
-    """All videos under src_root as a sorted (abs_path, rel_path) list, skipping
-    the work area so a re-run never tries to upscale its own intermediates."""
-    out = list(iter_videos(src_root))
+def walk_videos(src_root, skip_roots=None):
+    """All videos under src_root as a sorted (abs_path, rel_path) list, skipping the
+    work area (and any `skip_roots`, e.g. the output tree) so a re-run never tries to
+    upscale its own intermediates or its own finished outputs."""
+    out = list(iter_videos(src_root, skip_roots=skip_roots))
     out.sort(key=lambda t: t[1].lower())
     return out
 
@@ -446,12 +495,77 @@ class PassthroughVideoEngine:
 #  PER-VIDEO PROCESSING
 # ─────────────────────────────────────────────
 
-def _work_dirs(out_video):
-    """Per-video work area beside the output: <out_dir>/.imgtbx_video/<base>/
-    {in,up}. Survives between runs (segment-level resume); removed on completion."""
+def _work_dirs(out_video, work_base=None):
+    """Per-video staging area (input + upscaled segments + clip extraction + resume
+    state), returned as (in_dir, up_dir, work_root).
+
+    With `work_base` given (the resolved vcfg["work_root"], a LOCAL disk by default)
+    the dir is <work_base>/<name>_<hash>, keyed by a stable hash of the ABSOLUTE
+    output path so a later run's segment-level resume finds the same folder (and two
+    sources sharing a basename never collide). Staging on local disk keeps the long
+    pod compute + fetch off the possibly-network output drive; it is removed on
+    completion. A falsy `work_base` selects the legacy beside-the-output location
+    (<out_dir>/.imgtbx_video/<base>), kept for direct callers/tests."""
     base = os.path.splitext(os.path.basename(out_video))[0]
-    root = os.path.join(os.path.dirname(out_video), WORK_DIRNAME, base)
+    if work_base:
+        key = hashlib.blake2b(os.path.abspath(out_video).encode("utf-8", "surrogatepass"),
+                              digest_size=6).hexdigest()
+        root = os.path.join(work_base, f"{base}_{key}")
+    else:
+        root = os.path.join(os.path.dirname(out_video), WORK_DIRNAME, base)
     return os.path.join(root, "in"), os.path.join(root, "up"), root
+
+
+def _path_within(child, parent):
+    """True if `child` is `parent` or nested under it. Pure path math (no disk),
+    case-insensitive on Windows via normcase, fail-safe False on bad input."""
+    if not child or not parent:
+        return False
+    try:
+        c = os.path.normcase(os.path.abspath(child))
+        p = os.path.normcase(os.path.abspath(parent))
+    except Exception:                                   # noqa: BLE001
+        return False
+    return c == p or c.startswith(p + os.sep)
+
+
+def work_root_conflict(work_root, source_root):
+    """Reason string if `work_root` is UNSAFE to stage a run over `source_root` into,
+    else None. Staging INSIDE the scanned source tree (which includes an `__upscaled__`
+    output subfolder under it) lets the walk re-read the run's own input segments as if
+    they were fresh source videos; staging AT or ABOVE the source root conflates the two
+    the same way. Pure path math, fail-safe."""
+    if not work_root:                                   # empty = the local default, safe
+        return None
+    if _path_within(work_root, source_root):
+        return (f"the staging work folder is inside the source folder being scanned "
+                f"({work_root}): the scanner would re-read its own segments")
+    if _path_within(source_root, work_root):
+        return (f"the staging work folder contains the source folder being scanned "
+                f"({work_root}): pick a folder outside the source tree")
+    return None
+
+
+def is_network_path(path):
+    """Best-effort True if `path` is a network location (UNC or a mapped remote drive).
+    Real detection is Windows-only (GetDriveTypeW); fail-safe False elsewhere / on any
+    error. Used to WARN that staging on the network defeats local staging, not to block."""
+    if not path:
+        return False
+    try:
+        p = os.path.abspath(path)
+        if p.startswith("\\\\") or p.startswith("//"):  # UNC
+            return True
+        if os.name != "nt":
+            return False
+        drive = os.path.splitdrive(p)[0]
+        if not drive:
+            return False
+        import ctypes
+        DRIVE_REMOTE = 4
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -633,7 +747,7 @@ def enqueue_folder(conn, root_id, source_root, output_root, target, vcfg):
     `target` (the GUI does this per-file via prepare_job). Skips ineligible files
     and (target) jobs already done."""
     n = 0
-    for abs_path, rel in walk_videos(source_root):
+    for abs_path, rel in walk_videos(source_root, skip_roots=[output_root]):
         row = scan_file(conn, root_id, abs_path, rel)
         if row is None:
             continue
@@ -679,7 +793,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     resolution = ve.fit_short_side(info.width, info.height, target) or TARGET_RES.get(target, 1080)
 
     os.makedirs(os.path.dirname(out_video), exist_ok=True)
-    in_dir, up_dir, work_root = _work_dirs(out_video)
+    in_dir, up_dir, work_root = _work_dirs(out_video, vcfg["work_root"])
     os.makedirs(up_dir, exist_ok=True)
     db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
                            status="splitting", output_path=out_video, skip_reason=None)
@@ -715,6 +829,22 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         raise vp.FFmpegError(f"split produced no segments for {rel}")
     log(f"[{index}/{total}] {rel} -> {target}: {info.width}x{info.height} "
         f"{job_info.nb_frames}f; {len(segs)} segment(s) ({mode})")
+
+    # Black-output guard: a degenerate split re-encode (historically an interlaced source
+    # through NVENC, which has no interlaced-HEVC path) yields all-black segments that
+    # upscale to a black, audio-only deliverable — hours and real money for garbage, with
+    # nothing to notice it. Catch it locally BEFORE streaming to the pod: if the source's
+    # opening frames are clearly not black but the first segment's are, the re-encode
+    # broke. Comparing against the SOURCE (a relative test) means a legitimately dark or
+    # fade-from-black clip never false-trips. Fail-safe: a luma read returning None skips
+    # the check rather than blocking the run.
+    seg_luma = vp.mean_luma_head(segs[0].path)
+    src_luma = vp.mean_luma_head(job_info.path)
+    if vp.is_black_reencode(seg_luma, src_luma):
+        raise vp.FFmpegError(
+            f"first segment is black (mean luma {seg_luma:.1f}) though the source is not "
+            f"({src_luma:.1f}) — the split re-encode produced black frames; aborting "
+            f"{rel} before spending pod time. Check the source (interlacing/codec).")
 
     recorded = db.get_video_segments(conn, root_id, rel, target, clip_id=clip_id)
     if len(recorded) != len(segs):
@@ -813,8 +943,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             if _tr and not _trace_logged[0] and (
                     st.get("state") == "done" or len(_tr) >= 16):
                 _trace_logged[0] = True
-                log(f"    (pod phase trace [{st.get('phase_count')} lines]: "
-                    f"{' '.join(_tr[:60])})")
+                # File only: this E/U/D batch cadence is developer diagnostics — opaque
+                # to a non-technical user, so it stays out of the GUI terminal but is kept
+                # on disk for troubleshooting the progress-bar / s-per-frame calibration.
+                log_file_only(f"    (pod phase trace [{st.get('phase_count')} lines]: "
+                              f"{' '.join(_tr[:60])})")
             gui_event("SEGMENT", {"video_rel": rel, "target": target,
                                   "seg_index": _i, "total": len(segs),
                                   "state": st.get("state"),
@@ -985,6 +1118,17 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     a job the user removes after Start is no longer processed, and a reorder changes
     what runs next. Jobs already attempted this run are skipped so a 'failed' one is
     not retried in a loop."""
+    # Refuse up-front (before any pod is rented) if the staging folder sits inside the
+    # scanned source tree: the walk would re-read this run's own input segments as fresh
+    # source videos. Empty work_root = the safe local default, so this only fires on a
+    # bad custom Settings → Video → "Work folder (staging)".
+    conflict = work_root_conflict(vcfg.get("work_root"), source_root)
+    if conflict:
+        log(f"ERROR: cannot start - {conflict}. Change Settings -> Video -> "
+            f'"Work folder (staging)" to a folder outside the source tree '
+            f"(leave it empty to use the default local folder).")
+        return {"done": 0, "failed": 0, "stopped": conflict, "total": 0}
+
     initial = db.get_video_queue(conn, root_id)
     gui_event("QUEUE", [{"rel": j["rel_path"], "target": j["target"]} for j in initial])
     log(f"Queue: {len(initial)} job(s) under {source_root}.")
@@ -1147,11 +1291,12 @@ def main(argv=None):
                   notify_settings=notify_settings)
     except Exception as exc:                       # noqa: BLE001
         # Surface a clean, actionable one-liner instead of a raw traceback (a
-        # transient pod-GPU failure is the common case and is not a code bug); keep
-        # the full detail below it for debugging.
+        # transient pod-GPU failure is the common case and is not a code bug, and a
+        # non-technical user can't read a traceback); the full trace goes to the on-disk
+        # run log only, never the GUI terminal.
         log("")
         log(f"Run failed: {exc}")
-        log(traceback.format_exc())
+        log_file_only(traceback.format_exc())
         # Notify: a failure BEFORE the engine started (pod couldn't be created /
         # deployed) used to be silent, unlike the image runners' red "Engine Failed
         # to Start" alert; a mid-run crash that escapes run_queue is likewise

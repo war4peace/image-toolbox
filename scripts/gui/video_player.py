@@ -136,9 +136,12 @@ def warn_overlay_once(parent):
             APP_TITLE,
             f"{name} is running and its overlay is injected into this app.\n\n"
             "That overlay is known to crash the in-app video player (a driver-level "
-            "access violation that Windows reports against pythonw.exe). If the "
-            "player crashes, close it or add pythonw.exe to its exclusion / "
-            "\"Application detection level = None\" list, then try again.\n\n"
+            "access violation that Windows reports against pythonw.exe).\n\n"
+            "Recommended fix (keeps the overlay on your games): in RivaTuner, add an "
+            "application profile for pythonw.exe and set its \"Application detection "
+            "level\" to None (older builds: enable Stealth mode for it). RivaTuner "
+            "matches by program name, so one pythonw.exe entry covers this app wherever "
+            "it is installed. Or simply close RivaTuner / Afterburner while comparing.\n\n"
             "The frame comparison (Compare frames) is unaffected.")
     except Exception:                                # noqa: BLE001
         pass

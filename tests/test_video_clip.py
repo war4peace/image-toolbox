@@ -80,6 +80,119 @@ def test_output_path_clip_id_uniquifies_when_no_label_or_range():
     assert os.path.basename(p) == "v_clip7_4K.mp4"
 
 
+# ── staging work area (local by default) ─────────────────────────────────────
+
+def test_work_root_defaults_to_local_app_dir():
+    # An empty video.work_root resolves to a folder on the APP drive, NOT beside the
+    # (possibly network) output — so a mid-run share drop can't strand segments.
+    vcfg = bv.resolve_video_cfg({})
+    assert vcfg["work_root"] == bv._default_work_base()
+    assert vcfg["work_root"].startswith(bv.APP_ROOT)
+
+
+def test_work_root_honours_explicit_setting():
+    vcfg = bv.resolve_video_cfg({"video": {"work_root": r"D:\scratch"}})
+    assert vcfg["work_root"] == r"D:\scratch"
+
+
+def test_work_dirs_local_are_under_the_base_and_keyed_by_output():
+    base = os.path.join("Z:", "scratch")
+    a_in, a_up, a_root = bv._work_dirs("/out/a/movie.mp4", base)
+    b_in, b_up, b_root = bv._work_dirs("/out/b/movie.mp4", base)
+    # both live under the LOCAL base (not beside their outputs)...
+    assert a_root.startswith(base) and b_root.startswith(base)
+    assert os.path.dirname(a_root) == base
+    # ...and two sources sharing a basename get distinct, stable work dirs.
+    assert a_root != b_root
+    assert a_in == os.path.join(a_root, "in") and a_up == os.path.join(a_root, "up")
+    assert bv._work_dirs("/out/a/movie.mp4", base)[2] == a_root   # deterministic
+
+
+def test_work_dirs_falsy_base_keeps_legacy_beside_output():
+    in_dir, up_dir, root = bv._work_dirs("/out/a/movie.mp4", "")
+    assert root == os.path.join("/out/a", bv.WORK_DIRNAME, "movie")
+
+
+# ── walk excludes the output tree (don't rescan finished upscales as sources) ────────
+
+def _touch(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").close()
+
+
+def test_iter_videos_skips_the_output_subtree(tmp_path):
+    src = str(tmp_path / "Poze")
+    _touch(os.path.join(src, "!A New Life", "clip.avi"))                 # a real source
+    out = os.path.join(src, "__upscaled__")                             # default: inside src
+    _touch(os.path.join(out, "!A New Life", "clip_1080p.mp4"))          # a finished upscale
+    _touch(os.path.join(src, bv.WORK_DIRNAME, "x_ab12", "in", "seg_00000.mkv"))
+
+    # Without the skip, the walk re-reads the upscale as a source (the reported bug).
+    rels_unguarded = {rel for _ap, rel in bv.iter_videos(src)}
+    assert any(r.startswith("__upscaled__") for r in rels_unguarded)
+
+    # With the output root pruned, only the true source remains (work dir always pruned).
+    rels = {rel for _ap, rel in bv.iter_videos(src, skip_roots=[out])}
+    assert rels == {os.path.join("!A New Life", "clip.avi")}
+
+
+def test_walk_videos_forwards_skip_roots(tmp_path):
+    src = str(tmp_path / "src")
+    _touch(os.path.join(src, "a.mp4"))
+    out = os.path.join(src, "__upscaled__")
+    _touch(os.path.join(out, "a_4K.mp4"))
+    rels = {rel for _ap, rel in bv.walk_videos(src, skip_roots=[out])}
+    assert rels == {"a.mp4"}
+
+
+# ── staging-folder guards (don't stage inside the scanned tree / warn on network) ────
+
+def test_work_root_conflict_empty_is_safe():
+    assert bv.work_root_conflict("", os.path.join("S", "videos")) is None
+
+
+def test_work_root_conflict_inside_source_is_rejected():
+    src = os.path.abspath(os.path.join("S", "videos"))
+    inside = os.path.join(src, "__upscaled__", "staging")     # under the output subfolder
+    reason = bv.work_root_conflict(inside, src)
+    assert reason and "inside the source" in reason
+
+
+def test_work_root_conflict_above_source_is_rejected():
+    src = os.path.abspath(os.path.join("S", "videos", "trip"))
+    above = os.path.abspath(os.path.join("S", "videos"))      # source nested under work
+    reason = bv.work_root_conflict(above, src)
+    assert reason and "contains the source" in reason
+
+
+def test_work_root_conflict_sibling_is_fine():
+    src = os.path.abspath(os.path.join("S", "videos"))
+    sibling = os.path.abspath(os.path.join("S", "scratch"))
+    assert bv.work_root_conflict(sibling, src) is None
+
+
+def test_is_network_path_flags_unc_and_ignores_local(tmp_path):
+    assert bv.is_network_path("") is False
+    assert bv.is_network_path(str(tmp_path)) is False         # a real local dir
+    if os.name == "nt":
+        assert bv.is_network_path(r"\\nas\media\clips") is True
+
+
+def test_run_queue_refuses_staging_inside_source(db_conn, tmp_path):
+    # A work_root inside the scanned source must fail the run up-front (no pod rented),
+    # not silently stage segments the scanner would then re-read.
+    src_root = str(tmp_path / "src")
+    out_root = str(tmp_path / "out")
+    os.makedirs(src_root, exist_ok=True)
+    root = db.get_video_root_id(db_conn, src_root, out_root)
+    vcfg = bv.resolve_video_cfg({})
+    vcfg["work_root"] = os.path.join(src_root, "staging")     # inside the scanned tree
+
+    summary = bv.run_queue(None, db_conn, root, src_root, vcfg, bv.RunBudget(0, 0.0))
+    assert summary["done"] == 0 and summary["total"] == 0
+    assert summary["stopped"] and "inside the source" in summary["stopped"]
+
+
 # ── prepare_clip ─────────────────────────────────────────────────────────────
 
 @needs_ffmpeg
@@ -138,6 +251,7 @@ def test_clip_round_trip_passthrough(db_conn, tmp_path):
 
     root = db.get_video_root_id(db_conn, src_root, out_root)
     vcfg = bv.resolve_video_cfg({})
+    vcfg["work_root"] = str(tmp_path / "work")     # stage under tmp, not the app drive
     bv.prepare_clip(db_conn, root, src_root, out_root, "birthday.avi",
                     "1080p", 5.0, 12.0, "cake", vcfg)
 
@@ -158,7 +272,7 @@ def test_clip_round_trip_passthrough(db_conn, tmp_path):
     after = os.stat(src)
     assert (before.st_size, before.st_mtime) == (after.st_size, after.st_mtime)
     # the work area was cleaned up on completion (no stray clip/segment files)
-    work_root = bv._work_dirs(out_path)[2]
+    work_root = bv._work_dirs(out_path, vcfg["work_root"])[2]
     assert not os.path.exists(work_root)
 
 
@@ -169,6 +283,7 @@ def test_whole_file_and_clip_coexist_in_one_queue(db_conn, tmp_path):
     _make_source(os.path.join(src_root, "v.avi"), seconds=12)
     root = db.get_video_root_id(db_conn, src_root, out_root)
     vcfg = bv.resolve_video_cfg({})
+    vcfg["work_root"] = str(tmp_path / "work")     # stage under tmp, not the app drive
 
     bv.prepare_job(db_conn, root, src_root, out_root, "v.avi", "1080p", vcfg)
     bv.prepare_clip(db_conn, root, src_root, out_root, "v.avi", "1080p", 2.0, 6.0, "bit", vcfg)
