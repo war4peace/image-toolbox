@@ -1156,6 +1156,8 @@ class VideoTab(ttk.Frame):
                               command=lambda p=p: self._open_compare(row["abs"], p))
                 m.add_command(label=f"Open upscaled ({t})",
                               command=lambda p=p: self._open_path(p))
+                m.add_command(label=f"Open upscaled folder ({t})",
+                              command=lambda p=p: self._open_folder(p))
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:

@@ -348,6 +348,21 @@ def per_video_seed(vcfg, rel):
     return int(h, 16) % (2 ** 31 - 1)
 
 
+def updated_learned_batch(learned, first, final):
+    """OOM-recovery carry-forward: after a segment FIRST tried `first` and ended at
+    `final`, return the batch to reuse on this video's later segments.
+
+    A drop (final < first) means the pod hit OOM and recovered to a smaller batch;
+    all of a video's segments share the same resolution, so that smaller batch is
+    safe for the rest and starting there skips the per-segment re-discovery (a failed
+    forward pass + VRAM churn). Keep the smallest safe value seen; no drop leaves the
+    prior learned value (possibly None) unchanged. Pure so it can be unit-tested apart
+    from the heavy streaming loop."""
+    if first and final and final < first:
+        return final if learned is None else min(learned, final)
+    return learned
+
+
 # ─────────────────────────────────────────────
 #  RUN BUDGET (installment caps)
 # ─────────────────────────────────────────────
@@ -874,7 +889,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         f"(auto values resolved on the pod)")
     _resolved_logged = [False]
     _trace_logged = [False]
-    _initial_batch = [None]      # batch the pod first resolved (to flag a later OOM drop)
+    _learned_batch = [None]      # OOM-corrected batch carried to this video's later segments
+    _learn_logged = [False]      # log the carry-forward once per video, not per segment
     total_secs = 0.0
 
     for s in segs:
@@ -907,9 +923,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                         f"(runtime {fmt_hhmmss(now - _sw[0])})")
             rb = st.get("resolved_batch")
             if rb:
-                _stats["batch"] = rb
-                if _initial_batch[0] is None:
-                    _initial_batch[0] = rb
+                _stats["batch"] = rb                 # final (after any OOM recovery)
+                _stats.setdefault("first_batch", rb)  # what the pod tried FIRST this segment
             if rb and not _resolved_logged[0]:       # the pod reported its auto choices
                 _resolved_logged[0] = True
                 _noise = st.get("input_noise")
@@ -957,9 +972,19 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                                   "total_chunks": st.get("total_chunks"),
                                   "output_bytes": st.get("output_bytes")})
 
+        # Carry a batch the pod already OOM-corrected on an earlier segment of THIS
+        # video: same resolution across segments, so the safe batch is the same. This
+        # skips the per-segment re-discovery (a failed forward pass + VRAM churn) that
+        # otherwise repeats on every segment. An explicit config batch is still honoured
+        # as the ceiling; the learned value only ever lowers it.
+        req_batch = _learned_batch[0] or batch
+        if _learned_batch[0] and not _learn_logged[0]:
+            _learn_logged[0] = True
+            log(f"    reusing batch_size {req_batch} for the remaining segments "
+                f"(OOM-corrected earlier in this video; skips re-discovery)")
         _progress({"state": "running"})
         n = engine.process_segment(
-            s.path, up_path, resolution=resolution, batch_size=batch,
+            s.path, up_path, resolution=resolution, batch_size=req_batch,
             chunk_size=chunk, temporal_overlap=overlap,
             seed=seed, video_backend=vcfg["video_backend"],
             use_10bit=vcfg["use_10bit"], on_progress=_progress,
@@ -981,8 +1006,12 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                         f"{_seg_stats.get('reserved')} GB reserved")
         drop_txt = ""
         b = _seg_stats.get("batch")
-        if b is not None and _initial_batch[0] is not None and b != _initial_batch[0]:
-            drop_txt = f"; batch dropped {_initial_batch[0]} -> {b} (OOM recovery)"
+        first = _seg_stats.get("first_batch")
+        if b is not None and first is not None and b < first:
+            drop_txt = f"; batch dropped {first} -> {b} (OOM recovery)"
+        # Learn the smallest safe batch so this video's later segments start there (a
+        # forced batch that survives shows first == b, so it never re-learns).
+        _learned_batch[0] = updated_learned_batch(_learned_batch[0], first, b)
         # Phase breakdown (per-segment overhead beyond the pod time): submit=upload,
         # wait=submit->pod-done, fetch=download, finalize=local write. Since the pod now
         # times its whole retry loop (worker.py t0 before the loop), the reported `secs`
