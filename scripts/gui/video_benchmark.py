@@ -24,7 +24,7 @@ import video_estimate as ve
 import video_vram_sizer as sizer
 from gui.common import (APP_ROOT, APP_TITLE, CFG, GUI_MARKER, PYTHON_EXE, SCRIPT_DIR,
                         CREATE_NO_WINDOW, _geometry_on_screen, save_settings)
-from gui.widgets import ConsoleBuffer, Tooltip
+from gui.widgets import ConsoleBuffer, LogPane, Tooltip
 
 
 def _fmt_hms(seconds):
@@ -46,6 +46,9 @@ class BenchmarkWindow(tk.Toplevel):
 
     def __init__(self, master, tab):
         super().__init__(master)
+        # Build hidden, reveal once fully laid out: a Toplevel is mapped at a default size
+        # first, which flashed a tiny square before our geometry + widgets applied.
+        self.withdraw()
         self.tab = tab
         self.app = getattr(tab, "app", None)
         self.title(f"{APP_TITLE} — Benchmark GPU")
@@ -56,7 +59,11 @@ class BenchmarkWindow(tk.Toplevel):
         geo = self.app.settings.get("benchmark_geometry") if self.app is not None else None
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "720x560")
         self.minsize(640, 480)
-        self.transient(master)
+        # NOT transient(master): while the benchmark is up we MINIMIZE the main window (see
+        # _hide_master / _restore_master) so a non-technical user can't reach the tabs behind
+        # it and start a conflicting GPU job. A transient child is auto-hidden when its master
+        # is iconified, which would hide the benchmark itself, so it must be independent.
+        self._master_win = master
 
         self.proc = None
         self.console = ConsoleBuffer()
@@ -73,8 +80,35 @@ class BenchmarkWindow(tk.Toplevel):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Configure>", self._track_geometry, add="+")
+        self.deiconify()                    # reveal now that it's fully built (no flash)
+        # Modal: the log now lives INSIDE this window, so a local grab no longer freezes a
+        # needed helper. Modality also stops a second benchmark window being opened from the
+        # main app while this one is up. Deferred so the window is mapped before we grab.
         self.after(60, self._grab)
         self.after(80, self._detect_gpu)
+        self._hide_master()
+
+    def _grab(self):
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _hide_master(self):
+        """Minimize the main app window for the benchmark's lifetime (restored in _close)."""
+        try:
+            if self._master_win is not None and self._master_win.winfo_exists():
+                self._master_win.iconify()
+        except Exception:                              # noqa: BLE001
+            pass
+
+    def _restore_master(self):
+        try:
+            if self._master_win is not None and self._master_win.winfo_exists():
+                self._master_win.deiconify()
+                self._master_win.lift()
+        except Exception:                              # noqa: BLE001
+            pass
 
     # ── layout ───────────────────────────────────────────────────────────────
 
@@ -114,14 +148,14 @@ class BenchmarkWindow(tk.Toplevel):
         Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
                     "On: clears this card+model's saved probes and benchmarks from scratch.")
 
-        # Results table.
-        rf = ttk.LabelFrame(self, text=" Results ", padding=4)
+        # Results table (fixed 5 rows) + the program-output log below it, filling the rest.
+        rf = ttk.LabelFrame(self, text=" Results & log ", padding=4)
         rf.grid(row=3, column=0, sticky="nsew", pady=(8, 0), **pad)
         self.rowconfigure(3, weight=1)
-        rf.rowconfigure(0, weight=1)
+        rf.rowconfigure(1, weight=1)          # the log grows; the 5-row table stays put
         rf.columnconfigure(0, weight=1)
         cols = ("ceiling", "overlap", "spf", "peak", "status")
-        self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=6)
+        self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=5)
         self.tree.column("#0", width=110, stretch=False)
         self.tree.heading("#0", text="Target")
         for c, txt, w in (("ceiling", "Max batch", 90), ("overlap", "Overlap", 70),
@@ -129,10 +163,22 @@ class BenchmarkWindow(tk.Toplevel):
                           ("status", "Status", 200)):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, stretch=(c == "status"), anchor="w")
-        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.grid(row=0, column=0, sticky="ew")
         sb = ttk.Scrollbar(rf, orient="vertical", command=self.tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
+
+        logf = ttk.Frame(rf)
+        logf.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        logf.rowconfigure(1, weight=1)
+        logf.columnconfigure(0, weight=1)
+        ttk.Label(logf, text="Program output (no engine diagnostics)",
+                  foreground="#666").grid(row=0, column=0, sticky="w")
+        self.log_pane = LogPane(logf)
+        self.log_pane.grid(row=1, column=0, sticky="nsew")
+        # Mirror the clean output stream into the embedded pane (same observer pattern the
+        # old floating log window used).
+        self.console.add_observer(self._on_console)
 
         # VRAM-contention warning (shown only when other apps are holding VRAM).
         self.vram_warn_var = tk.StringVar(value="")
@@ -157,15 +203,8 @@ class BenchmarkWindow(tk.Toplevel):
         self.start_btn.grid(row=0, column=0)
         self.stop_btn = ttk.Button(bf, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(6, 0))
-        ttk.Button(bf, text="View log", command=self._view_log).grid(row=0, column=3)
         self.close_btn = ttk.Button(bf, text="Close", command=self._close)
-        self.close_btn.grid(row=0, column=4, padx=(6, 0))
-
-    def _grab(self):
-        try:
-            self.grab_set()
-        except tk.TclError:
-            pass
+        self.close_btn.grid(row=0, column=3)
 
     def _track_geometry(self, _e=None):
         if self.app is not None and self.state() == "normal":
@@ -327,11 +366,12 @@ class BenchmarkWindow(tk.Toplevel):
                     f"{used:.1f} GB of VRAM is already in use by other applications.\n\n"
                     "Close all non-essential applications for best benchmarking results. "
                     "Running now will measure a lower ceiling than this card can really do.\n\n"
-                    "Benchmark anyway?"):
+                    "Benchmark anyway?", parent=self):
                 return
         if self.restart_var.get():
             if not messagebox.askyesno(
-                    APP_TITLE, "Discard this card's saved benchmark results and start over?"):
+                    APP_TITLE, "Discard this card's saved benchmark results and start over?",
+                    parent=self):
                 return
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "video_benchmark.py"),
                "--targets", ",".join(targets)]
@@ -347,7 +387,8 @@ class BenchmarkWindow(tk.Toplevel):
                 cmd, cwd=APP_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW, env=env)
         except Exception as exc:                       # noqa: BLE001
-            messagebox.showerror(APP_TITLE, f"Could not start the benchmark:\n{exc}")
+            messagebox.showerror(APP_TITLE, f"Could not start the benchmark:\n{exc}",
+                                 parent=self)
             self.proc = None
             return
         self._hold = ""
@@ -500,15 +541,21 @@ class BenchmarkWindow(tk.Toplevel):
         except Exception:                              # noqa: BLE001
             pass
 
-    def _view_log(self):
-        if self.app is not None:
-            self.app.show_log(self.console, f"{APP_TITLE} — Benchmark output")
+    def _on_console(self, chunk):
+        """Feed the embedded log pane from the console's observer stream (None = cleared)."""
+        if not self.winfo_exists():
+            return
+        if chunk is None:
+            self.log_pane.clear()
+        else:
+            self.log_pane.feed(chunk)
+            self.log_pane.text.see("end")
 
     def _close(self):
         if self.proc is not None and self.proc.poll() is None:
             if not messagebox.askyesno(
                     APP_TITLE, "A benchmark is running. Stop it and close?\n\n"
-                    "(Finished probes are saved and will resume next time.)"):
+                    "(Finished probes are saved and will resume next time.)", parent=self):
                 return
             self._stop()
             try:
@@ -525,7 +572,8 @@ class BenchmarkWindow(tk.Toplevel):
             except Exception:                          # noqa: BLE001
                 pass
         try:
-            self.grab_release()
-        except tk.TclError:
+            self.console.remove_observer(self._on_console)
+        except Exception:                              # noqa: BLE001
             pass
+        self._restore_master()
         self.destroy()

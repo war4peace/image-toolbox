@@ -329,6 +329,7 @@ class UpscaleTab(ToolTab):
         # VRAM is fully committed during an upscale run — lock out the other tool
         self.app.set_tag_tab_enabled(not running)
         self.app.refresh_conciliate_lock()
+        self.app.refresh_benchmark_lock()
 
     def on_exit(self, code):
         self._set_running(False)

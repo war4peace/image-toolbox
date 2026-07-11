@@ -739,6 +739,7 @@ class VideoTab(ttk.Frame):
         try:
             if local:
                 self.benchmark_btn.grid()
+                self._refresh_benchmark_lock()         # honour any running local job
             else:
                 self.benchmark_btn.grid_remove()
         except Exception:                              # noqa: BLE001
@@ -747,14 +748,39 @@ class VideoTab(ttk.Frame):
     def _open_benchmark(self):
         """Open the per-card benchmark modal (feature #7). A run must not be in progress
         (it would fight the benchmark for the GPU)."""
-        if self.proc is not None:
-            messagebox.showinfo(APP_TITLE, "Stop the current run before benchmarking the GPU.")
+        # Any LOCAL-GPU job (this tab, Batch Upscale, or Tag & Rename) would fight the
+        # benchmark for the card. The button is greyed while one runs; this is the click-time
+        # backstop.
+        if self.app.local_gpu_job_running():
+            messagebox.showinfo(APP_TITLE,
+                                "Finish the current local job before benchmarking the GPU.")
+            return
+        # Reuse an already-open benchmark window instead of stacking a second one (the window
+        # is modal, so this is a belt-and-suspenders guard).
+        existing = getattr(self, "_benchmark_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_set()
             return
         try:
             from gui.video_benchmark import BenchmarkWindow
-            BenchmarkWindow(self.winfo_toplevel(), self)
+            self._benchmark_win = BenchmarkWindow(self.winfo_toplevel(), self)
         except Exception as exc:                       # noqa: BLE001
             messagebox.showerror(APP_TITLE, f"Could not open the benchmark window:\n{exc}")
+
+    def _refresh_benchmark_lock(self):
+        """Grey the benchmark button while any local-GPU job is running (see
+        App.local_gpu_job_running). The button is also hidden entirely in Remote mode by
+        _apply_mode_ui; guard for that (grid_remove'd widgets still accept configure)."""
+        btn = getattr(self, "benchmark_btn", None)
+        if btn is None:
+            return
+        try:
+            busy = self.app.local_gpu_job_running()
+        except Exception:                              # noqa: BLE001
+            busy = self.running
+        btn.configure(state="disabled" if busy else "normal")
 
     def _check_readiness(self):
         rpc = CFG.get("runpod", {})
@@ -2136,6 +2162,7 @@ class VideoTab(ttk.Frame):
         self.start_btn.configure(state="disabled")
         self.auto_resume_chk.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.app.refresh_benchmark_lock()             # lock the GPU benchmark for this run
         self.status_var.set(starting_msg)
         self.console.clear()
         self.app.taskbar_state("indeterminate")
@@ -2472,6 +2499,7 @@ class VideoTab(ttk.Frame):
         self.stop_btn.configure(state="disabled")
         # Auto-resume is pod-only: keep it greyed in Local mode, re-enable it in Remote.
         self._apply_mode_ui()
+        self.app.refresh_benchmark_lock()             # run over: re-enable the benchmark (if idle)
         # The run is over: its pod (if any) is no longer protected from terminate.
         # Cleared GUI-side (not via a runner event) so a hard-killed runner still
         # releases the protection. Mirrors ToolTab.on_exit.

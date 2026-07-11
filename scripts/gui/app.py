@@ -542,6 +542,29 @@ class App(tk.Tk):
         busy = self.upscale_tab.running or self.tag_tab.running
         self.nb.tab(self.conciliate_tab, state="disabled" if busy else "normal")
 
+    def local_gpu_job_running(self):
+        """True if any tool is running a job on the LOCAL GPU: a Batch Upscale or Tag & Rename
+        with the remote-pod toggle OFF, or a Video Upscale in Local-GPU mode. Remote-pod runs
+        use no local GPU, so they don't count. Used to lock the Video tab's GPU benchmark,
+        which would fight a local run for the card."""
+        def local(tab, remote_attr="remote_var"):
+            if not getattr(tab, "running", False):
+                return False
+            rv = getattr(tab, remote_attr, None)
+            return not (rv is not None and rv.get())   # no toggle == local
+        if local(self.upscale_tab) or local(self.tag_tab):
+            return True
+        v = self.video_tab
+        mode = getattr(v, "mode_var", None)
+        return bool(getattr(v, "running", False) and mode is not None and mode.get() == "local")
+
+    def refresh_benchmark_lock(self):
+        """Re-evaluate the Video tab's GPU-benchmark button against local-job state. Called
+        from every tool's run start/stop transition."""
+        fn = getattr(self.video_tab, "_refresh_benchmark_lock", None)
+        if fn is not None:
+            fn()
+
     # ── Shared log window ────────────────────────────────────────────────────
 
     def show_log(self, console, title):

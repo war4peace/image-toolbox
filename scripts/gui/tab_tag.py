@@ -350,6 +350,7 @@ class TagTab(ToolTab):
         self.undo_btn.configure(
             state="normal" if (not running and has_dir) else "disabled")
         self.app.refresh_conciliate_lock()
+        self.app.refresh_benchmark_lock()
 
     def on_exit(self, code):
         self._set_running(False)

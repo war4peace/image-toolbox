@@ -2153,8 +2153,29 @@ def main(argv=None):
             log(f"Local mode — upscaling on this machine's GPU (no pod). "
                 f"Thrash watchdog: {vcfg['thrash_stall_seconds']}s stall; "
                 f"engine: {'subprocess-per-attempt' if vcfg['local_use_subprocess'] else 'in-process'}.")
+            # torch.compile's inductor backend needs Triton. On Windows that means the
+            # `triton-windows` package (Ampere/Ada/Blackwell incl. the 3090); if it isn't
+            # installed, enabling compile stalls the first forward pass for minutes in a doomed
+            # build that emits no progress (looks hung) instead of the ~seconds the image Batch
+            # Upscaler takes. So gate compile on Triton actually being importable HERE (the
+            # worker shares this venv), rather than forcing it off: a user who installs
+            # triton-windows gets the same one-time-compile speedup the pod enjoys.
+            import importlib.util as _ilu
+            local_cfg = _worker_cfg()
+            want_compile = bool(local_cfg.get("compile_dit") or local_cfg.get("compile_vae"))
+            triton_ok = _ilu.find_spec("triton") is not None
+            if want_compile and not triton_ok:
+                log("    torch.compile disabled: Triton is not installed in this environment, "
+                    "so a compile would stall for minutes with no output. Run "
+                    "'pip install triton-windows' (matched to this PyTorch) to enable the "
+                    "compile speedup locally. The first segment now loads immediately.")
+                local_cfg["compile_dit"] = False
+                local_cfg["compile_vae"] = False
+            elif want_compile:
+                log("    torch.compile ON (Triton present): the first segment pays a one-time "
+                    "compile cost, then the rest of the video runs faster (shared fixed shape).")
             engine = LocalVideoEngine(
-                repo_dir, model_dir, _worker_cfg(),
+                repo_dir, model_dir, local_cfg,
                 conn=conn, gpu_id=None,
                 use_subprocess=vcfg["local_use_subprocess"],
                 thrash_stall_seconds=vcfg["thrash_stall_seconds"])
