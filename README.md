@@ -202,14 +202,24 @@ are replaced by their high-quality versions. No manual shuffling required.
 ### Video Upscaler
 
 Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler
-uses, on a **rented RunPod GPU**. This feature is remote-only by design: video
-means a diffusion pass per output frame, which is impractical on a home GPU.
+uses, either on a **rented RunPod GPU** (fast, paid) or on **your own local GPU**
+(free, slower). Video means a diffusion pass per output frame, so remote is the
+quick option; local is there so anyone with a capable GPU can do it at no cost.
 Your source videos are never modified.
 
+- **Run locally or remotely:** a **Run on** switch picks Remote (a rented RunPod
+  card, billed by the second) or Local (this machine's NVIDIA GPU, no cost). The
+  same walk, split, resume, mux and drift-check pipeline runs either way; only
+  where the GPU work happens changes. The switch follows your install type
+  (a Remote-only install can't run locally, and vice versa).
 - **Scan, queue, go:** scan a folder, filter the list (by path, resolution,
-  duration or FPS), pick a target per video (1080p / 1440p / 4K; only targets
-  the source is actually below are offered), build a queue, pick a GPU from the
-  live price list, press Start.
+  duration or FPS), pick a target per video, build a queue, pick a GPU, press
+  Start. Targets are offered as concrete output resolutions and filtered to what
+  the source can be upscaled to **and** what the chosen GPU can actually reach:
+  low-resolution sources get **2× / 4×** options (e.g. 320×240 → 640×480,
+  1280×960), and a target a small card would run out of memory on is not offered
+  (locally) or greys out in the queue (remotely, with Start refused if nothing
+  fits the chosen pod).
 - **Extract a scene:** for a long source you don't want to upscale in full, mark
   an in/out range on a live preview and queue just that clip. The source is never
   touched (the clip is cut to a temp file, upscaled, then reassembled), and each
@@ -231,14 +241,22 @@ Your source videos are never modified.
   upscaled result **side by side, in real time, with sound** (via a bundled
   libVLC), so you can judge motion and temporal quality, not just single frames.
 - **Auto-tuned:** you pick the target and the GPU; batch size, temporal overlap
-  and the remaining SeedVR2 knobs are resolved on the pod for the rented card's
-  actual VRAM, with automatic out-of-memory recovery. A choice of SeedVR2
-  models (7B / 3B variants) is available in Settings.
+  and the remaining SeedVR2 knobs are resolved for the card's actual VRAM, with
+  automatic out-of-memory recovery. A choice of SeedVR2 models (7B / 3B variants)
+  is available in Settings.
+- **Local runs are guarded, not gated:** on your own GPU the batch is sized
+  predictively from your card's VRAM (so it fits on the first try), targets that
+  would run out of memory aren't offered, a watchdog stops a run that starts
+  thrashing a long GPU session, and a one-click **Benchmark GPU** tool measures
+  the real safe batch and speed for your card so future runs, the offered
+  targets, and time estimates are calibrated to it. For best results, close
+  other GPU-heavy apps before a local run.
 
 Video upscaling is compute-heavy: as a rough guide, one hour of footage
-upscaled to 1080p costs about $28-46 of GPU time depending on the card (the
-in-app estimator shows the real numbers for your queue before you commit).
-Requires a RunPod account, like the other remote features.
+upscaled to 1080p costs about $28-46 of GPU time on a rented card (the in-app
+estimator shows the real numbers for your queue before you commit), or nothing
+but time on your own GPU. Remote runs require a RunPod account, like the other
+remote features; local runs need an NVIDIA GPU with a CUDA build of PyTorch.
 
 ### Settings
 

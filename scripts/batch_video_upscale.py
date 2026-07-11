@@ -20,11 +20,13 @@ ends a run cleanly after the current segment, leaving the rest `pending` for the
 next run — the cost is paid in affordable installments.
 
 The engine is injected (run_batch(engine, ...)) so the same orchestration runs
-against the real RemoteVideoEngine or, with --passthrough, a local no-pod engine
+against the real RemoteVideoEngine (a rented pod); the LOCAL SeedVR2 engine on this
+machine's GPU (--local, feature #7); or, with --passthrough, a local no-pod engine
 that stream-copies each segment (for testing the whole pipeline without a GPU).
 
 Usage:
     python scripts/batch_video_upscale.py <source> [output] [--target 1080p]
+    python scripts/batch_video_upscale.py <source> [output] --local        # this machine's GPU
     python scripts/batch_video_upscale.py <source> [output] --passthrough  # no pod
 """
 
@@ -94,6 +96,25 @@ def _default_work_base():
     segments; only the source read (at split) and the final output write ever touch
     the network. Overridable via the `video.work_root` setting."""
     return os.path.join(APP_ROOT, WORK_DIRNAME)
+
+
+def _resolve_app_path(value, default_rel):
+    """Resolve a config path anchored at the app root; env vars (%USERPROFILE% ...) are
+    expanded so config.json stays portable. Mirrors batch_upscale._resolve_path so the
+    LOCAL video engine finds the SAME vendored seedvr2 repo + SEEDVR2 weights the Batch
+    Upscaler uses."""
+    p = os.path.expandvars(value or default_rel)
+    return p if os.path.isabs(p) else os.path.normpath(os.path.join(APP_ROOT, p))
+
+
+def _local_seedvr2_paths(cfg):
+    """(repo_dir, model_dir) for the LOCAL video engine, from the `seedvr2` config
+    section (same keys the Batch Upscaler reads), defaulting to the vendored `seedvr2/`
+    and `models/SEEDVR2/` under the app root."""
+    s = cfg.get("seedvr2", {}) or {}
+    repo = _resolve_app_path(s.get("repo_dir", ""), "seedvr2")
+    model = _resolve_app_path(s.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
+    return repo, model
 
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common (0.4.3
 # item 5). Re-export them here exactly as the other three runners do, instead of
@@ -286,6 +307,61 @@ except Exception:                                  # pragma: no cover
     class _RemoteVideoStopped(Exception):
         pass
 
+# Pod/transport failure classes, for the self-healing supervisor (#6). Guarded like the
+# Stop signal so headless/passthrough load without the remote stack. `RemoteVideoError`
+# = a pod/tunnel liveness failure (redeploy-worthy); `RemoteVideoWorkerError` = a bad
+# source the worker rejected (a per-job failure, NEVER healed — a fresh pod would fail
+# the same). The fallbacks are unreachable classes so `_is_pod_failure` is simply False
+# without the remote stack.
+try:
+    from remote_video_engine import (RemoteVideoError as _RemoteVideoError,
+                                      RemoteVideoWorkerError as _RemoteVideoWorkerError)
+except Exception:                                  # pragma: no cover
+    class _RemoteVideoError(Exception):
+        pass
+
+    class _RemoteVideoWorkerError(_RemoteVideoError):
+        pass
+
+
+class PodLost(Exception):
+    """Raised out of run_queue (only when Auto-resume is armed) when the current job
+    failed because the POD/tunnel died, not because the source is bad. The supervisor
+    catches it, recovers the pod (reconnect or redeploy the identical card), and re-enters
+    run_queue, which resumes from the first unfinished segment. Carries the raw reason plus
+    the counts this pass completed BEFORE the loss, so the supervisor can accumulate an
+    accurate final summary across redeploys (each pass counts only its own jobs; a resumed
+    pass never re-counts a `done` job, so summing is correct)."""
+
+    def __init__(self, reason, done=0, failed=0, done_frames=0):
+        super().__init__(reason)
+        self.done = done
+        self.failed = failed
+        self.done_frames = done_frames
+
+
+def _is_pod_failure(exc):
+    """True when `exc` is a pod/transport liveness failure the supervisor should heal
+    (reconnect or redeploy), False for a bad-source worker error or anything else (which
+    stays a per-job failure). A RemoteVideoWorkerError is a subclass of RemoteVideoError,
+    so it is excluded explicitly."""
+    if isinstance(exc, _RemoteVideoWorkerError):
+        return False
+    return isinstance(exc, _RemoteVideoError)
+
+
+# Local-video thrash-watchdog signal (#7). Imported guarded so the remote / passthrough
+# paths still load without the local GPU stack. A ThrashDetected is a DEGRADATION episode
+# (a hung / VRAM-thrashing LOCAL GPU the mid-segment watchdog killed): it is NOT the
+# source's fault and must NOT be retried -- the run stops loudly and the segment resumes on
+# the next (post-reboot) run. The fallback class is unreachable, so `run_queue` simply never
+# takes the thrash branch on a tree without the local engine.
+try:
+    from local_video_engine import ThrashDetected as _ThrashDetected
+except Exception:                                  # pragma: no cover
+    class _ThrashDetected(Exception):
+        pass
+
 
 # Set when the GUI sends "q" on stdin (Stop). Now checked DURING a segment too (the
 # remote engine polls _STOP.is_set), so Stop aborts a long segment within a poll
@@ -366,6 +442,24 @@ def resolve_video_cfg(cfg, overrides=None):
         "watchdog_enabled":    bool(v.get("watchdog_enabled", u.get("watchdog_enabled", True))),
         "watchdog_factor":     float(v.get("watchdog_factor",
                                            u.get("watchdog_factor", 3.0)) or 3.0),
+        # LOCAL video only (#7). A local segment that makes NO pipeline progress for this
+        # many seconds is thrashing (VRAM soft-spilled to sysmem: a healthy decode is
+        # seconds, a thrashing one was ~25 min, docs 14) -> the mid-segment watchdog kills
+        # it and stops the run. Generous so a legitimately heavy step never false-trips.
+        "thrash_stall_seconds": int(v.get("thrash_stall_seconds", 300) or 300),
+        # LOCAL video only (#7). Run each GPU attempt in a FRESH child process so the
+        # thrash watchdog can kill a crawling segment (an in-process CUDA call can't be
+        # interrupted) AND every OOM retry gets a clean CUDA context (no fragmentation
+        # carryover). Default on (the product path); off = one cached in-process engine
+        # (the spike path), faster per attempt but un-killable and fragmentation-prone.
+        "local_use_subprocess": bool(v.get("local_use_subprocess", True)),
+        # Per-card benchmark suite (#7, docs 16/20). Optional PINNED standard clip: set
+        # both to a published, hash-verified GitHub asset to benchmark against a real
+        # video; left empty (default), the suite SYNTHESISES its source with ffmpeg, so it
+        # works offline with no asset to publish (the clip CONTENT is irrelevant to the
+        # ceiling, docs 14). An unpinned URL is refused (integrity rule).
+        "benchmark_clip_url":    str(v.get("benchmark_clip_url", "") or ""),
+        "benchmark_clip_sha256": str(v.get("benchmark_clip_sha256", "") or ""),
         # Adaptive batch tuning (item 9): on a multi-segment video, seed the batch from the
         # DB (or the pod's auto-pick), let the FIRST segment's real VRAM measurement refine
         # it up or down, then freeze + persist it (keyed by output-MP + card). Only active
@@ -888,12 +982,10 @@ def eligible_targets(width, height, skip_cutoff_pct=0):
     if not width or not height:
         return []
     import video_estimate as ve
-    out = []
-    for t in TARGET_RES:
-        s = ve.fit_scale(width, height, t)
-        if s is not None and s > 1.0 + skip_cutoff_pct / 100.0:
-            out.append(t)
-    return out
+    # Ratios (2x/4x) first then presets, deduped by output size (feature #7). GPU feasibility
+    # is applied by the GUI on top of this source-only set (the combobox filters to the
+    # detected/selected card; the queue greys jobs the picked pod GPU can't reach).
+    return ve.source_eligible_targets(width, height, skip_cutoff_pct)
 
 
 def _tc(seconds):
@@ -1362,11 +1454,14 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             + vram_txt + drop_txt + phase_txt)
 
         # Self-calibrate future estimates: record this segment's real OUTPUT
-        # megapixels vs seconds against the GPU that ran it (IMGTBX_GPU_OVERRIDE,
-        # the same key the GUI estimate uses). Megapixels, not frames, so the
-        # learned rate is aspect-independent (a 16:9 video costs more per frame than
-        # the 4:3 benchmark). Remote runs only; fail-safe, never breaks a run.
-        gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+        # megapixels vs seconds against the GPU that ran it. Megapixels, not frames, so
+        # the learned rate is aspect-independent (a 16:9 video costs more per frame than
+        # the 4:3 benchmark). The key is the REMOTE card (IMGTBX_GPU_OVERRIDE, the same
+        # key the remote GUI estimate uses) or, for a LOCAL run, the engine's own card
+        # name (which the local GUI estimate reads back) -- so both paths feed the one
+        # db.gpu_perf store. Passthrough has no gpu_id, so it never records. Fail-safe.
+        gpu_id = (os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+                  or getattr(engine, "gpu_id", "") or "")
         if gpu_id and n and secs:
             try:
                 import video_estimate as ve
@@ -1496,10 +1591,40 @@ def _job_frames(conn, root_id, job):
     return (vf["nb_frames"] if vf and vf["nb_frames"] else 0) or 0
 
 
+def _job_exceeds_gpu(conn, root_id, job, max_out_mp, logged=None):
+    """True if this job's OUTPUT megapixels exceed `max_out_mp` (the selected GPU's reach,
+    #7), so it should be DEFERRED (left pending for a bigger card), not attempted. 0 =
+    no cap. Logs each deferral once. A clip shares its source video's frame size."""
+    if not max_out_mp:
+        return False
+    vf = db.get_video_file(conn, root_id, job["rel_path"])
+    if not vf or not vf["width"] or not vf["height"]:
+        return False                                   # can't judge -> let it run
+    import video_estimate as ve
+    mp = ve.output_megapixels(vf["width"], vf["height"], job["target"])
+    if mp is None or mp <= max_out_mp + 1e-6:
+        return False
+    if logged is not None:
+        key = (job["rel_path"], job["target"], job["clip_id"])
+        if key not in logged:
+            logged.add(key)
+            log(f"  Deferred {job['rel_path']} -> {job['target']} ({mp:.1f} MP output): "
+                f"exceeds the selected GPU's reach (~{max_out_mp:.1f} MP); left pending "
+                f"for a larger card.")
+    return True
+
+
 def run_queue(engine, conn, root_id, source_root, vcfg, budget,
-              notify_settings=None):
+              notify_settings=None, auto_resume=False, notify_summary=True):
     """Process the durable queue (video_outputs not yet done) for this root against
     an injected engine. Returns a summary dict.
+
+    When `auto_resume` is set (the self-healing supervisor, #6), a job that fails because
+    the POD died (a liveness/transport error, per `_is_pod_failure`) is NOT counted as a
+    source failure: run_queue re-raises `PodLost` so the supervisor can recover the pod and
+    re-enter, and the job is left `pending`/`partial` so its finished segments resume. A
+    bad-source worker error still counts against the job (item 4 give-up) as usual, and with
+    `auto_resume` off the behaviour is exactly as before (mark failed, keep going).
 
     The LIVE DB queue is re-read before every job, so removing / reordering / adding a
     job in the GUI mid-run takes effect (the shared cache.db is the source of truth):
@@ -1536,9 +1661,15 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     # every job this run (the pod is shared), notify-only.
     slow_watch = (VideoSlowWatch(factor=vcfg.get("watchdog_factor", 3.0))
                   if vcfg.get("watchdog_enabled", True) else None)
+    # Feasibility cap (#7): the GUI passes the selected GPU's max feasible OUTPUT-MP so a job
+    # whose target exceeds the card is DEFERRED (left pending for a bigger GPU), not attempted
+    # and OOM-failed. 0 = no cap (headless / unknown card).
+    max_out_mp = float(os.environ.get("IMGTBX_MAX_OUTPUT_MP", 0) or 0)
+    deferred_logged = set()
     while not _STOP.is_set():
         pending = [j for j in db.get_video_queue(conn, root_id)
-                   if (j["rel_path"], j["target"], j["clip_id"]) not in attempted]
+                   if (j["rel_path"], j["target"], j["clip_id"]) not in attempted
+                   and not _job_exceeds_gpu(conn, root_id, j, max_out_mp, deferred_logged)]
         # Keep the GUI's progress denominator honest as the live queue changes.
         live_total = done_frames + sum(_job_frames(conn, root_id, j) for j in pending)
         gui_event("VTOTAL", live_total)
@@ -1563,7 +1694,32 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
                 f"(aborted mid-segment; pod will be torn down).")
             stopped = "stopped by user"
             break
+        except _ThrashDetected as exc:                 # local GPU thrash/hang (#7)
+            # A DEGRADATION episode, NOT a source failure: leave the job `partial` (its
+            # finished segments stay on disk and resume next run), DON'T bump fail_count,
+            # and stop the whole run loudly. Only a reboot reliably clears the degraded GPU
+            # state (docs 14/17), so continuing to the next job would just thrash again.
+            db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="partial")
+            log(f"[{idx}/{total}] GPU THRASH on {rel} -> {target}: {exc}")
+            log("    The local GPU stopped making progress (VRAM thrashing / hung). This is "
+                "a known SeedVR2 degradation of a long GPU session, not a code or source "
+                "fault. Reboot to clear it, then re-run: the queue resumes from the first "
+                "unfinished segment.")
+            gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
+                                  "outcome": "fail", "error": f"gpu thrash: {exc}"})
+            stopped = "gpu thrash"
+            break
         except Exception as exc:                       # noqa: BLE001 — log, keep going
+            # Self-healing (#6): a POD/transport death is not the source's fault. When the
+            # supervisor is armed, hand the run back to it WITHOUT bumping this job's
+            # fail_count or marking it failed — its finished segments stay on disk and the
+            # redeployed pod resumes them. `attempted` was already updated, but a fresh
+            # run_queue call (after redeploy) starts with an empty `attempted`, so the job
+            # is retried on the new pod. A bad-source worker error falls through to the
+            # normal per-job failure path below.
+            if auto_resume and _is_pod_failure(exc):
+                raise PodLost(str(exc)[:300], done=done, failed=failed,
+                              done_frames=done_frames) from exc
             failed += 1
             reason = str(exc)[:300]
             n = db.bump_video_fail_count(conn, root_id, rel, target, clip_id=clip_id)
@@ -1583,7 +1739,10 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
 
     summary = {"done": done, "failed": failed, "stopped": stopped,
                "total": done + failed}
-    _notify_summary(notify_settings, summary, source_root)
+    # The supervisor (#6) sends ONE accumulated summary across all its redeploys, so it
+    # passes notify_summary=False here to suppress a per-pod notification.
+    if notify_summary:
+        _notify_summary(notify_settings, summary, source_root)
     log(f"Summary: {done} done, {failed} failed of {done + failed}"
         + (f", stopped early ({stopped})" if stopped else "") + ".")
     return summary
@@ -1604,7 +1763,8 @@ def _stop_notice(stopped):
     string in `stopped`. The old code hard-coded "paused (per-run cap)" for every early
     stop, so a user Stop or the work-root refusal was mislabeled as a cost cap. `stopped`
     is the raw reason from run_queue: "stopped by user", a per-run cap message
-    ("per-run cap of ..."/"per-run cost cap of ..."), or the work-root-conflict refusal.
+    ("per-run cap of ..."/"per-run cost cap of ..."), the work-root-conflict refusal, or
+    "gpu thrash" (a local GPU degradation the watchdog stopped the run on).
     Pure, so it is unit-tested. resume_hint True = the rest of the queue stayed pending
     and re-running continues it; False = nothing was staged (the startup refusal)."""
     reason = (stopped or "").lower()
@@ -1612,6 +1772,8 @@ def _stop_notice(stopped):
         return "Video upscale paused (per-run cap)", 0xF1C40F, True
     if "staging work folder" in reason:               # work_root_conflict refusal
         return "Video upscale did not start", 0xE74C3C, False
+    if "thrash" in reason:                            # local GPU degradation (#7)
+        return "Video upscale stopped (GPU thrashing)", 0xE74C3C, True
     if reason == "stopped by user":
         return "Video upscale stopped", 0xF1C40F, True
     return "Video upscale stopped early", 0xF1C40F, True   # unknown reason: report plainly
@@ -1641,8 +1803,228 @@ def _notify_summary(notify_settings, summary, src_root):
         pass
 
 
+# ─────────────────────────────────────────────
+#  SELF-HEALING SUPERVISOR (#6, "Auto-resume")
+# ─────────────────────────────────────────────
+# When the user arms Auto-resume, a video run survives LOSING ITS POD mid-run without
+# babysitting: a connectivity blip reconnects to the surviving pod, a real pod loss waits
+# (indefinitely, no time cap) for the IDENTICAL card to return to stock and redeploys it,
+# and either way the run continues from the first unfinished segment (the segment-level
+# resume already exists). The guardrail is MONEY, not time: nothing is billed while waiting
+# for stock, so the only automatic stops are queue-done, user Stop, or the funds guard
+# tripping (a redeployed, running pod draining the balance). No GPU substitution, ever
+# (0.4.0): recovery redeploys only the card the user picked. See docs/future-features.md #6.
+
+def _interruptible_sleep(seconds, stop):
+    """Sleep up to `seconds`, waking early (within ~0.5s) once stop() is true. Keeps a
+    long wait-for-stock backoff responsive to a user Stop."""
+    end = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < end:
+        if stop():
+            return
+        time.sleep(min(0.5, end - time.monotonic()))
+
+
+def _gpu_in_stock(gpus, gpu_id):
+    """True if `gpu_id` is present (in stock) in an available_gpus() result. available_gpus
+    already filters to in-stock cards, so mere presence means deployable. Pure."""
+    return any(g.get("id") == gpu_id for g in (gpus or []))
+
+
+def _notify_stock(notify_settings, source_root, label, *, recovered, waited=0.0):
+    """One notification when a run enters the wait-for-stock state and one when the card
+    returns, so an unattended check-in shows what the run is doing (and that $0 is being
+    spent while it waits). Fail-safe."""
+    if not notify_settings:
+        return
+    try:
+        if recovered:
+            title = "Video upscale resuming"
+            desc = (f"{label} is back in stock after {fmt_hhmmss(waited)}; "
+                    f"redeploying the same card and continuing.")
+            color = 0x2ECC71                            # green
+        else:
+            title = "Video upscale waiting for GPU"
+            desc = (f"{label} is out of stock. Auto-resume is waiting for it to return "
+                    f"(no time cap, $0 billed while waiting).")
+            color = 0xF1C40F                            # amber
+        notifications.notify(notify_settings, title, desc, color,
+                             fields=[{"name": "Source", "value": source_root}])
+    except Exception:
+        pass
+
+
+def _wait_for_gpu_stock(list_gpus, gpu_id, gpu_label, *, notify_settings=None,
+                        source_root="", on_event=log, stop=None, sleep=None,
+                        first_interval=30.0, max_interval=300.0):
+    """Block until `gpu_id` is deployable again, polling list_gpus() with backoff.
+
+    No time cap (the guardrail is money, and nothing is billed while waiting) — only a user
+    Stop ends it. Returns True when the card is back, False if stopped. Notifies on entering
+    the wait and on recovery, and logs each poll. list_gpus / stop / sleep are injected so
+    the loop is offline-testable."""
+    stop = stop or _STOP.is_set
+    sleep = sleep or _interruptible_sleep
+    label = gpu_label or gpu_id
+    t0 = time.monotonic()
+    interval = first_interval
+    entered = False
+    while not stop():
+        try:
+            gpus = list_gpus()
+        except Exception as exc:                       # noqa: BLE001 (keep waiting)
+            on_event(f"Auto-resume: could not read GPU stock ({exc}); will retry.")
+            gpus = []
+        if _gpu_in_stock(gpus, gpu_id):
+            if entered:
+                waited = time.monotonic() - t0
+                on_event(f"Auto-resume: {label} is back in stock after "
+                         f"{fmt_hhmmss(waited)}; redeploying.")
+                _notify_stock(notify_settings, source_root, label,
+                              recovered=True, waited=waited)
+            return True
+        if not entered:
+            entered = True
+            on_event(f"Auto-resume: {label} is out of stock; waiting for it to return "
+                     f"(no time cap, $0 billed while waiting, checking every "
+                     f"{int(first_interval)}s, backing off to {int(max_interval)}s).")
+            _notify_stock(notify_settings, source_root, label, recovered=False)
+        else:
+            on_event(f"Auto-resume: still waiting for {label} "
+                     f"({fmt_hhmmss(time.monotonic() - t0)} elapsed, $0 billed).")
+        sleep(interval, stop)
+        interval = min(interval * 1.5, max_interval)    # back off (never a hard cap)
+    return False
+
+
+def _pod_still_running(list_pods, pod_id, name_prefix):
+    """True if `pod_id` is still RUNNING under this run's pod-name prefix (a connectivity
+    blip: reconnect, don't redeploy), False if it's gone (a real loss: redeploy). Any error
+    reading the control plane is treated as 'gone' so the healer redeploys rather than
+    hanging on a pod it can't confirm. `list_pods` is injected for testing."""
+    if not pod_id:
+        return False
+    try:
+        pods = list_pods()
+    except Exception:                                  # noqa: BLE001 (can't confirm -> gone)
+        return False
+    for p in pods or []:
+        if not isinstance(p, dict) or p.get("id") != pod_id:
+            continue
+        if p.get("desiredStatus") != "RUNNING":
+            return False
+        if name_prefix and not str(p.get("name", "")).startswith(name_prefix):
+            return False
+        return True
+    return False
+
+
+def _healer_gpu_target(cfg):
+    """(gpu_id, gpu_label, region) the healer watches stock for and redeploys. The card is
+    the one the user picked (IMGTBX_GPU_OVERRIDE, first entry = the picked card; the tail is
+    only ever fallbacks the video run doesn't use), falling back to the configured default so
+    a headless run still has a target. Region is the model volume's data center (a pod that
+    mounts the volume MUST land there). Best-effort: region is None if it can't be read, and
+    the redeploy still tries the card. Pure apart from the one volume_region lookup."""
+    override = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+    rcfg = cfg.get("runpod", {})
+    gpu_id = ((override.split(",")[0].strip() if override
+               else rcfg.get("gpu_type_id", "")) or "").strip()
+    region = None
+    try:
+        import runpod_client as rp
+        vol = (rcfg.get("network_volume_id", "") or "").strip()
+        if vol and rcfg.get("api_key"):
+            region = rp.volume_region(rcfg["api_key"], vol)
+    except Exception as exc:                           # noqa: BLE001 (best-effort)
+        debug_log("batch_video_upscale._healer_gpu_target region", exc=exc)
+    return gpu_id, gpu_id, region
+
+
+def _final_summary(done, failed, stopped):
+    return {"done": done, "failed": failed, "stopped": stopped, "total": done + failed}
+
+
+def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_stopped,
+                    funds_tripped, close_session, on_event, notify_settings, source_root):
+    """Drive a video run under Auto-resume (#6): loop deploy -> run one pass, healing a lost
+    pod between passes, until the queue completes, the user stops, the funds guard trips, or
+    a non-pod error escapes. Returns the accumulated final summary (and sends the ONE
+    end-of-run notification, since each pass suppressed its own).
+
+    All the RunPod-touching seams are injected so the loop is offline-testable:
+      session_factory(first) -> (session, engine)   deploy+start a pod (first=True on the
+                                                     very first attempt; it may raise, which
+                                                     propagates as a clean fail-to-start)
+      run_pass(engine)       -> summary              one run_queue pass (raises PodLost on a
+                                                     mid-run pod death; returns on a clean end)
+      pod_alive(session)     -> bool                 pod still up? (blip vs. loss)
+      wait_for_stock()       -> bool                 block for the same card; False if stopped
+      is_stopped()           -> bool                 user pressed Stop
+      funds_tripped(session) -> bool                 the funds guard stopped this pod
+      close_session(session, stop_pod)               teardown (stop_pod False keeps the pod)
+    """
+    acc_done = acc_failed = 0
+
+    def finish(stopped):
+        summary = _final_summary(acc_done, acc_failed, stopped)
+        _notify_summary(notify_settings, summary, source_root)
+        log(f"Summary: {acc_done} done, {acc_failed} failed of {acc_done + acc_failed}"
+            + (f", stopped early ({stopped})" if stopped else "") + ".")
+        return summary
+
+    first = True
+    while True:
+        try:
+            session, engine = session_factory(first)
+        except Exception:
+            if first:
+                raise                                  # nothing ran yet: clean fail-to-start
+            # A redeploy failed (a capacity race after stock appeared): wait and try again,
+            # never substitute a card. A user Stop during the wait ends the run.
+            on_event("Auto-resume: redeploy failed; waiting for the GPU again.")
+            if not wait_for_stock():
+                return finish("stopped by user")
+            continue
+        first = False
+        try:
+            summary = run_pass(engine)
+        except PodLost as exc:
+            acc_done += exc.done
+            acc_failed += exc.failed
+            reason = str(exc)
+            # Hard stops (never redeploy): the funds guard deliberately stopped the pod, or
+            # the user pressed Stop. Both look like a pod death to the engine; distinguishing
+            # them here is what keeps the healer from redeploying INTO the funds guard.
+            if funds_tripped(session):
+                on_event("Auto-resume: the funds safety-net stopped the pod; not redeploying "
+                         "(add funds or raise the cap, then re-run to continue).")
+                close_session(session, True)
+                return finish("funds safety-net")
+            if is_stopped():
+                close_session(session, True)
+                return finish("stopped by user")
+            if pod_alive(session):
+                on_event(f"Auto-resume: connectivity blip; pod {session.pod_id} is still up, "
+                         f"reconnecting. ({reason})")
+                close_session(session, False)          # keep the pod; drop the local tunnel
+                continue
+            on_event(f"Auto-resume: pod lost ({reason}); terminating any remnant and waiting "
+                     f"for the same GPU to return.")
+            close_session(session, True)
+            if not wait_for_stock():
+                return finish("stopped by user")
+            continue
+        else:
+            acc_done += summary["done"]
+            acc_failed += summary["failed"]
+            close_session(session, None)               # default teardown for the run's end
+            return finish(summary.get("stopped"))
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Video Upscaler runner (RunPod-only).")
+    p = argparse.ArgumentParser(
+        description="Video Upscaler runner (remote RunPod pod, or --local on this GPU).")
     p.add_argument("source", help="source folder (searched recursively)")
     p.add_argument("output", nargs="?",
                    help="output folder (default: <source>/<video.output_subdir>)")
@@ -1650,8 +2032,13 @@ def main(argv=None):
                    help="headless: scan + enqueue every eligible video to this "
                         "target before running. Omit to run the existing queue "
                         "(the GUI populates it via Prepare).")
-    p.add_argument("--passthrough", action="store_true",
-                   help="no pod: stream-copy each segment locally (pipeline test only)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--passthrough", action="store_true",
+                      help="no pod: stream-copy each segment locally (pipeline test only)")
+    mode.add_argument("--local", action="store_true",
+                      help="no pod: upscale on THIS machine's GPU (feature #7). Uses the "
+                           "local SeedVR2 engine + the predictive VRAM sizer + the "
+                           "mid-segment thrash watchdog.")
     args = p.parse_args(argv)
 
     src_root = os.path.abspath(args.source)
@@ -1680,44 +2067,125 @@ def main(argv=None):
         log(f"Enqueued {n} eligible video(s) to {args.target}.")
 
     budget = RunBudget(vcfg["per_run_minute_cap"], vcfg["per_run_cost_cap"])
-    session = None
-    engine = None
-    tele_stop = threading.Event()
+    # Auto-resume (#6): the GUI's per-run "Auto-resume" checkbox sets this env. Only
+    # meaningful for a real pod run (a passthrough test has no pod to lose).
+    auto_resume = (os.environ.get("IMGTBX_AUTO_RESUME", "").strip() in ("1", "true", "True")
+                   and not args.passthrough and not args.local)
+    engine = None                                  # set only for the passthrough path
+    active = {"session": None}                     # the live session (armed + non-armed)
+    started = {"v": False}                          # a pod started at least once (for _failure_notice)
+
+    def _worker_cfg():
+        # The pod's SeedVR2 engine reads the image upscale config; overlay the video-only
+        # quality/speed knobs so they apply on the video pod without changing the Batch
+        # Upscaler's behaviour. Engine flag names (see upscale_engine._build_args):
+        # compile_dit/compile_vae, uniform_batch_size, input_noise_scale.
+        wc = dict(cfg.get("upscale", {}))
+        wc["compile_dit"]        = vcfg["compile"]
+        wc["compile_vae"]        = vcfg["compile"]
+        wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
+        wc["input_noise_scale"]  = vcfg["input_noise_scale"]
+        wc["dit_model"]          = vcfg["dit_model"]
+        return wc
+
+    def make_session(first=True):
+        """Deploy + start one video pod, wire telemetry, and tell the GUI which pod is
+        live. Returns (session, engine). On a start failure it closes the partial session
+        (no orphan pod) before re-raising. Called once (non-armed) or once per redeploy
+        (supervised); a redeploy transparently reuses a surviving pod via RemoteSession's
+        _find_existing_pod (the blip path)."""
+        from remote_run import RemoteSession
+        sess = RemoteSession(cfg.get("runpod", {}), _worker_cfg(),
+                             APP_ROOT, on_event=log, mode="video")
+        try:
+            eng = sess.start()
+        except Exception:
+            try:
+                sess.close()
+            except Exception as exc:               # noqa: BLE001 (fail-safe teardown)
+                debug_log("batch_video_upscale.make_session close-on-fail", exc=exc)
+            raise
+        budget.cost_per_hr = sess.cost_per_hr
+        # Tell the GUI which pod is live so the RunPod tab won't offer to terminate the
+        # pod this (paid, multi-hour) run depends on, and hand it the pod's real billed
+        # $/h for the live cost readout. NOTE: gui_event() JSON-encodes its payload, so
+        # the Video tab reads the decoded value.
+        gui_event("POD", sess.pod_id or "")
+        if sess.cost_per_hr is not None:
+            gui_event("RCOST", sess.cost_per_hr)
+        ev = threading.Event()
+        _start_remote_telemetry(eng, ev)           # stream CPU/RAM/GPU to the GUI row
+        sess._tele_stop = ev
+        active["session"] = sess
+        started["v"] = True
+        return sess, eng
+
+    def close_session(sess, stop_pod=None):
+        """Tear one session down (its telemetry + tunnel + pod). stop_pod: None = default
+        (stop a pod we created), True = stop it, False = KEEP the pod (a blip reconnect
+        reuses it). Clears the GUI's live-pod marker whenever a pod actually goes away."""
+        ev = getattr(sess, "_tele_stop", None)
+        if ev:
+            ev.set()
+        try:
+            sess.close() if stop_pod is None else sess.close(stop_pod=stop_pod)
+        except Exception as exc:                   # noqa: BLE001 (fail-safe teardown)
+            debug_log("batch_video_upscale.close_session", exc=exc)
+        if active.get("session") is sess:
+            active["session"] = None
+        if stop_pod is not False:                  # True or default => no pod remains
+            gui_event("POD", "")
+
     try:
         if args.passthrough:
             log("Passthrough mode — no pod; segments are stream-copied locally.")
             engine = PassthroughVideoEngine()
+            run_queue(engine, conn, root_id, src_root, vcfg, budget,
+                      notify_settings=notify_settings)
+        elif args.local:
+            # Local mode (#7): the SeedVR2 work runs on THIS machine's GPU, no pod. Same
+            # walk/split/reassemble/mux/resume pipeline as the remote path; only the injected
+            # engine changes. The predictive VRAM sizer picks the batch (conn + gpu self-ID
+            # give it learned self-calibration) and the mid-segment thrash watchdog guards a
+            # degrading GPU when local_use_subprocess is on (the default product path).
+            from local_video_engine import LocalVideoEngine
+            repo_dir, model_dir = _local_seedvr2_paths(cfg)
+            log(f"Local mode — upscaling on this machine's GPU (no pod). "
+                f"Thrash watchdog: {vcfg['thrash_stall_seconds']}s stall; "
+                f"engine: {'subprocess-per-attempt' if vcfg['local_use_subprocess'] else 'in-process'}.")
+            engine = LocalVideoEngine(
+                repo_dir, model_dir, _worker_cfg(),
+                conn=conn, gpu_id=None,
+                use_subprocess=vcfg["local_use_subprocess"],
+                thrash_stall_seconds=vcfg["thrash_stall_seconds"])
+            run_queue(engine, conn, root_id, src_root, vcfg, budget,
+                      notify_settings=notify_settings)
+        elif auto_resume:
+            import runpod_client as rp
+            rcfg = cfg.get("runpod", {})
+            api_key = rcfg.get("api_key", "")
+            gpu_id, gpu_label, region = _healer_gpu_target(cfg)
+            log("Auto-resume is ON: if the pod is lost, the run reconnects or waits for "
+                f"the same GPU ({gpu_label or 'configured card'}) to return and continues "
+                "from the first unfinished segment (no time cap; $0 billed while waiting).")
+            _run_supervised(
+                make_session,
+                lambda eng: run_queue(eng, conn, root_id, src_root, vcfg, budget,
+                                      notify_settings=notify_settings,
+                                      auto_resume=True, notify_summary=False),
+                pod_alive=lambda s: _pod_still_running(
+                    lambda: rp.list_pods(api_key), s.pod_id, s.pod_name_prefix),
+                wait_for_stock=lambda: _wait_for_gpu_stock(
+                    lambda: rp.available_gpus(api_key, data_center_id=region),
+                    gpu_id, gpu_label, notify_settings=notify_settings, source_root=src_root),
+                is_stopped=_STOP.is_set,
+                funds_tripped=lambda s: getattr(s, "_funds_tripped", False),
+                close_session=close_session,
+                on_event=log, notify_settings=notify_settings, source_root=src_root)
         else:
-            from remote_run import RemoteSession
-            # The pod's SeedVR2 engine reads the image upscale config; overlay the
-            # video-only quality/speed knobs so they apply on the video pod without
-            # changing the Batch Upscaler's behaviour. Engine flag names (see
-            # upscale_engine._build_args): compile_dit/compile_vae, uniform_batch_size,
-            # input_noise_scale.
-            worker_cfg = dict(cfg.get("upscale", {}))
-            worker_cfg["compile_dit"]        = vcfg["compile"]
-            worker_cfg["compile_vae"]        = vcfg["compile"]
-            worker_cfg["uniform_batch_size"] = vcfg["uniform_batch_size"]
-            worker_cfg["input_noise_scale"]  = vcfg["input_noise_scale"]
-            worker_cfg["dit_model"]          = vcfg["dit_model"]
-            session = RemoteSession(cfg.get("runpod", {}), worker_cfg,
-                                    APP_ROOT, on_event=log, mode="video")
-            engine = session.start()
-            budget.cost_per_hr = session.cost_per_hr
-            # Tell the GUI which pod is live so the RunPod tab won't offer to
-            # terminate the pod this (paid, multi-hour) run depends on, and hand
-            # it the pod's real billed $/h for the live cost readout. Mirrors the
-            # image runners (batch_upscale / tag_and_rename). NOTE: this runner's
-            # gui_event() JSON-encodes its payload, so the Video tab reads the
-            # decoded value (data), not the raw payload string.
-            gui_event("POD", session.pod_id or "")
-            if session.cost_per_hr is not None:
-                gui_event("RCOST", session.cost_per_hr)
-            # Stream the pod's CPU/RAM/GPU to the GUI's remote-telemetry row.
-            _start_remote_telemetry(engine, tele_stop)
-
-        run_queue(engine, conn, root_id, src_root, vcfg, budget,
-                  notify_settings=notify_settings)
+            _sess, engine = make_session(True)
+            run_queue(engine, conn, root_id, src_root, vcfg, budget,
+                      notify_settings=notify_settings)
     except Exception as exc:                       # noqa: BLE001
         # Surface a clean, actionable one-liner instead of a raw traceback (a
         # transient pod-GPU failure is the common case and is not a code bug, and a
@@ -1730,7 +2198,7 @@ def main(argv=None):
         # deployed) used to be silent, unlike the image runners' red "Engine Failed
         # to Start" alert; a mid-run crash that escapes run_queue is likewise
         # reported here (per-video failures are covered by the summary). Item 9.
-        title, desc = _failure_notice(engine is not None, exc)
+        title, desc = _failure_notice(engine is not None or started["v"], exc)
         try:
             notifications.notify(
                 notify_settings, title, desc, 0xE74C3C,   # red
@@ -1741,11 +2209,17 @@ def main(argv=None):
             pass
         return 1
     finally:
-        tele_stop.set()
-        if session is not None:
-            session.close()
+        # Close whatever is still live: the supervised path closes its final session itself
+        # (active["session"] is then None), so this handles the non-armed run, a fail-to-
+        # start, and the passthrough engine.
+        sess = active.get("session")
+        if sess is not None:
+            close_session(sess, None)
         elif engine is not None:
-            engine.close()
+            try:
+                engine.close()
+            except Exception as exc:               # noqa: BLE001 (fail-safe)
+                debug_log("batch_video_upscale.main engine.close", exc=exc)
         _close_log()
     return 0
 

@@ -84,12 +84,35 @@ def map_gpu(gpu_id_or_name):
     return None
 
 
+# Dynamic upscale-RATIO targets (feature #7): a low-res source gets 2x/4x targets computed
+# from its own size, not just the named preset boxes. The token is "2X"/"4X"; its output is
+# simply source x N (no box-fit), so a 320x240 source -> 640x480 / 1280x960. Ordered small
+# first. (2x and 4x only, by product decision.)
+RATIO_TARGETS = {"2X": 2, "4X": 4}
+
+
+def ratio_of(target):
+    """The integer upscale ratio for a ratio target token ('2X' -> 2), or None for a preset
+    (1080p/1440p/4K) or an unknown token."""
+    return RATIO_TARGETS.get(str(target or "").upper())
+
+
+def is_ratio_target(target):
+    return ratio_of(target) is not None
+
+
 def fit_scale(src_w, src_h, target):
-    """The scale that fits a (src_w x src_h) frame INSIDE the target's landscape box
-    (preserving aspect): min(box_w/w, box_h/h). >1 = an upscale, <1 = a downscale.
+    """The upscale factor for (src -> target). For a RATIO target it is the ratio itself
+    (2/4); for a preset it is the box-fit scale min(box_w/w, box_h/h) that fits the source
+    INSIDE the target's landscape box (preserving aspect). >1 = an upscale, <1 = a downscale.
     None if the dims or target are unknown."""
+    if not src_w or not src_h:
+        return None
+    n = ratio_of(target)
+    if n:
+        return float(n)                              # a ratio target scales by N, no box-fit
     box = TARGET_BOX.get(target)
-    if not box or not src_w or not src_h:
+    if not box:
         return None
     return min(box[0] / src_w, box[1] / src_h)
 
@@ -140,6 +163,129 @@ def output_megapixels(src_w, src_h, target):
     return BENCH_OUT_MP.get(target)
 
 
+# ─────────────────────────────────────────────
+#  FEASIBILITY: max output a GPU can upscale to (#7)
+# ─────────────────────────────────────────────
+# The VAE-decode ceiling scales with OUTPUT megapixels and is model-independent (docs 14),
+# so a card's reach is best expressed as a max feasible output-MP. These per-VRAM-tier caps
+# are SEEDS: 24 GB = 1080p (~2.1 MP) is measured on the 3090 (user's call: allow the tight
+# 1080p); the rest are conservative guesses biased LOW so the guard errs toward NOT offering
+# an OOM target. A card's OWN benchmark/learned data (db.max_feasible_output_mp) RAISES its
+# cap above the seed once it proves a bigger output fits. Ascending (min VRAM GB, max MP).
+_MAX_MP_TIERS = [
+    (8,  0.6),
+    (10, 0.9),
+    (12, 1.1),
+    (16, 1.4),
+    (20, 1.8),
+    (24, 2.1),      # 1080p (1920x1080 = 2.07 MP) — measured on the 3090
+    (32, 3.8),      # 1440p (2560x1440 = 3.69 MP)
+    (48, 8.4),      # 4K   (3840x2160 = 8.29 MP)
+    (80, 8.4),
+]
+
+
+def _seed_max_mp(total_vram_gb):
+    """The seed max feasible output-MP for a card of `total_vram_gb` (largest tier <= VRAM,
+    +0.5 GB tolerance for a 23.6-reported 24 GB card). None if VRAM is unknown."""
+    if not total_vram_gb or total_vram_gb <= 0:
+        return None
+    cap = _MAX_MP_TIERS[0][1]
+    for thr, mp in _MAX_MP_TIERS:
+        if total_vram_gb + 0.5 >= thr:
+            cap = mp
+    return cap
+
+
+def max_output_mp(total_vram_gb, gpu_id=None, conn=None):
+    """The largest OUTPUT megapixels this card is believed able to upscale to: the VRAM-tier
+    seed, RAISED to anything the card's own benchmark/learned data proves feasible (never
+    lowered — a single contended failure shouldn't hide a target; the benchmark's free-VRAM
+    tag handles that). Returns 0.0 if VRAM is unknown (callers then don't filter)."""
+    cap = _seed_max_mp(total_vram_gb) or 0.0
+    if conn is not None and gpu_id:
+        try:
+            import db
+            proven = db.max_feasible_output_mp(conn, gpu_id)
+            if proven and proven > cap:
+                cap = proven
+        except Exception:
+            pass
+    return cap
+
+
+# ─────────────────────────────────────────────
+#  TARGET ENUMERATION (ratios + presets), feature #7
+# ─────────────────────────────────────────────
+
+# All candidate targets, small output first: the ratio targets then the named presets. The
+# feasible/eligible helpers filter this by "is it an upscale" and "does it fit the GPU".
+_ALL_TARGETS = list(RATIO_TARGETS) + list(SHORT_SIDE)   # ["2X","4X","1080p","1440p","4K"]
+
+# Ratio targets are for LOW-RES sources: never offer a ratio whose output exceeds the largest
+# preset (4K, ~8.3 MP), so a 4K source isn't offered an 8K "2x" (and still counts as
+# "already >= 4K, nothing to upscale to" in the scan, as before).
+_MAX_RATIO_OUTPUT_MP = TARGET_BOX["4K"][0] * TARGET_BOX["4K"][1] / 1_000_000.0
+
+
+def source_eligible_targets(src_w, src_h, skip_cutoff_pct=0):
+    """Targets that are a genuine UPSCALE of this source (ignoring the GPU), ratios first
+    then presets, ordered by output size and DEDUPED by output dims (if a ratio and a preset
+    yield the same frame, the preset name wins). A downscale / barely-below source is dropped
+    (skip-cutoff), and a ratio bigger than 4K is dropped (ratios are a low-res-source feature).
+    This is the source-only set; feasible_targets() then filters it by VRAM."""
+    if not src_w or not src_h:
+        return []
+    min_scale = 1.0 + (skip_cutoff_pct or 0) / 100.0
+    seen_dims = {}
+    for t in _ALL_TARGETS:
+        s = fit_scale(src_w, src_h, t)
+        d = output_dims(src_w, src_h, t)
+        if s is None or d is None or s <= min_scale:
+            continue
+        if is_ratio_target(t):
+            if d in seen_dims:                          # a preset at the same size wins
+                continue
+            if d[0] * d[1] / 1_000_000.0 > _MAX_RATIO_OUTPUT_MP + 1e-6:
+                continue                                # ratio bigger than 4K: not offered
+        seen_dims[d] = t
+    # order by output area (small first), stable
+    ordered = sorted(seen_dims.items(), key=lambda kv: kv[0][0] * kv[0][1])
+    return [t for _d, t in ordered]
+
+
+def feasible_targets(src_w, src_h, max_mp, skip_cutoff_pct=0):
+    """The source-eligible targets that ALSO fit the GPU (output-MP <= max_mp). When max_mp
+    is falsy (unknown GPU) the source-eligible set is returned unfiltered (no false guard)."""
+    elig = source_eligible_targets(src_w, src_h, skip_cutoff_pct)
+    if not max_mp:
+        return elig
+    out = []
+    for t in elig:
+        mp = output_megapixels(src_w, src_h, t)
+        if mp is None or mp <= max_mp + 1e-6:
+            out.append(t)
+    return out
+
+
+def target_is_feasible(src_w, src_h, target, max_mp):
+    """True if (source -> target) fits a GPU whose max feasible output-MP is `max_mp`. A
+    falsy max_mp (unknown) is treated as feasible (don't gray a row we can't judge)."""
+    if not max_mp:
+        return True
+    mp = output_megapixels(src_w, src_h, target)
+    return mp is None or mp <= max_mp + 1e-6
+
+
+def target_label(src_w, src_h, target):
+    """A combobox/display label showing the concrete output size, e.g. '2x (640x480)' or
+    '1080p (1440x1080)'. Falls back to the bare token when dims are unknown."""
+    d = output_dims(src_w, src_h, target)
+    n = ratio_of(target)
+    name = f"{n}x" if n else str(target)
+    return f"{name} ({d[0]}x{d[1]})" if d else str(target)
+
+
 def seconds_per_mp(gpu_id, target, conn=None):
     """Seconds per OUTPUT megapixel for (gpu, target). Prefers the user's OWN
     measured history (db.gpu_perf, task `video-mp-<target>`, recorded in MP) once
@@ -153,9 +299,13 @@ def seconds_per_mp(gpu_id, target, conn=None):
                 return per_100 / 100.0          # gpu_perf stores seconds / 100 units
         except Exception:
             pass
+    # A ratio target (2x/4x) has no benchmark row of its own; its s/MP is well-approximated
+    # by the 1080p preset's (SeedVR2 cost is ~per-output-MP), so remote cost/GPU-ranking works
+    # for a ratio-target queue instead of dropping every card for "no rate".
+    rate_target = "1080p" if (is_ratio_target(target) and target not in RATES) else target
     model = map_gpu(gpu_id)
-    rate = RATES.get(target, {}).get(model) if model else None
-    bench_mp = BENCH_OUT_MP.get(target)
+    rate = RATES.get(rate_target, {}).get(model) if model else None
+    bench_mp = BENCH_OUT_MP.get(rate_target)
     if rate is None or not bench_mp:
         return None
     return rate / bench_mp
@@ -214,6 +364,97 @@ def estimate_queue(jobs, gpu_id, price_per_hour, spin_up_seconds=DEFAULT_SPIN_UP
         "total_frames": total_frames,
         "segments": total_segments,
         "cost_per_segment": (cost / total_segments) if total_segments else 0.0,
+    }
+
+
+# ─────────────────────────────────────────────
+#  LOCAL time estimate (feature #7): no cost, no pod spin-up
+# ─────────────────────────────────────────────
+# The local estimate is HISTORY-DRIVEN and honest: it uses the user's OWN measured
+# seconds-per-output-MP for THIS card+target (db.gpu_perf, the same store the remote
+# path fills, keyed by the nvidia-smi card name), and shows nothing invented before
+# that. A run self-calibrates per segment (batch_video_upscale records each segment),
+# so the SECOND run onward shows a real measured time; the first run is covered by the
+# in-run live ETA. LOCAL_RATES is a SEED hook the per-card benchmark suite (docs §16)
+# populates with rigorously-measured rates -- deliberately empty now rather than
+# fabricated (we have no honest per-card table yet, only the dev's own 3090, which
+# history captures directly). Cards absent from both history and seed estimate as
+# "calibrates after the first segment", not a guessed number.
+LOCAL_RATES = {}                 # {target: {card model token: seconds per output-MP}}
+_LOCAL_MODEL_TOKENS = []         # [(substring, model token)] — grows with LOCAL_RATES
+
+# Trust floor (cumulative output-MP) before the LOCAL estimate uses measured history. Far
+# lower than the remote 300: a local card is a single deterministic device, so even a
+# small first segment (or one benchmark probe) is a trustworthy sample. One 60 s segment is
+# thousands of MP, so real runs still calibrate after the first segment; this just lets the
+# benchmark's short clip (tens of MP) register too.
+LOCAL_MIN_MP = 40
+
+
+def map_local_gpu(gpu_id_or_name):
+    """Resolve a local card name to a LOCAL_RATES seed token, or None if unseeded."""
+    s = (gpu_id_or_name or "").upper()
+    for token, model in _LOCAL_MODEL_TOKENS:
+        if token in s:
+            return model
+    return None
+
+
+def local_seconds_per_mp(gpu_id, target, conn=None):
+    """(seconds/output-MP, calibrated) for a LOCAL (gpu, target). Prefers the user's OWN
+    measured history (db.gpu_perf, `video-mp-<target>`) -> calibrated=True; else a
+    LOCAL_RATES seed -> calibrated=False; else (None, False) when we have neither (the GUI
+    then shows work-size only, honestly declining to invent a time)."""
+    if conn is not None:
+        try:
+            import db
+            per_100 = db.get_gpu_perf(conn, f"video-mp-{target}", gpu_id, min_images=LOCAL_MIN_MP)
+            if per_100:
+                return per_100 / 100.0, True
+        except Exception:
+            pass
+    model = map_local_gpu(gpu_id)
+    spm = LOCAL_RATES.get(target, {}).get(model) if model else None
+    return (spm, False) if spm else (None, False)
+
+
+def record_benchmark_rate(conn, gpu_id, target, out_megapixels, seconds):
+    """Record a BENCHMARK probe's timing as the measured rate for (gpu, target). Like
+    record_run but with a low trust floor (a benchmark clip is short but a controlled, clean
+    single-probe measurement, not noisy accumulation), so one probe calibrates the estimate."""
+    try:
+        import db
+        db.record_gpu_perf(conn, f"video-mp-{target}", gpu_id, out_megapixels, seconds,
+                           min_images=1)
+    except Exception:
+        pass
+
+
+def estimate_queue_local(jobs, gpu_id, conn=None):
+    """TIME estimate for the whole queue on a LOCAL card: no cost, no pod spin-up (the
+    engine is already resident). `jobs` = [{frames, target, segments, width, height}].
+    Returns {duration_seconds, total_frames, segments, calibrated} or None when the card
+    has no rate (history or seed) for some queued target. `calibrated` is True only when
+    EVERY job's rate came from measured history (so the GUI can mark a seeded guess)."""
+    total_proc = 0.0
+    total_frames = 0
+    total_segments = 0
+    calibrated = True
+    for j in jobs:
+        spm, cal = local_seconds_per_mp(gpu_id, j["target"], conn)
+        mp_per_frame = output_megapixels(j.get("width"), j.get("height"), j["target"])
+        if spm is None or mp_per_frame is None:
+            return None
+        total_proc += (j.get("frames") or 0) * mp_per_frame * spm
+        calibrated = calibrated and cal
+        total_frames += j.get("frames") or 0
+        total_segments += j.get("segments") or 0
+    return {
+        "duration_seconds": total_proc,
+        "processing_seconds": total_proc,
+        "total_frames": total_frames,
+        "segments": total_segments,
+        "calibrated": calibrated,
     }
 
 

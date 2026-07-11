@@ -41,9 +41,12 @@ Upscaler"**.
 - **No rotation.** Skip the orientation/auto-straighten step entirely (videos are
   not sideways camera photos). This removes the whole `orientation.py` dependency
   from this path.
-- **RunPod-only by design.** Local SeedVR2 video is both too slow (a diffusion
-  pass per frame) and exposed to the GPU-degradation bug that motivated remote
-  upscaling (#1). This feature never offers a local path.
+- **RunPod-only as originally built.** Local SeedVR2 video was excluded because it
+  is slow (a diffusion pass per frame) and exposed to the GPU-degradation bug that
+  motivated remote upscaling (#1). **This decision is being reversed** (0.5.0): local
+  is a **free-and-slow** alternative to the **expensive-and-fast** remote path, gated
+  to Local/Both installs, with the two objections handled as loud guards, not gates.
+  See `docs/local-video-upscaler.md`. The remote path documented here is unchanged.
 - **Shared config & database.** No new config file and no new database. Settings
   live in a new `video` section of the existing `config.json`; resume/queue state
   lives in new tables in the existing `db/cache.db`. See sections 9 and 10.
@@ -919,8 +922,11 @@ as the other tools); it adds no pipeline logic.
 
 ### 15.1 Resolved decisions (the contract)
 
-- **Remote-only.** No local path; the tab is blocked with guidance until remote is
-  ready (15.3 step 1).
+- **Remote OR local as built (0.5.0).** The tab has a **"Run on:" selector**
+  (Remote (RunPod) / Local GPU), gated by the install mode: Remote-only disables Local,
+  Local-only disables Remote, Both remembers the last choice. Local runs SeedVR2 on this
+  machine's GPU with the predictive VRAM sizer + mid-segment thrash watchdog and no pod.
+  Designed + as-built in `docs/local-video-upscaler.md` (sections 10, 15, 17, 18).
 - **A persistent, DB-backed QUEUE is the core object.** "Prepare" adds a
   (source, target) job to the queue; Start processes the whole queue. The queue is
   exactly the set of `video_outputs` rows not yet `done`, so it **survives app
@@ -1595,3 +1601,85 @@ come from the source dimensions unchanged.
 - **Picker seek precision on old codecs:** libVLC seek granularity on AVI/mjpeg
   sources vs the ffmpeg frame-decode; if libVLC seek is coarse, drive the mark
   readout from an ffmpeg frame index at the settled time so the marks stay exact.
+
+## 17. Self-healing remote runs ("Auto-resume", 0.5.0-experimental)
+
+> Status: **BUILT (experimental), video only.** Design & decisions:
+> `docs/future-features.md` #6. This section is the as-built map.
+
+**Problem.** A long remote run uses one contiguous pod. If that pod dies involuntarily
+mid-run (RunPod reclaims the host, a spot eviction, the ssh tunnel or the internet drops),
+`run_queue` used to catch the engine error, mark the remaining jobs `failed`, and end.
+Finished videos are safe (`done` on disk) but the rest needed a **manual** restart. For an
+overnight job that is exactly the babysitting this feature removes.
+
+**Opt-in.** An **"Auto-resume"** checkbox sits to the right of the Video Upscaler's Start
+button (`gui/tab_video.py`), per-run and **default OFF** (a visible choice at the point of
+action, not a hidden global Setting). Ticked, it sets `IMGTBX_AUTO_RESUME=1` for that run;
+unticked, an interruption behaves exactly as before. The checkbox disables while a run is
+active (like Start).
+
+**Failure taxonomy (the crux).** Everything the pod does surfaces to the client as an
+exception, so the healer must tell apart three look-alikes:
+- **bad source** — the worker ran and rejected the segment (unreadable codec, black-output
+  guard). Now a distinct `remote_video_engine.RemoteVideoWorkerError`; redeploying an
+  identical pod would fail identically, so this is NEVER healed. It counts toward the job's
+  `fail_count` (item-4 give-up) as usual.
+- **pod/transport loss** — a dropped tunnel, a lost job, connection refused: plain
+  `RemoteVideoError`. This is what the healer recovers.
+- **deliberate stop** — the funds guard stopped the pod (`session._funds_tripped`) or the
+  user pressed Stop (`_STOP`). Looks like a pod loss to the engine; distinguishing it is
+  what keeps the healer from redeploying straight back INTO the funds guard.
+
+`batch_video_upscale._is_pod_failure(exc)` encodes the first split (a `RemoteVideoWorkerError`
+is excluded even though it subclasses `RemoteVideoError`).
+
+**run_queue propagation.** With `auto_resume=True`, the per-job handler, on a pod failure,
+re-raises `PodLost(reason, done, failed, done_frames)` **without** bumping the source's
+`fail_count` or marking it failed: its finished segments stay on disk and the job stays
+`pending`/`partial`, so a redeployed pod resumes it. It also takes `notify_summary=False`
+so each pod-pass stays quiet and the supervisor sends ONE accumulated end-of-run summary.
+
+**The supervisor (`_run_supervised`).** A loop around deploy + one `run_queue` pass:
+1. `session_factory(first)` deploys + starts a pod, wires telemetry, emits `POD`/`RCOST`.
+   A failure on the **very first** deploy propagates (a clean fail-to-start, reported by
+   `main()`); a failure on a **redeploy** routes back to wait-for-stock (a capacity race).
+2. One pass runs. A clean return (queue done / installment cap / user Stop that `run_queue`
+   returned) ends the run.
+3. On `PodLost`: accumulate the carried counts, then decide:
+   - **funds tripped** or **user Stop** -> stop, no redeploy (the money/'`Stop`' guardrails).
+   - **pod still alive** (`_pod_still_running` finds it `RUNNING` under the mode-aware name
+     prefix) -> a **blip**: `close_session(stop_pod=False)` drops the local tunnel but KEEPS
+     the pod, and the loop reconnects (a fresh `RemoteSession` reattaches via
+     `_find_existing_pod`). No spend, no model reload.
+   - **pod gone** -> a **loss**: `close_session(stop_pod=True)` terminates any remnant (the
+     double-bill guard), then `_wait_for_gpu_stock` blocks until the IDENTICAL card is back,
+     and the loop redeploys it.
+
+**Wait-for-stock (`_wait_for_gpu_stock`).** Polls `available_gpus` for the exact picked
+card id (`IMGTBX_GPU_OVERRIDE` first entry, else the configured default; region from the
+model volume). **No time cap** — the guardrail is money, and while waiting **no pod runs so
+nothing is billed**; only a user Stop ends the wait. Backoff 30 s -> 300 s (slows retries,
+never stops them, so a flapping stock doesn't thrash cold-start model reloads). Notifies on
+entering the wait and on recovery, so an unattended check-in shows "waiting for <card>,
+$0 billed, N elapsed". A control-plane read error is swallowed and retried.
+
+**No GPU substitution, ever (0.4.0).** Recovery redeploys **only** the card the user picked.
+The Auto-resume checkbox gates *whether* to auto-recover (and the unattended spend that
+implies), never *which* card.
+
+**Billing safety.** The redeployed, running pod is re-guarded by `funds_guard` each deploy
+(start floor + session cost cap), and the on-pod dead-man's switch is the backstop for a pod
+the healer somehow orphans. Terminating the remnant before a loss-redeploy prevents two
+billed pods. The cost/time `RunBudget` is shared across redeploys, so the per-run installment
+caps span the whole supervised run, not each pod.
+
+**Testing (`tests/test_video_autoresume.py`, 17 tests).** Every RunPod-touching seam is
+injected (session factory, pod-alive, wait-for-stock, funds/stop predicates), so the whole
+feature is exercised offline: the classifier, run_queue's armed/unarmed propagation, the
+wait-for-stock poll (return-on-stock, stop-aware, error-tolerant), blip-vs-loss detection,
+target resolution, and the supervisor's loss->wait->redeploy->resume / blip->reconnect /
+funds-trip / user-Stop / redeploy-race / first-start-failure paths.
+
+**Scope.** Video only for now (the long, most-exposed run). Generalising the same supervisor
+to the image runners (batch upscale / tag) is the follow-up if it proves out.

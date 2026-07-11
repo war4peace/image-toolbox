@@ -29,6 +29,17 @@ from remote_upscale_engine import RemoteUpscaleEngine, RemoteUpscaleError
 
 
 class RemoteVideoError(Exception):
+    """A liveness / transport failure talking to the pod worker (a dropped tunnel,
+    a lost job, a connection refused). The self-healing supervisor (#6) treats this
+    as a POD failure worth reconnecting/redeploying for, NOT a bad source."""
+    pass
+
+
+class RemoteVideoWorkerError(RemoteVideoError):
+    """The worker ran but reported an error ON THE SEGMENT (a bad/corrupt source, a
+    codec the pod can't read). This is a per-job failure, NOT a pod loss: redeploying
+    a fresh identical pod would hit the exact same error, so the supervisor must let
+    it count against the job's fail_count (item 4 give-up) instead of healing it."""
     pass
 
 
@@ -176,7 +187,10 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
                 self.last_segment_seconds = st.get("seconds")
                 return int(st.get("frames_written") or 0)
             if state == "error":
-                raise RemoteVideoError(f"worker error on segment: {st.get('error')}")
+                # A source/content failure, not a pod loss (see RemoteVideoWorkerError):
+                # the supervisor must NOT redeploy for this, or it would loop forever on
+                # the same bad segment.
+                raise RemoteVideoWorkerError(f"worker error on segment: {st.get('error')}")
             if state == "unknown":
                 raise RemoteVideoError("worker lost the job (it may have restarted).")
             time.sleep(poll_interval)

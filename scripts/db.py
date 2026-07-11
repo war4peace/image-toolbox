@@ -223,6 +223,29 @@ CREATE TABLE IF NOT EXISTS video_batch_learn (
     updated_at TEXT,
     PRIMARY KEY (gpu_id, mp_bucket)
 );
+-- Per-card VRAM benchmark suite (feature #7, docs/local-video-upscaler.md 16/20).
+-- One row per PROBE: a fixed 4n+1 batch tried at a given OUTPUT size on this card+model,
+-- run in an isolated subprocess (test-till-it-breaks upward sweep). Persisted per probe so
+-- a stopped benchmark RESUMES at the nearest untried batch, and so a report survives. The
+-- final ceiling (max 'ok' batch per cell) is copied into video_batch_learn + gpu_perf, but
+-- these raw rows stay as the audit trail / resume state.
+CREATE TABLE IF NOT EXISTS video_bench (
+    gpu_id        TEXT    NOT NULL,   -- nvidia-smi card name (the sizer/estimate key)
+    model         TEXT    NOT NULL,   -- model family tag (7b / 3b / 3b_fp16)
+    out_w         INTEGER NOT NULL,   -- benchmarked OUTPUT width
+    out_h         INTEGER NOT NULL,   -- benchmarked OUTPUT height
+    batch         INTEGER NOT NULL,   -- 4n+1 batch probed
+    outcome       TEXT    NOT NULL,   -- 'ok' | 'oom' | 'thrash' | 'error'
+    frames        INTEGER,            -- frames processed (outcome 'ok')
+    seconds       REAL,               -- wall seconds for the probe (outcome 'ok')
+    peak_alloc    REAL,               -- peak allocated VRAM, GB
+    peak_reserved REAL,               -- peak reserved VRAM, GB
+    free_vram     REAL,               -- FREE VRAM (GB) at probe start: distinguishes a
+                                      -- contended failure (other apps holding VRAM) from a
+                                      -- true ceiling, so a later clean run supersedes it
+    updated_at    TEXT,
+    PRIMARY KEY (gpu_id, model, out_w, out_h, batch)
+);
 """
 
 _conn = None   # one connection per process
@@ -364,6 +387,12 @@ def _ensure_video_columns(conn):
                          "ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
     except Exception as exc:
         debug_log("db._ensure_video_columns(video_outputs)", exc=exc)
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_bench)")]
+        if cols and "free_vram" not in cols:       # #7: free-VRAM tag for contended probes
+            conn.execute("ALTER TABLE video_bench ADD COLUMN free_vram REAL")
+    except Exception as exc:
+        debug_log("db._ensure_video_columns(video_bench)", exc=exc)
 
 
 def _norm(p):
@@ -457,6 +486,98 @@ def put_learned_batch(conn, gpu_id, mp_bucket, batch):
         "VALUES (?, ?, ?, ?) ON CONFLICT(gpu_id, mp_bucket) DO UPDATE SET "
         "batch = excluded.batch, updated_at = excluded.updated_at",
         (gpu_id, int(mp_bucket), int(batch), now))
+    conn.commit()
+
+
+# ─────────────────────────────────────────────
+#  VIDEO BENCHMARK SUITE (per-card, feature #7 / docs 16 + 20)
+# ─────────────────────────────────────────────
+
+@_locked
+def record_bench_probe(conn, gpu_id, model, out_w, out_h, batch, outcome,
+                       frames=None, seconds=None, peak_alloc=None, peak_reserved=None,
+                       free_vram=None):
+    """Persist ONE benchmark probe (a fixed batch at an output size on this card+model).
+    Upserts, so re-running a probe overwrites the prior outcome (the newest run wins).
+    `free_vram` (GB free at probe start) tags a probe run under other-app VRAM contention,
+    so resume can re-try a failure that happened with less headroom than is free now.
+    Best-effort: bad args are ignored. Commits so a crash/kill can't lose finished probes."""
+    if not gpu_id or not model or not out_w or not out_h or not batch or not outcome:
+        return
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "INSERT INTO video_bench (gpu_id, model, out_w, out_h, batch, outcome, frames, "
+        "seconds, peak_alloc, peak_reserved, free_vram, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(gpu_id, model, out_w, out_h, batch) DO UPDATE SET "
+        "outcome=excluded.outcome, frames=excluded.frames, seconds=excluded.seconds, "
+        "peak_alloc=excluded.peak_alloc, peak_reserved=excluded.peak_reserved, "
+        "free_vram=excluded.free_vram, updated_at=excluded.updated_at",
+        (gpu_id, model, int(out_w), int(out_h), int(batch), str(outcome),
+         (int(frames) if frames is not None else None),
+         (float(seconds) if seconds is not None else None),
+         (float(peak_alloc) if peak_alloc is not None else None),
+         (float(peak_reserved) if peak_reserved is not None else None),
+         (float(free_vram) if free_vram is not None else None), now))
+    conn.commit()
+
+
+@_locked
+def get_bench_probes(conn, gpu_id, model, out_w=None, out_h=None):
+    """All recorded probes for (gpu_id, model), optionally narrowed to one output cell,
+    as a list of plain dicts ordered by output size then batch. Used to RESUME a stopped
+    sweep (skip finished batches) and to render the report. Empty list on no history."""
+    if not gpu_id or not model:
+        return []
+    sql = ("SELECT out_w, out_h, batch, outcome, frames, seconds, peak_alloc, "
+           "peak_reserved, free_vram, updated_at FROM video_bench WHERE gpu_id=? AND model=?")
+    params = [gpu_id, model]
+    if out_w and out_h:
+        sql += " AND out_w=? AND out_h=?"
+        params += [int(out_w), int(out_h)]
+    sql += " ORDER BY out_w*out_h, batch"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+@_locked
+def max_feasible_output_mp(conn, gpu_id):
+    """The largest OUTPUT megapixels PROVEN feasible for this card (feature #7 feasibility
+    guard): the biggest 'ok' probe in video_bench plus the biggest learned batch bucket in
+    video_batch_learn (a present bucket means a real run fit that output class). Returns None
+    when there is no proof yet (the caller then uses the VRAM-tier seed). The learned
+    bucket -> MP is a conservative lower edge (bucket * 0.5)."""
+    if not gpu_id:
+        return None
+    best = 0.0
+    try:
+        for r in conn.execute(
+                "SELECT out_w, out_h FROM video_bench WHERE gpu_id=? AND outcome='ok'",
+                (gpu_id,)):
+            if r["out_w"] and r["out_h"]:
+                best = max(best, (r["out_w"] * r["out_h"]) / 1_000_000.0)
+    except Exception as exc:                           # noqa: BLE001 (fail-safe)
+        debug_log("db.max_feasible_output_mp(video_bench)", exc=exc)
+    try:
+        for r in conn.execute(
+                "SELECT mp_bucket FROM video_batch_learn WHERE gpu_id = ? OR gpu_id LIKE ?",
+                (gpu_id, gpu_id + "|%")):
+            if r["mp_bucket"]:
+                best = max(best, r["mp_bucket"] * 0.5)
+    except Exception as exc:                           # noqa: BLE001 (fail-safe)
+        debug_log("db.max_feasible_output_mp(video_batch_learn)", exc=exc)
+    return best or None
+
+
+@_locked
+def clear_bench(conn, gpu_id, model=None):
+    """Delete benchmark probes for a card (all models, or one model). For a 'restart'
+    from the GUI. Commits. The derived video_batch_learn / gpu_perf rows are left alone
+    (a re-run overwrites them); only the raw probe/resume rows are cleared."""
+    if not gpu_id:
+        return
+    if model:
+        conn.execute("DELETE FROM video_bench WHERE gpu_id=? AND model=?", (gpu_id, model))
+    else:
+        conn.execute("DELETE FROM video_bench WHERE gpu_id=?", (gpu_id,))
     conn.commit()
 
 

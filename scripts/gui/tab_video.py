@@ -16,8 +16,8 @@ from tkinter import ttk, filedialog, messagebox
 import runpod_client
 import ssh_setup
 import taskbar_progress
-from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings
-from gui.widgets import ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer
+from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode
+from gui.widgets import ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
 from gui.tooltab import ToolTab
 
@@ -358,9 +358,11 @@ class SegmentsManager(tk.Toplevel):
 # ─────────────────────────────────────────────
 
 class VideoTab(ttk.Frame):
-    """The Video Upscaler tab (#2, phase 5). RunPod-only. A two-list setup flow
-    (scan list -> Prepare -> a durable queue), a cheapest-first GPU picker with a
-    live cost estimate, and a frames-based running view. Standalone (not a ToolTab)
+    """The Video Upscaler tab (#2, phase 5). Runs on a rented RunPod pod OR, feature #7,
+    on this machine's LOCAL GPU (a "Run on" mode selector, gated by the install mode). A
+    two-list setup flow (scan list -> Prepare -> a durable queue), a cheapest-first GPU
+    picker with a live cost estimate (remote) / the detected card (local), and a
+    frames-based running view. Standalone (not a ToolTab)
     because its shape is very different from the image tabs; it reuses the runner's
     GPU-free helpers (batch_video_upscale) and the cost estimator (video_estimate)
     in-process, and drives the queue via the batch_video_upscale subprocess.
@@ -417,11 +419,45 @@ class VideoTab(ttk.Frame):
     def _build(self):
         self.columnconfigure(0, weight=1)
 
-        # 1) Remote-readiness strip.
-        self.ready_var = tk.StringVar(value="Checking remote readiness …")
-        self.ready_lbl = tk.Label(self, textvariable=self.ready_var, anchor="w",
+        # 1) Mode selector + readiness strip. "Run on" picks REMOTE (a rented RunPod
+        # GPU) or LOCAL (this machine's GPU, feature #7). The install mode gates it: a
+        # Remote-only install can't run locally (no torch/SeedVR2) and a Local-only
+        # install has no remote path, so the unavailable radio is disabled. On a "both"
+        # install the last choice is remembered.
+        top = ttk.Frame(self)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.columnconfigure(3, weight=1)
+        ttk.Label(top, text="Run on:").grid(row=0, column=0, sticky="w")
+        imode = get_install_mode()
+        if imode == "remote":
+            default_mode = "remote"
+        elif imode == "local":
+            default_mode = "local"
+        else:
+            default_mode = (self.app.settings.get("video_mode", "remote")
+                            if getattr(self.app, "settings", None) else "remote")
+        self.mode_var = tk.StringVar(value=default_mode)
+        self.mode_remote_rb = ttk.Radiobutton(
+            top, text="Remote (RunPod)", value="remote",
+            variable=self.mode_var, command=self._on_mode_change)
+        self.mode_remote_rb.grid(row=0, column=1, padx=(6, 0))
+        self.mode_local_rb = ttk.Radiobutton(
+            top, text="Local GPU", value="local",
+            variable=self.mode_var, command=self._on_mode_change)
+        self.mode_local_rb.grid(row=0, column=2, padx=(6, 0))
+        if imode == "remote":
+            self.mode_local_rb.configure(state="disabled")
+            Tooltip(self.mode_local_rb,
+                    "This is a Remote-only install (no local SeedVR2 / torch).\n"
+                    "Re-run setup as Local or Both to upscale on this machine.")
+        elif imode == "local":
+            self.mode_remote_rb.configure(state="disabled")
+            Tooltip(self.mode_remote_rb,
+                    "This is a Local-only install (no RunPod remote stack).")
+        self.ready_var = tk.StringVar(value="Checking readiness …")
+        self.ready_lbl = tk.Label(top, textvariable=self.ready_var, anchor="w",
                                   fg="#7f8a99", font=("Segoe UI", 9))
-        self.ready_lbl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.ready_lbl.grid(row=0, column=3, sticky="ew", padx=(16, 0))
 
         # 2) Source / output folders.
         ff = ttk.Frame(self)
@@ -519,7 +555,7 @@ class VideoTab(ttk.Frame):
         ttk.Label(pf, text="Target:").grid(row=0, column=2)
         self.target_var = tk.StringVar()
         self.target_combo = ttk.Combobox(pf, textvariable=self.target_var,
-                                         state="readonly", width=8, values=[])
+                                         state="readonly", width=15, values=[])
         self.target_combo.grid(row=0, column=3, padx=4)
         self.target_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_prepare_btn())
         self.prepare_btn = ttk.Button(pf, text="Prepare ▾ add to queue",
@@ -595,23 +631,47 @@ class VideoTab(ttk.Frame):
         self.gpu_combo = ttk.Combobox(gf, textvariable=self.gpu_var, state="readonly",
                                      width=40, values=[])
         self.gpu_combo.grid(row=0, column=1, padx=4)
-        self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_estimate())
+        self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_gpu_change())
         ttk.Button(gf, text="↻", width=3, command=self._refresh_gpus).grid(row=0, column=2)
+        # Local-only: benchmark THIS card to find its real per-target batch ceiling +
+        # speed (feature #7). Created here, shown/hidden by _apply_mode_ui (pod runs
+        # have no local benchmark). Column 3 so it sits right of the refresh button.
+        self.benchmark_btn = ttk.Button(gf, text="Benchmark GPU…", command=self._open_benchmark)
+        self.benchmark_btn.grid(row=0, column=3, padx=(8, 0))
+        Tooltip(self.benchmark_btn,
+                "Measure the largest safe batch (and the real speed) for each target on "
+                "this GPU. Runs a short test-till-it-breaks sweep; results calibrate local "
+                "batch sizing + the time estimate. Safe to stop and resume.")
         self.estimate_var = tk.StringVar(value="Add videos to the queue for an estimate.")
         ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
                   foreground="#2f6f3f").grid(row=0, column=5, sticky="ew", padx=(12, 0))
 
-        # 7) Start / Stop + progress + status.
+        # 7) Start / Stop + Auto-resume + progress + status.
         af = ttk.Frame(self)
         af.grid(row=6, column=0, sticky="ew", pady=(8, 0))
-        af.columnconfigure(2, weight=1)
+        af.columnconfigure(3, weight=1)
         self.start_btn = ttk.Button(af, text="Start Upscaling", command=self._start)
         self.start_btn.grid(row=0, column=0)
         self.stop_btn = ttk.Button(af, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(6, 0))
+        # Self-healing (#6): opt-in, per-run, visible at the point of action (not a hidden
+        # Setting), default OFF. When on, a lost pod reconnects or waits for the SAME GPU to
+        # return and the run continues from the first unfinished segment. Passed to the
+        # runner as IMGTBX_AUTO_RESUME (see _start).
+        self.auto_resume_var = tk.BooleanVar(value=False)
+        self.auto_resume_chk = ttk.Checkbutton(af, text="Auto-resume",
+                                               variable=self.auto_resume_var)
+        self.auto_resume_chk.grid(row=0, column=2, padx=(10, 0))
+        Tooltip(self.auto_resume_chk,
+                "Survive losing the pod mid-run without babysitting.\n"
+                "A connectivity blip reconnects to the same pod; a real pod loss waits "
+                "(no time cap, $0 billed while waiting) for the SAME GPU to come back in "
+                "stock, redeploys it, and continues from the first unfinished segment.\n"
+                "Never substitutes a different card. The funds safety-net, a completed "
+                "queue, or Stop still end the run.")
         self.progress = ProgressBar(af, width=200)
-        self.progress.grid(row=0, column=2, sticky="ew", padx=12)
-        ttk.Button(af, text="View log", command=self._view_log).grid(row=0, column=3)
+        self.progress.grid(row=0, column=3, sticky="ew", padx=12)
+        ttk.Button(af, text="View log", command=self._view_log).grid(row=0, column=4)
         self.status_var = tk.StringVar(value="Ready.")
         tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
                  font=("Consolas", 9)).grid(row=7, column=0, sticky="ew", pady=(4, 0))
@@ -622,6 +682,9 @@ class VideoTab(ttk.Frame):
         self.remote_telemetry_row = TelemetryRow(self, prefix="Remote pod")
         self.remote_telemetry_row.grid(row=8, column=0, sticky="ew", pady=(2, 0))
         self.remote_telemetry_row.grid_remove()
+
+        # Greys the pod-only Auto-resume control if we're starting in Local mode.
+        self._apply_mode_ui()
 
     # ── readiness ────────────────────────────────────────────────────────────
 
@@ -640,19 +703,91 @@ class VideoTab(ttk.Frame):
         readiness so a RunPod API key / SSH key / volume set after launch is seen,
         and refresh the durable queue."""
         self.restore_defaults_if_empty()
+        self._apply_mode_ui()
         self._check_readiness()
         self._load_queue()
+        # Local mode: auto-detect the card (a cheap nvidia-smi, unlike the remote GPU
+        # list which hits the RunPod API and stays user-triggered via ↻).
+        if self.mode_var.get() == "local":
+            self._refresh_gpus()
+
+    def _on_mode_change(self):
+        """Local/Remote radio flipped: persist the choice (a 'both' install remembers
+        it), re-check readiness, adapt the auto-resume control (pod-only) and refresh the
+        GPU display + estimate for the new mode."""
+        try:
+            if getattr(self.app, "settings", None) is not None:
+                self.app.settings["video_mode"] = self.mode_var.get()
+                save_settings(self.app.settings)
+        except Exception:                              # noqa: BLE001 (persist is best-effort)
+            pass
+        self._apply_mode_ui()
+        self._check_readiness()
+        self._refresh_gpus()
+
+    def _apply_mode_ui(self):
+        """Enable/disable the mode-specific controls. Auto-resume heals a LOST POD, so it is
+        meaningless locally: grey it out (and clear it) in Local mode. The Benchmark button
+        is the inverse: it calibrates the LOCAL card, so it only shows in Local mode."""
+        local = self.mode_var.get() == "local"
+        try:
+            if local:
+                self.auto_resume_var.set(False)
+            self.auto_resume_chk.configure(state="disabled" if local else "normal")
+        except Exception:                              # noqa: BLE001
+            pass
+        try:
+            if local:
+                self.benchmark_btn.grid()
+            else:
+                self.benchmark_btn.grid_remove()
+        except Exception:                              # noqa: BLE001
+            pass
+
+    def _open_benchmark(self):
+        """Open the per-card benchmark modal (feature #7). A run must not be in progress
+        (it would fight the benchmark for the GPU)."""
+        if self.proc is not None:
+            messagebox.showinfo(APP_TITLE, "Stop the current run before benchmarking the GPU.")
+            return
+        try:
+            from gui.video_benchmark import BenchmarkWindow
+            BenchmarkWindow(self.winfo_toplevel(), self)
+        except Exception as exc:                       # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Could not open the benchmark window:\n{exc}")
 
     def _check_readiness(self):
         rpc = CFG.get("runpod", {})
+        mode = self.mode_var.get()
 
         def work():
-            msg, ok = self._readiness_text(rpc)
+            msg, ok = self._readiness_text(rpc, mode)
             self.after(0, lambda: self._set_ready(msg, ok))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _readiness_text(self, rpc):
+    def _readiness_text(self, rpc, mode="remote"):
+        # Local mode (#7): only ffmpeg + a local NVIDIA GPU matter (no RunPod key / SSH /
+        # volume). Everything else in the pipeline (split/reassemble/mux) is local anyway.
+        if mode == "local":
+            try:
+                import video_pipeline as vp
+                vp.find_ffmpeg()
+            except Exception:
+                return ("Not ready: ffmpeg not found - re-run the first-launch setup, or "
+                        "put ffmpeg.exe + ffprobe.exe in ffmpeg\\bin (or on the PATH).", False)
+            try:
+                import system_telemetry as st
+                g = st.sample_gpu()                    # (used_mb, total_mb, temp_c) or None
+                name = st.gpu_name()
+            except Exception:
+                g, name = None, None
+            if not g:
+                return ("Not ready: no NVIDIA GPU detected (nvidia-smi). Local upscaling "
+                        "needs a CUDA GPU; use Remote instead.", False)
+            vram = f"{g[1] / 1024:.0f} GB" if g[1] else "?"
+            return (f"Local ready — {name or 'GPU'}, {vram} VRAM. The first segment "
+                    f"calibrates the batch size for your card.", True)
         # Local ffmpeg first (a purely local check): every video job needs the
         # local split/reassemble/mux, so without it nothing else matters. Only
         # a successful lookup is cached, so installing ffmpeg later and
@@ -1110,20 +1245,60 @@ class VideoTab(ttk.Frame):
         if not row:
             return
         self.srcfile_var.set(row["abs"])
+        self._populate_target_combo(row)
+        self._sync_prepare_btn()
+
+    def _current_max_mp(self):
+        """The max feasible OUTPUT megapixels for the currently selected GPU (local detected
+        card or the picked pod GPU), or 0.0 when no GPU is selected (then nothing is filtered).
+        Local uses the card's own benchmark/learned data; remote uses the VRAM-tier seed."""
+        g = self._selected_gpu()
+        if not g:
+            return 0.0
+        import video_estimate as ve
+        return ve.max_output_mp(g.get("memory_gb"), g.get("id") or g.get("name"), self._conn())
+
+    def _queue_feasibility(self, jobs, g):
+        """(max_mp, feasible_jobs, infeasible_count) for a queue on GPU `g`. When the card's
+        max output-MP is unknown (0) nothing is filtered. Drives the Start refusal and the
+        IMGTBX_MAX_OUTPUT_MP the runner uses to DEFER (not fail) jobs the card can't reach."""
+        import video_estimate as ve
+        max_mp = (ve.max_output_mp(g.get("memory_gb"), g.get("id") or g.get("name"),
+                                   self._conn()) if g else 0.0)
+        if not max_mp:
+            return max_mp, jobs, 0
+        feasible = [j for j in jobs
+                    if ve.target_is_feasible(j.get("width"), j.get("height"), j["target"], max_mp)]
+        return max_mp, feasible, len(jobs) - len(feasible)
+
+    def _populate_target_combo(self, row):
+        """Fill the Target combobox with the targets the source can reach on the SELECTED GPU
+        (feature #7): source-eligible ratios + presets, filtered by the card's feasibility, each
+        shown as a concrete output resolution. Stores a label->token map so Prepare gets the
+        canonical token."""
+        import video_estimate as ve
+        r = row.get("r") or {}
+        w, h = r.get("width"), r.get("height")
         done_targets = self._done_targets(row["rel"])
-        self.target_combo.configure(values=row["elig"])
-        if row["elig"]:
-            # default to the first eligible target not already done
-            nxt = next((t for t in row["elig"] if t not in done_targets), row["elig"][0])
-            self.target_var.set(nxt)
+        max_mp = self._current_max_mp()
+        feas = [t for t in row.get("elig", []) if ve.target_is_feasible(w, h, t, max_mp)]
+        labels = [ve.target_label(w, h, t) for t in feas]
+        self._target_label_to_token = dict(zip(labels, feas))
+        self.target_combo.configure(values=labels)
+        if feas:
+            nxt = next((t for t in feas if t not in done_targets), feas[0])
+            self.target_var.set(ve.target_label(w, h, nxt))
         else:
             self.target_var.set("")
-        self._sync_prepare_btn()
+
+    def _selected_target_token(self):
+        """The canonical target token ('1080p' / '2X' …) for the label shown in the combobox."""
+        return getattr(self, "_target_label_to_token", {}).get(self.target_var.get())
 
     def _sync_prepare_btn(self):
         sel = self.scan_tree.selection()
         row = self._scan_rows.get(sel[0]) if sel else None
-        target = self.target_var.get()
+        target = self._selected_target_token()
         ok = bool(row and target)
         if ok and target in self._done_targets(row["rel"]):
             ok = False                           # already upscaled to this target (15.1 step 5)
@@ -1341,7 +1516,7 @@ class VideoTab(ttk.Frame):
     def _prepare(self):
         sel = self.scan_tree.selection()
         row = self._scan_rows.get(sel[0]) if sel else None
-        target = self.target_var.get()
+        target = self._selected_target_token()
         if not row or not target:
             return
         r = row.get("r") or {}
@@ -1428,8 +1603,34 @@ class VideoTab(ttk.Frame):
                 "codec": codec}
         self._populate_queue_filters()
         self._apply_queue_filters()
+        self._apply_queue_feasibility()
         self._refresh_scan_outputs()
         self._update_estimate()
+
+    def _apply_queue_feasibility(self):
+        """Grey out queued jobs whose target the SELECTED GPU can't reach (feature #7). The
+        row is tagged 'infeasible' (muted) and `row['feasible']` is set, which the Start gate
+        reads to refuse a run with nothing runnable and to defer the rest."""
+        import video_estimate as ve
+        self.queue_tree.tag_configure("infeasible", foreground="#8a8f98")
+        max_mp = self._current_max_mp()
+        for iid, row in self._queue_rows.items():
+            feasible = ve.target_is_feasible(row.get("w"), row.get("h"), row["target"], max_mp)
+            row["feasible"] = feasible
+            tags = [t for t in self.queue_tree.item(iid, "tags") if t != "infeasible"]
+            if not feasible:
+                tags.append("infeasible")
+            self.queue_tree.item(iid, tags=tags)
+
+    def _on_gpu_change(self):
+        """The selected GPU changed: re-estimate, re-grey the queue by the new card's reach,
+        and re-filter the Target combobox for the currently selected scan row."""
+        self._update_estimate()
+        self._apply_queue_feasibility()
+        sel = self.scan_tree.selection()
+        if sel and sel[0] in self._scan_rows:
+            self._populate_target_combo(self._scan_rows[sel[0]])
+            self._sync_prepare_btn()
 
     def _populate_queue_filters(self):
         """Fill the queue filter combos with the DISTINCT targets/statuses now queued
@@ -1644,6 +1845,8 @@ class VideoTab(ttk.Frame):
     # ── GPU picker + estimate ────────────────────────────────────────────────
 
     def _refresh_gpus(self):
+        if self.mode_var.get() == "local":
+            return self._refresh_local_gpu()
         rpc = CFG.get("runpod", {})
         if not rpc.get("api_key"):
             self.gpu_var.set("(set a RunPod API key)")
@@ -1684,7 +1887,44 @@ class VideoTab(ttk.Frame):
             self.gpu_combo.current(0)
         else:
             self.gpu_var.set("no eligible GPU available right now")
-        self._update_estimate()
+        self._on_gpu_change()
+
+    def _refresh_local_gpu(self):
+        """Local mode (#7): the 'GPU' is simply this machine's card (no live list / price /
+        stock). Detect it off-thread (nvidia-smi) and show it as the single choice so the
+        rest of the flow (estimate, Start) reads it through `_selected_gpu` unchanged."""
+        self.gpu_var.set("detecting local GPU …")
+        self.gpu_combo.configure(values=[])
+
+        def work():
+            try:
+                import system_telemetry as st
+                g = st.sample_gpu()
+                name = st.gpu_name() or "Local GPU"
+            except Exception:                          # noqa: BLE001
+                g, name = None, None
+            self.after(0, lambda: self._populate_local_gpu(g, name))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_local_gpu(self, g, name):
+        if not g:
+            self._gpu_choices = []
+            self.gpu_combo.configure(values=[])
+            self.gpu_var.set("no NVIDIA GPU detected")
+            self._update_estimate()
+            return
+        vram_gb = round((g[1] or 0) / 1024.0)
+        # A synthetic choice shaped like a remote GPU dict (id/name/memory_gb/price/stock)
+        # so _selected_gpu / _start read it the same way; price=None marks it free/local.
+        # id = the nvidia-smi card name so it matches the perf key the LOCAL runner records
+        # under (batch_video_upscale uses engine.gpu_id = the same name), letting the
+        # estimate read this card's own measured history back.
+        self._gpu_choices = [{"id": name, "name": name, "memory_gb": vram_gb,
+                              "price": None, "stock": "local"}]
+        self.gpu_combo.configure(values=[f"{name}, {vram_gb} GB"])
+        self.gpu_combo.current(0)
+        self._on_gpu_change()
 
     def _selected_gpu(self):
         if not self._gpu_choices:
@@ -1727,6 +1967,8 @@ class VideoTab(ttk.Frame):
         if not jobs:
             self.estimate_var.set("Add videos to the queue for an estimate.")
             return
+        if self.mode_var.get() == "local":
+            return self._update_local_estimate(jobs)
         g = self._selected_gpu()
         if not g:
             self.estimate_var.set(f"{len(jobs)} job(s) queued — pick a GPU (↻).")
@@ -1741,6 +1983,28 @@ class VideoTab(ttk.Frame):
             f"${est['cost']:.2f} · {est['segments']} segments · "
             f"${est['cost_per_segment']:.3f}/segment")
 
+    def _update_local_estimate(self, jobs):
+        """Local mode (#7): no cost (the GPU is free). The TIME is HONEST and history-driven
+        -- once this card+target has measured history (db.gpu_perf, filled per segment by a
+        local run) the estimate shows a real time; before that it shows the work SIZE and
+        says the first segment calibrates it (rather than quoting a fabricated number). A
+        seeded (benchmark-suite) rate is flagged '(rough)'."""
+        import video_estimate as ve
+        g = self._selected_gpu()
+        est = (ve.estimate_queue_local(jobs, g.get("id") or g.get("name"), self._conn())
+               if g else None)
+        segs = sum(j.get("segments") or 1 for j in jobs)
+        if est:
+            qual = "" if est["calibrated"] else " (rough)"
+            self.estimate_var.set(
+                f"{len(jobs)} job(s) · ~{ve.fmt_duration(est['duration_seconds'])}{qual} · "
+                f"{segs} segments · runs on your GPU (no cost).")
+            return
+        frames = sum(j.get("frames") or 0 for j in jobs)
+        self.estimate_var.set(
+            f"{len(jobs)} job(s) · {frames:,} frames · {segs} segments · runs on your GPU "
+            f"(no cost). Time depends on the target; the first segment calibrates it.")
+
     # ── start / stop / run ───────────────────────────────────────────────────
 
     def _start(self):
@@ -1753,20 +2017,35 @@ class VideoTab(ttk.Frame):
         if not jobs:
             messagebox.showinfo(APP_TITLE, "The queue is empty. Prepare a video first.")
             return
+        if self.mode_var.get() == "local":
+            return self._start_local(jobs)
         g = self._selected_gpu()
         if not g:
             messagebox.showwarning(APP_TITLE, "Pick a GPU (press ↻ to load the list).")
             return
         import video_estimate as ve
-        est = ve.estimate_queue(jobs, g.get("id") or g.get("name"), g.get("price"),
+        # Feasibility guard (#7): a low-VRAM pod can't reach every target. Refuse if NOTHING
+        # in the queue fits it; otherwise run only the feasible jobs (the rest stay pending
+        # for a bigger card) and estimate on those.
+        max_mp, feasible, infeasible_n = self._queue_feasibility(jobs, g)
+        if not feasible:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"None of the {len(jobs)} queued video(s) fit {g['name']} "
+                f"({g.get('memory_gb', '?')} GB): every target exceeds its VRAM. Pick a "
+                "larger GPU, or lower the targets (grayed rows can't run on this card).")
+            return
+        est = ve.estimate_queue(feasible, g.get("id") or g.get("name"), g.get("price"),
                                 self._spin_up(), conn=self._conn())
         if CFG.get("video", {}).get("confirm_before_rent", True):
             cost = f"${est['cost']:.2f}" if est else "?"
             dur = ve.fmt_duration(est["duration_seconds"]) if est else "?"
+            skip = (f"\n\n{infeasible_n} video(s) exceed this GPU and will be skipped "
+                    "(left in the queue for a larger card)." if infeasible_n else "")
             if not messagebox.askyesno(
                     APP_TITLE,
                     f"Rent {g['name']} (${g.get('price', 0):.2f}/h) and upscale "
-                    f"{len(jobs)} job(s)?\n\nEstimated: {dur}, {cost}.\n\n"
+                    f"{len(feasible)} job(s)?\n\nEstimated: {dur}, {cost}.{skip}\n\n"
                     "A billed pod is created and torn down when done."):
                 return
         # Pass ONLY the selected GPU — never silently fall back to a different GPU
@@ -1780,11 +2059,60 @@ class VideoTab(ttk.Frame):
         # run that would drop the balance below the floor before renting a pod (#1).
         if est and est.get("cost"):
             env["IMGTBX_RUN_ESTIMATE"] = f"{est['cost']:.4f}"
+        # Defer (not fail) any target this card can't reach (#7).
+        if max_mp:
+            env["IMGTBX_MAX_OUTPUT_MP"] = f"{max_mp:.4f}"
+        # Self-healing (#6): arm the auto-resume supervisor for this run only.
+        if self.auto_resume_var.get():
+            env["IMGTBX_AUTO_RESUME"] = "1"
         self._run_gpu = g.get("id") or g.get("name")     # for the time-based estimate
-        self._begin_run(sum(j["frames"] for j in jobs))
+        self._begin_run(sum(j["frames"] for j in feasible))
         self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
 
-    def _begin_run(self, total_frames):
+    def _start_local(self, jobs):
+        """Start a LOCAL run (#7): the SeedVR2 work runs on this machine's GPU, no pod, no
+        cost, no GPU-override/auto-resume/funds plumbing. The runner picks the batch with
+        the predictive VRAM sizer and guards a degrading GPU with the thrash watchdog; if
+        the card can't do a target it OOM-recovers to a smaller window or stops loudly."""
+        g = self._selected_gpu()
+        if not g:
+            messagebox.showwarning(
+                APP_TITLE, "No local NVIDIA GPU detected (press ↻ to re-check).")
+            return
+        # Feasibility guard (#7): the target combobox already filters to this card, but the
+        # queue can hold a job prepared under a different card / before a benchmark. Refuse
+        # if nothing fits; otherwise run only the feasible jobs.
+        max_mp, feasible, infeasible_n = self._queue_feasibility(jobs, g)
+        if not feasible:
+            messagebox.showwarning(
+                APP_TITLE,
+                f"None of the {len(jobs)} queued video(s) fit {g['name']} "
+                f"({g.get('memory_gb', '?')} GB): every target exceeds what it can upscale "
+                "to. Lower the targets (grayed rows can't run on this card).")
+            return
+        if CFG.get("video", {}).get("confirm_before_local", True):
+            skip = (f"\n\n{infeasible_n} video(s) exceed this GPU and will be skipped."
+                    if infeasible_n else "")
+            if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"Upscale {len(feasible)} job(s) on {g['name']} ({g.get('memory_gb', '?')} GB)?{skip}\n\n"
+                    "For best results, close all non-essential applications and reduce active "
+                    "machine usage to a minimum (other apps holding VRAM can slow the run or "
+                    "force a smaller batch).\n\n"
+                    "This runs on your own GPU (no cost). It can be slow, and a long GPU "
+                    "session may degrade (the run stops loudly if it does; reboot and re-run "
+                    "to continue)."):
+                return
+        env = {}
+        if max_mp:                                       # defer (not fail) unreachable targets
+            env["IMGTBX_MAX_OUTPUT_MP"] = f"{max_mp:.4f}"
+        self._run_gpu = g.get("id") or g.get("name")
+        self._begin_run(sum(j.get("frames") or 0 for j in feasible),
+                        starting_msg="Starting local upscale …")
+        self._launch("batch_video_upscale.py",
+                     [self._src_root, self._out_root, "--local"], env)
+
+    def _begin_run(self, total_frames, starting_msg="Starting pod …"):
         self._run_total = total_frames
         self._run_done = 0
         self._cur_seg_frames = self._cur_seg_done = 0
@@ -1806,8 +2134,9 @@ class VideoTab(ttk.Frame):
         self._eta_done = 0            # done_now at the last ETA refresh (so a stall can't inflate it)
         self.progress.set(0)
         self.start_btn.configure(state="disabled")
+        self.auto_resume_chk.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_var.set("Starting pod …")
+        self.status_var.set(starting_msg)
         self.console.clear()
         self.app.taskbar_state("indeterminate")
         if self._run_tick_job is None:
@@ -2141,6 +2470,8 @@ class VideoTab(ttk.Frame):
         self.proc = None
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        # Auto-resume is pod-only: keep it greyed in Local mode, re-enable it in Remote.
+        self._apply_mode_ui()
         # The run is over: its pod (if any) is no longer protected from terminate.
         # Cleared GUI-side (not via a runner event) so a hard-killed runner still
         # releases the protection. Mirrors ToolTab.on_exit.

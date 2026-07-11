@@ -5,9 +5,11 @@ Candidate features that are **not yet implemented**, sorted by difficulty
 dependencies" for the threads that drive ordering, and "Decided against /
 constraints" at the bottom for ideas investigated and dropped.
 
-What actually remains is two much-lower-priority milestones (HTTP interface #3,
-Unraid #4), each of which introduces a new process model, networking, or
-packaging, plus one smaller candidate (video conciliation #5).
+The near-term milestone is **local video upscaling (#7)**, a free-and-slow
+alternative to the expensive remote path (design in `docs/local-video-upscaler.md`).
+Beyond it, two much-lower-priority milestones remain (HTTP interface #3, Unraid #4),
+each of which introduces a new process model, networking, or packaging, plus one
+smaller candidate (video conciliation #5).
 
 **Shipped milestones (kept only as a numbering legend).** Roadmap **#1 (remote
 upscaling)** and **#2 (video upscaling)** are done and live; they are no longer
@@ -71,13 +73,28 @@ the roadmap numbers stable.)
 - **Risk:** low. No GPU, no new dependency; the "never touch originals /
   archive-first" guarantees carry over unchanged.
 
-## 6. Self-healing remote runs (auto-recover a lost pod) — Moderate (candidate)
+## 6. Self-healing remote runs (auto-recover a lost pod) — SHIPPED (0.5.0-experimental)
 Make a long remote run (video especially) survive **losing its pod mid-run** without
 the user babysitting it. Today the run uses one contiguous pod; if that pod dies
 involuntarily (RunPod reclaims the host, a spot eviction, the SSH tunnel drops, the
 internet drops), `run_queue` catches the engine error, marks the remaining jobs
 `failed`, and ends. Finished videos are safe (`done` on disk), but the rest need a
 **manual** restart to resume. This closes that gap.
+
+**Shipped as-built (0.5.0-experimental, video only):** an opt-in **"Auto-resume"**
+checkbox next to the Video Upscaler's Start button (per-run, default OFF) arms a
+supervisor in `batch_video_upscale.py`. The engine now distinguishes a bad-source
+`RemoteVideoWorkerError` from a liveness `RemoteVideoError`; when armed, `run_queue`
+re-raises the latter as `PodLost` (carrying the pass's counts, WITHOUT bumping the
+source's `fail_count`), and `_run_supervised` wraps deploy + `run_queue` in a heal loop:
+a **blip** (pod still `RUNNING`, `_pod_still_running`) closes the tunnel but KEEPS the pod
+and reconnects; a **loss** terminates the remnant (double-bill guard), waits unbounded for
+the IDENTICAL card via `_wait_for_gpu_stock` (backoff 30->300 s, `_STOP`-aware, notify on
+enter/recover), and redeploys the same `IMGTBX_GPU_OVERRIDE` card. Hard stops that never
+redeploy: the funds guard tripping (`session._funds_tripped`), a user Stop, or a completed
+queue. The RunPod-touching seams are injected so the loop is fully offline-tested
+(`tests/test_video_autoresume.py`). See `docs/video-upscaler.md` section 17. The rest of
+this entry is the original design record; the decisions below were all honoured as-built.
 
 - **Desired behaviour (user request, 2026-07-07):**
   1. **Detect** a mid-run failure and classify it: transient connectivity blip
@@ -159,6 +176,44 @@ internet drops), `run_queue` catches the engine error, marks the remaining jobs
   redeploy are where the care goes. Scope it to the **video** run first (long,
   most exposed), then generalise to the image runners if it proves out.
 
+## 7. Local video upscaling (a free alternative to remote) — PLANNED (0.5.0-experimental)
+Reverses the Video Upscaler's original **"RunPod-only, never a local path"**
+decision (see `docs/video-upscaler.md` section 1): run the same SeedVR2 video work
+**on the user's own GPU**, in-process, as a **free-and-slow** alternative to the
+**expensive-and-fast** remote pod. Remote video costs ~$1/hour of GPU time per
+under-a-minute of footage; local is almost free. The original exclusion rested on
+one machine's data (a 24 GB RTX 3090); a capable-GPU user should get to choose.
+
+- **Reuse:** `batch_video_upscale.py` already runs on an **injected engine** with a
+  no-pod `PassthroughVideoEngine`, and all container work (split/reassemble/mux/
+  drift/resume/watchdog) is already local. The one genuinely new piece is a
+  `LocalVideoEngine` wrapping the in-process SeedVR2 streaming path (`chunk_size>0`).
+- **The two original objections become loud guards, not gates:** the
+  GPU-degradation bug is handled exactly as local *image* upscaling handles it
+  (detect + notify + auto-stop + resume, never refuse), and speed is handled by an
+  honest local time estimate shown up front. Both are N-of-1 / measurable, not
+  blockers.
+- **Custom targets + no VRAM gate:** local must allow **targets beyond the remote
+  `VRAM_FLOOR`** (both explicit output resolution AND upscale ratio), so the real
+  ceiling is found empirically ("test till it breaks") rather than guessed
+  conservatively. An in-app **local benchmark harness** (short-clip sweep) sets the
+  real per-card tiers and self-improves `db.gpu_perf` / `video_batch_learn`.
+- **Gated to Local/Both installs** (needs torch + SeedVR2 locally), exactly like
+  local image upscaling; Remote-only installs keep today's remote-only tab.
+- **Per-card VRAM benchmark suite (companion, planned):** a user-runnable tool that finds
+  the **maximum safe (batch, overlap)** for a configurable **source -> target resolution**
+  pair on their own GPU and writes it to the sizer's learned store, so AUTO starts at the
+  card's true ceiling instead of a conservative seed. Each probe runs in a fresh subprocess
+  (the only safe way to push a batch to failure without VRAM fragmentation poisoning the next,
+  per the local-video benchmarking). The predictive sizer (`video_vram_sizer.py`, built) already
+  consumes what it produces. See `docs/local-video-upscaler.md` section 16.
+- **Phase 2 (deferred):** a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class):
+  fast, low-VRAM, deterministic, drops into the same engine seam. Decide after local
+  SeedVR2 ships.
+- **Risk:** low-moderate. The orchestration exists; the work is the engine, custom
+  targets, the benchmark harness, and un-gating the tab. Full design of record in
+  **`docs/local-video-upscaler.md`**.
+
 ---
 
 ## Sequencing & dependencies
@@ -172,12 +227,11 @@ internet drops), `run_queue` catches the engine error, marks the remaining jobs
 - **#5 (video conciliation) is independent and lower-effort** — no new process
   model or dependency, just lineage recording on the video path plus scan/plan
   wiring; it can land whenever the Video Upscaler is exercised enough to want it.
-- **#6 (self-healing remote runs)** builds on the shipped remote/video stack (segment
-  resume, `available_gpus`, `_find_existing_pod`, `funds_guard`) plus the 0.4.9
-  resume-path hardening (items 1/4/5 above): those are load-bearing prerequisites, not
-  parallel work, because the healer resumes unattended and repeatedly (see the note under
-  #6). No new process model; the effort is orchestration + billing safety, not pipeline
-  code. Worth doing once unattended overnight video runs become routine.
+- **#6 (self-healing remote runs) is SHIPPED (0.5.0-experimental, video only).** It built
+  on the shipped remote/video stack (segment resume, `available_gpus`, `_find_existing_pod`,
+  `funds_guard`) plus the 0.4.9 resume-path hardening (items 1/4/5 above), which were the
+  load-bearing prerequisites (the healer resumes unattended and repeatedly). Next step, if
+  it proves out: generalise the same supervisor to the image runners (batch upscale / tag).
 - **Architectural watch-item:** the app is dependency-light and Windows-only. #3
   and #4 each push toward extra packages, a long-running server, and
   cross-platform support, so adopt those deliberately.

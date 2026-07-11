@@ -1,0 +1,760 @@
+# Local Video Upscaling (design)
+
+Design notes for **local video upscaling**: running the Video Upscaler's SeedVR2
+work **on the user's own GPU**, in-process, instead of (or as an alternative to)
+a rented RunPod pod. UI: a **local / remote toggle** on the existing **Video
+Upscaler** tab, mirroring the image tabs' "Run on remote pod" checkbox.
+
+> Status: **PLANNED (0.5.0-experimental).** This doc is the design of record and
+> the decision reversal it depends on. Nothing is built yet. The first code step
+> is a `LocalVideoEngine` spike (see section 12).
+
+---
+
+## 1. Why this reverses a documented decision
+
+`docs/video-upscaler.md` (section 1) states the Video Upscaler is **"RunPod-only
+by design"** and **"never offers a local path"**, for two reasons: local SeedVR2
+video is too slow (a diffusion pass per frame), and it is exposed to the
+GPU-degradation bug that motivated remote upscaling (#1).
+
+That decision was taken on **one machine's data point** (the developer's RTX 3090,
+24 GB), at a time when remote was the only proven path. It is a developer-bias
+constraint, not a product one. Two things reverse it:
+
+- **The value proposition is different, not worse.** Remote video is **expensive**:
+  on the order of **$1/hour of GPU time for a bit under one minute of upscaled
+  footage**. Local video is **almost free**. Local is not "a worse remote": it is a
+  **free-and-slow(-and-possibly-thrashy)** tier next to an **expensive-and-fast**
+  one. Users with a capable GPU should get to choose; limiting a 5090 owner because
+  the developer had a 3090 is the wrong call.
+- **The two original objections are guard-and-measure problems, not blockers**
+  (section 3), and we already shipped **local batch *image* upscaling** over the
+  exact same degradation bug.
+
+**Direction can adjust on new findings.** The app has matured; we now have the
+injected-engine seam, the watchdog, two-granularity resume, and real benchmark
+tooling. The "never local" language in `docs/video-upscaler.md` is superseded by
+this document.
+
+## 2. Scope
+
+- **In:** local SeedVR2 video upscaling, in-process, on a Local/Both install, as an
+  alternative to remote for the same per-video flow (probe -> split -> upscale each
+  segment -> reassemble -> mux -> drift check). A **local / remote toggle** on the
+  Video tab. **Custom targets** beyond the three presets (section 6). A **local
+  benchmark harness** (section 8). **Loud** degradation/OOM guards (section 7).
+- **Out (this phase):** the non-SeedVR fixed-ratio 2x/4x engine (section 11, a
+  separate later phase); any change to the remote path's behaviour.
+- **Never touch the source.** Unchanged from the remote path: all work happens on
+  temp copies and a separate output tree.
+
+## 3. The two objections, as guards not gates
+
+**Degradation bug (loud guard, no gate).** The slowdown-until-reboot bug is real
+but **N=1** (the developer's specific GPU/OS/driver/workflow history could all
+contribute). We shipped local *image* upscaling over it by **detecting and
+notifying**, not by refusing to run. Local video does the same:
+
+- Wire the existing **slow-segment watchdog** (`batch_video_upscale.py`,
+  `VideoSlowWatch`, anchors to the running-minimum s/MP) into the local path.
+- Detect hard **OOM** (`runner_common.is_oom_error`) and treat it as an episode.
+- On an episode: **notify loudly** (every configured backend + taskbar), **auto-stop
+  after the current segment**, and rely on **two-granularity resume** so the user
+  reboots and continues from the first unfinished segment. Same contract the image
+  watchdog already provides, adapted to "segment" as the unit.
+
+**Speed (measure and show, no gate).** Diffusion per frame is slow on consumer
+cards, but a remote RTX 5090 was already used for 1080p; a **local** 5090 is the
+same silicon. The mitigation is **transparency up front**, not exclusion: show an
+honest local time estimate before Start (section 9), and let the user decide.
+Short-clip benchmarking (section 8) makes the estimate real per card.
+
+## 4. Reuse: the engine seam already exists
+
+Local video is **not** a from-scratch feature. `batch_video_upscale.py` already
+runs on an **injected engine** (`run_batch(engine, ...)`) and ships two engine
+shapes today: the real `RemoteVideoEngine` and a `PassthroughVideoEngine` (no-pod
+testing). **Everything except the GPU step already runs locally**: walk, split,
+CFR-normalize, forced-keyframe re-encode, deinterlace, concat, audio-mux,
+duration-drift, two-granularity resume, installment caps, the slow-segment
+watchdog, notifications, taskbar.
+
+So local video reduces to:
+
+1. A new **`LocalVideoEngine`** (section 5) — the one genuinely new piece.
+2. **Custom targets** (section 6) — new UI + a small amount of plumbing on top of
+   the existing box-fit math.
+3. **Local benchmark harness** (section 8) — `pod/bench_video.py` run locally,
+   driven from the GUI.
+4. **Local time estimate** — a cost-free variant of `video_estimate.py`.
+5. **Un-gate the tab** (section 10) — a local/remote toggle; remove the hard
+   "remote-only" block for Local/Both installs.
+
+## 5. `LocalVideoEngine`
+
+A drop-in for the injected engine interface (`process_segment(...)`,
+`last_segment_seconds`, `last_phase`, `telemetry()`, `device_name`, `close()`),
+wrapping the **in-process SeedVR2 streaming path** (`chunk_size>0`) — the same path
+the pod worker uses (`pod/worker.py --mode video`), **not** the still image path.
+
+- Loads DiT/VAE **once** and caches them, reusing `upscale_engine.py`'s load-once
+  pattern (the resident-worker model on the pod; here the process is the worker).
+- Uses the **streaming** (`chunk_size>0`) inference so RAM stays bounded (SeedVR2's
+  load-all path holds every output frame uncompressed; the streaming path is why
+  the remote worker doesn't OOM host RAM). The local engine inherits that bound.
+- **Offload knobs are the local VRAM lever.** SeedVR2 offloads (the wizard's
+  principle: any card can run any model, just slower). On a small-VRAM card the
+  engine runs at batch=1 with heavier offload; on a big card it uses a larger
+  temporal window/batch. The local benchmark (section 8) finds the safe batch per
+  (card, output-MP), feeding the existing `video_batch_learn` adaptive-batch table.
+- `telemetry()` reads local `system_telemetry.sample_gpu` (VRAM/temp) so the tab's
+  telemetry row works without a pod.
+- Only available on Local/Both installs (needs torch + SeedVR2 locally, section 10).
+
+## 6. Custom targets: BOTH explicit resolution AND ratio
+
+The current pipeline has **only three preset boxes** (`TARGET_BOX`/`TARGET_RES`:
+1080p / 1440p / 4K) and cannot express anything else. Prototyping ("test till it
+breaks, then pull back", section 8) is impossible inside three fixed presets, and
+users with unusual sources want finer control. Local mode adds a **Custom** target
+with **two interchangeable input modes** (user toggles; ratio reduces to a
+resolution internally):
+
+- **Explicit output resolution** — enter an output short-side in px (or WxH); the
+  existing **box-fit** math (`video_estimate.fit_scale` / `output_dims`, which
+  already generalizes to any box) fits the source to it, aspect preserved. This is
+  the precise mode for sweeping a card to its OOM ceiling.
+- **Upscale ratio** — enter a multiplier (2x / 4x / custom) applied to the source
+  dimensions. Matches the ComfyUI mental model and the future fixed-ratio engine
+  (section 11). Note the **VRAM ceiling moves per source** in this mode (a 2x of a
+  1280x800 clip is far larger than a 2x of a 320x240 clip), so the estimate and the
+  OOM guard, not a fixed floor, are what protect the user.
+
+Both modes coexist with the three presets (presets stay for one-click common
+cases). The preset boxes remain landscape-fit boxes; a custom explicit resolution
+is likewise treated as a box.
+
+**Built (0.5.0): the RATIO half + the feasibility guard shipped; see section 21.**
+The 2x/4x ratio targets and a per-GPU feasibility filter are as-built; the arbitrary
+explicit-resolution entry field is still the remaining part of this section.
+
+## 7. No VRAM gate on local: the floor becomes advisory
+
+Remote uses `video_estimate.VRAM_FLOOR = {1080p: 32, 1440p: 80, 4K: 90}` to **refuse
+to offer** a card that cannot serve a target *at a usable batch*. That floor is a
+**remote card-picking** input and must **not** gate local:
+
+- **Local never hard-refuses on VRAM.** SeedVR2 offloads; a 24 GB card genuinely
+  produces small outputs at batch=1 (the developer's proven ComfyUI case: 640x480
+  -> 1280x960, ~1.23 MP). Refusing it would earn exactly the "we didn't test enough"
+  ridicule from technical users who *can* make it work.
+- **The floor becomes advisory:** a target above the card's advisory floor shows a
+  **warning** ("this may be slow or run out of memory on this GPU"), never a block.
+- **Targets must be allowed to EXCEED the calculated maximums.** The custom target
+  (section 6) deliberately lets the developer/user push past `VRAM_FLOOR` so the
+  ceiling can be **found empirically** (test till it breaks) rather than guessed
+  conservatively. The OOM guard (section 3) catches the break cleanly and resumes.
+
+## 8. Local benchmark harness (test till it breaks)
+
+An in-app, automatable benchmark that establishes the **real** per-card ceilings and
+rates, so tiers come from measurement, not the developer's single guess. This is
+essentially `pod/bench_video.py` run **locally** through `LocalVideoEngine`.
+
+- **Input:** a short clip (5-10 s). `video_pipeline` already extracts clips (the
+  segment-picker path / `extract_clip`), so the harness can cut a short segment from
+  any source, or use a bundled sample.
+- **Sweep:** for a chosen source resolution, upscale the clip at an **ascending
+  series of targets** (custom resolutions / ratios) until it **OOMs or degrades**,
+  then record the last good target as the card's ceiling for that source class.
+- **Log:** seconds/frame, seconds/output-MP, peak VRAM, batch used, and
+  OOM/degradation outcome, per (card, source-res, target). Write the rate to
+  `db.gpu_perf` (task `video-mp-<target>` already exists) and the safe batch to
+  `video_batch_learn`, so **the app's own estimate self-improves** and future runs
+  start at a safe batch.
+- **Automate:** a "Benchmark this GPU" action that runs the sweep unattended and
+  writes a report, so a non-developer user can calibrate their own card.
+
+The developer's **prototyping stage** uses this harness to build the first real
+local tier table across sources (roughly 320x240 to 1280x800) and destinations,
+before any tier is hard-coded as a default recommendation.
+
+## 9. Local time estimate (no cost)
+
+`video_estimate.py` already computes **duration** from `db.gpu_perf` history and a
+seeded rate table (`seconds_per_mp`, `estimate_queue`). Local needs a **cost-free
+variant**: same duration math, no `price_per_hour`, no spin-up-pod term (model load
+is the only warm-up). Show the estimated wall-clock before Start so nobody launches
+a 20-hour local job blind. Seed it from the local benchmark (section 8) and refine
+per card from real runs.
+
+**Built (0.5.0): see section 19 for the as-built history-driven local estimator.**
+
+## 10. Install-mode gate and the tab toggle
+
+- **Local video is Local/Both only** (needs torch + SeedVR2 locally), exactly like
+  local *image* upscaling. A **Remote-only** install keeps today's remote-only Video
+  tab unchanged.
+- **Un-gate the tab:** `docs/video-upscaler.md` 15.1 currently says "Remote-only. No
+  local path; the tab is blocked with guidance until remote is ready." Replace the
+  hard block with a **local / remote toggle** (mirroring the image tabs' "Run on
+  remote pod" checkbox). On a Local/Both install the toggle defaults sensibly and
+  either path is selectable; on Remote-only, local is disabled with the same
+  guidance as today.
+
+**Built (0.5.0): see section 18 for the as-built runner wiring + tab toggle.**
+
+## 11. Phase 2 (planned, not now): non-SeedVR fixed-ratio engine
+
+A later, separate phase: a **non-SeedVR, fixed-ratio 2x/4x** upscaler (a
+Real-ESRGAN / RealCUGAN-class model) as a second local engine.
+
+- **Why it may matter more for a broad audience:** it is fast, low-VRAM,
+  deterministic, and runs on any GPU, where local SeedVR2 is slow *everywhere*. For
+  many users "fast, good-enough, runs on my card" beats "slow, generative, best."
+- **Cost:** a new model dependency, a quality tradeoff (deterministic sharpening vs.
+  SeedVR2's generative detail), and a second engine to maintain. It drops into the
+  **same injected-engine seam** (section 4), so it is additive, not a rewrite.
+- **Decision deferred.** Prototype and evaluate quality after local SeedVR2 ships.
+
+## 12. Build order
+
+1. **This design doc** + the decision reversal (done: this file; the "never local"
+   passages in `docs/video-upscaler.md` are updated to point here; a
+   `docs/future-features.md` milestone is added).
+2. **`LocalVideoEngine` spike** — prove the in-process streaming path (`chunk_size>0`)
+   end-to-end on the local GPU against one short clip. No UI yet. Unblocks everything.
+3. **Local benchmark harness** (section 8) on top of the spike; developer runs the
+   prototyping sweep to build the first real tier table.
+4. **Custom targets** (section 6, both modes) + **advisory-only VRAM** (section 7).
+5. **Tab toggle + local time estimate + loud guards** (sections 3, 9, 10).
+6. **Phase 2** (section 11): evaluate the fixed-ratio engine.
+
+## 13. Open questions
+
+- **Tier defaults vs. free-for-all.** After the prototyping sweep, do we ship
+  **recommended** local targets per detected VRAM (wizard-style suggestion, still
+  overridable) or leave local fully open with only the advisory warning? Leaning
+  suggestion-with-override, matching the first-start wizard's philosophy.
+- **Degradation recovery UX.** After an auto-stop episode, prompt "reboot and resume"
+  explicitly, or just leave the queue resumable and notify? The image path leaves it
+  resumable; video runs are longer, so a clearer prompt may be warranted.
+- **Engine parity with the proof point.** The developer's ComfyUI proof (640x480 ->
+  1280x960 on a 24 GB 3090) used **SeedVR2**, the **same** engine the app vendors
+  (numz build), so those VRAM/feasibility observations transfer directly. The local
+  benchmark still runs against the vendored engine to get exact per-card numbers, but
+  there is no cross-version uncertainty to account for.
+- **Concurrency with local image tools.** A local video run owns the GPU in-process;
+  the existing GPU-overlap warning (which today treats video as pod-only, so it never
+  contends) must be extended to grey out local image upscaling / local tag while a
+  **local** video run is active.
+
+### 13.1 Future research: decouple the VAE-decode batch from the DiT batch
+
+**The single highest-value idea to raise the 24 GB ceiling without quality loss.**
+Benchmarking (section 14) shows the batch ceiling on a 24 GB card is set by **VAE
+decode memory**, not by DiT: bs17 upscales fine through DiT, then OOMs in Phase 3
+(decode). Decode memory scales with `batch x output_pixels`. The textbook fix,
+`decode_tiled` (spatial VAE tiling), is **rejected on quality grounds** (it adds
+per-frame seam artifacts; a standing project preference, see the image path).
+
+The seam-free alternative: **decode in smaller TEMPORAL sub-groups than the DiT batch.**
+Keep a large temporal window through DiT (which is what buys motion continuity, the
+thing the user cares about) but run the VAE decode over fewer frames at a time, so decode
+peak memory is bounded **without** spatial tiling (no seams). This decouples "continuity
+window" (DiT batch + overlap) from "decode memory" (decode sub-batch), which today are
+the same number and therefore collide on 24 GB. It would let a 24 GB card run, say, a
+bs17/ov6 DiT window while decoding 5 frames at a time.
+
+Needs SeedVR2-internal changes (the decode loop currently uses the same `batch_size`),
+so it is a research item, not a config knob. If it works it is the path to overlap-6 +
+1080p on a 24 GB card at full quality. Investigate against the vendored engine's
+`generation_phases` / VAE decode path.
+
+## 14. Benchmark log (as-measured, local)
+
+Real measurements from the `LocalVideoEngine` spike (`scripts/spike_local_video.py`),
+recorded for future reference. This is the empirical basis for the local tier table
+(sections 6-8): it replaces guessed VRAM floors with what the hardware actually does.
+
+**Rig / method.** RTX 3090 (24 GB), PyTorch 2.11 CUDA, **SDPA** attention (SageAttention
+/ FlashAttention not installed), **CPU offload** (resident=False: 24 GB < the 40 GB
+resident threshold, so DiT+VAE park in system RAM between passes), `opencv` writer, no
+10-bit. Test clip: first 5 s of `benchmark-videos/Pisici.AVI` = **149 frames, 320x240**.
+Target **1080p** box-fits to **1440x1080** (4.5x, **1.56 MP/frame**). Reproduce:
+
+    .venv\Scripts\python.exe scripts\spike_local_video.py --resolution 1080 \
+        --batch <B> --overlap <O> [--dit-model <file>]
+
+| Model | Req b/ov | RAN b/ov | Peak VRAM alloc/reserved | Time (149f) | s/frame · s/MP | Result |
+|-------|----------|----------|--------------------------|-------------|----------------|--------|
+| 7B fp16 | AUTO / 0 | **5 / 0** | 17.1 / 20.8 GB | 375.9 s | 2.52 · 1.62 | PASS (healthy baseline) |
+| 7B fp16 | 33 / 6 | thrash | (spilled >24 GB) | KILLED | — | **THRASH** (sysmem fallback was ON) |
+| 7B fp16 | 13 / 6 | **5 / 4** | 22.7 / 26.8 GB* | 1845 s† | 12.39 · 7.96 | bs13,bs9 OOM -> fell to bs5 |
+| 7B FP8-mixed | 17 / 6 | **5 / 4** | 22.7 / 26.7 GB | 1954 s† | 13.12 · 8.43 | bs17,13,9 OOM (all in decode) -> bs5 |
+| 3B fp16 | 9 / 6 | **5 / 4** | 22.6 / 26.7 GB | 1420 s† | 9.53 · 6.13 | bs9 OOM (decode) -> bs5 |
+
+*reserved 26.8 GB EXCEEDS the 24 GB card = sysmem fallback still partially used on the
+failed higher-batch attempts (a stale per-app profile can override the global
+"No Sysmem Fallback"; see below). †the 1845 s includes the wasted bs13+bs9 attempts
+(each re-runs the full VAE encode before the DiT OOM); the clean bs5 pass alone is ~376 s.
+
+**Findings so far:**
+- **The batch ceiling is set by VAE DECODE memory, not DiT** (measured on FP8: bs17 and
+  bs13 pass DiT then OOM in **Phase 3 decode**). Decode peak = `batch x output_pixels`.
+  See section 13.1 for the seam-free way to lift this wall.
+- **The decode wall is essentially DiT-precision-INDEPENDENT.** The VAE
+  (`ema_vae_fp16.safetensors`) is the same file for every DiT, and in the offload regime
+  the DiT is parked on CPU during decode, so **7B FP8 lands at the same bs5/ov4 as 7B
+  fp16** (bs9/ov6 still OOMs on FP8). Lowering DiT precision does NOT buy a bigger batch
+  on 24 GB. The remaining quality-preserving lever for a bigger batch is a smaller MODEL
+  footprint overall (3B: less total VRAM churn) or a lower target, pending 13.1.
+- **ALL THREE models cap at bs5/ov4 @ 1080p on 24 GB** (7B fp16, 7B FP8-mixed, 3B fp16 all
+  fall to bs5; peak alloc ~22.6-22.7 GB is the wall). **3B did NOT push bs9/ov6 into reach.**
+  So the decode wall is confirmed model-INDEPENDENT: model choice buys speed (3B's DiT is
+  lighter), not a bigger batch. **Overlap-6 at 1080p on 24 GB is BLOCKED for every model.**
+
+**24 GB tier conclusion (as-measured):** at **1080p** a 24 GB card is limited to **bs5 /
+overlap 4** regardless of model. To get **overlap 6** on 24 GB at full quality there are only
+two levers: (a) **lower the target resolution** so the decode tensor shrinks and a bigger batch
+fits (a 720p / 960-short-side target should let bs9-13 fit -> overlap 6; NOT yet benchmarked,
+the obvious next run), or (b) the **section 13.1 decode-decoupling** research (overlap-6 AND
+1080p, but needs engine work). `decode_tiled` would also work but is quality-rejected. This
+gives the tier UX its shape: on 24 GB, offer the user a **continuity-vs-resolution** choice
+(e.g. "1080p @ ov4" OR "720p @ ov6"), not both, until 13.1 lands. Model choice on 24 GB is a
+**speed** decision (3B fastest), not a batch/continuity one. **(Confirmed by 14.1: at
+1280x960 all three models run bs17/ov6 clean.)**
+
+### 14.1 Flat 2x (640x480 -> 1280x960): overlap-6 IS reachable on 24 GB
+
+The motivating real-world case for old 640x480 footage. Genuine 2x, **1280x960 output
+= 1.23 MP** (vs 1080p's 1440x1080 = 1.56 MP). Source: 640x480 clip (lanczos-derived from
+the 320x240 asset, so timing/VRAM are valid, quality is not native-representative).
+Started at bs17/ov6:
+
+| Model | Req b/ov | RAN b/ov | Peak alloc/reserved | Time (149f) | s/frame · s/MP | Result |
+|-------|----------|----------|---------------------|-------------|----------------|--------|
+| 7B fp16 | 17 / 6 | **17 / 6** | 20.9 / 25.5 GB | 725.5 s | 4.87 · 3.96 | PASS clean, **no fallback** |
+| 7B FP8-mixed | 17 / 6 | **17 / 6** | 20.9 / 25.5 GB | 698.9 s | 4.69 · 3.82 | PASS clean |
+| 3B fp16 | 17 / 6 | **17 / 6** | 20.9 / 25.5 GB | 617.9 s | 4.15 · 3.37 | PASS clean (fastest) |
+
+**Findings (the important one for 24 GB):**
+- **Overlap-6 IS achievable on 24 GB at 1280x960** (2x of 640x480): all three models ran the
+  full **bs17/ov6** window, no OOM, healthy ~5 s/frame (NOT the bs33 thrash). The earlier
+  "overlap-6 blocked" verdict was **1080p-specific**, not a 24 GB verdict.
+- **The batch ceiling is EXTREMELY resolution-sensitive near the 24 GB wall.** Dropping the
+  output just 21% (1.56 -> 1.23 MP, i.e. 1440x1080 -> 1280x960) flips the ceiling from **bs5
+  to bs17+** (3.4x the batch). The wall sits between these two output sizes. Practical rule
+  for 24 GB: **outputs up to ~1280x960 get a large window (overlap-6, great continuity);
+  1080p-class outputs are pinned to bs5/ov4.**
+- **Model choice looks speed-only HERE, but is NOT near the ceiling (corrected by 14.2).**
+  All three peak at an identical 20.9 GB *at bs17* and 3B is ~15% faster (617 vs 725 s). But
+  bs17 is well below 7B's ceiling; push to bs29 (14.2) and 3B fits where 7B collapses. So the
+  "model-independent" claim holds only with margin, not at the edge.
+- **Caveat - the bs17 ceiling here is "at the edge".** Reserved hit **25.5 GB, above the
+  24 GB physical**, on the SUCCESSFUL runs: the allocator pool spilled ~1.5 GB into sysmem
+  harmlessly (live alloc 20.9 GB fits; runs stayed healthy, not thrashing). But a STRICT
+  "No Sysmem Fallback" config might turn bs17/1280x960 into a clean OOM. Verify the per-app
+  fallback policy for the venv python before the productized VRAM model trusts this ceiling;
+  treat 1280x960/bs17 as the edge, not comfortable headroom. (Also confirms the global
+  no-fallback setting is not fully applying to this process.)
+
+**Revised 24 GB tier picture:** the continuity-vs-resolution crossover is right at
+**~1280x960 vs 1440x1080**. Old low-res footage (<= 1280x960 output) gets overlap-6 for free;
+only 1080p-class targets force the ov4 compromise (or await section 13.1).
+- **VAE decode is the bottleneck, not DiT** (decode ~6-8 s/batch vs DiT ~3.2 s/batch at
+  bs5). Suspect the PyTorch-2.11 Conv3d/cuDNN "VAE 3x memory" workaround; investigate
+  `decode_tiled` for local.
+- **Windows sysmem-fallback must be OFF** ("Prefer No Sysmem Fallback") or an over-large
+  batch **thrashes silently instead of OOMing** (~250x slowdown; one decode batch took
+  25 min at bs33). Driver updates RESET this; a global setting can be overridden by a
+  per-app `python.exe` profile. With it truly off, an overcommit OOMs cleanly and the
+  engine's retry auto-steps the batch down.
+- **No persistent degradation observed** across these runs despite ~33 h uptime (the bug
+  is a separate, reboot-only failure; the thrash above is batch-induced and curable).
+
+### 14.2 Pushing to bs29: model DOES matter, and cascade-recovery is DESTRUCTIVE
+
+Same 2x/1280x960 case, started at **bs29/ov6** (the fallback ladder covers 29->25->21->17->...):
+
+| Model | Req b/ov | RAN b/ov | Peak alloc/reserved | Time (149f) | s/frame | Result |
+|-------|----------|----------|---------------------|-------------|---------|--------|
+| 7B fp16 | 29 / 6 | **5 / 4** | 20.9 / 25.5 GB | 1865 s | 12.52 | OOM cascade 29->5 (COLLAPSED) |
+| 7B FP8-mixed | 29 / 6 | **5 / 4** | 20.1 / 24.3 GB | 1771 s | 11.88 | OOM cascade 29->5 (COLLAPSED) |
+| 3B fp16 | 29 / 6 | **29 / 6** | 21.1 / 25.6 GB | 583 s | 3.91 | **PASS clean, first try** |
+
+Two findings, both corrections/additions to 14.1:
+
+- **Model choice DOES buy batch headroom near the ceiling (corrects 14.1's "speed-only").**
+  **3B fits bs29/ov6 on the first attempt** (21.1 GB, clean); **7B (both precisions) cannot
+  fit bs29** and OOM. At bs17 all three fit identically only because bs17 is below every
+  model's ceiling; at the edge the 7B's larger DiT footprint (a transient during the DiT
+  phase, even offloaded) pushes it over first. So on 24 GB, **3B is the model that unlocks
+  the largest temporal window** (bs29/ov6 vs the 7B's ~bs17), which matters for continuity,
+  not just speed.
+
+- **Cascading OOM-recovery from too-high a start is DESTRUCTIVE (VRAM fragmentation).** 7B
+  fp16 ran **bs17 clean when STARTED at bs17** (14.1, 20.9 GB), yet here **bs17 OOMs when
+  REACHED via 29->25->21->17** and the run collapses all the way to bs5. Same batch, same
+  resolution, same (fresh) process: the only difference is the failed higher attempts before
+  it. `torch.cuda.empty_cache()` between retries does NOT undo the caching-allocator
+  fragmentation the failed bs29/25/21 attempts leave behind, so a batch that fits from a
+  clean start fails after a cascade. **Consequence: "start high, fail fast" UNDER-reports the
+  true ceiling.** This is NOT session-wide degradation: 3B ran LAST in the chain and cleanly
+  used 21.1 GB, so the card still had headroom; the 7B collapse is within-run fragmentation.
+
+**Productization consequences (important):**
+1. The batch sizer must be a **predictive VRAM model that starts at/near the right batch**,
+   NOT an optimistic-high start that recovers by cascading down (which fragments and
+   under-shoots). This reinforces section 7 / the shared-sizer plan.
+2. If a retry is ever needed, it likely needs a **hard CUDA context reset** (or a fresh
+   subprocess per attempt), not just `empty_cache()`, to clear fragmentation.
+3. The predictive model must be **per-model** (3B and 7B have different ceilings), keyed on
+   `batch x output-MP` PLUS a model-footprint term.
+
+**Fresh-boot re-run (planned) will confirm the fragmentation hypothesis:** on a clean session,
+7B started DIRECTLY at bs17 should run clean, while 7B started at bs29 should still cascade to
+bs5 (fragmentation is per-run, boot-independent). 3B bs29 should remain clean.
+
+### 14.3 Fresh boot + STRICT no-sysmem-fallback: the honest ceiling
+
+Re-ran on a clean session, "Prefer No Sysmem Fallback" set globally AND per-app for the venv
+python. Idle desktop overhead **~3 GB** (2977 MiB), so effective headroom ~21 GB, not 24.
+
+| Fresh run | RAN b/ov | Peak alloc/reserved | Time (149f) | s/frame | Result |
+|-----------|----------|---------------------|-------------|---------|--------|
+| 7B fp16 bs17 **direct** | **17 / 6** | 20.9 / 25.5 GB | 753 s | 5.06 | **CLEAN** |
+| 7B fp16 bs29 | 5 / 4 | 20.5 / 24.3 GB | 1795 s | 12.05 | cascade -> bs5 |
+| 3B fp16 bs29 | 5 / 4 | 20.1 / 24.3 GB | 1508 s | 10.12 | cascade -> bs5 |
+| 3B fp16 bs33 | 5 / 4 | 21.0 / 25.5 GB | 1709 s | 11.47 | cascade -> bs5 |
+
+**Confirmed:**
+- **Fragmentation/cascade destruction is REAL and boot-independent.** 7B bs17 **direct** = clean;
+  7B bs29 still cascades to bs5. Per-process fragmentation, exactly as predicted. => the sizer
+  MUST be predictive, and cascade-recovery is destructive (14.2 stands).
+
+**Corrected (two earlier claims were sysmem-aided artifacts):**
+- **"3B fits bs29/ov6" (14.2) was FALSE under honest conditions.** That pre-restart success had
+  reserved 25.6 GB (>24 physical) = it leaned on sysmem spill. On the fresh strict session
+  (no spill + ~3 GB desktop), **3B bs29 OOMs and cascades to bs5**, same as 7B. So 3B does NOT
+  truly clear bs29; the "3B unlocks a bigger window" claim is **retracted** pending an honest
+  DIRECT test of 3B at intermediate batches (bs21/bs25), which the matrix did not run (it tested
+  3B only at bs29/bs33, both above the ceiling, so both cascaded).
+- **"Prefer No Sysmem Fallback" is a SOFT preference, not a hard cutoff.** Even fresh + strict,
+  the clean bs17 run still shows reserved 25.5 GB (>24): a *small* overcommit (~1.5 GB) is still
+  tolerated via a little spill, while a *large* overcommit (bs29, several GB) hard-OOMs. This
+  explains every reserved>24 reading. Consequence: bs17 "fits" only with a sliver of soft spill,
+  so treat it as the edge; a truly spill-free config would likely sit a notch lower.
+
+**Honest 24 GB ceiling (desktop running):** the only CONFIRMED clean DIRECT run is **7B bs17/ov6**
+(~5 s/frame), and it rides ~1.5 GB of soft spill. 3B's honest direct ceiling is **untested** (only
+seen cascading from too-high starts). So the real-use ceiling at 1280x960 is **~bs17/ov6**, model
+dependence unconfirmed, and **overlap-6 IS still reachable there** (bs17 > 7). The earlier bs29
+optimism was sysmem-inflated.
+
+**Tested lever - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: NOT AVAILABLE on Windows.**
+The idea was to attack the contiguity failure (the VAE `concat_splits` needs a fresh contiguous
+block; fragmentation blocks it) with growable segments. **Result: PyTorch 2.11 emits
+`UserWarning: expandable_segments not supported on this platform` and ignores the setting**
+(confirmed via the env var on this Win11 / CUDA build). So the allocator-level fix is **off the
+table on Windows**; we cannot lean on a smarter allocator to undo fragmentation.
+
+**This HARDENS the productization requirements (no allocator escape hatch on Windows):**
+1. The batch sizer MUST be **predictive** - pick a batch that fits on the FIRST try, per model,
+   keyed on `batch x output-MP` + a model-footprint term + the live free-VRAM headroom (which
+   includes the ~3 GB desktop). Never start high and cascade.
+2. If a feasibility probe / retry is ever needed, it needs a **fresh subprocess (new CUDA
+   context) per attempt** - `empty_cache()` does NOT clear fragmentation and `expandable_segments`
+   is unavailable, so an in-process retry is destructive (14.2/14.3). A subprocess pays a model
+   reload but guarantees a clean allocator.
+3. Because "Prefer No Sysmem Fallback" is soft (14.3), the sizer should target **~2 GB below**
+   the measured physical ceiling so it does not depend on the tolerated sliver of spill.
+
+## 15. As built: the predictive VRAM sizer (`scripts/video_vram_sizer.py`)
+
+The batch/overlap picker for the LOCAL path, built to the requirements above. It picks the
+largest window predicted to fit on the FIRST try; it never starts high and cascades (which
+fragments VRAM irrecoverably on Windows, 14.2/14.3). Design = **tier-anchored +
+self-calibrating** (the "option b" chosen after 14.3 showed the pod's 5090 curve does not
+transfer to the 3090, so a hand-fit curve can't be the source of truth):
+
+- **Seed** per (VRAM tier, output-MP): `_SEED_BY_TIER`. The **24 GB tier is the measured
+  anchor** (<= 1.35 MP -> bs17/ov6; 1080p-class -> bs5/ov4, from 14.1/14.3 and the user's
+  decision). Every OTHER tier is a deliberately CONSERVATIVE (biased-low) guess: a too-small
+  seed only shrinks the window, a too-big one causes the first-run OOM we are avoiding.
+- **Free-VRAM step-DOWN** (`_fit_to_free`, never up): budgets against LIVE free VRAM
+  (`free_vram_gb` -> torch `mem_get_info`, then nvidia-smi), so the ~3 GB desktop overhead or a
+  busy card trims the batch instead of OOMing. The step-down uses a 3090-calibrated working-set
+  estimate `peak ~= 14.85 + 0.289 * batch * out_MP` (fit on the two clean 3090 anchors) - a
+  STARTING estimate only, since the curve is per-architecture.
+- **Learned override** (supersedes the seed): after each segment `record_result` stores the
+  batch that actually ran clean in `db.video_batch_learn`, keyed by a **model-qualified gpu id
+  (`"<gpu>|<model_tag>"`)** + the 0.5 MP bucket - so 7B and 3B keep separate rows, remote rows
+  are untouched, and the sizer converges to each real card+model over time (exactly like the
+  remote path self-improves `db.gpu_perf`). `get_learned_batch` is still free-VRAM-clamped.
+- **Overlap** is the quality-floored `auto_overlap` (>= 6, the measured seam-free minimum),
+  clamped below the batch (so bs5 -> ov4, bs9+ -> ov6).
+
+Wired into `LocalVideoEngine.__init__(conn=, gpu_id=)` and `process_segment`: on AUTO
+(`batch<=0`) the sizer picks the window from the output size; the OOM-retry loop remains a
+backstop, and whatever batch runs clean is recorded for learning. Unit-tested tkinter/GPU-free
+(seed picks, step-down, learned override, model-key isolation, overlap floor).
+
+## 16. Planned: per-card VRAM benchmark suite (user-runnable)
+
+The sizer's seeds are honest only for 24 GB; every other card starts from a conservative guess
+that learning nudges one segment at a time. A **benchmark suite the user runs once on their own
+card** closes that gap directly: it determines the **maximum safe (batch, overlap)** for a
+**configurable source -> target resolution pair** and writes the result straight into the
+learned store, so real runs then start at the true ceiling instead of crawling up from the
+conservative seed.
+
+- **Input:** a source resolution and a target (or an explicit output resolution / ratio, matching
+  the custom-target modes of section 6), plus the model. A short bundled/derived clip at the
+  chosen source size is enough (the wall is set by OUTPUT size, section 14, so the source content
+  is irrelevant to the ceiling).
+- **Method:** for that (model, output-MP), probe batches **upward from a safe floor** in 4n+1
+  steps, **each attempt in a FRESH SUBPROCESS** (mandatory: an in-process sweep would fragment
+  VRAM and under-report, 14.2/14.3; `expandable_segments` can't save it on Windows, 14.3). The
+  last batch that completes clean, minus a safety notch, is the card's ceiling; overlap follows
+  `auto_overlap`. Record peak VRAM + s/frame per step for the estimate.
+- **Output:** write `(gpu|model, mp_bucket) -> batch` to `db.video_batch_learn` (the sizer's
+  learned store) and the timing to `db.gpu_perf` (the local time estimate), plus a short report.
+  A "Benchmark this GPU" action makes it one click for a non-technical user; the developer uses
+  the same tool to build the shipped seed tables for cards other than the 3090.
+- **Why a suite, not the AUTO path:** AUTO must be safe on the first try (no cascade), so it can
+  only ever learn *downward* from a seed or *upward* one careful segment at a time. The benchmark
+  suite is the sanctioned place to push UPWARD to failure (test-till-it-breaks, section 8) exactly
+  because each probe is an isolated subprocess, so a failed probe can't poison the next.
+- **Status:** BUILT (0.5.0) -- see section 20 for the as-built suite. Tracked in
+  `docs/future-features.md` #7.
+
+## 17. As built: the mid-segment thrash watchdog (`local_video_worker.py` + `LocalVideoEngine`)
+
+The predictive sizer (section 15) makes thrash rare, but it is a SAFETY NET for the residual
+cases: an unmeasured card whose seed is too high, or a machine where "No Sysmem Fallback" is off
+(then an over-budget batch **thrashes** instead of OOMing -- a healthy VAE decode step is seconds,
+a thrashing one was ~25 min, section 14). The existing per-segment slow-watchdog only checks
+AFTER a segment, which is useless when one segment crawls for hours; this catches it DURING.
+
+**Why a subprocess (not a thread).** A thrashing segment is stuck inside a synchronous in-process
+`process_video` CUDA call, and Python cannot safely interrupt a thread running a CUDA C-extension
+(14.2/14.3). So `use_subprocess=True` (the product path) runs **each attempt in a fresh child
+process** (`local_video_worker.py`, one `UpscaleEngine.process_video` call) that the parent can
+KILL. Three payoffs, not just the watchdog:
+  * **killable** -> the watchdog can abort a crawling segment promptly;
+  * **fresh CUDA context per attempt** -> no fragmentation carryover, so an OOM retry at a smaller
+    batch starts clean instead of inheriting the failed attempt's fragmented pool (the destructive
+    cascade of 14.2/14.3 is gone);
+  * it is the **same subprocess-per-attempt** the benchmark suite (section 16) needs.
+The cost is a **model reload per attempt** (~12 s in offload mode); a resident-killable-worker
+optimization can reclaim it later. Left off (`use_subprocess=False`, the spike default) the engine
+runs in-process, reusing one cached model.
+
+**Mechanism.** The parent reads the child's stdout: **every line is a liveness heartbeat**, so a
+gap longer than **`thrash_stall_seconds`** (config `video.thrash_stall_seconds`, default 300, floor
+30) means the GPU is thrashing/hung -> **kill the process tree** (`taskkill /T /F` on Windows, the
+only reliable tree-kill) -> raise **`ThrashDetected`**. A CUDA OOM (the worker's `@@LVW-OOM@@`
+marker / exit 42) is turned into a normal OOM error so the caller retries **smaller in a NEW clean
+process**. Pipeline progress lines are forwarded to the parent's stdout for GUI-log parity, and the
+parent stays **GPU-free** (device name + free VRAM via nvidia-smi, `free_vram_gb(prefer_smi=True)`,
+so it never holds a CUDA context the child needs).
+
+**`ThrashDetected` is a DEGRADATION episode, not an OOM:** the retry loop does NOT step down from it
+(retrying a thrash would just thrash again). It propagates so the runner surfaces it loudly and
+stops the run; the unfinished segment resumes on the next run (post-reboot, per the segment resume
+cache) -- the same contract as the image watchdog's auto-stop.
+
+**Config:** `video.thrash_stall_seconds` (default 300). A 4K target with a legitimately long decode
+step may need a higher value; the 30 s floor guards against a false trip. Wired into
+`LocalVideoEngine(use_subprocess=, thrash_stall_seconds=)`; the runner (tab-toggle step) passes the
+config value. Watchdog timing tested GPU-free with a fake worker (clean / OOM / stall-kill paths).
+
+## 18. As built: the runner wiring + the Local/Remote tab toggle
+
+This is the step that makes everything above (the engine, the sizer, the watchdog) actually
+reachable from the GUI. Nothing new in the pipeline: the same walk / split / reassemble / mux /
+resume orchestration runs; only the **injected engine** changes and a **mode selector** picks it.
+
+**Runner (`batch_video_upscale.py`).**
+  * **`--local` flag** (mutually exclusive with `--passthrough`): constructs a
+    `LocalVideoEngine` and runs `run_queue` with no pod. `_local_seedvr2_paths(cfg)` resolves the
+    vendored `seedvr2/` repo + `models/SEEDVR2/` weights off the app root (the SAME `seedvr2`
+    config keys the Batch Upscaler reads), and the engine is fed `_worker_cfg()` (the upscale
+    config overlaid with the video quality/speed knobs, `dit_model` included), `conn`, `gpu_id=None`
+    (the engine self-identifies the card via nvidia-smi so the learned store keys per-card), plus
+    `use_subprocess` + `thrash_stall_seconds` from config.
+  * **Two new config keys** in `resolve_video_cfg`: `video.thrash_stall_seconds` (default 300) and
+    `video.local_use_subprocess` (default **on** = the product path: subprocess-per-attempt with the
+    thrash watchdog + fresh CUDA context; off = the in-process spike path).
+  * **`ThrashDetected` handling in `run_queue`:** caught as its own branch (like the mid-segment
+    Stop), it marks the job `partial` (finished segments resume next run), logs a loud
+    degradation message, emits a `VRESULT` fail event, and **stops the whole run** WITHOUT bumping
+    the source's `fail_count` (a degraded GPU is not the source's fault, and the next job would just
+    thrash again -- reboot to clear it). `_stop_notice` maps the `"gpu thrash"` reason to a **red,
+    resume-hinted** summary notification. `auto_resume` is forced off for `--local` (there is no pod
+    to lose). Guarded import so the remote/passthrough trees load without the local stack.
+
+**GUI (`gui/tab_video.py`).** A **"Run on:" selector** (Remote (RunPod) / Local GPU) at the top of
+the tab, gated by the install mode: **Remote-only** disables Local (tooltip: re-run setup as
+Local/Both), **Local-only** disables Remote, **Both** remembers the last choice
+(`gui_settings.video_mode`). The mode re-skins the tab without duplicating it:
+  * **Readiness** — Local checks only ffmpeg + a local NVIDIA GPU (nvidia-smi via
+    `system_telemetry.sample_gpu` / `gpu_name`), not the RunPod key/SSH/volume; shows
+    "Local ready -- <card>, <VRAM> GB. The first segment calibrates the batch size."
+  * **GPU display** — Local detects THIS machine's card (a cheap nvidia-smi, auto-run on entry,
+    unlike the remote list which hits the API and stays behind `↻`) and shows it as the single
+    choice, shaped like a remote GPU dict (`price=None` marks it free) so `_selected_gpu` / the
+    estimate / Start read it unchanged.
+  * **Estimate** — history-driven, see section 19. No cost, no funds guard, no GPU-override env.
+  * **Auto-resume** — pod-only, so it is greyed out in Local mode.
+  * **Start** — Local launches `batch_video_upscale.py <src> <out> --local` after a light,
+    cost-free confirm that warns the run can be slow and may degrade (stops loudly if so).
+
+**Tested** (GPU-free): `resolve_video_cfg` local defaults/overrides, `_local_seedvr2_paths`
+(default + env-expanded config), `_stop_notice("gpu thrash")`, and a `run_queue` thrash scenario
+proving the run stops after the episode, leaves the job `partial` with `fail_count == 0`, and never
+touches the following job (`tests/test_video_local.py`). The full 173-test video suite still passes.
+
+## 19. As built: the local time estimate (history-driven, honest)
+
+The estimate reuses the remote estimator's **per-output-megapixel** model (so it is
+aspect-correct and generalises to any target), with two differences: **no cost** and **no
+pod spin-up** term (a local model load is the only warm-up, and it is small next to a
+multi-hour queue). The design choice that matters: it is **history-driven and refuses to
+fabricate**. We have no honest per-card rate table for consumer GPUs (only the dev's own
+3090, and even that varies ~2.5x per output-MP between a bs5 1080p run and a bs17 2x run,
+because per-frame cost depends on source size + batch, not output-MP alone). So:
+
+  * **`estimate_queue_local(jobs, gpu_id, conn)`** (in `video_estimate.py`) sums
+    `frames x output_MP x seconds_per_MP` per job, no price, no spin-up. It returns `None`
+    (the GUI then shows only the work SIZE) rather than guess when a target has no rate.
+  * **`local_seconds_per_mp`** prefers the user's OWN measured history
+    (`db.gpu_perf`, task `video-mp-<target>`, keyed by the nvidia-smi card name) ->
+    `calibrated=True`; else a `LOCAL_RATES` **seed** (currently EMPTY -- the per-card
+    benchmark suite, section 16, is what will fill it with rigorously-measured rates) ->
+    `calibrated=False`; else nothing. A seeded (un-measured) estimate is shown flagged
+    **"(rough)"**.
+  * **Self-calibration is now wired for local.** `batch_video_upscale.process_job` recorded
+    each segment's real output-MP vs. seconds into `db.gpu_perf` ONLY under the remote
+    `IMGTBX_GPU_OVERRIDE` key; it now falls back to **`engine.gpu_id`** (the local card
+    name) when there is no override, so a LOCAL run feeds the SAME store the local estimate
+    reads back. Passthrough has no `gpu_id`, so it never pollutes the store. One segment of a
+    real video is thousands of output-MP -- far past the 300-MP trust floor -- so the
+    estimate becomes **calibrated after the first segment**: the first run is covered by the
+    in-run live ETA (the progress bar), and every run after shows a real measured time.
+  * **GUI** (`_update_local_estimate`): calibrated -> `"N job(s) . ~H:MM:SS . M segments .
+    runs on your GPU (no cost)"`; seeded -> the same with `~H:MM:SS (rough)`; neither ->
+    the work-size line + "the first segment calibrates it". The local GPU choice's `id` is
+    set to the nvidia-smi card name so it matches the perf key the runner records under.
+
+**Tested** (GPU-free, `tests/test_video_local.py`): `None` for an unseeded card with no
+history; a measured-history estimate is `calibrated=True` with the exact expected seconds;
+a monkeypatched `LOCAL_RATES` seed is `calibrated=False` ("(rough)"); and a queue is `None`
+if ANY target lacks a rate. The estimate suite (26 tests) and full video suite still pass.
+
+## 20. As built: the per-card VRAM benchmark suite
+
+The suite closes the loop for BOTH earlier systems: it feeds the sizer (section 15) a real
+per-card ceiling and the estimate (section 19) a real rate, replacing the conservative seed
+with measurement. It is the sanctioned place to push UPWARD to failure, safe to do so ONLY
+because each probe is an isolated subprocess (a failed probe's fragmented VRAM dies with its
+process instead of poisoning the next, 14.2/14.3).
+
+**Flow.** A modal (`gui/video_benchmark.py`, "Benchmark GPU…" button, Local mode only)
+detects the card, loads any prior results, shows a rough runtime estimate, and drives
+`scripts/video_benchmark.py`. For each selected target the runner sweeps batches **upward in
+4n+1 steps** (5, 9, ... up to a cap of 65 -- deliberately PAST the sizer's AUTO cap of 33,
+since a big card's true ceiling is higher) on a short clip, via
+**`LocalVideoEngine.probe_batch`** (a fixed-batch, no-step-down wrapper over the fresh-subprocess
+`local_video_worker.py`). It stops a target at the first OOM/thrash; the last clean batch is the
+ceiling.
+
+**Persistence + resume.** Every probe is written to **`db.video_bench`** the instant it
+finishes (`gpu_id, model, out_w, out_h, batch -> outcome/frames/seconds/peak`). So a **Stop**
+(stdin `q`, which kills the in-flight probe's subprocess and discards only that partial) is
+graceful, and re-opening **resumes at the nearest untried batch** (`next_batch` skips recorded
+probes; a recorded failure ends the cell). The pure sweep logic (`build_plan`, `batch_series`,
+`next_batch`, `cell_ceiling`, `estimate_runtime`) is separated from the GPU driving and
+unit-tested.
+
+**Outputs.** Per finished cell, `_record_cell_result` copies the ceiling into the sizer's
+learned store (`db.put_learned_batch`, `gpu|model` + MP bucket) and the ceiling probe's timing
+into the estimate store (`ve.record_benchmark_rate` -> `db.gpu_perf`, low trust floor since a
+benchmark probe is a clean controlled measurement). The sizer now **honours a learned value
+above the AUTO cap** (a measurement beats the safety cap); the seed path stays capped. The
+local estimate's read floor dropped to **40 MP** (`LOCAL_MIN_MP`) so one short benchmark clip
+registers.
+
+**The benchmark clip** (`benchmark_clip.py`) is either a **pinned** GitHub asset
+(config `video.benchmark_clip_url` + `benchmark_clip_sha256`, SHA-256 verified, unpinned
+refused) scaled to each cell's source, or -- by default, with no asset to publish -- an
+**ffmpeg-synthesised** `testsrc2` clip at the exact size. The content is irrelevant to the
+ceiling (set by OUTPUT size, section 14), so synthesis is a valid, offline, reproducible
+source; a download failure falls back to it. Source per cell = a clean 2x of the output
+(`resolution` = the output short side), cached by size.
+
+**VRAM-contention guard + tag.** Other GPU apps (a 3D tool, a slicer, a browser) holding VRAM
+would make a sweep OOM early and record an artificially LOW ceiling that then caps every real
+run. Two protections: (1) the modal samples used VRAM on open and again at Start and, above
+**2.5 GB** occupied, shows a prominent (non-blocking) warning -- *"Close all non-essential
+applications for best benchmarking results…"*; (2) each probe records the **free VRAM at probe
+start** (`video_bench.free_vram`), so `next_batch` treats a failure that happened with materially
+less headroom than is free NOW (`STALE_MARGIN_GB` = 1.5) as a contention artifact and RE-PROBES
+it (it also doesn't cap the sweep below itself) -- a later clean run cleanly supersedes a
+contended one instead of being permanently capped by it. The regular LOCAL upscale confirm also
+now advises closing non-essential apps + minimising machine use.
+
+**Tested** (GPU-free, `tests/test_video_benchmark.py`, 16 tests): the sweep logic
+(series/plan/cell/next-batch/ceiling/estimate), stale-contended-failure re-probe (incl. below a
+trustworthy failure), the `video_bench` round-trip + clear + `free_vram` tag, the clip download
+integrity (unpinned refused, hash verified/mismatch-deleted via a `file://` URL), an
+**end-to-end sweep with a fake engine** (records 5/9/13 ok + 17 oom, learns 13), and a **resume**
+(pre-seeded 5/9, continues at 13). Full suite (513 tests) passes.
+
+## 21. As built: dynamic ratio targets + the per-GPU feasibility guard
+
+Two problems in one: a 24 GB card would happily let you pick 4K (guaranteed OOM), and a
+low-res source had no sane target between the presets. Both are now solved by a single
+notion, the **max feasible OUTPUT megapixels** of the selected GPU, plus **2x/4x ratio
+targets** computed from each source.
+
+**Target model.** `video_estimate` gained ratio target tokens (`2X`/`4X`, product decision:
+those two only) alongside the presets. `fit_scale` -- the one function the pipeline already
+routes resolution through -- returns the ratio for a ratio token and the box-fit scale for a
+preset, so `output_dims` / `fit_short_side` / `output_megapixels` / `classify_upscale` (and
+therefore `process_job`'s `--resolution`) handle ratios with no other change. A target is
+stored as its token (`2X` / `1080p` / ...); its concrete output is derived per source. Ratio
+outputs are capped at 4K, so a ratio is a low-res-source feature (a 4K source still reads as
+"nothing to upscale to").
+
+**Feasibility.** `max_output_mp(total_vram_gb, gpu_id, conn)` returns the largest output-MP a
+card is believed to reach: a per-VRAM-tier SEED (24 GB = 1080p / ~2.1 MP, measured on the
+3090, the user's call to allow the tight 1080p; smaller tiers conservative), RAISED by
+anything the card's own benchmark/learned data proves (`db.max_feasible_output_mp`, never
+lowered). `source_eligible_targets` enumerates the ratios + presets that are a real upscale
+(deduped by output dims: a 960x540 source's "2x" IS 1080p, so the preset label wins);
+`feasible_targets` filters that to `<= max_output_mp`; `target_label` shows each as a concrete
+resolution (`2x (640x480)`, `1080p (1440x1080)`).
+
+**GUI.** The Target combobox lists only feasible targets for the currently selected GPU
+(local: the detected card, benchmark-aware; remote: the picked pod), labelled with their
+output size. The queue **greys** any job the selected GPU can't reach (re-evaluated when the
+GPU selection changes), and **Start is refused** if nothing in the queue fits; when some jobs
+fit and others don't, the run proceeds on the feasible ones and reports how many were skipped.
+
+**Runner.** The GUI passes the card's `IMGTBX_MAX_OUTPUT_MP`; `run_queue` DEFERS (leaves
+`pending`, logs once) any job whose output-MP exceeds it, rather than attempting and
+OOM-failing it -- so a mixed queue runs what fits and keeps the rest for a bigger card. The
+remote cost estimator approximates a ratio target's rate with the 1080p preset's s/MP, so the
+GPU picker still ranks cards for a ratio-target queue.
+
+**Examples (as tested).** A 320x240 source offers `2x (640x480)` + `4x (1280x960)` + `1080p`
+on a 24 GB card, `+ 1440p` on a 32 GB card, and only `2x` on a 12 GB card. The dedupe, the
+benchmark-raises-the-cap path, and the runner defer are unit-tested
+(`tests/test_video_targets.py`, 9 tests). Full suite (522) passes.
+
+**Not yet:** the arbitrary explicit-resolution entry (the other half of section 6), and a
+VRAM-aware remote GPU-list pre-filter for ratio targets (the queue-grey + Start guard cover
+correctness meanwhile).
