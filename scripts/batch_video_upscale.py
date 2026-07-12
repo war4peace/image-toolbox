@@ -452,7 +452,13 @@ def resolve_video_cfg(cfg, overrides=None):
         # interrupted) AND every OOM retry gets a clean CUDA context (no fragmentation
         # carryover). Default on (the product path); off = one cached in-process engine
         # (the spike path), faster per attempt but un-killable and fragmentation-prone.
-        "local_use_subprocess": bool(v.get("local_use_subprocess", True)),
+        # Default OFF: the LOCAL engine runs IN-PROCESS, exactly like the proven image Batch
+        # Upscaler (loads UpscaleEngine in the runner, calls process_video directly, streams
+        # SeedVR2's output to the runner's own stdout). The subprocess-per-attempt path adds a
+        # nested worker + stdout pipe purely for mid-segment thrash-kill; that pipe was the sole
+        # source of the local "stall at first segment" hangs. Opt back in with
+        # video.local_use_subprocess=true only if you specifically need the killable watchdog.
+        "local_use_subprocess": bool(v.get("local_use_subprocess", False)),
         # Per-card benchmark suite (#7, docs 16/20). Optional PINNED standard clip: set
         # both to a published, hash-verified GitHub asset to benchmark against a real
         # video; left empty (default), the suite SYNTHESISES its source with ffmpeg, so it
@@ -2059,6 +2065,21 @@ def main(argv=None):
 
     # GUI mode (stdin is a pipe): watch for a "q" Stop line.
     if GUI_MODE:
+        # Windows loader-lock deadlock guard (local in-process path). The stdin watcher blocks
+        # in `for line in sys.stdin`; on Windows that blocked pipe read holds the loader lock.
+        # Importing numpy AFTER it then DEADLOCKS: numpy's C-extension DLL spins up OpenBLAS/
+        # OpenMP worker threads in its DllMain, and thread creation needs the loader lock the
+        # blocked read is holding. The runner hangs before the engine loads; only a Stop (which
+        # ends the watcher) unwedges it. Fix: import numpy FIRST, single-threaded, THEN start
+        # the watcher. numpy ONLY -- do NOT pre-import torch here: SeedVR2 sets the CUDA
+        # allocator backend and must import torch itself, and once numpy is loaded torch imports
+        # cleanly after the thread anyway. In-process local path only (remote/subprocess don't
+        # import numpy in this process).
+        if args.local and not vcfg.get("local_use_subprocess"):
+            try:
+                import numpy       # noqa: F401  (the DLL that deadlocked; load it thread-free)
+            except Exception:      # noqa: BLE001  (fail-safe: engine import will surface it)
+                pass
         threading.Thread(target=_watch_stdin_for_stop, daemon=True).start()
 
     # Headless: pre-populate the queue from the folder (the GUI does this per-file).
@@ -2145,35 +2166,39 @@ def main(argv=None):
         elif args.local:
             # Local mode (#7): the SeedVR2 work runs on THIS machine's GPU, no pod. Same
             # walk/split/reassemble/mux/resume pipeline as the remote path; only the injected
-            # engine changes. The predictive VRAM sizer picks the batch (conn + gpu self-ID
-            # give it learned self-calibration) and the mid-segment thrash watchdog guards a
-            # degrading GPU when local_use_subprocess is on (the default product path).
+            # engine changes. The predictive VRAM sizer picks the batch (conn + gpu self-ID give
+            # it learned self-calibration). DEFAULT is in-process (mirrors the image Batch
+            # Upscaler); the opt-in subprocess mode adds the mid-segment thrash-kill watchdog.
             from local_video_engine import LocalVideoEngine
             repo_dir, model_dir = _local_seedvr2_paths(cfg)
+            _sub = vcfg["local_use_subprocess"]
             log(f"Local mode — upscaling on this machine's GPU (no pod). "
-                f"Thrash watchdog: {vcfg['thrash_stall_seconds']}s stall; "
-                f"engine: {'subprocess-per-attempt' if vcfg['local_use_subprocess'] else 'in-process'}.")
-            # torch.compile's inductor backend needs Triton. On Windows that means the
-            # `triton-windows` package (Ampere/Ada/Blackwell incl. the 3090); if it isn't
-            # installed, enabling compile stalls the first forward pass for minutes in a doomed
-            # build that emits no progress (looks hung) instead of the ~seconds the image Batch
-            # Upscaler takes. So gate compile on Triton actually being importable HERE (the
-            # worker shares this venv), rather than forcing it off: a user who installs
-            # triton-windows gets the same one-time-compile speedup the pod enjoys.
+                f"Engine: {'subprocess-per-attempt (thrash watchdog: ' + str(vcfg['thrash_stall_seconds']) + 's stall)' if _sub else 'in-process (like the image Batch Upscaler)'}.")
+            # torch.compile needs BOTH Triton AND a C compiler on PATH (inductor shells out to
+            # MSVC cl.exe on Windows to build kernels): Triton alone is NOT enough. With Triton
+            # present but no compiler, SeedVR2's first VAE compile HANGS under the GUI's piped
+            # stdio (it errors 'cl is not found' in a console) -- the exact "stuck at first
+            # segment" symptom. So gate on a real compile-capability probe, checked HERE (the
+            # worker shares this venv); a user with triton-windows + an activated MSVC toolchain
+            # gets the pod-grade speedup, everyone else runs fine without compile.
             import importlib.util as _ilu
+            import shutil as _sh
             local_cfg = _worker_cfg()
             want_compile = bool(local_cfg.get("compile_dit") or local_cfg.get("compile_vae"))
             triton_ok = _ilu.find_spec("triton") is not None
-            if want_compile and not triton_ok:
-                log("    torch.compile disabled: Triton is not installed in this environment, "
-                    "so a compile would stall for minutes with no output. Run "
-                    "'pip install triton-windows' (matched to this PyTorch) to enable the "
-                    "compile speedup locally. The first segment now loads immediately.")
+            compiler_ok = bool(_sh.which("cl") or _sh.which("cc") or _sh.which("gcc")
+                               or _sh.which("clang"))
+            if want_compile and not (triton_ok and compiler_ok):
+                why = ("Triton is not installed" if not triton_ok
+                       else "no C compiler (MSVC cl.exe) is on PATH")
+                log(f"    torch.compile disabled: {why}. It would otherwise stall the first "
+                    f"segment (compiling with no output) or fail. Local runs continue without "
+                    f"compile; only speed is affected, not quality. First segment loads now.")
                 local_cfg["compile_dit"] = False
                 local_cfg["compile_vae"] = False
             elif want_compile:
-                log("    torch.compile ON (Triton present): the first segment pays a one-time "
-                    "compile cost, then the rest of the video runs faster (shared fixed shape).")
+                log("    torch.compile ON (Triton + compiler present): the first segment pays "
+                    "a one-time compile cost, then the rest runs faster (shared fixed shape).")
             engine = LocalVideoEngine(
                 repo_dir, model_dir, local_cfg,
                 conn=conn, gpu_id=None,

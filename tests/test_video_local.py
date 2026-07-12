@@ -39,14 +39,16 @@ def db_conn(tmp_path, monkeypatch):
 def test_resolve_video_cfg_local_defaults():
     v = bv.resolve_video_cfg({})
     assert v["thrash_stall_seconds"] == 300
-    assert v["local_use_subprocess"] is True
+    # Default is IN-PROCESS (like the image Batch Upscaler); the nested-worker subprocess
+    # path is opt-in (it was the sole source of the local stall-at-first-segment hangs).
+    assert v["local_use_subprocess"] is False
 
 
 def test_resolve_video_cfg_local_overrides():
     v = bv.resolve_video_cfg({"video": {"thrash_stall_seconds": 120,
-                                        "local_use_subprocess": False}})
+                                        "local_use_subprocess": True}})
     assert v["thrash_stall_seconds"] == 120
-    assert v["local_use_subprocess"] is False
+    assert v["local_use_subprocess"] is True
 
 
 # ── seedvr2 path resolution ──────────────────────────────────────────────────

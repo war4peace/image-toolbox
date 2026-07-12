@@ -90,8 +90,8 @@ def _query_gpu_name():
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
-            creationflags=_CREATE_NO_WINDOW)
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10, creationflags=_CREATE_NO_WINDOW)
         name = out.stdout.strip().splitlines()[0].strip()
         return name or None
     except Exception:                                # noqa: BLE001
@@ -419,8 +419,15 @@ class LocalVideoEngine:
         if use_10bit:
             cmd += ["--use-10bit"]
 
+        # MUST decode as UTF-8: the worker hardens its stdout to UTF-8 and SeedVR2 prints emoji
+        # banners (e.g. 🏃). Without an explicit encoding, text=True defaults to the Windows ANSI
+        # code page (cp1252), whose undefined byte 0x8F (part of 🏃's UTF-8) raises
+        # UnicodeDecodeError in the reader thread -> the pipe stops draining -> the worker blocks
+        # on write -> proc.wait() deadlocks (the "stuck at first segment" hang). errors="replace"
+        # keeps any stray bytes from ever killing the reader again.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, creationflags=_CREATE_NO_WINDOW)
+                                text=True, encoding="utf-8", errors="replace",
+                                bufsize=1, creationflags=_CREATE_NO_WINDOW)
         lines = queue.Queue()
 
         def _reader():

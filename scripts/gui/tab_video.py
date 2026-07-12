@@ -642,6 +642,17 @@ class VideoTab(ttk.Frame):
                 "Measure the largest safe batch (and the real speed) for each target on "
                 "this GPU. Runs a short test-till-it-breaks sweep; results calibrate local "
                 "batch sizing + the time estimate. Safe to stop and resume.")
+        # Local-only, on-demand: install Triton so the local engine can use torch.compile
+        # (a pod-grade speedup). Shown only in Local mode when Triton is missing but a pinned
+        # wheel exists for this Python/torch; hidden once installed. See _refresh_compile_offer.
+        self.compile_btn = ttk.Button(gf, text="Enable compile speedup…",
+                                      command=self._install_triton)
+        self.compile_btn.grid(row=0, column=4, padx=(8, 0))
+        self.compile_btn.grid_remove()
+        Tooltip(self.compile_btn,
+                "Install Triton (verified download) so local runs can use torch.compile, "
+                "the same speedup the rented-pod runs use. Without it, local runs work fine "
+                "but skip compile.")
         self.estimate_var = tk.StringVar(value="Add videos to the queue for an estimate.")
         ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
                   foreground="#2f6f3f").grid(row=0, column=5, sticky="ew", padx=(12, 0))
@@ -744,6 +755,48 @@ class VideoTab(ttk.Frame):
                 self.benchmark_btn.grid_remove()
         except Exception:                              # noqa: BLE001
             pass
+        self._refresh_compile_offer()
+
+    def _refresh_compile_offer(self):
+        """Show the 'Enable compile speedup…' button only in Local mode, when Triton is not
+        yet installed but a pinned wheel exists for this Python/torch. Hidden otherwise (Remote
+        mode, already installed, or unsupported combo). Fail-safe."""
+        btn = getattr(self, "compile_btn", None)
+        if btn is None:
+            return
+        try:
+            show = self.mode_var.get() == "local"
+            if show:
+                import triton_setup
+                # Offer the Triton install only when it would actually enable compile: a pinned
+                # wheel exists, Triton isn't installed yet, AND a C compiler is on PATH (inductor
+                # needs one; Triton alone can't compile SeedVR2, so don't send the user to install
+                # it in vain).
+                show = (triton_setup.is_supported()
+                        and not triton_setup.triton_installed()
+                        and triton_setup.compiler_available())
+            if show:
+                btn.grid()
+            else:
+                btn.grid_remove()
+        except Exception:                              # noqa: BLE001
+            try:
+                btn.grid_remove()
+            except Exception:                          # noqa: BLE001
+                pass
+
+    def _install_triton(self):
+        """On-demand: download + install the verified triton-windows wheel, then hide the
+        offer. Local runs pick up torch.compile automatically on the next Start."""
+        from gui.dialogs import prompt_install_triton
+
+        def done(ok):
+            self._refresh_compile_offer()
+            if ok:
+                messagebox.showinfo(
+                    APP_TITLE, "Triton installed. Local runs will now use the torch.compile "
+                               "speedup (the first segment pays a one-time compile cost).")
+        prompt_install_triton(self.winfo_toplevel(), on_done=done)
 
     def _open_benchmark(self):
         """Open the per-card benchmark modal (feature #7). A run must not be in progress

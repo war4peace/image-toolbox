@@ -264,3 +264,88 @@ class OllamaPullDialog(tk.Toplevel):
 #   "file"   -> logs/video_progress_debug.log only, kept OFF the window (flip to this
 #               once the bar is trusted, so the window stays clean);
 #   None     -> off (remove the instrumentation).
+
+
+def prompt_install_triton(parent, on_done=None):
+    """Offer to download + install the verified triton-windows wheel on demand, so the local
+    video engine can use torch.compile (feature #7). If Triton is already present, calls
+    on_done(True) at once. Otherwise asks, runs the install off the UI thread behind a small
+    progress dialog, and calls on_done(bool installed). Mirrors prompt_install_libvlc;
+    fail-safe (never raises into the GUI)."""
+    import triton_setup
+
+    if triton_setup.triton_installed():
+        if on_done:
+            on_done(True)
+        return
+    spec = triton_setup.wheel_for_env()
+    if spec is None:
+        messagebox.showinfo(
+            APP_TITLE, "No matching Triton build is pinned for this Python/PyTorch, so the "
+                       "compile speedup can't be enabled automatically. Local runs still work "
+                       "without it.")
+        if on_done:
+            on_done(False)
+        return
+    if not messagebox.askyesno(
+            APP_TITLE,
+            f"Enable the local torch.compile speedup?\n\nThis downloads and installs Triton "
+            f"(triton-windows {spec['version']}, a ~50 MB verified download) into the app's "
+            f"environment. Local video runs then compile like the rented-pod runs do.\n\n"
+            f"Install now?"):
+        if on_done:
+            on_done(False)
+        return
+
+    dlg = tk.Toplevel(parent)
+    dlg.title("Installing Triton")
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    ttk.Label(dlg, text="Downloading and installing Triton…",
+              padding=(14, 12, 14, 4)).pack()
+    pb = ttk.Progressbar(dlg, mode="determinate", length=320, maximum=100)
+    pb.pack(padx=14, pady=(0, 6))
+    status = tk.StringVar(value="Starting…")
+    ttk.Label(dlg, textvariable=status, foreground="#7f8a99",
+              padding=(14, 0, 14, 12)).pack()
+    try:
+        dlg.grab_set()
+    except tk.TclError:
+        pass
+
+    def _set(msg):
+        try:
+            status.set(msg)
+            # Reflect the "Downloading … NN%" lines on the bar; ignore non-percent messages.
+            if "%" in msg:
+                pct = msg.rsplit(" ", 1)[-1].rstrip("%")
+                if pct.isdigit():
+                    pb.configure(mode="determinate")
+                    pb["value"] = int(pct)
+            else:
+                pb.configure(mode="indeterminate")
+                pb.start(12)
+        except (tk.TclError, ValueError):
+            pass
+
+    def _done(ok, msg):
+        try:
+            pb.stop()
+        except tk.TclError:
+            pass
+        try:
+            dlg.grab_release()
+            dlg.destroy()
+        except tk.TclError:
+            pass
+        if not ok:
+            messagebox.showerror(APP_TITLE, f"Could not install Triton:\n{msg}\n\n"
+                                            "Local runs still work without the compile speedup.")
+        if on_done:
+            on_done(bool(ok))
+
+    def work():
+        ok, msg = triton_setup.install(progress=lambda m: parent.after(0, _set, m))
+        parent.after(0, _done, ok, msg)
+
+    threading.Thread(target=work, daemon=True).start()
