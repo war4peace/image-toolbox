@@ -51,6 +51,47 @@ def test_resolve_video_cfg_local_overrides():
     assert v["local_use_subprocess"] is True
 
 
+# ── shared compile-capability gate (runner AND benchmark) ────────────────────
+
+def test_gate_local_compile_disables_without_compiler(monkeypatch):
+    # Triton present but NO C compiler = the exact "stuck at first segment/probe" hang the
+    # gate prevents (inductor shells out to a missing cl.exe under piped stdio). Both the
+    # local runner and the benchmark route their engine settings through here, so the
+    # benchmark can no longer trip the hang the runner already guarded against.
+    import importlib.util as ilu
+    import shutil as sh
+    monkeypatch.setattr(ilu, "find_spec", lambda name: object() if name == "triton" else None)
+    monkeypatch.setattr(sh, "which", lambda name: None)          # no compiler on PATH
+    s = {"compile_dit": True, "compile_vae": True}
+    disabled, why = bv.gate_local_compile(s)
+    assert disabled is True and "compiler" in why.lower()
+    assert s["compile_dit"] is False and s["compile_vae"] is False
+
+
+def test_gate_local_compile_keeps_compile_when_capable(monkeypatch):
+    import importlib.util as ilu
+    import shutil as sh
+    monkeypatch.setattr(ilu, "find_spec", lambda name: object())  # triton present
+    monkeypatch.setattr(sh, "which", lambda name: r"C:\cl.exe" if name == "cl" else None)
+    s = {"compile_dit": True, "compile_vae": True}
+    disabled, why = bv.gate_local_compile(s)
+    assert disabled is False and why is None
+    assert s["compile_dit"] is True and s["compile_vae"] is True
+
+
+def test_gate_local_compile_noop_when_compile_off(monkeypatch):
+    # Nothing to gate (and no capability probe / log) when compile was never requested.
+    called = {"probe": False}
+
+    def _boom(*a, **k):
+        called["probe"] = True
+        return None
+    monkeypatch.setattr("shutil.which", _boom)
+    s = {"compile_dit": False, "compile_vae": False}
+    assert bv.gate_local_compile(s) == (False, None)
+    assert called["probe"] is False
+
+
 # ── seedvr2 path resolution ──────────────────────────────────────────────────
 
 def test_local_seedvr2_paths_defaults_to_app_root():
@@ -144,9 +185,36 @@ def test_local_estimate_seed_is_flagged_rough(monkeypatch):
     assert est["duration_seconds"] == pytest.approx(10 * 2.0736 * 2.0, rel=1e-3)
 
 
-def test_local_estimate_none_if_any_target_unrated(db_conn):
+def test_local_estimate_falls_back_across_targets_when_one_unrated(db_conn):
     gpu = "NVIDIA GeForce RTX 3090"
     db.record_gpu_perf(db_conn, "video-mp-1080p", gpu, 1000, 1600.0, min_images=300)
-    # 1080p is calibrated, 4K is not -> the whole-queue estimate declines (None).
+    # 1080p is measured; 4K has no rate of its OWN, but the card's pooled video-MP history
+    # covers it (rough, cross-target). So the queue estimate is NO LONGER None -- it keeps the
+    # progress bar / estimate alive on the first run of a new target -- but is flagged rough.
     jobs = [_job(target="1080p"), _job(target="4K", w=3840, h=2160)]
+    est = ve.estimate_queue_local(jobs, gpu, conn=db_conn)
+    assert est is not None
+    assert est["calibrated"] is False            # 4K used the fallback -> not fully measured
+
+
+def test_local_estimate_still_none_with_no_history_for_any_target(db_conn):
+    gpu = "NVIDIA GeForce RTX 3090"
+    # No video-MP history at all for this card -> nothing to fall back to -> honest None.
+    jobs = [_job(target="4K", w=3840, h=2160)]
     assert ve.estimate_queue_local(jobs, gpu, conn=db_conn) is None
+
+
+def test_seconds_per_mp_cross_target_fallback_keeps_progress_bar_alive(db_conn):
+    # The Video tab's live progress bar gets its per-segment time budget from
+    # estimate_job -> seconds_per_mp. Without a cross-target fallback, the FIRST run of a new
+    # target (e.g. 4x after the card has only run 2x) has no rate -> the bar sits dead at 0 %
+    # the whole run (the reported bug). The pooled video-MP history must cover it.
+    gpu = "NVIDIA GeForce RTX 3090"
+    db.record_gpu_perf(db_conn, "video-mp-2X", gpu, 1000, 1600.0, min_images=300)
+    assert ve.seconds_per_mp(gpu, "2X", conn=db_conn) == pytest.approx(1.6, rel=1e-3)  # exact
+    # 4X has no rate of its own -> pooled fallback (1.6 s/MP) so estimate_job is non-None.
+    assert ve.seconds_per_mp(gpu, "4X", conn=db_conn) == pytest.approx(1.6, rel=1e-3)
+    secs = ve.estimate_job(100, "4X", gpu, conn=db_conn, src_w=640, src_h=480)
+    assert secs is not None and secs > 0
+    # A card with no video history at all still declines (no fabrication).
+    assert ve.seconds_per_mp("Totally Unknown GPU", "4X", conn=db_conn) is None

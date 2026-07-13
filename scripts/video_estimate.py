@@ -297,6 +297,13 @@ def seconds_per_mp(gpu_id, target, conn=None):
             per_100 = db.get_gpu_perf(conn, f"video-mp-{target}", gpu_id, min_images=300)
             if per_100:
                 return per_100 / 100.0          # gpu_perf stores seconds / 100 units
+            # The EXACT target has no history, but this card may have run OTHER targets. SeedVR2
+            # cost is ~per-output-MP, so the card's pooled video-MP rate is a good cross-target
+            # estimate -- enough to keep the live progress bar / estimate alive on the FIRST run
+            # of a new target (which then records its own rate). Uses the user's OWN data.
+            any_100 = db.get_video_mp_rate_any(conn, gpu_id, min_images=300)
+            if any_100:
+                return any_100 / 100.0
         except Exception:
             pass
     # A ratio target (2x/4x) has no benchmark row of its own; its s/MP is well-approximated
@@ -411,6 +418,13 @@ def local_seconds_per_mp(gpu_id, target, conn=None):
             per_100 = db.get_gpu_perf(conn, f"video-mp-{target}", gpu_id, min_images=LOCAL_MIN_MP)
             if per_100:
                 return per_100 / 100.0, True
+            # Exact target unmeasured, but the card may have run OTHER targets: its pooled
+            # video-MP rate is a rough cross-target estimate (SeedVR2 cost is ~per-output-MP),
+            # so the FIRST run of a new target still gets a live bar / estimate. Rough (the s/MP
+            # varies by regime), so calibrated=False -> the readout marks it "(rough)".
+            any_100 = db.get_video_mp_rate_any(conn, gpu_id, min_images=LOCAL_MIN_MP)
+            if any_100:
+                return any_100 / 100.0, False
         except Exception:
             pass
     model = map_local_gpu(gpu_id)

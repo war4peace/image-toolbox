@@ -54,16 +54,45 @@ APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ── plan constants ───────────────────────────────────────────────────────────
 
 BATCH_FLOOR = 5
-# The benchmark deliberately probes PAST the sizer's AUTO cap (33): it is the sanctioned
-# "test till it breaks" tool, and a big card's true ceiling can be higher. A learned value
-# above 33 is honoured by the sizer (a measured truth beats the AUTO safety cap).
-DEFAULT_BATCH_CAP = 65
-DEFAULT_FRAMES = 37                 # >= the largest batch so every window runs at least once
+# The benchmark is the sanctioned "test till it breaks" tool: it sweeps UPWARD until the card
+# OOMs/thrashes, and that OOM is the real terminal -- NOT an arbitrary batch number. So the cap
+# is only a very high SAFETY ceiling to bound the probe list / stop a (pathological) card that
+# never OOMs; the sweep almost always stops far below it. A big remote card (future public
+# benchmarking) can legitimately reach hundreds, so this is set high enough not to clip it.
+# Configurable via --batch-cap. A learned value above the sizer's AUTO cap is honoured (a
+# measured truth beats a safety cap).
+DEFAULT_BATCH_CAP = 513
+# The clip's frame count is sized PER PROBE to at least the batch (a window can't exceed the
+# clip's frames, or SeedVR2 silently collapses it to a SMALLER batch). This is the MINIMUM /
+# small-batch floor: probes at or below it reuse one short clip; a larger batch gets a clip
+# grown to its own size so the probed batch is the batch that actually runs.
+DEFAULT_FRAMES = 37
 DEFAULT_PROBES_PER_CELL = 6         # runtime-estimate heuristic (most cards break by ~bs29)
 
-# Target name -> OUTPUT box (landscape 16:9), mirrors video_estimate.TARGET_BOX so the
-# benchmarked output-MP buckets line up with what real runs look up.
-TARGETS = {"1080p": (1920, 1080), "1440p": (2560, 1440), "4K": (3840, 2160)}
+# Target name -> OUTPUT box. Two groups:
+#   * a 4:3 ladder (the common old-camera aspect), one cell per 0.5-MP sizer bucket a small
+#     card can actually reach, each a size real runs produce -- so a 24 GB card has meaningful
+#     targets BELOW the 2.1-MP 1080p edge (which was the only feasible preset before);
+#   * the 16:9 presets (mirror video_estimate.TARGET_BOX) for widescreen sources / bigger cards.
+# The VAE-decode ceiling is set by OUTPUT megapixels, not aspect (docs 14), and the sizer keys
+# learned batch on the MP bucket -- so a PORTRAIT 3:4 target is the identical pixel count (hence
+# identical ceiling) as its 4:3 transpose, and benchmarking only the 4:3 side covers both.
+TARGETS = {
+    # 4:3 landscape ladder + the two DISTINCT 3:4 portrait points. A portrait output is NOT the
+    # transpose of a landscape one: box-fit height-caps a 3:4 source to a SMALLER area than a 4:3
+    # source (e.g. into the 1080p box a 4:3 source -> 1440x1080 = 1.56 MP, a 3:4 source ->
+    # 810x1080 = 0.87 MP), so its VAE-decode ceiling differs and it needs its own cell. (A TRUE
+    # transpose like 960x1280 == 1280x960 in pixels, so THOSE aren't duplicated.)
+    "540x720":   (540, 720),      # 0.39 MP  portrait 3:4 (small box-fit output)
+    "960x720":   (960, 720),      # 0.69 MP  landscape 4:3 (2x of 480x360)
+    "810x1080":  (810, 1080),     # 0.87 MP  portrait 3:4 (1080p box-fit of a 3:4 source)
+    "1280x960":  (1280, 960),     # 1.23 MP  landscape 4:3 (2x of 640x480 / 4x of 320x240)
+    "1440x1080": (1440, 1080),    # 1.56 MP  landscape 4:3 (1080p box-fit of a 4:3 source)
+    "1600x1200": (1600, 1200),    # 1.92 MP  landscape 4:3 (tops the 24 GB band)
+    "1080p": (1920, 1080),        # 2.07 MP  (16:9)
+    "1440p": (2560, 1440),        # 3.69 MP  (16:9)
+    "4K":    (3840, 2160),        # 8.29 MP  (16:9)
+}
 
 
 def batch_series(floor=BATCH_FLOOR, cap=DEFAULT_BATCH_CAP):
@@ -123,11 +152,43 @@ def next_batch(cell_probes, series, free_now=None, stale_margin=STALE_MARGIN_GB)
     return None
 
 
+def drop_collapsed(rows):
+    """Discard any 'ok' probe recorded with FEWER frames than its batch. Such a probe's
+    temporal window was collapsed to the clip's frame count, so it secretly measured a SMALLER
+    batch and was mislabelled (the pre-fix 37-frame clip made every 'batch 41+' really run 37).
+    These phantom rows must not be trusted as tried (in the sweep) NOR as a ceiling (when
+    recording), so they are dropped everywhere the persisted probes are read -- old data
+    self-heals as the affected batches get re-probed with correctly-sized clips."""
+    return [p for p in rows
+            if not (p.get("outcome") == "ok" and p.get("frames")
+                    and int(p["frames"]) < int(p["batch"]))]
+
+
 def cell_ceiling(cell_probes):
-    """The largest batch that ran clean for a cell (its ceiling), or None if even the floor
-    failed (the card can't do this output size)."""
+    """The largest batch that ran clean for a cell (its ceiling / max fit), or None if even
+    the floor failed (the card can't do this output size). This is the "how far can it push"
+    number; the batch AUTO actually uses is throughput_optimal_batch (below)."""
     oks = [int(p["batch"]) for p in cell_probes if p["outcome"] == "ok"]
     return max(oks) if oks else None
+
+
+def throughput_optimal_batch(cell_probes, tol=0.01):
+    """The batch AUTO should USE: the one with the best measured throughput (min seconds per
+    frame) among the clean 'ok' probes -- NOT the raw ceiling. As batch grows, s/frame falls
+    (fixed costs amortise) until the working set overflows VRAM and spills to system RAM, which
+    makes a BIGGER batch SLOWER. So the fastest batch is the LARGEST window that runs WITHOUT
+    spill: best speed AND as much temporal continuity as the card sustains cleanly. The raw
+    ceiling sits one step into that spill zone (it fits, but crawls). Within `tol` of the best
+    s/frame the LARGER batch wins (equal speed -> favour the bigger window). None if no ok probe
+    carries timing (the caller then falls back to the ceiling)."""
+    timed = [p for p in cell_probes if p.get("outcome") == "ok"
+             and p.get("seconds") and p.get("frames")]
+    if not timed:
+        return None
+    def spf(p):
+        return p["seconds"] / p["frames"]
+    best = min(spf(p) for p in timed)
+    return max(int(p["batch"]) for p in timed if spf(p) <= best * (1.0 + tol))
 
 
 def _probe_seconds_estimate(cell, gpu_id, conn, default_spf=4.0):
@@ -216,23 +277,35 @@ def _engine_settings(cfg, vcfg):
     wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
     wc["input_noise_scale"] = vcfg["input_noise_scale"]
     wc["dit_model"] = vcfg["dit_model"]
+    # Same compile-capability gate the local RUNNER applies (shared helper). Without it a
+    # machine with no C compiler HANGS on the first probe's VAE compile under piped stdio
+    # (the "stuck at first segment" deadlock) -- the benchmark must not skip this gate.
+    bv.gate_local_compile(wc, log)
     return wc
 
 
 def _record_cell_result(conn, gpu_id, model_tag, cell):
-    """After a cell's sweep, copy its ceiling into the sizer's learned store and its rate
-    into the estimate store, so AUTO + the estimate self-improve. Reads the persisted probes
-    (the ceiling row carries the timing). Returns the ceiling batch (or None)."""
-    probes = db.get_bench_probes(conn, gpu_id, model_tag, cell["out_w"], cell["out_h"])
+    """After a cell's sweep, save the THROUGHPUT-OPTIMAL batch (not the raw ceiling) into the
+    sizer's learned store and record ITS rate into the estimate store, so AUTO runs use the
+    fastest window and the estimate reflects it. The raw ceiling (max fit) is still returned
+    for display. Returns (ceiling, saved) -- both None if the card can't do this output."""
+    probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+                                                cell["out_w"], cell["out_h"]))
     ceil = cell_ceiling(probes)
     if not ceil:
-        return None
-    db.put_learned_batch(conn, f"{gpu_id}|{model_tag}", sizer.mp_bucket(cell["mp"]), ceil)
-    row = max((p for p in probes if p["outcome"] == "ok"), key=lambda p: p["batch"], default=None)
+        return None, None
+    saved = throughput_optimal_batch(probes) or ceil
+    db.put_learned_batch(conn, f"{gpu_id}|{model_tag}", sizer.mp_bucket(cell["mp"]), saved)
+    # Rate from the SAVED (optimal) probe, so the estimate matches the batch AUTO will run;
+    # fall back to the largest ok probe if the optimal one somehow lacks timing.
+    row = next((p for p in probes if p["outcome"] == "ok" and int(p["batch"]) == saved), None)
+    if not (row and row.get("seconds") and row.get("frames")):
+        row = max((p for p in probes if p["outcome"] == "ok"),
+                  key=lambda p: p["batch"], default=None)
     if row and row.get("seconds") and row.get("frames"):
         out_mp = row["frames"] * cell["mp"]
         ve.record_benchmark_rate(conn, gpu_id, cell["name"], out_mp, row["seconds"])
-    return ceil
+    return ceil, saved
 
 
 def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP):
@@ -265,6 +338,9 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     log(f"Benchmarking {gpu_id} ({model_tag}) — {len(plan)} target(s), frames={frames}, "
         f"batches {series[0]}..{series[-1]}.")
     log(f"Estimated runtime: ~{fmt_hhmmss(est)} (rough).")
+    log("Note: every probe runs in a fresh process (isolated CUDA context per batch), so it "
+        "opens with a brief silent model load (a few seconds locally) before any progress. "
+        "That is normal, not a hang.")
     gui_event("BSTART", {"gpu": gpu_id, "model": model_tag,
                          "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
                                    "mp": round(c["mp"], 2)} for c in plan],
@@ -283,17 +359,11 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                                 "out_h": cell["out_h"]})
             log(f"\n[{cell['name']}] output {cell['out_w']}x{cell['out_h']} "
                 f"({cell['mp']:.2f} MP), source {cell['src_w']}x{cell['src_h']}:")
-            try:
-                clip = bclip.ensure_source_clip(
-                    work, cell["src_w"], cell["src_h"], frames,
-                    base_url=vcfg.get("benchmark_clip_url"),
-                    base_sha256=vcfg.get("benchmark_clip_sha256"), log=log)
-            except Exception as exc:                    # noqa: BLE001 (skip this cell)
-                log(f"  could not prepare a source clip ({exc}); skipping this target.")
-                continue
 
-            cell_probes = list(db.get_bench_probes(conn, gpu_id, model_tag,
-                                                   cell["out_w"], cell["out_h"]))
+            # Drop collapsed phantom rows (frames < batch) so they are neither trusted as tried
+            # nor as a ceiling; the affected batches get re-probed with correctly-sized clips.
+            cell_probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+                                                             cell["out_w"], cell["out_h"]))
             while not _STOP.is_set():
                 # Free VRAM at probe start (via nvidia-smi, parent stays GPU-free): tags this
                 # probe AND lets a failure recorded earlier under contention be re-tried now.
@@ -301,10 +371,25 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 b = next_batch(cell_probes, series, free_now=free_now)
                 if b is None:
                     break
+                # The clip MUST have >= b frames: a temporal window can't exceed the clip's
+                # frame count, or SeedVR2 silently collapses it to a SMALLER batch (a 37-frame
+                # clip probing "batch 65" really ran batch 37). Size it to at least b so the
+                # batch we probe is the batch that runs; cached per (dims, frames), so each
+                # distinct size is synthesised once and reused.
+                probe_frames = max(int(frames), int(b))
+                try:
+                    clip = bclip.ensure_source_clip(
+                        work, cell["src_w"], cell["src_h"], probe_frames,
+                        base_url=vcfg.get("benchmark_clip_url"),
+                        base_sha256=vcfg.get("benchmark_clip_sha256"), log=log)
+                except Exception as exc:                # noqa: BLE001 (can't source: stop this target)
+                    log(f"  could not prepare a {probe_frames}-frame source clip ({exc}); "
+                        f"stopping this target.")
+                    break
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running"})
                 log(f"  probing batch {b} …")
                 res = engine.probe_batch(clip, probe_out, resolution=cell["resolution"],
-                                         batch=b, frames=frames, should_stop=_STOP.is_set)
+                                         batch=b, frames=probe_frames, should_stop=_STOP.is_set)
                 if res["outcome"] == "stopped":
                     stopped = "stopped by user"
                     break
@@ -330,11 +415,15 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                     break
             if _STOP.is_set() and stopped is None:
                 stopped = "stopped by user"
-            ceil = _record_cell_result(conn, gpu_id, model_tag, cell)
-            log(f"  {cell['name']} ceiling: "
-                + (f"batch {ceil} (saved)" if ceil else "no batch fit (card can't do this target)"))
-            gui_event("BCEILING", {"name": cell["name"], "ceiling": ceil,
-                                   "overlap": sizer.auto_overlap(ceil) if ceil else None})
+            ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell)
+            if saved:
+                extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
+                log(f"  {cell['name']}: saved batch {saved}{extra} — AUTO runs use {saved} "
+                    f"(the fastest window; the max that fits can be slower, riding VRAM spill).")
+            else:
+                log(f"  {cell['name']}: no batch fit (card can't do this target)")
+            gui_event("BCEILING", {"name": cell["name"], "ceiling": ceil, "saved": saved,
+                                   "overlap": sizer.auto_overlap(saved) if saved else None})
             if stopped:
                 break
     finally:

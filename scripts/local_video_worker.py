@@ -73,9 +73,19 @@ def main(argv=None):
     with open(args.settings, "r", encoding="utf-8") as f:
         settings = json.load(f)
 
+    # A fresh worker is SILENT during torch + CUDA init + model load (import time, before any
+    # pipeline output). Locally that is usually a few seconds (weights are on a warm local
+    # disk); it is only a cold torch/CUDA init that can stretch it. With no heartbeat that
+    # dead air looks like a hang -- the reason a healthy probe got Stopped early. Emit an
+    # immediate liveness line (flushed) BEFORE the heavy import so the parent forwards it to
+    # the GUI at once, and it also resets the parent's thrash-stall timer.
+    print(f"Loading CUDA + SeedVR2 model for batch {args.batch} "
+          f"(a few seconds; no progress until it loads) ...", flush=True)
+
     from upscale_engine import UpscaleEngine
     engine = UpscaleEngine(args.repo_dir, args.model_dir, settings,
                            debug=bool(settings.get("debug", False)))
+    print(f"Model loaded; upscaling {args.resolution}px at batch {args.batch} ...", flush=True)
 
     try:
         import torch

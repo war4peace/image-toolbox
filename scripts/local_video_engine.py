@@ -425,7 +425,16 @@ class LocalVideoEngine:
         # UnicodeDecodeError in the reader thread -> the pipe stops draining -> the worker blocks
         # on write -> proc.wait() deadlocks (the "stuck at first segment" hang). errors="replace"
         # keeps any stray bytes from ever killing the reader again.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        # stdin=DEVNULL is REQUIRED, not cosmetic: the worker never reads stdin (Stop is
+        # delivered by killing the process tree), but if it INHERITS the GUI's live stdin
+        # pipe, Python's `-u` interpreter startup deadlocks in a native stdio flush/seek
+        # (Py_InitializeFromConfig -> fflush -> lseek -> NtQueryInformationFile) before our
+        # code ever runs -- especially through this venv's redirector python.exe, which adds
+        # an stdio-pumping process hop. That is the "stuck at probing batch N, VRAM flat,
+        # never loads" benchmark hang. A null stdin can't block, and detaches the worker from
+        # the GUI's stdin entirely (so it can never steal the watcher's Stop line either).
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace",
                                 bufsize=1, creationflags=_CREATE_NO_WINDOW)
         lines = queue.Queue()

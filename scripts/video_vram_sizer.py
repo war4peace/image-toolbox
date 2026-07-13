@@ -19,7 +19,7 @@ Design = tier-anchored + self-calibrating (docs "option b"):
   * a FREE-VRAM step-DOWN (never up): the user's desktop eats ~3 GB, so we budget the
     batch against LIVE free VRAM, not the card total, and shrink the seed if free is low.
   * a LEARNED override: after each segment the real outcome is recorded per
-    (gpu|model, output-MP bucket) in db.video_batch_learn (model-qualified key, so 7B and
+    (gpu|model, output-MP key) in db.video_batch_learn (model-qualified key, so 7B and
     3B keep separate rows and remote rows are untouched). A learned value supersedes the
     seed, so the sizer self-calibrates per card+model over time -- like the remote path
     self-improves db.gpu_perf. No fragile hand-fit curve is trusted as ground truth.
@@ -47,7 +47,9 @@ except Exception:                                    # noqa: BLE001
 BATCH_FLOOR = 5              # below this a temporal window barely helps (matches pod)
 BATCH_CAP = 33               # AUTO-path ceiling; a manual override may exceed it
 MIN_OVERLAP = 6              # quality floor: measured, 3 left a seam, 6 was undetectable
-_MP_BUCKET_MP = 0.5          # 0.5 MP DB-key grid (matches batch_video_upscale._mp_bucket)
+_MP_KEY_MP = 0.05            # fine MP DB-key grid (matches db.MP_KEY_UNIT + bv._MP_KEY_MP): the
+                            # sizer reads the NEAREST key >= the run MP, so distinct real output
+                            # sizes get distinct rows without a coarse bucket merging them
 
 # Working-set model for the free-VRAM step-down: peak GB ~= FIXED + K * batch * out_MP.
 # Fit on this project's RTX 3090 7B-fp16 OFFLOAD clean runs (docs 14.1/14.3):
@@ -83,9 +85,9 @@ def to_4n1(x):
 
 
 def mp_bucket(mp):
-    """Stable integer DB-key bucket for a per-frame output-MP value (0.5 MP grid),
-    identical to batch_video_upscale._mp_bucket so buckets line up."""
-    return int(round(max(0.0, float(mp or 0)) / _MP_BUCKET_MP))
+    """Stable integer DB key for a per-frame output-MP value (fine _MP_KEY_MP grid),
+    identical to batch_video_upscale._mp_bucket + db.MP_KEY_UNIT so keys line up."""
+    return int(round(max(0.0, float(mp or 0)) / _MP_KEY_MP))
 
 
 def auto_overlap(batch):
@@ -194,7 +196,10 @@ def pick(model, out_w, out_h, conn=None, gpu_id=None, free_gb=None, total_gb=Non
     is_learned = False
     if conn is not None and gpu_id and _db is not None:
         try:
-            learned = _db.get_learned_batch(conn, f"{gpu_id}|{tag}", mp_bucket(mp))
+            # NEAREST recorded key >= this run's MP: a ceiling measured at a LARGER output is a
+            # safe bound here (decode memory rises with MP), so each benchmarked size serves
+            # nearby smaller runs without a coarse bucket merging distinct sizes.
+            learned = _db.get_learned_batch_ge(conn, f"{gpu_id}|{tag}", mp_bucket(mp))
             if learned and learned > 0:
                 batch = int(learned)
                 is_learned = True

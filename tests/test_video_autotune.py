@@ -61,10 +61,13 @@ def test_request_batch_precedence():
     assert bv._request_batch(0, None, None) == 0  # auto (pod sizes it)
 
 
-def test_mp_bucket_groups_and_separates():
-    # 0.5 MP grid: near-identical sizes share a bucket, tiers stay distinct.
-    assert bv._mp_bucket(8.3) == bv._mp_bucket(8.4)          # landscape 4K neighbours
-    assert bv._mp_bucket(2.6) != bv._mp_bucket(8.3)          # portrait vs landscape 4K
+def test_mp_bucket_is_fine_grained_and_separates_real_sizes():
+    # FINE grid (0.05 MP): distinct real output sizes get distinct keys, so a portrait box-fit
+    # output (810x1080 = 0.87 MP) no longer collides with a landscape one (1280x960 = 1.23 MP)
+    # as it did under the old 0.5-MP bucket. Very-near sizes still merge (history reused).
+    assert bv._mp_bucket(0.87) != bv._mp_bucket(1.23)       # portrait vs landscape (was one bucket)
+    assert bv._mp_bucket(0.39) != bv._mp_bucket(0.69)       # two small distinct points
+    assert bv._mp_bucket(8.30) == bv._mp_bucket(8.31)       # near-identical sizes still merge
     assert bv._mp_bucket(0) == 0
     assert isinstance(bv._mp_bucket(3.7), int)
 
@@ -80,6 +83,27 @@ def test_learned_batch_roundtrip(db_conn):
     # a different card / bucket is independent
     assert db.get_learned_batch(db_conn, "GPU-Y", 17) is None
     assert db.get_learned_batch(db_conn, "GPU-X", 8) is None
+
+
+def test_learned_batch_ge_nearest_at_or_above(db_conn):
+    # The sizer's read: the nearest recorded key >= the run's key (a ceiling measured at a LARGER
+    # output is a safe bound for a smaller run). Keys are in 0.05-MP units here.
+    db.put_learned_batch(db_conn, "GPU-X", 14, 25)         # 0.69 MP -> batch 25
+    db.put_learned_batch(db_conn, "GPU-X", 25, 17)         # 1.23 MP -> batch 17
+    assert db.get_learned_batch_ge(db_conn, "GPU-X", 14) == 25   # exact
+    assert db.get_learned_batch_ge(db_conn, "GPU-X", 20) == 17   # between -> next above (1.23)
+    assert db.get_learned_batch_ge(db_conn, "GPU-X", 25) == 17   # exact upper
+    assert db.get_learned_batch_ge(db_conn, "GPU-X", 26) is None  # above everything -> use seed
+    assert db.get_learned_batch_ge(db_conn, "GPU-Y", 14) is None  # other card independent
+
+
+def test_learned_batch_ge_skips_stale_to_next(db_conn):
+    db.put_learned_batch(db_conn, "GPU-X", 14, 25)
+    db.put_learned_batch(db_conn, "GPU-X", 25, 17)
+    db_conn.execute("UPDATE video_batch_learn SET updated_at='2000-01-01T00:00:00' WHERE mp_key=14")
+    db_conn.commit()
+    # The nearest (14) is stale -> skip it and return the fresh 25's batch (still a safe >= bound).
+    assert db.get_learned_batch_ge(db_conn, "GPU-X", 14) == 17
 
 
 def test_learned_batch_staleness(db_conn):

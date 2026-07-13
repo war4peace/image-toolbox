@@ -217,11 +217,13 @@ CREATE TABLE IF NOT EXISTS gpu_perf (
     PRIMARY KEY (task, gpu_id)
 );
 CREATE TABLE IF NOT EXISTS video_batch_learn (
-    gpu_id    TEXT    NOT NULL,       -- IMGTBX_GPU_OVERRIDE (the card the run deployed)
-    mp_bucket INTEGER NOT NULL,       -- per-frame OUTPUT megapixels, bucketed (item 9)
+    gpu_id    TEXT    NOT NULL,       -- IMGTBX_GPU_OVERRIDE / model-qualified card key
+    mp_key    INTEGER NOT NULL,       -- per-frame OUTPUT megapixels / MP_KEY_UNIT (fine grid,
+                                      -- feature #7: fine enough that distinct real output sizes
+                                      -- get distinct rows; the sizer reads NEAREST key >= run MP)
     batch     INTEGER NOT NULL,       -- converged safe 4n+1 batch for this card+output size
     updated_at TEXT,
-    PRIMARY KEY (gpu_id, mp_bucket)
+    PRIMARY KEY (gpu_id, mp_key)
 );
 -- Per-card VRAM benchmark suite (feature #7, docs/local-video-upscaler.md 16/20).
 -- One row per PROBE: a fixed 4n+1 batch tried at a given OUTPUT size on this card+model,
@@ -247,6 +249,14 @@ CREATE TABLE IF NOT EXISTS video_bench (
     PRIMARY KEY (gpu_id, model, out_w, out_h, batch)
 );
 """
+
+# The video_batch_learn key grid (per-frame OUTPUT megapixels -> integer key). FINE (0.05 MP)
+# so distinct real output sizes -- e.g. a portrait 810x1080 (0.87 MP) vs a landscape 1280x960
+# (1.23 MP) box-fit output -- get their OWN learned-batch row instead of colliding in one coarse
+# bucket. The sizer looks up the nearest recorded key >= the run's MP (a ceiling measured at a
+# LARGER output is a safe bound for a smaller one), so a fine grid costs no safety. Must match
+# video_vram_sizer._MP_KEY_MP and batch_video_upscale._MP_KEY_MP.
+MP_KEY_UNIT = 0.05
 
 _conn = None   # one connection per process
 
@@ -299,6 +309,7 @@ def _open_conn():
     conn.execute("PRAGMA foreign_keys=ON")
     _migrate_video_tables(conn)
     _migrate_video_clip_columns(conn)
+    _migrate_video_batch_learn(conn)
     conn.executescript(SCHEMA)
     _ensure_video_columns(conn)
     conn.commit()
@@ -328,6 +339,23 @@ def _migrate_video_tables(conn):
             conn.commit()
     except Exception as exc:
         debug_log("db._migrate_video_tables", exc=exc)
+
+
+def _migrate_video_batch_learn(conn):
+    """The learned-batch cache was re-keyed from a coarse 0.5-MP bucket (`mp_bucket` column) to
+    a fine MP_KEY_UNIT grid (`mp_key`) for sizing precision (feature #7). The two can't be told
+    apart by value, so if a DB still carries the old `mp_bucket` column, DROP the table and let
+    SCHEMA recreate it with `mp_key`. No real data lost: video_batch_learn is a regenerable
+    cache derived from video_bench + live runs (the raw ceilings survive in video_bench, keyed by
+    exact output dims). Runs once (after the drop, the column is `mp_key`, so it's a no-op).
+    Fail-safe."""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_batch_learn)")]
+        if cols and "mp_bucket" in cols:
+            conn.executescript("DROP TABLE IF EXISTS video_batch_learn;")
+            conn.commit()
+    except Exception as exc:
+        debug_log("db._migrate_video_batch_learn", exc=exc)
 
 
 def _migrate_video_clip_columns(conn):
@@ -446,46 +474,93 @@ def get_gpu_perf(conn, task, gpu_id, min_images=100):
     return seconds / images * 100.0
 
 
+@_locked
+def get_video_mp_rate_any(conn, gpu_id, min_images=300):
+    """Seconds-per-100-output-MP for this card pooled ACROSS EVERY video target (all
+    `video-mp-<target>` rows summed). A cross-target fallback for the time estimate / live
+    progress bar when the EXACT target has no history yet (e.g. the first 4x run after the card
+    has only done 2x): SeedVR2 cost is ~per-output-MP, so a card's blended video-MP rate is a
+    rough but honest estimate from the user's OWN data. None until there is enough pooled
+    history. gpu_id namespaces are disjoint (local card name vs remote GPU id), so this never
+    mixes a local rate into a remote estimate."""
+    if not gpu_id:
+        return None
+    row = conn.execute(
+        "SELECT SUM(images) AS images, SUM(seconds) AS seconds FROM gpu_perf "
+        "WHERE gpu_id = ? AND task LIKE 'video-mp-%'", (gpu_id,)).fetchone()
+    if not row:
+        return None
+    images, seconds = row["images"], row["seconds"]
+    if not images or images < min_images or not seconds or seconds <= 0:
+        return None
+    return seconds / images * 100.0
+
+
 # ─────────────────────────────────────────────
 #  VIDEO BATCH LEARNING (auto-tune seed, item 9)
 # ─────────────────────────────────────────────
 
-@_locked
-def get_learned_batch(conn, gpu_id, mp_bucket, max_age_days=90):
-    """The converged safe batch previously learned for (gpu_id, output-MP bucket), or None
-    when there is no entry or it is stale (> max_age_days old: drivers + worker code change,
-    so an old value may no longer be optimal). Seeds the auto-tuner's first segment; the
-    first segment's real measurement then refines it up or down."""
-    if not gpu_id or mp_bucket is None:
-        return None
-    row = conn.execute(
-        "SELECT batch, updated_at FROM video_batch_learn WHERE gpu_id = ? AND mp_bucket = ?",
-        (gpu_id, int(mp_bucket))).fetchone()
+def _row_fresh(row, max_age_days):
+    """True if a video_batch_learn row is present and not stale (> max_age_days old)."""
     if not row or not row["batch"]:
-        return None
+        return False
     if max_age_days and row["updated_at"]:
         try:
             age = datetime.datetime.now() - datetime.datetime.strptime(
                 row["updated_at"], "%Y-%m-%dT%H:%M:%S")
             if age.days > max_age_days:
-                return None
+                return False
         except (ValueError, TypeError):
             pass
-    return int(row["batch"])
+    return True
 
 
 @_locked
-def put_learned_batch(conn, gpu_id, mp_bucket, batch):
-    """Record the converged safe batch for (gpu_id, output-MP bucket). Overwrites any prior
-    value (the newest measurement wins, so a driver/code change self-corrects). Commits."""
-    if not gpu_id or mp_bucket is None or not batch or batch <= 0:
+def get_learned_batch(conn, gpu_id, mp_key, max_age_days=90):
+    """The converged safe batch learned for EXACTLY (gpu_id, output-MP key), or None when there
+    is no entry or it is stale (> max_age_days old: drivers + worker code change, so an old value
+    may no longer be optimal). Exact-key match (round-trip with put_learned_batch); the sizer's
+    read is get_learned_batch_ge, which generalises to nearby sizes."""
+    if not gpu_id or mp_key is None:
+        return None
+    row = conn.execute(
+        "SELECT batch, updated_at FROM video_batch_learn WHERE gpu_id = ? AND mp_key = ?",
+        (gpu_id, int(mp_key))).fetchone()
+    return int(row["batch"]) if _row_fresh(row, max_age_days) else None
+
+
+@_locked
+def get_learned_batch_ge(conn, gpu_id, mp_key, max_age_days=90):
+    """The learned safe batch for the SMALLEST recorded output-MP key >= `mp_key`, or None when
+    nothing at-or-above is recorded (caller then uses the seed) / the nearest matches are stale.
+    A ceiling measured at an output AT LEAST this large is a SAFE bound here: the VAE-decode
+    ceiling falls monotonically as output-MP rises, so a batch that fit a bigger output also fits
+    a smaller one. This is the sizer's lookup -- it lets each benchmarked size serve nearby
+    smaller runs conservatively, so the fine key grid never needs an exact hit to be useful."""
+    if not gpu_id or mp_key is None:
+        return None
+    rows = conn.execute(
+        "SELECT batch, updated_at FROM video_batch_learn "
+        "WHERE gpu_id = ? AND mp_key >= ? ORDER BY mp_key ASC",
+        (gpu_id, int(mp_key))).fetchall()
+    for row in rows:
+        if _row_fresh(row, max_age_days):
+            return int(row["batch"])
+    return None
+
+
+@_locked
+def put_learned_batch(conn, gpu_id, mp_key, batch):
+    """Record the converged safe batch for (gpu_id, output-MP key). Overwrites any prior value
+    (the newest measurement wins, so a driver/code change self-corrects). Commits."""
+    if not gpu_id or mp_key is None or not batch or batch <= 0:
         return
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     conn.execute(
-        "INSERT INTO video_batch_learn (gpu_id, mp_bucket, batch, updated_at) "
-        "VALUES (?, ?, ?, ?) ON CONFLICT(gpu_id, mp_bucket) DO UPDATE SET "
+        "INSERT INTO video_batch_learn (gpu_id, mp_key, batch, updated_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT(gpu_id, mp_key) DO UPDATE SET "
         "batch = excluded.batch, updated_at = excluded.updated_at",
-        (gpu_id, int(mp_bucket), int(batch), now))
+        (gpu_id, int(mp_key), int(batch), now))
     conn.commit()
 
 
@@ -541,10 +616,10 @@ def get_bench_probes(conn, gpu_id, model, out_w=None, out_h=None):
 @_locked
 def max_feasible_output_mp(conn, gpu_id):
     """The largest OUTPUT megapixels PROVEN feasible for this card (feature #7 feasibility
-    guard): the biggest 'ok' probe in video_bench plus the biggest learned batch bucket in
-    video_batch_learn (a present bucket means a real run fit that output class). Returns None
+    guard): the biggest 'ok' probe in video_bench plus the biggest learned key in
+    video_batch_learn (a present key means a real run fit that output class). Returns None
     when there is no proof yet (the caller then uses the VRAM-tier seed). The learned
-    bucket -> MP is a conservative lower edge (bucket * 0.5)."""
+    key -> MP is a conservative lower edge (mp_key * MP_KEY_UNIT)."""
     if not gpu_id:
         return None
     best = 0.0
@@ -558,10 +633,10 @@ def max_feasible_output_mp(conn, gpu_id):
         debug_log("db.max_feasible_output_mp(video_bench)", exc=exc)
     try:
         for r in conn.execute(
-                "SELECT mp_bucket FROM video_batch_learn WHERE gpu_id = ? OR gpu_id LIKE ?",
+                "SELECT mp_key FROM video_batch_learn WHERE gpu_id = ? OR gpu_id LIKE ?",
                 (gpu_id, gpu_id + "|%")):
-            if r["mp_bucket"]:
-                best = max(best, r["mp_bucket"] * 0.5)
+            if r["mp_key"]:
+                best = max(best, r["mp_key"] * MP_KEY_UNIT)
     except Exception as exc:                           # noqa: BLE001 (fail-safe)
         debug_log("db.max_feasible_output_mp(video_batch_learn)", exc=exc)
     return best or None

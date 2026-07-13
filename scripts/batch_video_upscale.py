@@ -116,6 +116,44 @@ def _local_seedvr2_paths(cfg):
     model = _resolve_app_path(s.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
     return repo, model
 
+
+def gate_local_compile(settings, log=None):
+    """Gate torch.compile on a real compile-capability probe, for ANY local SeedVR2 run
+    (the batch runner AND the benchmark, which share this venv). torch.compile needs BOTH
+    Triton AND a C compiler (MSVC cl.exe) on PATH -- inductor shells out to build kernels,
+    so Triton alone is NOT enough. With Triton present but no compiler, SeedVR2's first VAE
+    compile HANGS under the GUI's piped stdio (it would error 'cl is not found' in a
+    console): the exact "stuck at first segment / first probe" symptom. So a machine
+    without a compiler must never even try -- route EVERY local engine's settings through
+    here, not just the batch runner's, or the benchmark trips the same hang.
+
+    Mutates `settings` in place (compile_dit/compile_vae -> False when it can't compile) and
+    returns (disabled: bool, reason: str|None). A user with triton-windows + an activated
+    MSVC toolchain keeps the pod-grade speedup; everyone else runs fine without compile
+    (speed only, not quality)."""
+    want_compile = bool(settings.get("compile_dit") or settings.get("compile_vae"))
+    if not want_compile:
+        return False, None
+    import importlib.util as _ilu
+    import shutil as _sh
+    triton_ok = _ilu.find_spec("triton") is not None
+    compiler_ok = bool(_sh.which("cl") or _sh.which("cc") or _sh.which("gcc")
+                       or _sh.which("clang"))
+    if triton_ok and compiler_ok:
+        if log:
+            log("    torch.compile ON (Triton + compiler present): the first segment pays "
+                "a one-time compile cost, then the rest runs faster (shared fixed shape).")
+        return False, None
+    why = ("Triton is not installed" if not triton_ok
+           else "no C compiler (MSVC cl.exe) is on PATH")
+    settings["compile_dit"] = False
+    settings["compile_vae"] = False
+    if log:
+        log(f"    torch.compile disabled: {why}. It would otherwise stall the first "
+            f"segment (compiling with no output) or fail. Local runs continue without "
+            f"compile; only speed is affected, not quality.")
+    return True, why
+
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common (0.4.3
 # item 5). Re-export them here exactly as the other three runners do, instead of
 # keeping private copies that could drift from the shared marker/atomic-write rule
@@ -553,16 +591,18 @@ def per_video_seed(vcfg, rel):
 # tuning engages: a 1-2 segment clip has nothing to amortise (and _fit_batch_to_frames
 # already collapses a short clip to one batch), so it keeps the plain auto path.
 MIN_TUNE_SEGMENTS = 2
-# Output-megapixel bucket for the learned-batch DB key. 0.5 MP groups near-identical
-# output sizes (so history is reused across similar videos) while keeping portrait vs
-# landscape vs target tiers distinct (VRAM scales with output MP, which box-fit makes
-# aspect-dependent, so keying by target name alone would be wrong).
-_MP_BUCKET_MP = 0.5
+# Output-megapixel key for the learned-batch DB row. A FINE grid: distinct real output sizes
+# (portrait vs landscape box-fit outputs differ in area, so in VRAM ceiling) get their OWN row
+# instead of colliding in a coarse bucket. History is still reused across nearby sizes because
+# the readers look up the NEAREST recorded key >= the run's MP (get_learned_batch_ge) -- a
+# ceiling measured at a larger output is a safe bound for a smaller one. Keying by target name
+# alone would be wrong (box-fit makes output MP aspect-dependent).
+_MP_KEY_MP = 0.05           # fine MP DB-key grid (matches db.MP_KEY_UNIT + sizer._MP_KEY_MP)
 
 
 def _mp_bucket(mp):
-    """Stable integer DB-key bucket for a per-frame output-megapixel value (0.5 MP grid)."""
-    return int(round(max(0.0, float(mp or 0)) / _MP_BUCKET_MP))
+    """Stable integer DB key for a per-frame output-megapixel value (fine _MP_KEY_MP grid)."""
+    return int(round(max(0.0, float(mp or 0)) / _MP_KEY_MP))
 
 
 def _request_batch(explicit_batch, tuned, learned):
@@ -1296,7 +1336,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     converged = [False]
     if tuning:
         try:
-            tuned[0] = db.get_learned_batch(conn, gpu_id, mp_bucket)
+            # Nearest recorded key >= this segment's MP (safe bound: a batch that fit a bigger
+            # output fits a smaller one), so the fine key grid still seeds across nearby sizes.
+            tuned[0] = db.get_learned_batch_ge(conn, gpu_id, mp_bucket)
         except Exception as exc:                       # noqa: BLE001 (fail-safe)
             debug_log("batch_video_upscale get_learned_batch", exc=exc)
         if tuned[0]:
@@ -2174,31 +2216,11 @@ def main(argv=None):
             _sub = vcfg["local_use_subprocess"]
             log(f"Local mode — upscaling on this machine's GPU (no pod). "
                 f"Engine: {'subprocess-per-attempt (thrash watchdog: ' + str(vcfg['thrash_stall_seconds']) + 's stall)' if _sub else 'in-process (like the image Batch Upscaler)'}.")
-            # torch.compile needs BOTH Triton AND a C compiler on PATH (inductor shells out to
-            # MSVC cl.exe on Windows to build kernels): Triton alone is NOT enough. With Triton
-            # present but no compiler, SeedVR2's first VAE compile HANGS under the GUI's piped
-            # stdio (it errors 'cl is not found' in a console) -- the exact "stuck at first
-            # segment" symptom. So gate on a real compile-capability probe, checked HERE (the
-            # worker shares this venv); a user with triton-windows + an activated MSVC toolchain
-            # gets the pod-grade speedup, everyone else runs fine without compile.
-            import importlib.util as _ilu
-            import shutil as _sh
+            # Gate torch.compile on a real compile-capability probe (shared with the
+            # benchmark): without a C compiler it would HANG the first VAE compile under the
+            # GUI's piped stdio ("stuck at first segment"). See gate_local_compile.
             local_cfg = _worker_cfg()
-            want_compile = bool(local_cfg.get("compile_dit") or local_cfg.get("compile_vae"))
-            triton_ok = _ilu.find_spec("triton") is not None
-            compiler_ok = bool(_sh.which("cl") or _sh.which("cc") or _sh.which("gcc")
-                               or _sh.which("clang"))
-            if want_compile and not (triton_ok and compiler_ok):
-                why = ("Triton is not installed" if not triton_ok
-                       else "no C compiler (MSVC cl.exe) is on PATH")
-                log(f"    torch.compile disabled: {why}. It would otherwise stall the first "
-                    f"segment (compiling with no output) or fail. Local runs continue without "
-                    f"compile; only speed is affected, not quality. First segment loads now.")
-                local_cfg["compile_dit"] = False
-                local_cfg["compile_vae"] = False
-            elif want_compile:
-                log("    torch.compile ON (Triton + compiler present): the first segment pays "
-                    "a one-time compile cost, then the rest runs faster (shared fixed shape).")
+            gate_local_compile(local_cfg, log)
             engine = LocalVideoEngine(
                 repo_dir, model_dir, local_cfg,
                 conn=conn, gpu_id=None,

@@ -39,7 +39,8 @@ class BenchmarkWindow(tk.Toplevel):
     for the video_benchmark runner's @@TBX@@ events (BSTART / BCELL / BPROBE / BCEILING /
     BDONE) and renders a per-target results table live."""
 
-    ALL_TARGETS = ["1080p", "1440p", "4K"]
+    # Driven off the runner's table so the two never drift: the 4:3 ladder + 16:9 presets.
+    ALL_TARGETS = list(vb.TARGETS.keys())
     # Above this much VRAM already occupied (beyond normal desktop overhead), other apps are
     # holding VRAM and a benchmark would under-report the ceiling: warn (but don't block).
     VRAM_BUSY_WARN_GB = 2.5
@@ -112,6 +113,21 @@ class BenchmarkWindow(tk.Toplevel):
 
     # ── layout ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _target_label(t):
+        """Checkbox text: dims-named ladder cells show the dimensions (with ×) + aspect, preset
+        names keep their name; both carry the output megapixels so the VRAM cost is visible at a
+        glance (the ceiling scales with output MP)."""
+        w, h = vb.TARGETS[t]
+        mp = w * h / 1_000_000.0
+        if "x" in t:
+            return f"{w}×{h} {'3:4' if h > w else '4:3'} · {mp:.1f} MP"
+        return f"{t} · {mp:.1f} MP"
+
+    def _is_ladder(self, t):
+        """True for a dims-named 4:3 ladder cell (vs a 16:9 preset like 1080p/1440p/4K)."""
+        return "x" in t
+
     def _build(self):
         self.columnconfigure(0, weight=1)
         pad = dict(padx=10)
@@ -127,23 +143,26 @@ class BenchmarkWindow(tk.Toplevel):
         tk.Message(self, text=info, width=680, anchor="w", justify="left",
                    fg="#7f8a99").grid(row=1, column=0, sticky="ew", **pad)
 
-        # Target selection.
+        # Target selection. Too many for one row now (4:3 ladder + presets), so wrap into a grid;
+        # the default check-state is set later in _fill_gpu, once the card's VRAM is known.
         tf = ttk.LabelFrame(self, text=" Targets to benchmark ", padding=8)
         tf.grid(row=2, column=0, sticky="ew", pady=(8, 0), **pad)
         self._toggles = []
         self._target_cb = {}
+        cols = 4
         for i, t in enumerate(self.ALL_TARGETS):
-            v = tk.BooleanVar(value=(t == "1080p"))
+            v = tk.BooleanVar(value=False)
             v.trace_add("write", lambda *_a: self._refresh_estimate())
             self.target_vars[t] = v
-            cb = ttk.Checkbutton(tf, text=t, variable=v)
-            cb.grid(row=0, column=i, padx=(0, 16), sticky="w")
+            cb = ttk.Checkbutton(tf, text=self._target_label(t), variable=v)
+            cb.grid(row=i // cols, column=i % cols, padx=(0, 16), pady=(0, 4), sticky="w")
             self._toggles.append(cb)
             self._target_cb[t] = cb
         self.restart_var = tk.BooleanVar(value=False)
         rb = ttk.Checkbutton(tf, text="Restart (discard saved results for this card)",
                              variable=self.restart_var, command=self._refresh_estimate)
-        rb.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        rb.grid(row=(len(self.ALL_TARGETS) + cols - 1) // cols, column=0, columnspan=cols,
+                sticky="w", pady=(6, 0))
         self._toggles.append(rb)
         Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
                     "On: clears this card+model's saved probes and benchmarks from scratch.")
@@ -154,13 +173,15 @@ class BenchmarkWindow(tk.Toplevel):
         self.rowconfigure(3, weight=1)
         rf.rowconfigure(1, weight=1)          # the log grows; the 5-row table stays put
         rf.columnconfigure(0, weight=1)
-        cols = ("ceiling", "overlap", "spf", "peak", "status")
+        cols = ("ceiling", "saved", "overlap", "spf", "peak", "status")
         self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=5)
         self.tree.column("#0", width=110, stretch=False)
         self.tree.heading("#0", text="Target")
-        for c, txt, w in (("ceiling", "Max batch", 90), ("overlap", "Overlap", 70),
-                          ("spf", "s/frame", 80), ("peak", "Peak VRAM", 110),
-                          ("status", "Status", 200)):
+        # "Max batch" = how far the card pushed (the raw ceiling); "Used" = the batch AUTO
+        # actually runs (the fastest window, which can be lower: the ceiling rides VRAM spill).
+        for c, txt, w in (("ceiling", "Max batch", 84), ("saved", "Used", 60),
+                          ("overlap", "Overlap", 66), ("spf", "s/frame", 74),
+                          ("peak", "Peak VRAM", 104), ("status", "Status", 180)):
             self.tree.heading(c, text=txt)
             self.tree.column(c, width=w, stretch=(c == "status"), anchor="w")
         self.tree.grid(row=0, column=0, sticky="ew")
@@ -231,7 +252,16 @@ class BenchmarkWindow(tk.Toplevel):
         self.gpu_id = name or "local"
         self.total_vram_gb = round((g[1] or 0) / 1024.0)
         self.header_var.set(f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
-        # Default-check the targets this card can plausibly reach (all stay toggleable).
+        # Default-check the targets this card can plausibly reach (all stay toggleable). Pre-check
+        # every feasible LANDSCAPE 4:3 ladder cell (the common old-camera case); PORTRAIT cells
+        # stay available but unchecked (you only need them if you shot portrait, and they'd double
+        # the default run time). Add the 16:9 presets only on cards big enough for them.
+        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
+        for t in self.ALL_TARGETS:
+            if self._is_ladder(t):
+                w, h = vb.TARGETS[t]
+                if max_mp and w >= h and (w * h / 1_000_000.0) <= max_mp + 1e-6:
+                    self.target_vars[t].set(True)
         if self.total_vram_gb >= 40:
             self.target_vars["1440p"].set(True)
         if self.total_vram_gb >= 80:
@@ -297,13 +327,15 @@ class BenchmarkWindow(tk.Toplevel):
         for t in self.ALL_TARGETS:
             self._ensure_row(t)
             box = vb.TARGETS[t]
-            probes = db.get_bench_probes(self.conn, self.gpu_id, self.model_tag, box[0], box[1])
+            probes = vb.drop_collapsed(db.get_bench_probes(
+                self.conn, self.gpu_id, self.model_tag, box[0], box[1]))
             if not probes:
                 self.tree.set(self._rows[t], "status", "not benchmarked")
                 continue
             ceil = vb.cell_ceiling(probes)
+            saved = vb.throughput_optimal_batch(probes)
             done = vb.next_batch(probes, vb.batch_series()) is None
-            self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)")
+            self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)", saved=saved)
 
     @property
     def conn(self):
@@ -314,14 +346,14 @@ class BenchmarkWindow(tk.Toplevel):
             self._rows[target] = self.tree.insert("", "end", text=target)
         return self._rows[target]
 
-    def _set_ceiling(self, target, ceil, status):
+    def _set_ceiling(self, target, ceil, status, saved=None):
         iid = self._ensure_row(target)
-        if ceil:
-            self.tree.set(iid, "ceiling", str(ceil))
-            self.tree.set(iid, "overlap", str(sizer.auto_overlap(ceil)))
-        else:
-            self.tree.set(iid, "ceiling", "—")
-            self.tree.set(iid, "overlap", "—")
+        self.tree.set(iid, "ceiling", str(ceil) if ceil else "—")
+        self.tree.set(iid, "saved", str(saved) if saved else "—")
+        # Overlap reflects the batch AUTO will actually run: the saved (fastest) one, else the
+        # ceiling while a sweep is still in flight and the optimum isn't known yet.
+        ov_b = saved or ceil
+        self.tree.set(iid, "overlap", str(sizer.auto_overlap(ov_b)) if ov_b else "—")
         self.tree.set(iid, "status", status)
 
     def _selected_targets(self):
@@ -511,8 +543,10 @@ class BenchmarkWindow(tk.Toplevel):
                     self.tree.set(iid, "status", f"batch {data.get('batch')} {oc}")
         elif kind == "BCEILING" and data:
             ceil = data.get("ceiling")
-            self._set_ceiling(data["name"], ceil,
-                              f"done — max batch {ceil}" if ceil else "can't do this target")
+            saved = data.get("saved")
+            status = (f"done — uses {saved} (max fit {ceil})" if saved and ceil and saved != ceil
+                      else f"done — batch {saved}" if saved else "can't do this target")
+            self._set_ceiling(data["name"], ceil, status, saved=saved)
         elif kind == "BDONE" and data:
             self.status_var.set("Benchmark stopped." if data.get("stopped") else "Benchmark complete.")
 
@@ -525,13 +559,16 @@ class BenchmarkWindow(tk.Toplevel):
         self._apply_feasibility()                      # keep infeasible targets gated
         for t in self.ALL_TARGETS:                     # reflect the persisted final state
             box = vb.TARGETS[t]
-            probes = db.get_bench_probes(self.conn, self.gpu_id, self.model_tag, box[0], box[1])
+            probes = vb.drop_collapsed(db.get_bench_probes(
+                self.conn, self.gpu_id, self.model_tag, box[0], box[1]))
             if probes:
                 ceil = vb.cell_ceiling(probes)
+                saved = vb.throughput_optimal_batch(probes)
                 done = vb.next_batch(probes, vb.batch_series()) is None
                 cur = self.tree.set(self._rows.get(t, self._ensure_row(t)), "status")
                 if not cur.startswith("done") and not cur.startswith("can't"):
-                    self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)")
+                    self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)",
+                                      saved=saved)
         self.restart_var.set(False)
         self._refresh_estimate()
         # Nudge the tab to re-read the (now calibrated) estimate on its next view.
