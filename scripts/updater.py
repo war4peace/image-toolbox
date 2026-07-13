@@ -28,6 +28,8 @@ import subprocess
 import urllib.request
 import urllib.error
 
+from net_ssl import ssl_context
+
 GITHUB_REPO        = "war4peace/image-toolbox"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE      = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -119,7 +121,7 @@ def check_for_update(current_version, timeout=10):
             "User-Agent": _USER_AGENT,
             "Accept":     "application/vnd.github+json",
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             data = json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -186,7 +188,7 @@ def fetch_expected_sha256(sums_url, asset_name=INSTALLER_ASSET, timeout=30):
         return None
     try:
         req = urllib.request.Request(sums_url, headers={"User-Agent": _USER_AGENT})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             text = resp.read().decode("utf-8", "replace")
     except Exception:
         return None
@@ -225,7 +227,7 @@ def download_installer(url, expected_size=0, sha256_url=None, dest_dir=None,
     part     = dest + ".part"
 
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
         total = int(resp.headers.get("Content-Length") or expected_size or 0)
         done  = 0
         with open(part, "wb") as f:

@@ -38,6 +38,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+from net_ssl import ssl_context
+
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 
@@ -96,7 +98,7 @@ def _post_json(url, payload, timeout=10):
     req = urllib.request.Request(
         url, data=data,
         headers={"Content-Type": "application/json", "User-Agent": _BROWSER_UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
         body = resp.read().decode("utf-8", "replace")
     try:
         return json.loads(body)
@@ -106,7 +108,7 @@ def _post_json(url, payload, timeout=10):
 
 def _get_json(url, timeout=10):
     req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
         body = resp.read().decode("utf-8", "replace")
     return json.loads(body)
 
@@ -214,7 +216,7 @@ def send_ntfy(server, topic, title, description, color, fields=None, token=None,
     data = _ntfy_body(description, fields).encode("utf-8")
     try:
         req = urllib.request.Request(f"{server}/{topic}", data=data, headers=headers, method="POST")
-        urllib.request.urlopen(req, timeout=timeout)
+        urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
     except urllib.error.HTTPError as exc:
         body = ""
         try: body = exc.read().decode("utf-8", "replace")
@@ -365,7 +367,7 @@ def test_ntfy(server, topic, token="", timeout=10):
     data = "ntfy notifications are working.".encode("utf-8")
     try:
         req = urllib.request.Request(f"{server}/{topic}", data=data, headers=headers, method="POST")
-        urllib.request.urlopen(req, timeout=timeout)
+        urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
         return True, f"Sent a test message to {server}/{topic}. Check the ntfy app."
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):

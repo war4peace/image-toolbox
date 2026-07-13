@@ -396,14 +396,20 @@ try {
         # all live on the pod.
         Step "Installing the lightweight components (Remote mode - no local GPU stack)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
-        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc")
+        # certifi: a Remote-only install has no GPU stack to drag in a CA bundle,
+        # and a fresh Windows VM's OS root store often can't verify RunPod's cert
+        # (Python's OpenSSL doesn't auto-fetch roots the way SChannel does). We hand
+        # urllib certifi's bundle explicitly (net_ssl.py), so it must be present.
+        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi")
     } else {
         Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
         Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
         Step "Installing the remaining components"
-        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc")
+        # certifi is listed explicitly (usually a transitive dep here) so net_ssl.py
+        # always has a CA bundle to trust, independent of the OS root store.
+        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc", "certifi")
     }
 
     # -- 5b. OpenSSH (Remote mode reaches the pod over SSH) -------------------

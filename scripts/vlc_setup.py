@@ -21,6 +21,8 @@ import tempfile
 import subprocess
 import urllib.request
 
+from net_ssl import ssl_context
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_ROOT = os.path.dirname(_SCRIPT_DIR)
 
@@ -84,7 +86,7 @@ def _download(url, dest, progress=None):
     # Default urllib UA (Python-urllib/...): a browser UA makes get.videolan.org
     # serve an HTML mirror-chooser instead of the file (see VLC_URL note).
     req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+    with urllib.request.urlopen(req, timeout=120, context=ssl_context()) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         got = 0
         while True:

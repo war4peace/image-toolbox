@@ -89,7 +89,7 @@ class _FakeResp:
 
 
 def _install_fake_urlopen(monkeypatch, installer_bytes, sums_text):
-    def fake_urlopen(req, timeout=None):
+    def fake_urlopen(req, timeout=None, context=None):
         url = getattr(req, "full_url", req)
         if url.endswith(updater.SHA256SUMS_ASSET):
             return _FakeResp((sums_text or "").encode("utf-8"))

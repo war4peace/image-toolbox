@@ -35,6 +35,8 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+from net_ssl import ssl_context
+
 BASE_URL    = "https://rest.runpod.io/v1"
 _USER_AGENT = "ImageToolbox-RunPod"
 
@@ -215,7 +217,7 @@ def _request(method, path, api_key, body=None, params=None, timeout=30):
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise RunPodError(_http_error_message(exc)) from exc
@@ -660,7 +662,7 @@ def _graphql(api_key, query, variables=None, timeout=30):
             "User-Agent":    _BROWSER_UA,
         })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         raise RunPodError(_http_error_message(exc)) from exc
