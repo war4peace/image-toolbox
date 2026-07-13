@@ -36,6 +36,13 @@ Endpoints:
     GET  /video/status?id=ID          -> {state, total_frames, frames_written,
                                           output_bytes, elapsed, seconds, error}
     GET  /video/fetch?id=ID           -> upscaled mp4 bytes (409 until done)
+  Remote benchmark (feature #7, docs/local-video-upscaler.md section 22) reuses the
+  same async job slot to measure ONE fixed-batch window with no auto-size / no OOM
+  step-down (the sweep must SEE the OOM to find the ceiling):
+    POST /video/probe?resolution=&batch_size=&temporal_overlap=&ext=.mkv
+                                      body = a short clip (>= batch frames)
+                                      -> {"id":...}  (poll /video/status for the
+                                         outcome: ok / oom / error + peak VRAM; no fetch)
   The heartbeat is refreshed on every line of pipeline progress (a tee over the
   SeedVR2 tqdm output), so a long segment that is genuinely working stays alive
   while a HUNG GPU goes stale and the dead-man's switch can reclaim the pod.
@@ -477,16 +484,17 @@ def _auto_batch(out_w, out_h, vram_gb, resident, model=None):
 
 
 _MIN_OVERLAP = 6                 # measured: 3 left a visible seam, 6 was undetectable
+_MAX_OVERLAP = 15                # cap: the seam is a local transition, so blending beyond ~15
+                                 # frames is redundant compute for no visible gain (batch/6 ran
+                                 # away to 80 at batch 480). MUST match sizer.MAX_OVERLAP.
 
 
 def _auto_overlap(batch):
-    """Frames blended between batches to HIDE the seam. This is a quality floor, not a
-    cost knob: too little (3) ruins the result, so never go below _MIN_OVERLAP (6),
-    growing ~batch/6 for very large windows, clamped below the batch. With a big batch
-    the fixed overlap is cheap (low redundancy); a tiny VRAM-forced batch pays more for
-    it, which is the right trade (quality over a hair of cost). Use a big-VRAM card so
-    the batch can be large and the overlap is nearly free."""
-    return min(batch - 1, max(_MIN_OVERLAP, round(batch / 6)))
+    """Frames blended between batches to HIDE the seam. A quality floor with a cost cap:
+    too little (3) ruins the result, so never go below _MIN_OVERLAP (6); it grows ~batch/6
+    but is capped at _MAX_OVERLAP (15), since a larger window doesn't widen the seam, and
+    clamped below the batch. MUST match scripts/video_vram_sizer.auto_overlap."""
+    return min(batch - 1, _MAX_OVERLAP, max(_MIN_OVERLAP, round(batch / 6)))
 
 
 _NT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")   # tqdm "n/total" pairs
@@ -841,6 +849,83 @@ def _run_video_job(job, params):
         _touch(_HEARTBEAT)
 
 
+def _run_probe_job(job, params):
+    """Run ONE fixed-batch upscale window for the REMOTE benchmark (feature #7,
+    docs/local-video-upscaler.md section 22) and record its outcome, WITHOUT the
+    production auto-sizing or OOM step-down. The benchmark sweeps UPWARD to failure, so
+    a probe that OOMs must REPORT 'oom' (that batch is the cell's ceiling) instead of
+    silently recovering to a smaller window the way _run_video_job does.
+
+    In-process in the resident worker (approach b, section 22.1): the model is already
+    loaded, and each probe measures the way a real segment runs (process_video), with
+    peak VRAM read from a fresh reset. The output is discarded (no /video/fetch); only
+    outcome / seconds / frames / peak matter. The clip is sized by the client to hold the
+    batch (>= b frames), so no frame-collapse fit is needed here."""
+    job["state"] = "running"
+    _touch(_HEARTBEAT)
+    tee = _HeartbeatTee(sys.stdout, job)
+    b = _to_4n1(max(1, int(params["batch_size"])))
+    frames = int(job.get("total_frames") or 0)
+    o = int(params["temporal_overlap"])
+    if o < 0:                                # AUTO overlap: the quality-floored value for b
+        o = _auto_overlap(b)
+    if o >= b:                               # SeedVR2 resets overlap >= batch to 0; clamp
+        o = max(0, b - 1)
+    # Chunk so frames STREAM out (> 0): one clean pass when the window spans the clip,
+    # else mirror LocalVideoEngine._resolve_window so local and remote probe identically.
+    if frames and b >= frames:
+        chunk = b
+    elif b > 89:
+        chunk = max(1, b - o)
+    else:
+        chunk = b * max(1, round(90 / b))
+    job["resolved_batch"], job["resolved_overlap"], job["resolved_chunk"] = b, o, chunk
+    t0 = None
+    try:
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            with _GPU_LOCK:
+                try:
+                    import torch
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:
+                    pass
+                t0 = time.time()
+                n = _ENGINE.process_video(
+                    job["input"], job["output"], resolution=params["resolution"],
+                    batch_size=b, chunk_size=chunk, temporal_overlap=o,
+                    seed=params["seed"], video_backend=params["video_backend"],
+                    use_10bit=params["use_10bit"])
+                job["seconds"] = time.time() - t0
+        try:                                  # ground-truth working set vs the allocator pool
+            import torch
+            gb = 1024 ** 3
+            job["peak_alloc_gb"] = round(torch.cuda.max_memory_allocated() / gb, 1)
+            job["peak_reserved_gb"] = round(torch.cuda.max_memory_reserved() / gb, 1)
+        except Exception:
+            pass
+        job["frames_written"] = int(n or 0)
+        job["outcome"] = "ok"
+        job["state"] = "done"
+        _log(f"probe {job['id'][:8]} bs={b}: ok, {job['frames_written']} frames in "
+             f"{job['seconds']:.1f}s peakVRAM={job.get('peak_alloc_gb')}/"
+             f"{job.get('peak_reserved_gb')}GB")
+    except Exception as exc:                  # noqa: BLE001 -- OOM is an EXPECTED sweep outcome
+        if t0 is not None:
+            job["seconds"] = time.time() - t0   # a too-big batch burns real GPU time before OOM
+        _empty_cuda_cache()
+        if _is_oom(exc):
+            job["outcome"] = "oom"
+            job["state"] = "done"             # a COMPLETED probe; its result is "ceiling here"
+            _log(f"probe {job['id'][:8]} bs={b}: OOM (ceiling for this target)")
+        else:
+            job["outcome"] = "error"
+            job["error"] = str(exc)
+            job["state"] = "error"
+            _log(f"probe {job['id'][:8]} bs={b}: ERROR {exc}")
+    finally:
+        _touch(_HEARTBEAT)
+
+
 def _cleanup_job(job):
     """Remove a finished job's temp dir (input + output). Best effort."""
     if not job:
@@ -892,6 +977,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/video/submit":
             self._handle_video_submit(parsed)
+            return
+        if parsed.path == "/video/probe":
+            self._handle_video_probe(parsed)
             return
         if parsed.path != "/upscale":
             self._send(404, b"not found", "text/plain")
@@ -1062,6 +1150,76 @@ class Handler(BaseHTTPRequestHandler):
                            "total_frames": job["total_frames"]}).encode()
         self._send(200, body, "application/json")
 
+    def _handle_video_probe(self, parsed):
+        """Remote benchmark (feature #7, docs section 22): measure ONE fixed-batch window
+        and report its outcome (ok/oom) + timing + peak VRAM, with NO auto-size and NO OOM
+        step-down. Shares the single video-job slot + the /video/status polling with
+        /video/submit; the client fetches nothing (the upscaled output is discarded)."""
+        global _VIDEO_JOB
+        data = self._read_body()               # always drain first
+        if _ENGINE is None:
+            self._send(503, b"video engine not loaded (worker not in video mode)",
+                       "text/plain")
+            return
+        if not data:
+            self._send(400, b"empty body", "text/plain")
+            return
+        q = parse_qs(parsed.query)
+        try:
+            params = {
+                "resolution":       int(q.get("resolution", ["1080"])[0]),
+                # A probe uses the EXACT batch it is given (no auto, no step-down). -1
+                # overlap = AUTO (the quality-floored value for the batch).
+                "batch_size":       int(q.get("batch_size", ["5"])[0]),
+                "chunk_size":       0,
+                "temporal_overlap": int(q.get("temporal_overlap", ["-1"])[0]),
+                "seed":             int(q["seed"][0]) if q.get("seed") else None,
+                "video_backend":    q.get("video_backend", ["opencv"])[0],
+                "use_10bit":        q.get("use_10bit", ["0"])[0] in ("1", "true", "True"),
+            }
+        except ValueError as exc:
+            self._send(400, f"bad parameter: {exc}".encode(), "text/plain")
+            return
+        ext = q.get("ext", [".mkv"])[0]
+        if not ext.startswith("."):
+            ext = "." + ext
+
+        with _VIDEO_LOCK:
+            if _VIDEO_JOB is not None and _VIDEO_JOB["state"] in ("queued", "running"):
+                self._send(409, b"a video job is already running", "text/plain")
+                return
+            _cleanup_job(_VIDEO_JOB)           # reclaim the previous probe/segment dir
+            job_dir = tempfile.mkdtemp(prefix="prb_")
+            in_path = os.path.join(job_dir, "in" + ext)
+            with open(in_path, "wb") as f:
+                f.write(data)
+            job = {
+                "id": uuid.uuid4().hex,
+                "state": "queued",
+                "probe": True,
+                "dir": job_dir,
+                "input": in_path,
+                "output": os.path.join(job_dir, "out.mp4"),
+                "total_frames": _count_video_frames(in_path),
+                "frames_written": None,
+                "frames_processed": None,
+                "outcome": None,
+                "output_bytes": 0,
+                "seconds": None,
+                "error": None,
+                "started": time.time(),
+                "last_output_t": time.time(),
+            }
+            _VIDEO_JOB = job
+            threading.Thread(target=_run_probe_job, args=(job, params),
+                             daemon=True).start()
+        _log(f"probe job {job['id'][:8]} accepted: {len(data)}B "
+             f"({job['total_frames']} frames) res={params['resolution']} "
+             f"bs={params['batch_size']}")
+        body = json.dumps({"id": job["id"],
+                           "total_frames": job["total_frames"]}).encode()
+        self._send(200, body, "application/json")
+
     def _handle_video_status(self, q):
         job = _VIDEO_JOB
         jid = (q.get("id") or [None])[0]
@@ -1089,6 +1247,7 @@ class Handler(BaseHTTPRequestHandler):
             "elapsed":          round(time.time() - job["started"], 1),
             "seconds":          job.get("seconds"),
             "error":            job.get("error"),
+            "outcome":          job.get("outcome"),        # probe result: ok / oom / error
             "resolved_batch":   job.get("resolved_batch"),
             "resolved_overlap": job.get("resolved_overlap"),
             "resolved_chunk":   job.get("resolved_chunk"),

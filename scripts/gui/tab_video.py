@@ -748,11 +748,14 @@ class VideoTab(ttk.Frame):
         except Exception:                              # noqa: BLE001
             pass
         try:
+            # The button now shows in BOTH modes: local calibrates THIS card, remote
+            # calibrates a rented pod GPU (feature #7, docs section 22). Only the local
+            # sweep contends for the local GPU, so only local honours the running-job lock.
+            self.benchmark_btn.grid()
             if local:
-                self.benchmark_btn.grid()
-                self._refresh_benchmark_lock()         # honour any running local job
+                self._refresh_benchmark_lock()
             else:
-                self.benchmark_btn.grid_remove()
+                self.benchmark_btn.configure(state="normal")
         except Exception:                              # noqa: BLE001
             pass
         self._refresh_compile_offer()
@@ -799,15 +802,26 @@ class VideoTab(ttk.Frame):
         prompt_install_triton(self.winfo_toplevel(), on_done=done)
 
     def _open_benchmark(self):
-        """Open the per-card benchmark modal (feature #7). A run must not be in progress
-        (it would fight the benchmark for the GPU)."""
-        # Any LOCAL-GPU job (this tab, Batch Upscale, or Tag & Rename) would fight the
-        # benchmark for the card. The button is greyed while one runs; this is the click-time
-        # backstop.
-        if self.app.local_gpu_job_running():
-            messagebox.showinfo(APP_TITLE,
-                                "Finish the current local job before benchmarking the GPU.")
-            return
+        """Open the per-card benchmark modal (feature #7). LOCAL calibrates this machine's
+        GPU (which no other local job may be using); REMOTE calibrates the picked pod GPU
+        (docs section 22): it deploys a pod for the selected card and sweeps it there."""
+        remote = self.mode_var.get() != "local"
+        gpu = None
+        if remote:
+            gpu = self._selected_gpu()
+            if not gpu or not gpu.get("id"):
+                messagebox.showinfo(APP_TITLE,
+                                    "Pick a GPU from the list first (press ↻ to refresh "
+                                    "live availability), then Benchmark GPU.")
+                return
+        else:
+            # Any LOCAL-GPU job (this tab, Batch Upscale, or Tag & Rename) would fight the
+            # benchmark for the card. The button is greyed while one runs; this is the
+            # click-time backstop.
+            if self.app.local_gpu_job_running():
+                messagebox.showinfo(APP_TITLE,
+                                    "Finish the current local job before benchmarking the GPU.")
+                return
         # Reuse an already-open benchmark window instead of stacking a second one (the window
         # is modal, so this is a belt-and-suspenders guard).
         existing = getattr(self, "_benchmark_win", None)
@@ -818,7 +832,8 @@ class VideoTab(ttk.Frame):
             return
         try:
             from gui.video_benchmark import BenchmarkWindow
-            self._benchmark_win = BenchmarkWindow(self.winfo_toplevel(), self)
+            self._benchmark_win = BenchmarkWindow(self.winfo_toplevel(), self,
+                                                  remote=remote, gpu=gpu)
         except Exception as exc:                       # noqa: BLE001
             messagebox.showerror(APP_TITLE, f"Could not open the benchmark window:\n{exc}")
 

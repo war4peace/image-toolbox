@@ -47,6 +47,9 @@ except Exception:                                    # noqa: BLE001
 BATCH_FLOOR = 5              # below this a temporal window barely helps (matches pod)
 BATCH_CAP = 33               # AUTO-path ceiling; a manual override may exceed it
 MIN_OVERLAP = 6              # quality floor: measured, 3 left a seam, 6 was undetectable
+MAX_OVERLAP = 15             # cost cap: the seam is a local transition, so blending more than
+                            # ~15 frames adds redundant compute for no visible gain (batch/6
+                            # ran away to 80 at batch 480). Above the floor, 15 hides any seam.
 _MP_KEY_MP = 0.05            # fine MP DB-key grid (matches db.MP_KEY_UNIT + bv._MP_KEY_MP): the
                             # sizer reads the NEAREST key >= the run MP, so distinct real output
                             # sizes get distinct rows without a coarse bucket merging them
@@ -91,10 +94,11 @@ def mp_bucket(mp):
 
 
 def auto_overlap(batch):
-    """Frames blended between batches to hide the seam. A QUALITY floor, not a cost knob:
-    never below MIN_OVERLAP (6), growing ~batch/6 for large windows, clamped below batch.
+    """Frames blended between batches to hide the seam. A QUALITY floor with a cost cap:
+    never below MIN_OVERLAP (6), grows ~batch/6, but capped at MAX_OVERLAP (15) since the
+    seam is a local transition that a larger window doesn't widen, and clamped below batch.
     Matches pod/worker._auto_overlap."""
-    return min(max(1, batch - 1), max(MIN_OVERLAP, round(batch / 6)))
+    return min(max(1, batch - 1), MAX_OVERLAP, max(MIN_OVERLAP, round(batch / 6)))
 
 
 def model_tag(model):
@@ -149,6 +153,31 @@ def _predicted_peak_gb(batch, mp):
     """Estimated peak VRAM (GB) for a batch at `mp` output megapixels (3090-calibrated,
     a starting estimate off that card)."""
     return _WS_FIXED_GB + _WS_PER_BATCH_MP * batch * mp
+
+
+# Fraction of TOTAL VRAM the benchmark's starting batch should be predicted to use. Kept
+# well under 1.0 so there is headroom to climb to the real wall, AND because the working-set
+# model above is 3090-OFFLOAD-calibrated and OVER-predicts on a big resident card (a PRO 6000
+# at 0.39 MP really used ~42 GB at batch 513, the model predicts ~72), so this predicted
+# fraction maps to an even smaller real fraction: the floor is conservative by construction.
+FLOOR_BUDGET_FRAC = 0.55
+
+
+def vram_floor_batch(total_gb, mp, budget_frac=FLOOR_BUDGET_FRAC):
+    """A VRAM-aware STARTING batch for the benchmark's ceiling climb: the largest 4n+1 whose
+    predicted peak fits `budget_frac` of the card's total VRAM. On a high-VRAM card this skips
+    the pointless low rungs (batch 5..N obviously fit), so the sweep opens near the interesting
+    region instead of crawling up from 5. It is deliberately CONSERVATIVE (see FLOOR_BUDGET_FRAC):
+    the geometric climb reaches the true wall from here in a few doublings, so the floor's exact
+    value barely matters; it only has to avoid absurdly small starts. Falls back to BATCH_FLOOR
+    when VRAM/MP is unknown."""
+    if not total_gb or total_gb <= 0 or not mp or mp <= 0:
+        return BATCH_FLOOR
+    budget = float(total_gb) * float(budget_frac)
+    if budget <= _WS_FIXED_GB:                        # not even the fixed working set fits
+        return BATCH_FLOOR
+    batch = (budget - _WS_FIXED_GB) / (_WS_PER_BATCH_MP * mp)
+    return max(BATCH_FLOOR, to_4n1(batch))
 
 
 def _seed_batch(tier, mp):

@@ -1,12 +1,18 @@
 """
 video_benchmark.py
 ------------------
-Per-card VRAM benchmark suite for LOCAL video upscaling (feature #7,
-docs/local-video-upscaler.md sections 16 / 20). Finds each card's REAL ceiling by
+Per-card VRAM benchmark suite for video upscaling (feature #7,
+docs/local-video-upscaler.md sections 16 / 20 / 22). Finds a card's REAL ceiling by
 upscaling a short clip at an ASCENDING series of batches until it OOMs or thrashes,
 then writes the last-good batch into the sizer's learned store (`db.video_batch_learn`)
 and the measured rate into the estimate's store (`db.gpu_perf`), so AUTO runs start at
 the true ceiling and the time estimate is calibrated -- without the developer guessing.
+
+Runs on the LOCAL card (fresh-subprocess isolation per probe) OR (--remote) on a rented
+RunPod GPU (in-process on the resident pod worker via /video/probe, section 22): the sweep
+orchestration is IDENTICAL, only the injected engine changes. A remote sweep keys its
+learned batch under the PLAIN RunPod id the run reads (section 22.3) and deploys + tears
+down its own pod.
 
 Why a dedicated tool and not the AUTO path: AUTO must be safe on the first try (no
 cascade), so it only ever learns downward from a seed or upward one careful segment at a
@@ -61,7 +67,12 @@ BATCH_FLOOR = 5
 # benchmarking) can legitimately reach hundreds, so this is set high enough not to clip it.
 # Configurable via --batch-cap. A learned value above the sizer's AUTO cap is honoured (a
 # measured truth beats a safety cap).
-DEFAULT_BATCH_CAP = 513
+DEFAULT_BATCH_CAP = 3000            # "go stupid" on high-VRAM cards: a PRO 6000 at 0.4 MP never
+                                    # reached the old 513 wall (only 42/96 GB used), so raise the
+                                    # safety ceiling far enough to find the real one. This is only
+                                    # tractable because the sweep climbs GEOMETRICALLY (next_batch),
+                                    # not every 4n+1 rung -- a linear sweep to 3000 would be ~750
+                                    # probes; the doubling climb + binary refine is ~a dozen.
 # The clip's frame count is sized PER PROBE to at least the batch (a window can't exceed the
 # clip's frames, or SeedVR2 silently collapses it to a SMALLER batch). This is the MINIMUM /
 # small-batch floor: probes at or below it reuse one short clip; a larger batch gets a clip
@@ -126,30 +137,122 @@ def build_plan(targets, frames=DEFAULT_FRAMES):
 STALE_MARGIN_GB = 1.5
 
 
-def next_batch(cell_probes, series, free_now=None, stale_margin=STALE_MARGIN_GB):
-    """The next batch to probe for a cell, or None if the cell is FINISHED. `cell_probes` =
-    [{batch, outcome, free_vram?}]. A recorded oom/thrash normally ends the cell (nothing
-    bigger can fit) -- EXCEPT a failure recorded with materially less free VRAM than `free_now`
-    (other-app contention, not the ceiling): that one is ignored so the batch is re-probed, and
-    it doesn't cap the sweep below itself. Returns the lowest untried batch below any trustworthy
-    failure, else None."""
-    seen = {}                       # batch -> outcome, EXCLUDING stale contended failures
-    terminal = None                 # lowest trustworthy failure batch (nothing >= it can fit)
+def next_batch(cell_probes, floor, cap=DEFAULT_BATCH_CAP, free_now=None,
+               stale_margin=STALE_MARGIN_GB):
+    """The next batch to probe for a cell's ceiling search, or None when the ceiling is pinned
+    (cell FINISHED). Two phases, exploiting that VRAM fit is MONOTONE in batch (once a batch
+    OOMs, nothing bigger fits):
+
+      * Phase 1 (no failure yet): geometric climb -- start at the VRAM-aware `floor`, then
+        DOUBLE the largest ok batch each step, up to `cap`. A high-VRAM card reaches the wall
+        in a few probes instead of crawling every 4n+1 rung.
+      * Phase 2 (a genuine failure exists): binary-refine between the largest ok and the first
+        failure to pin the exact max-fit rung; done when they are adjacent 4n+1 rungs.
+
+    `cell_probes` = [{batch, outcome, free_vram?}]. A failure recorded with materially less free
+    VRAM than `free_now` (local other-app contention, not the true ceiling) is ignored so it is
+    re-probed and doesn't cap the sweep; remote passes free_now=None (a dedicated pod has no
+    contention), disabling that path. `floor` only sets the FIRST probe, so a resumed cell (or
+    the GUI's done-check via cell_done) gets the same terminal answer regardless of it."""
+    lo_floor = sizer.to_4n1(max(BATCH_FLOOR, int(floor or BATCH_FLOOR)))
+    hi_cap = sizer.to_4n1(max(lo_floor, int(cap or DEFAULT_BATCH_CAP)))
+
+    oks, bads = [], []
     for p in cell_probes:
-        b = int(p["batch"])
-        oc = p["outcome"]
-        if oc in ("oom", "thrash"):
+        b = sizer.to_4n1(int(p["batch"]))
+        oc = p.get("outcome")
+        if oc == "ok":
+            oks.append(b)
+        elif oc in ("oom", "thrash"):
             pf = p.get("free_vram")
             if free_now is not None and pf is not None and pf < free_now - stale_margin:
-                continue            # contended failure: allow a re-probe
-            terminal = b if terminal is None else min(terminal, b)
-        seen[b] = oc
-    for b in series:
-        if terminal is not None and b >= terminal:
-            break
-        if b not in seen:
-            return b
-    return None
+                continue            # contended failure: allow a re-probe, don't cap the sweep
+            bads.append(b)
+    oks = sorted(set(oks))
+    bads = sorted(set(bads))
+    tried = set(oks) | set(bads)
+    min_bad = bads[0] if bads else None
+    max_ok = oks[-1] if oks else None
+
+    # Phase 2: bracket the ceiling below the first genuine failure.
+    if min_bad is not None:
+        below = [b for b in oks if b < min_bad]
+        if not below:
+            lo = sizer.to_4n1(BATCH_FLOOR)
+            if lo >= min_bad:
+                return None         # even the floor fails: the card can't do this cell
+            if lo not in tried:
+                return lo           # confirm a low anchor before bisecting
+        else:
+            lo = max(below)
+        if lo + 4 >= min_bad:
+            return None             # adjacent rungs: ceiling = lo, done
+        mid = sizer.to_4n1((lo + min_bad) // 2)
+        if mid <= lo:
+            mid = lo + 4
+        if mid >= min_bad or mid in tried:
+            return None
+        return mid
+
+    # Phase 1: no failure yet -> geometric climb from the floor toward the cap.
+    if max_ok is None:
+        return lo_floor
+    if max_ok >= hi_cap:
+        return None                 # reached the cap without failing (capped ceiling)
+    nxt = sizer.to_4n1(min(hi_cap, max_ok * 2))
+    if nxt <= max_ok:
+        nxt = min(hi_cap, max_ok + 4)
+    return nxt if nxt > max_ok else None
+
+
+def cell_done(cell_probes, cap=DEFAULT_BATCH_CAP):
+    """True when a cell's ceiling is pinned and no more probes are needed. Floor-independent
+    (the floor only affects the FIRST probe), so the GUI can render 'saved' vs 'partial' from
+    the persisted probes alone, without knowing the card's VRAM."""
+    return next_batch(cell_probes, BATCH_FLOOR, cap, free_now=None) is None
+
+
+# A couple of tiny THROWAWAY upscales before a cell's measured sweep, so the pod's cold
+# first-forward cost (kernel autotune / JIT, and the per-RESOLUTION torch.compile that is on by
+# default) is paid on 9 discarded frames instead of inflating the first real probe's s/frame (a
+# slow first batch, flagged by the user). Remote ONLY: the local path reloads the model per probe
+# in a fresh subprocess, so there is no warm state to build (every probe is cold by design).
+WARMUP_PROBES = 2
+WARMUP_BATCH = 9
+WARMUP_FRAMES = 9
+
+
+def _warmup_cell(engine, work, cell, vcfg, log, should_stop):
+    """Run WARMUP_PROBES discarded bs9 upscales at the cell's resolution to warm the resident
+    pod (compile/autotune) before its measured probes. Best-effort and fail-safe: any error just
+    means the first real probe does the warming instead; a warmup must never fail a benchmark."""
+    try:
+        clip = bclip.ensure_source_clip(
+            work, cell["src_w"], cell["src_h"], WARMUP_FRAMES,
+            base_url=vcfg.get("benchmark_clip_url"),
+            base_sha256=vcfg.get("benchmark_clip_sha256"), log=None)
+    except Exception as exc:                             # noqa: BLE001
+        log(f"  (warmup skipped: could not prepare a clip: {exc})")
+        return
+    out = os.path.join(work, "warmup_out.mp4")
+    # The first warmup pass absorbs the one-time torch.compile for this resolution, which can
+    # take a few minutes with no output; say so, or it reads as a hang (it is NOT).
+    log(f"  warming up ({WARMUP_PROBES} throwaway bs{WARMUP_BATCH} passes, discarded); the first "
+        f"absorbs a one-time compile for this resolution and can take a few minutes …")
+    for i in range(WARMUP_PROBES):
+        if should_stop():
+            return
+        try:
+            engine.probe_batch(clip, out, resolution=cell["resolution"], batch=WARMUP_BATCH,
+                               overlap=0, frames=WARMUP_FRAMES, should_stop=should_stop)
+        except Exception as exc:                         # noqa: BLE001 (never fail a run)
+            log(f"  (warmup pass {i + 1} failed, continuing cold: {exc})")
+            return
+    try:
+        if os.path.exists(out):
+            os.remove(out)
+    except OSError:
+        pass
 
 
 def drop_collapsed(rows):
@@ -267,35 +370,67 @@ def _watch_stdin_for_stop():
 
 # ── the run ──────────────────────────────────────────────────────────────────
 
-def _engine_settings(cfg, vcfg):
-    """The SeedVR2 engine settings: the image-upscale config overlaid with the video-only
-    quality/speed knobs (mirrors batch_video_upscale._worker_cfg), so the benchmark measures
-    the SAME configuration a real local run uses."""
+def _worker_settings(cfg, vcfg):
+    """The SeedVR2 engine settings the benchmark measures with: the image-upscale config
+    overlaid with the video-only quality/speed knobs (mirrors batch_video_upscale._worker_cfg),
+    so the benchmark measures the SAME configuration a real run uses. Shared by the LOCAL and
+    REMOTE paths; the local-compiler gate is applied by _engine_settings, NOT here (it is a
+    check of the LOCAL machine's compiler and must not run for a pod, which has its own)."""
     wc = dict(cfg.get("upscale", {}))
     wc["compile_dit"] = vcfg["compile"]
     wc["compile_vae"] = vcfg["compile"]
     wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
     wc["input_noise_scale"] = vcfg["input_noise_scale"]
     wc["dit_model"] = vcfg["dit_model"]
-    # Same compile-capability gate the local RUNNER applies (shared helper). Without it a
-    # machine with no C compiler HANGS on the first probe's VAE compile under piped stdio
-    # (the "stuck at first segment" deadlock) -- the benchmark must not skip this gate.
+    return wc
+
+
+def _engine_settings(cfg, vcfg):
+    """LOCAL engine settings: _worker_settings plus the compile-capability gate the local
+    RUNNER applies. Without the gate a machine with no C compiler HANGS on the first probe's
+    VAE compile under piped stdio (the "stuck at first segment" deadlock)."""
+    wc = _worker_settings(cfg, vcfg)
     bv.gate_local_compile(wc, log)
     return wc
 
 
-def _record_cell_result(conn, gpu_id, model_tag, cell):
+def _deploy_remote_engine(cfg, vcfg):
+    """Deploy a video pod for the selected GPU (IMGTBX_GPU_OVERRIDE) and return
+    (engine, session), reusing the RUN's RemoteSession (deploy -> push -> start worker ->
+    ssh tunnel -> funds guard -> dead-man's switch). The caller tears the session down
+    (which stops the pod) in its finally. Emits POD / RCOST for the GUI's live cost readout."""
+    from remote_run import RemoteSession
+    sess = RemoteSession(cfg.get("runpod", {}), _worker_settings(cfg, vcfg),
+                         APP_ROOT, on_event=log, mode="video")
+    try:
+        engine = sess.start()
+    except Exception:
+        try:
+            sess.close()
+        except Exception:                              # noqa: BLE001 (fail-safe teardown)
+            pass
+        raise
+    gui_event("POD", sess.pod_id or "")
+    if sess.cost_per_hr is not None:
+        gui_event("RCOST", sess.cost_per_hr)
+    return engine, sess
+
+
+def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
     """After a cell's sweep, save the THROUGHPUT-OPTIMAL batch (not the raw ceiling) into the
     sizer's learned store and record ITS rate into the estimate store, so AUTO runs use the
-    fastest window and the estimate reflects it. The raw ceiling (max fit) is still returned
-    for display. Returns (ceiling, saved) -- both None if the card can't do this output."""
+    fastest window and the estimate reflects it. `learn_key` is the video_batch_learn key the
+    consuming run READS: `gpu|model` for a LOCAL run (the sizer's key), or the PLAIN RunPod id
+    for a REMOTE run (process_job reads the un-model-qualified IMGTBX_GPU_OVERRIDE, section 22.3).
+    The raw ceiling (max fit) is still returned for display. Returns (ceiling, saved) -- both
+    None if the card can't do this output."""
     probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
                                                 cell["out_w"], cell["out_h"]))
     ceil = cell_ceiling(probes)
     if not ceil:
         return None, None
     saved = throughput_optimal_batch(probes) or ceil
-    db.put_learned_batch(conn, f"{gpu_id}|{model_tag}", sizer.mp_bucket(cell["mp"]), saved)
+    db.put_learned_batch(conn, learn_key, sizer.mp_bucket(cell["mp"]), saved)
     # Rate from the SAVED (optimal) probe, so the estimate matches the batch AUTO will run;
     # fall back to the largest ok probe if the optimal one somehow lacks timing.
     row = next((p for p in probes if p["outcome"] == "ok" and int(p["batch"]) == saved), None)
@@ -308,26 +443,50 @@ def _record_cell_result(conn, gpu_id, model_tag, cell):
     return ceil, saved
 
 
-def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP):
-    """Drive the sweep. Persists every probe, honours a Stop (stdin 'q') between and DURING a
-    probe (the current probe's subprocess is killed, its partial result discarded so it
-    re-runs on resume), and writes learned batch + rate per finished cell. Returns a summary."""
+def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP,
+                  remote=False):
+    """Drive the sweep on the LOCAL card or (remote=True) a rented RunPod GPU. Persists every
+    probe, honours a Stop (stdin 'q') between and DURING a probe, and writes the learned batch +
+    rate per finished cell. On the REMOTE path the sweep runs in-process on the pod (section 22),
+    keys the learned batch under the PLAIN RunPod id the run reads, and tears the pod down at the
+    end. Returns a summary."""
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
     conn = db.get_conn()
-
-    from local_video_engine import LocalVideoEngine, _query_gpu_name
-    gpu_id = _query_gpu_name() or "local"
     model_tag = sizer.model_tag(vcfg["dit_model"])
-    repo_dir, model_dir = bv._local_seedvr2_paths(cfg)
     work = os.path.join(vcfg["work_root"], "benchmark")
     os.makedirs(work, exist_ok=True)
 
-    series = batch_series(cap=int(batch_cap or DEFAULT_BATCH_CAP))
+    cap = int(batch_cap or DEFAULT_BATCH_CAP)
     plan = build_plan(targets, frames)
     if not plan:
         log("No valid benchmark targets selected; nothing to do.")
         return {"cells": 0, "stopped": None}
+
+    # Total VRAM drives the per-cell starting FLOOR (skip the low rungs a big card obviously
+    # clears). Remote: the pod's card, passed by the GUI from the picker; local: read live.
+    if remote:
+        try:
+            total_gb = float(os.environ.get("IMGTBX_GPU_VRAM_GB", "") or 0) or None
+        except ValueError:
+            total_gb = None
+    else:
+        total_gb = sizer.free_vram_gb(prefer_smi=True)[1]
+
+    # Identify the card + the learned-batch key the CONSUMING run reads (section 22.3):
+    #   local  -> the sizer's `gpu|model` key;
+    #   remote -> the PLAIN RunPod id (process_job reads the un-model-qualified override).
+    if remote:
+        gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip().split(",")[0].strip()
+        if not gpu_id:
+            log("Remote benchmark needs a selected GPU (none passed). Pick a GPU on the "
+                "Video tab (Remote), then press Benchmark GPU.")
+            return {"cells": 0, "stopped": "no GPU selected"}
+        learn_key = gpu_id
+    else:
+        from local_video_engine import _query_gpu_name
+        gpu_id = _query_gpu_name() or "local"
+        learn_key = f"{gpu_id}|{model_tag}"
 
     if not resume:
         db.clear_bench(conn, gpu_id, model_tag)
@@ -335,25 +494,54 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     done = sum(len(db.get_bench_probes(conn, gpu_id, model_tag, c["out_w"], c["out_h"]))
                for c in plan) if resume else 0
     est = estimate_runtime(plan, gpu_id, conn, done=done)
-    log(f"Benchmarking {gpu_id} ({model_tag}) — {len(plan)} target(s), frames={frames}, "
-        f"batches {series[0]}..{series[-1]}.")
+    where = "on a RunPod pod" if remote else "locally"
+    vram_note = (f"{total_gb:.0f} GB VRAM -> floor scales per target" if total_gb
+                 else "VRAM unknown -> climbing from the base floor")
+    log(f"Benchmarking {gpu_id} ({model_tag}) {where}: {len(plan)} target(s), frames={frames}, "
+        f"geometric climb to a measured ceiling (cap {cap}, {vram_note}).")
     log(f"Estimated runtime: ~{fmt_hhmmss(est)} (rough).")
-    log("Note: every probe runs in a fresh process (isolated CUDA context per batch), so it "
-        "opens with a brief silent model load (a few seconds locally) before any progress. "
-        "That is normal, not a hang.")
-    gui_event("BSTART", {"gpu": gpu_id, "model": model_tag,
+    if remote:
+        log("Note: the pod loads the model once from the network volume (a minute or two) before "
+            "the first probe; the sweep then runs in-process on the pod. $0-nothing-lost if you "
+            "Stop -- finished probes are saved and resume next time.")
+    else:
+        log("Note: every probe runs in a fresh process (isolated CUDA context per batch), so it "
+            "opens with a brief silent model load (a few seconds locally) before any progress. "
+            "That is normal, not a hang.")
+    gui_event("BSTART", {"gpu": gpu_id, "model": model_tag, "remote": bool(remote),
                          "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
                                    "mp": round(c["mp"], 2)} for c in plan],
-                         "series": series, "frames": frames, "estimate_seconds": round(est)})
+                         "batch_cap": cap, "frames": frames, "estimate_seconds": round(est)})
 
-    engine = LocalVideoEngine(repo_dir, model_dir, _engine_settings(cfg, vcfg),
-                              use_subprocess=True, conn=conn, gpu_id=gpu_id)
+    session = None
+    tele_stop = None
+    if remote:
+        # Deploy the pod for the picked card. A capacity failure (stock empty, no substitution)
+        # raises here and lands cleanly in the benchmark log (RemoteSession emits the reason).
+        engine, session = _deploy_remote_engine(cfg, vcfg)
+        # Stream the pod's CPU/RAM/VRAM/temp to the GUI (RTELEM events) exactly like a real
+        # remote run, so the benchmark window shows the same "Remote pod" row and MQTT gets
+        # the system/remote/* topics. Best-effort; stopped at teardown.
+        tele_stop = threading.Event()
+        bv._start_remote_telemetry(engine, tele_stop)
+    else:
+        from local_video_engine import LocalVideoEngine
+        repo_dir, model_dir = bv._local_seedvr2_paths(cfg)
+        engine = LocalVideoEngine(repo_dir, model_dir, _engine_settings(cfg, vcfg),
+                                  use_subprocess=True, conn=conn, gpu_id=gpu_id)
+
+    def funds_tripped():
+        return bool(session is not None and getattr(session, "_funds_tripped", False))
+
+    def stop_now():
+        return _STOP.is_set() or funds_tripped()
+
     probe_out = os.path.join(work, "probe_out.mp4")
     stopped = None
     try:
         for cell in plan:
-            if _STOP.is_set():
-                stopped = "stopped by user"
+            if stop_now():
+                stopped = "funds guard" if funds_tripped() else "stopped by user"
                 break
             gui_event("BCELL", {"name": cell["name"], "out_w": cell["out_w"],
                                 "out_h": cell["out_h"]})
@@ -364,11 +552,18 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             # nor as a ceiling; the affected batches get re-probed with correctly-sized clips.
             cell_probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
                                                              cell["out_w"], cell["out_h"]))
-            while not _STOP.is_set():
-                # Free VRAM at probe start (via nvidia-smi, parent stays GPU-free): tags this
-                # probe AND lets a failure recorded earlier under contention be re-tried now.
-                free_now, _tot = sizer.free_vram_gb(prefer_smi=True)
-                b = next_batch(cell_probes, series, free_now=free_now)
+            floor = sizer.vram_floor_batch(total_gb, cell["mp"])   # VRAM-aware start rung
+            # Warm the resident pod for THIS resolution so the first measured probe isn't
+            # cold-inflated (remote only; skip a cell already finished on resume).
+            if remote and not stop_now() and not cell_done(cell_probes, cap):
+                _warmup_cell(engine, work, cell, vcfg, log, stop_now)
+            while not stop_now():
+                # Free VRAM at probe start. LOCAL: read via nvidia-smi (parent stays GPU-free)
+                # to tag the probe AND allow a contended earlier failure to be re-tried. REMOTE:
+                # the pod's VRAM isn't visible here, and a dedicated pod has no contention, so
+                # skip it (free_now=None disables the stale-contention re-probe path).
+                free_now = None if remote else sizer.free_vram_gb(prefer_smi=True)[0]
+                b = next_batch(cell_probes, floor, cap, free_now=free_now)
                 if b is None:
                     break
                 # The clip MUST have >= b frames: a temporal window can't exceed the clip's
@@ -389,9 +584,9 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running"})
                 log(f"  probing batch {b} …")
                 res = engine.probe_batch(clip, probe_out, resolution=cell["resolution"],
-                                         batch=b, frames=probe_frames, should_stop=_STOP.is_set)
+                                         batch=b, frames=probe_frames, should_stop=stop_now)
                 if res["outcome"] == "stopped":
-                    stopped = "stopped by user"
+                    stopped = "funds guard" if funds_tripped() else "stopped by user"
                     break
                 db.record_bench_probe(
                     conn, gpu_id, model_tag, cell["out_w"], cell["out_h"], b,
@@ -411,11 +606,13 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                                      "spf": round(spf, 2) if spf else None,
                                      "peak_alloc": res.get("peak_alloc_gb"),
                                      "peak_reserved": res.get("peak_reserved_gb")})
-                if res["outcome"] != "ok":
-                    break
-            if _STOP.is_set() and stopped is None:
-                stopped = "stopped by user"
-            ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell)
+                # NB: do NOT break on an oom/thrash. The geometric climb overshoots the wall on
+                # purpose; next_batch then binary-refines DOWNWARD (probing smaller batches) to
+                # pin the exact max-fit rung, and ends the cell by returning None. Breaking here
+                # would stop at the first (overshot) failure and mis-record the ceiling.
+            if stop_now() and stopped is None:
+                stopped = "funds guard" if funds_tripped() else "stopped by user"
+            ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell, learn_key)
             if saved:
                 extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
                 log(f"  {cell['name']}: saved batch {saved}{extra} — AUTO runs use {saved} "
@@ -427,10 +624,20 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             if stopped:
                 break
     finally:
+        if tele_stop is not None:
+            tele_stop.set()                            # end the pod telemetry sampler
         try:
             engine.close()
         except Exception:                              # noqa: BLE001
             pass
+        if session is not None:
+            # Tear the pod down (billing stops). RemoteSession.close() stops a pod we
+            # created; a pod we reused (attached) is left as we found it.
+            try:
+                session.close()
+            except Exception:                          # noqa: BLE001 (fail-safe teardown)
+                pass
+            gui_event("POD", "")
         try:
             if os.path.exists(probe_out):
                 os.remove(probe_out)
@@ -439,8 +646,10 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
 
     summary = {"cells": len(plan), "stopped": stopped}
     gui_event("BDONE", summary)
-    log(f"\nBenchmark {'stopped' if stopped else 'complete'}: {len(plan)} target(s). "
-        "Results saved; AUTO runs and the time estimate now use them.")
+    tail = ("Results saved; AUTO runs and the time estimate now use them."
+            if not remote else
+            "Results saved; remote runs on this card now seed from them.")
+    log(f"\nBenchmark {'stopped' if stopped else 'complete'}: {len(plan)} target(s). " + tail)
     return summary
 
 
@@ -453,6 +662,9 @@ def main(argv=None):
     p.add_argument("--restart", action="store_true",
                    help="discard prior probes for this card+model and start fresh "
                         "(default resumes).")
+    p.add_argument("--remote", action="store_true",
+                   help="benchmark a rented RunPod GPU (the card in IMGTBX_GPU_OVERRIDE) "
+                        "instead of the local card (feature #7, docs section 22).")
     args = p.parse_args(argv)
 
     _open_log()
@@ -461,7 +673,7 @@ def main(argv=None):
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     try:
         run_benchmark(targets, frames=args.frames, resume=not args.restart,
-                      batch_cap=args.batch_cap)
+                      batch_cap=args.batch_cap, remote=args.remote)
     except Exception as exc:                            # noqa: BLE001
         import traceback
         log(f"Benchmark failed: {exc}")

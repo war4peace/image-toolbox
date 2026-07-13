@@ -1273,8 +1273,10 @@ resolved **on the pod**, the only place that knows the card's real VRAM.
   bs33=172 GB; the 1440p ~75 GB plateau checks out) to the largest 4n+1 that fits
   `vram * 0.80`, capped at 33 (continuity flattens past there; throughput past ~9) and
   floored at 5. Picks ~5 at 4K on 96 GB, ~17 at 4K on a B200, 33 at 1440p on 96 GB.
-- **temporal_overlap** — `_auto_overlap(batch)` = ~1/6 of the window, clamped `[2,
-  batch-1]` (SeedVR2 silently resets overlap >= batch to 0).
+- **temporal_overlap** — `_auto_overlap(batch)` = ~1/6 of the window, floored at 6 (seam
+  quality) and capped at 15 (the seam is a local transition, so a bigger window doesn't need
+  a bigger blend; batch/6 ran away to 80 at batch 480), clamped below batch (SeedVR2 silently
+  resets overlap >= batch to 0).
 - **chunk_size** — ~90 frames rounded to whole batches (RAM-bound, no quality effect).
 - **attention_mode** — `UpscaleEngine._resolve_attention("auto")` reads SeedVR2's
   `compatibility.SAGE_ATTN_*_AVAILABLE` / `FLASH_ATTN_*_AVAILABLE` flags and picks the

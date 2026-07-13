@@ -123,6 +123,26 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         }
         return frames
 
+    def probe_batch(self, src_path, dest_path, *, resolution, batch, overlap=None,
+                    frames=None, poll_interval=5, should_stop=None):
+        """Benchmark primitive (feature #7, docs/local-video-upscaler.md section 22):
+        stream one short clip to the pod's /video/probe, measure ONE fixed-batch window,
+        and return the outcome dict. This is the SAME contract as
+        LocalVideoEngine.probe_batch, so scripts/video_benchmark.py drives a LOCAL or a
+        REMOTE sweep through one code path (an engine swap).
+
+        Returns {outcome, batch, overlap, frames, seconds, peak_alloc_gb,
+        peak_reserved_gb} where outcome is 'ok' | 'oom' | 'error' | 'stopped'. Never
+        raises for an OOM (an expected sweep outcome); a lost pod / dropped tunnel raises
+        RemoteVideoError so the benchmark reports the pod died. `dest_path` and `frames`
+        are ignored (the pod discards the upscaled output and counts frames itself; the
+        client-generated clip already holds the batch)."""
+        ext = os.path.splitext(src_path)[1] or ".mkv"
+        b = int(batch)
+        ov = -1 if overlap is None else int(overlap)         # -1 = the pod's AUTO overlap
+        job_id = self._submit_probe(src_path, ext, resolution, b, ov)
+        return self._await_probe(job_id, b, poll_interval, should_stop)
+
     # ── protocol steps ──────────────────────────────────────────────────────
 
     def _submit(self, src_path, ext, resolution, batch_size, chunk_size,
@@ -210,3 +230,72 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
             raise RemoteVideoError(f"fetch failed HTTP {exc.code}: {detail}") from exc
         except Exception as exc:                       # noqa: BLE001
             raise RemoteVideoError(f"fetch failed: {exc}") from exc
+
+    # ── probe steps (remote benchmark, section 22) ───────────────────────────
+
+    def _submit_probe(self, src_path, ext, resolution, batch, overlap):
+        """Upload the probe clip to /video/probe (streamed straight from the file, like
+        _submit) and return the job id. Raises RemoteVideoError on a transport failure."""
+        q = (f"?resolution={int(resolution)}&batch_size={int(batch)}"
+             f"&temporal_overlap={int(overlap)}&ext={ext}")
+        size = os.path.getsize(src_path)
+        try:
+            with open(src_path, "rb") as body:
+                req = urllib.request.Request(
+                    self._url("/video/probe" + q), data=body, method="POST",
+                    headers={"Content-Type": "application/octet-stream",
+                             "Content-Length": str(size)})
+                with urllib.request.urlopen(req, timeout=self.SUBMIT_TIMEOUT) as resp:
+                    info = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise RemoteVideoError(f"probe submit failed HTTP {exc.code}: {detail}") from exc
+        except Exception as exc:                       # noqa: BLE001
+            raise RemoteVideoError(f"probe submit failed: {exc}") from exc
+        job_id = info.get("id")
+        if not job_id:
+            raise RemoteVideoError(f"worker returned no probe id: {info}")
+        return job_id
+
+    def _await_probe(self, job_id, batch, poll_interval, should_stop=None):
+        """Poll /video/status until the probe leaves the running state, then return the
+        outcome dict (never raising for an 'oom'/'error' RESULT -- those are the sweep's
+        own outcomes). A `should_stop` that turns True returns {'outcome': 'stopped'}; a
+        sustained poll outage or a job the worker forgot raises RemoteVideoError (a pod
+        loss the benchmark surfaces, not a probe result)."""
+        url = self._url(f"/video/status?id={job_id}")
+        misses = 0
+        while True:
+            if should_stop and should_stop():
+                return {"outcome": "stopped", "batch": batch}
+            try:
+                with urllib.request.urlopen(url, timeout=self.STATUS_TIMEOUT) as resp:
+                    st = json.loads(resp.read().decode("utf-8", "replace"))
+                misses = 0
+            except Exception as exc:                   # noqa: BLE001
+                misses += 1
+                if misses >= 6:
+                    raise RemoteVideoError(
+                        f"lost contact with the worker while probing batch {batch}: {exc}")
+                time.sleep(poll_interval)
+                continue
+            state = st.get("state")
+            if state in ("done", "error"):
+                # The worker tags the probe result explicitly; fall back by state for an
+                # older worker that predates the `outcome` field.
+                outcome = st.get("outcome") or ("error" if state == "error" else "ok")
+                res = {
+                    "outcome":          outcome,
+                    "batch":            int(st.get("resolved_batch") or batch),
+                    "overlap":          st.get("resolved_overlap"),
+                    "frames":           st.get("frames_written"),
+                    "seconds":          st.get("seconds"),
+                    "peak_alloc_gb":    st.get("peak_alloc_gb"),
+                    "peak_reserved_gb": st.get("peak_reserved_gb"),
+                }
+                if outcome == "error":
+                    res["error"] = st.get("error")
+                return res
+            if state == "unknown":
+                raise RemoteVideoError("worker lost the probe job (it may have restarted).")
+            time.sleep(poll_interval)

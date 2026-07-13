@@ -74,3 +74,13 @@ def test_recovery_overlap_re_derives_to_the_seam_floor_not_the_inherited_value()
     assert w._auto_overlap(49) == 8                          # large batch -> large overlap
     assert w._auto_overlap(9) == 6                           # re-derived small: the seam floor
     assert w._auto_overlap(9) < w._auto_overlap(49)          # never inherits the larger value
+
+
+def test_overlap_is_capped_so_a_big_batch_does_not_blow_it_up():
+    # batch/6 ran away (batch 480 -> 80), redundant compute for no visible gain. The seam is a
+    # local transition, so overlap caps at _MAX_OVERLAP=15 above the floor, still >> the seam
+    # floor. Cap engages once batch/6 > 15 (batch > ~90); below that it is unchanged.
+    assert w._auto_overlap(480) == 15
+    assert w._auto_overlap(90) == 15                         # round(90/6)=15, right at the cap
+    assert w._auto_overlap(89) == 15                         # round(89/6)=15
+    assert w._auto_overlap(85) < 15                          # round(85/6)=14, below the cap

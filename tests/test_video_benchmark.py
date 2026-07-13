@@ -85,40 +85,82 @@ def test_sizer_uses_nearest_benchmark_at_or_above(db_conn):
     assert b2 != 21
 
 
-def test_next_batch_fresh_resume_and_done():
-    series = vb.batch_series(cap=33)
-    assert vb.next_batch([], series) == 5                                   # fresh
-    assert vb.next_batch([{"batch": 5, "outcome": "ok"}], series) == 9      # continue
-    # a gap (5 ok, 13 ok, 9 missing) resumes at the lowest untried
+def test_next_batch_geometric_climb_then_bracket():
+    # Phase 1: start at the floor, then DOUBLE (snapped to 4n+1) until a failure.
+    assert vb.next_batch([], 5, 33) == 5                                    # fresh -> floor
+    assert vb.next_batch([{"batch": 5, "outcome": "ok"}], 5, 33) == 9       # 5*2 -> 9
     assert vb.next_batch([{"batch": 5, "outcome": "ok"},
-                          {"batch": 13, "outcome": "ok"}], series) == 9
-    # a failure ends the cell
+                          {"batch": 9, "outcome": "ok"}], 5, 33) == 17      # 9*2 -> 17
+    # Phase 2: a failure brackets the ceiling; binary-refine between the last ok and it.
     assert vb.next_batch([{"batch": 5, "outcome": "ok"},
-                          {"batch": 9, "outcome": "oom"}], series) is None
-    assert vb.next_batch([{"batch": 5, "outcome": "thrash"}], series) is None
+                          {"batch": 9, "outcome": "ok"},
+                          {"batch": 17, "outcome": "oom"}], 5, 33) == 13    # mid(9,17)
+    # Adjacent ok/oom rungs => ceiling pinned, cell done.
+    assert vb.next_batch([{"batch": 9, "outcome": "ok"},
+                          {"batch": 13, "outcome": "oom"}], 5, 33) is None
+    # The floor itself failing (nothing smaller tried) => card can't do this cell.
+    assert vb.next_batch([{"batch": 5, "outcome": "thrash"}], 5, 33) is None
+
+
+def test_next_batch_climbs_from_a_high_vram_floor_to_a_high_ceiling():
+    # The "go stupid" path: a big card starts high (337) and doubles toward a 3000 cap, so it
+    # reaches a ~1500 wall in a handful of probes instead of ~370 linear rungs.
+    seq, probes = [], []
+    outcome = lambda b: "ok" if b <= 1400 else "oom"
+    for _ in range(60):
+        b = vb.next_batch(probes, 337, 3000)
+        if b is None:
+            break
+        seq.append(b)
+        probes.append({"batch": b, "outcome": outcome(b)})
+    assert seq[0] == 337                                    # opened at the VRAM floor, not 5
+    assert seq[1] == 673 and seq[2] == 1345                 # geometric doubling
+    assert len(seq) < 20                                    # ~a dozen (climb + binary), not ~370
+    assert vb.cell_ceiling(probes) == 1397                  # binary refine pins the EXACT wall
+    assert max(seq) > 1400                                  # it overshot the wall then refined down
+
+
+def test_next_batch_floor_too_high_searches_below():
+    # A predicted floor that OOMs first must fall back below it (confirm a low anchor, then
+    # bisect), never leaving the cell unbenchmarked.
+    assert vb.next_batch([{"batch": 337, "outcome": "oom"}], 337, 3000) == 5   # anchor low
+    nxt = vb.next_batch([{"batch": 337, "outcome": "oom"},
+                         {"batch": 5, "outcome": "ok"}], 337, 3000)
+    assert 5 < nxt < 337                                    # bisecting up toward the wall
 
 
 def test_next_batch_stale_contended_failure_is_retried():
-    series = vb.batch_series(cap=33)
     # A batch-9 oom recorded when only 15 GB was free; now 22 GB is free (7 GB more headroom):
     # the failure was contention, not the ceiling -> re-probe 9, and it does NOT cap the sweep.
     probes = [{"batch": 5, "outcome": "ok", "free_vram": 15.0},
               {"batch": 9, "outcome": "oom", "free_vram": 15.0}]
-    assert vb.next_batch(probes, series, free_now=22.0) == 9      # stale fail -> retried
-    # With the SAME headroom as when it failed, the failure is trusted (terminal).
-    assert vb.next_batch(probes, series, free_now=15.0) is None
+    assert vb.next_batch(probes, 5, 33, free_now=22.0) == 9       # stale fail -> retried
+    # With the SAME headroom as when it failed, the failure is trusted (terminal, ceiling=5).
+    assert vb.next_batch(probes, 5, 33, free_now=15.0) is None
     # No free_now (can't tell) -> trust the recorded failure, as before.
-    assert vb.next_batch(probes, series) is None
+    assert vb.next_batch(probes, 5, 33) is None
 
 
-def test_next_batch_stale_failure_below_trustworthy_one():
-    series = vb.batch_series(cap=33)
-    # 9 failed under contention (stale), 21 failed clean (trustworthy). We should re-probe the
-    # gap below 21 (9, 13, 17) but never reach 21+.
-    probes = [{"batch": 5, "outcome": "ok", "free_vram": 22.0},
-              {"batch": 9, "outcome": "oom", "free_vram": 15.0},
-              {"batch": 21, "outcome": "oom", "free_vram": 22.0}]
-    assert vb.next_batch(probes, series, free_now=22.0) == 9
+def test_cell_done_is_floor_independent():
+    # cell_done answers 'ceiling pinned?' from the probes alone (GUI has no VRAM), matching
+    # next_batch's terminal condition regardless of the floor used to start.
+    assert vb.cell_done([{"batch": 9, "outcome": "ok"},
+                         {"batch": 13, "outcome": "oom"}]) is True
+    assert vb.cell_done([{"batch": 5, "outcome": "ok"}]) is False        # can still climb
+
+
+def test_vram_floor_batch_scales_with_vram_and_is_safe_when_unknown():
+    # Unknown VRAM or MP -> the base floor (climb from 5), never a crash.
+    assert sizer.vram_floor_batch(None, 0.389) == sizer.BATCH_FLOOR
+    assert sizer.vram_floor_batch(96, 0) == sizer.BATCH_FLOOR
+    # A small card at a modest output has no headroom above the fixed working set -> base floor.
+    assert sizer.vram_floor_batch(24, 0.389) == sizer.BATCH_FLOOR
+    # A big card at a small output starts HIGH (skips the pointless low rungs), a valid 4n+1.
+    big = sizer.vram_floor_batch(96, 0.389)
+    assert big > 200 and (big - 1) % 4 == 0
+    # Monotone: more VRAM -> higher floor; a bigger output (more VRAM/frame) -> lower floor.
+    assert sizer.vram_floor_batch(96, 0.389) > sizer.vram_floor_batch(48, 0.389)
+    assert sizer.vram_floor_batch(96, 8.29) < sizer.vram_floor_batch(96, 0.389)
 
 
 def test_cell_ceiling():
@@ -166,7 +208,7 @@ def test_record_cell_result_feeds_sizer_and_estimate(db_conn):
                               frames=37, seconds=185.0, peak_alloc=20.9, peak_reserved=23.0)
     db.record_bench_probe(db_conn, gpu, model, 1920, 1080, 21, "oom")
 
-    ceil, saved = vb._record_cell_result(db_conn, gpu, model, cell)
+    ceil, saved = vb._record_cell_result(db_conn, gpu, model, cell, f"{gpu}|{model}")
     assert ceil == 17 and saved == 17          # equal-speed probes -> saved == max fit
 
     # Sizer now starts AUTO at the saved (fastest) batch for this card+output.
@@ -186,7 +228,7 @@ def test_record_cell_result_none_when_floor_fails(db_conn):
     gpu, model = "SmallCard", "7b"
     cell = vb.build_cell("4K", 3840, 2160)
     db.record_bench_probe(db_conn, gpu, model, 3840, 2160, 5, "oom")   # can't even do the floor
-    assert vb._record_cell_result(db_conn, gpu, model, cell) == (None, None)
+    assert vb._record_cell_result(db_conn, gpu, model, cell, f"{gpu}|{model}") == (None, None)
     # nothing learned for that bucket
     assert db.get_learned_batch(db_conn, f"{gpu}|{model}", sizer.mp_bucket(cell["mp"])) is None
 
@@ -215,7 +257,7 @@ def test_record_cell_result_ignores_collapsed_rows(db_conn):
                               frames=max(b, 37), seconds=100.0, peak_alloc=10.0, peak_reserved=12.0)
     for b in (41, 65):                                        # collapsed phantoms (frames < batch)
         db.record_bench_probe(db_conn, gpu, model, 540, 720, b, "ok", frames=37, seconds=100.0)
-    assert vb._record_cell_result(db_conn, gpu, model, cell) == (33, 33)
+    assert vb._record_cell_result(db_conn, gpu, model, cell, f"{gpu}|{model}") == (33, 33)
 
 
 def test_throughput_optimal_batch_picks_knee_not_ceiling():
@@ -245,7 +287,7 @@ def test_record_cell_result_saves_fastest_not_ceiling(db_conn):
                               frames=max(b, 37), seconds=spf * max(b, 37),
                               peak_alloc=20.0, peak_reserved=22.0)
     db.record_bench_probe(db_conn, gpu, model, 960, 720, 73, "oom")
-    ceil, saved = vb._record_cell_result(db_conn, gpu, model, cell)
+    ceil, saved = vb._record_cell_result(db_conn, gpu, model, cell, f"{gpu}|{model}")
     assert ceil == 69 and saved == 61                         # max fit 69, but USES the fast 61
     # AUTO now starts at the efficient batch, not the spill-edge ceiling.
     b, _ = sizer.pick("seedvr2_ema_7b_fp16.safetensors", 960, 720,
@@ -267,7 +309,8 @@ class _FakeEngine:
     def __init__(self, *a, **k):
         self.asked = []
 
-    def probe_batch(self, src, dest, *, resolution, batch, frames=None, should_stop=None):
+    def probe_batch(self, src, dest, *, resolution, batch, overlap=None, frames=None,
+                    should_stop=None):
         self.asked.append(batch)
         if batch <= 13:
             return {"outcome": "ok", "batch": batch, "overlap": 6, "frames": frames,
@@ -285,6 +328,9 @@ def fake_run(db_conn, tmp_path, monkeypatch):
     import local_video_engine as lve
     monkeypatch.setattr(lve, "LocalVideoEngine", lambda *a, **k: engine)
     monkeypatch.setattr(lve, "_query_gpu_name", lambda: "FakeGPU")
+    # No GPU in the test: force the VRAM read to unknown so the climb starts at the base floor
+    # (5) deterministically, independent of whatever card the test machine actually has.
+    monkeypatch.setattr(sizer, "free_vram_gb", lambda *a, **k: (None, None))
     monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "dummy.mp4"))
     monkeypatch.setattr(vb.bv, "_load_config", lambda: {
         "video": {"work_root": str(tmp_path / "work"),
@@ -295,20 +341,21 @@ def fake_run(db_conn, tmp_path, monkeypatch):
 
 def test_run_benchmark_sweeps_records_and_learns(fake_run, db_conn):
     vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
-    assert fake_run.asked == [5, 9, 13, 17]                 # stopped at the first oom
-    rows = db.get_bench_probes(db_conn, "FakeGPU", "7b", 1920, 1080)
+    # Geometric climb 5->9->17(oom), then binary-refine mid(9,17)=13; ceiling 13 pinned.
+    assert fake_run.asked == [5, 9, 17, 13]                 # climb 5,9,17(oom); refine mid->13
+    rows = db.get_bench_probes(db_conn, "FakeGPU", "7b", 1920, 1080)   # returned sorted by batch
     assert [(r["batch"], r["outcome"]) for r in rows] == [(5, "ok"), (9, "ok"), (13, "ok"), (17, "oom")]
     # ceiling 13 landed in the sizer's learned store
     assert db.get_learned_batch(db_conn, "FakeGPU|7b", sizer.mp_bucket(2.0736)) == 13
 
 
 def test_run_benchmark_resumes_from_saved(fake_run, db_conn):
-    # Pre-seed a partial sweep (5, 9 already clean); a resume must continue at 13.
+    # Pre-seed a partial sweep (5, 9 already clean); a resume must continue the climb, not redo.
     for b in (5, 9):
         db.record_bench_probe(db_conn, "FakeGPU", "7b", 1920, 1080, b, "ok",
                               frames=37, seconds=100.0)
     vb.run_benchmark(["1080p"], frames=37, resume=True, batch_cap=33)
-    assert fake_run.asked == [13, 17]                       # skipped the saved 5, 9
+    assert fake_run.asked == [17, 13]                       # skipped the saved 5, 9; climb+refine
 
 
 def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeypatch):
@@ -339,6 +386,7 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
     import local_video_engine as lve
     monkeypatch.setattr(lve, "LocalVideoEngine", lambda *a, **k: eng)
     monkeypatch.setattr(lve, "_query_gpu_name", lambda: "FakeGPU")
+    monkeypatch.setattr(sizer, "free_vram_gb", lambda *a, **k: (None, None))   # floor -> 5
     monkeypatch.setattr(vb.bv, "_load_config", lambda: {
         "video": {"work_root": str(tmp_path / "work"),
                   "dit_model": "seedvr2_ema_7b_fp16.safetensors"},
@@ -352,6 +400,108 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
     assert max(b for b, _ in eng.asked) > 37
     assert vb.cell_ceiling([{"batch": b, "outcome": ("ok" if b <= 45 else "oom")}
                             for b, _ in eng.asked]) == 45
+
+
+# ── remote sweep (fake pod: no RunPod, no GPU) ───────────────────────────────
+
+class _FakeSession:
+    """Stand-in for remote_run.RemoteSession: records that the pod was torn down."""
+    def __init__(self):
+        self.pod_id = "pod-abc"
+        self.cost_per_hr = 0.69
+        self._funds_tripped = False
+        self.closed = False
+
+    def close(self, *a, **k):
+        self.closed = True
+
+
+def _remote_cfg(tmp_path):
+    return {"video": {"work_root": str(tmp_path / "work"),
+                      "dit_model": "seedvr2_ema_7b_fp16.safetensors"},
+            "upscale": {}, "seedvr2": {}, "runpod": {}}
+
+
+def test_run_benchmark_remote_keys_plain_id_and_tears_down(db_conn, tmp_path, monkeypatch):
+    """A REMOTE sweep keys the learned batch under the PLAIN RunPod id (what process_job's
+    auto-tuner reads), NOT the model-qualified local key, and tears the pod down at the end
+    (docs section 22.3)."""
+    engine = _FakeEngine()
+    session = _FakeSession()
+    monkeypatch.setattr(vb, "_deploy_remote_engine", lambda cfg, vcfg: (engine, session))
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    gpu = "NVIDIA GeForce RTX 5090"
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", gpu)
+
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33, remote=True)
+    assert summary["stopped"] is None
+    # A remote sweep warms the pod first (WARMUP_PROBES bs9 throwaways), then the measured
+    # climb 5,9,17(oom) + binary-refine mid->13.
+    assert engine.asked[:vb.WARMUP_PROBES] == [vb.WARMUP_BATCH] * vb.WARMUP_PROBES
+    assert engine.asked[vb.WARMUP_PROBES:] == [5, 9, 17, 13]
+    # probes stored under the RunPod id (returned sorted by batch; 17 is the recorded oom)
+    rows = db.get_bench_probes(db_conn, gpu, "7b", 1920, 1080)
+    assert (17, "oom") in [(r["batch"], r["outcome"]) for r in rows]
+    # learned batch stored under the PLAIN id (the remote run's read key), NOT gpu|model
+    assert db.get_learned_batch(db_conn, gpu, sizer.mp_bucket(2.0736)) == 13
+    assert db.get_learned_batch(db_conn, f"{gpu}|7b", sizer.mp_bucket(2.0736)) is None
+    # the remote RUN's auto-tuner seed (get_learned_batch_ge on the plain id) now finds it
+    assert db.get_learned_batch_ge(db_conn, gpu, sizer.mp_bucket(2.0736)) == 13
+    assert session.closed is True                            # pod torn down (billing stops)
+
+
+def test_remote_warmup_runs_but_is_not_recorded(db_conn, tmp_path, monkeypatch):
+    """The pod's cold first-forward cost is absorbed by throwaway bs9 warmups (a slow first
+    batch the user flagged). They run before the measured sweep but are NOT persisted, so they
+    can't pollute the ceiling or the throughput timing. Remote only."""
+    engine = _FakeEngine()
+    session = _FakeSession()
+    monkeypatch.setattr(vb, "_deploy_remote_engine", lambda cfg, vcfg: (engine, session))
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "GPU-warm")
+
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33, remote=True)
+    rows = db.get_bench_probes(db_conn, "GPU-warm", "7b", 1920, 1080)
+    # Every asked batch = WARMUP_PROBES warmups + the measured probes; only the measured ones
+    # are in the DB, so the warmups added exactly WARMUP_PROBES un-recorded passes.
+    assert len(engine.asked) == vb.WARMUP_PROBES + len(rows)
+    assert engine.asked[:vb.WARMUP_PROBES] == [vb.WARMUP_BATCH] * vb.WARMUP_PROBES
+
+
+def test_local_sweep_does_not_warm_up(fake_run, db_conn):
+    """The LOCAL path reloads the model per probe (fresh subprocess), so there is no warm state
+    to build -- warmup must be skipped, and the measured sweep starts immediately."""
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
+    assert fake_run.asked == [5, 9, 17, 13]                  # measured sweep, no warmup prefix
+
+
+def test_run_benchmark_remote_refuses_without_selected_gpu(tmp_path, monkeypatch):
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    monkeypatch.delenv("IMGTBX_GPU_OVERRIDE", raising=False)
+    deployed = []
+    monkeypatch.setattr(vb, "_deploy_remote_engine",
+                        lambda *a: (deployed.append(1), (None, None))[1])
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, remote=True)
+    assert summary["stopped"] == "no GPU selected"
+    assert deployed == []                                    # never spun a pod up
+
+
+def test_run_benchmark_remote_stops_on_funds_guard(db_conn, tmp_path, monkeypatch):
+    """The funds guard tripping ends the sweep cleanly (live accrual + guard is the only
+    money control; no separate cost cap)."""
+    engine = _FakeEngine()
+    session = _FakeSession()
+    session._funds_tripped = True                            # tripped before the first probe
+    monkeypatch.setattr(vb, "_deploy_remote_engine", lambda cfg, vcfg: (engine, session))
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "NVIDIA GeForce RTX 5090")
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, remote=True)
+    assert summary["stopped"] == "funds guard"
+    assert engine.asked == []                                # nothing probed after the trip
+    assert session.closed is True
 
 
 def test_download_verifies_hash(tmp_path):

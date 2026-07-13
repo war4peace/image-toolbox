@@ -97,3 +97,78 @@ def test_process_segment_records_streamed_byte_count(tmp_path, monkeypatch):
     # last_phase["bytes"] comes from the streamed count, not len(out) held in RAM.
     assert eng.last_phase["bytes"] == len(out_payload)
     assert eng.last_segment_seconds == 2
+
+
+# ── remote benchmark probe (section 22): submit /video/probe, poll, map the outcome ──
+
+def test_probe_submit_streams_the_clip_and_returns_id(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mkv"
+    src.write_bytes(b"c" * 4096)
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["clen"] = req.get_header("Content-length")
+        captured["data"] = req.data
+        return io.BytesIO(b'{"id": "p1"}')
+
+    monkeypatch.setattr(rve.urllib.request, "urlopen", fake_urlopen)
+    jid = _engine()._submit_probe(str(src), ".mkv", 1080, 9, -1)
+    assert jid == "p1"
+    assert "/video/probe" in captured["url"]
+    assert "batch_size=9" in captured["url"] and "temporal_overlap=-1" in captured["url"]
+    # streamed from the open file (Content-Length set, not read whole into RAM)
+    assert captured["clen"] == "4096"
+    assert hasattr(captured["data"], "read")
+
+
+def test_probe_batch_ok_end_to_end(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mkv"
+    src.write_bytes(b"C" * 4096)
+    seq = iter([
+        b'{"id": "p1"}',                                    # submit
+        b'{"state": "running"}',                            # first poll: not done yet
+        b'{"state": "done", "outcome": "ok", "resolved_batch": 9, '
+        b'"resolved_overlap": 6, "frames_written": 37, "seconds": 100.0, '
+        b'"peak_alloc_gb": 20.0, "peak_reserved_gb": 22.0}',
+    ])
+    monkeypatch.setattr(rve.urllib.request, "urlopen",
+                        lambda req_or_url, timeout=None: io.BytesIO(next(seq)))
+    res = _engine().probe_batch(str(src), str(tmp_path / "o.mp4"),
+                                resolution=1080, batch=9, frames=37, poll_interval=0)
+    assert res == {"outcome": "ok", "batch": 9, "overlap": 6, "frames": 37,
+                   "seconds": 100.0, "peak_alloc_gb": 20.0, "peak_reserved_gb": 22.0}
+
+
+def test_probe_batch_oom_is_a_result_not_a_raise(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mkv"
+    src.write_bytes(b"C" * 128)
+    seq = iter([b'{"id": "p2"}',
+                b'{"state": "done", "outcome": "oom", "resolved_batch": 73, '
+                b'"resolved_overlap": 12, "seconds": 30.0}'])
+    monkeypatch.setattr(rve.urllib.request, "urlopen",
+                        lambda req_or_url, timeout=None: io.BytesIO(next(seq)))
+    res = _engine().probe_batch(str(src), str(tmp_path / "o.mp4"),
+                                resolution=1080, batch=73, poll_interval=0)
+    assert res["outcome"] == "oom" and res["batch"] == 73
+    assert res["frames"] is None                           # an oom probe carries no frames
+
+
+def test_probe_batch_stops_responsively(tmp_path, monkeypatch):
+    src = tmp_path / "clip.mkv"
+    src.write_bytes(b"C" * 128)
+    # submit returns an id; the first poll sees should_stop -> 'stopped' (no pod-loss raise).
+    monkeypatch.setattr(rve.urllib.request, "urlopen",
+                        lambda req_or_url, timeout=None: io.BytesIO(b'{"id": "p3"}'))
+    res = _engine().probe_batch(str(src), str(tmp_path / "o.mp4"),
+                                resolution=1080, batch=9, poll_interval=0,
+                                should_stop=lambda: True)
+    assert res["outcome"] == "stopped"
+
+
+def test_probe_await_raises_on_lost_job(tmp_path, monkeypatch):
+    # A worker that forgot the job (restarted) is a POD loss, not a probe result -> raise.
+    monkeypatch.setattr(rve.urllib.request, "urlopen",
+                        lambda req_or_url, timeout=None: io.BytesIO(b'{"state": "unknown"}'))
+    with pytest.raises(rve.RemoteVideoError):
+        _engine()._await_probe("gone", 9, poll_interval=0)

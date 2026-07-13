@@ -514,7 +514,7 @@ class LocalVideoEngine:
         # Default overlap = the sizer's quality-floored auto value for this batch (>=6 once
         # the window allows), so a benchmark ceiling is measured at the overlap real runs use.
         ov = (_sizer.auto_overlap(b) if _sizer is not None
-              else (max(0, b - 1) if b <= 6 else max(6, round(b / 6))))
+              else (max(0, b - 1) if b <= 6 else min(15, max(6, round(b / 6)))))
         if overlap is not None:
             ov = min(max(0, int(overlap)), max(0, b - 1))
         _b, ov, chunk = self._resolve_window(b, 0, ov, frames)

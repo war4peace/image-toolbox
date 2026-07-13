@@ -11,6 +11,7 @@ batch. The findings feed the sizer (AUTO batch) and the local time estimate auto
 
 import os
 import json
+import time
 import queue
 import codecs
 import threading
@@ -23,8 +24,9 @@ import video_benchmark as vb
 import video_estimate as ve
 import video_vram_sizer as sizer
 from gui.common import (APP_ROOT, APP_TITLE, CFG, GUI_MARKER, PYTHON_EXE, SCRIPT_DIR,
-                        CREATE_NO_WINDOW, _geometry_on_screen, save_settings)
-from gui.widgets import ConsoleBuffer, LogPane, Tooltip
+                        CREATE_NO_WINDOW, _geometry_on_screen, save_settings,
+                        fmt_funds, funds_color, config_funds_floor, _FUNDS_GREY)
+from gui.widgets import ConsoleBuffer, LogPane, TelemetryRow, Tooltip
 
 
 def _fmt_hms(seconds):
@@ -45,14 +47,22 @@ class BenchmarkWindow(tk.Toplevel):
     # holding VRAM and a benchmark would under-report the ceiling: warn (but don't block).
     VRAM_BUSY_WARN_GB = 2.5
 
-    def __init__(self, master, tab):
+    def __init__(self, master, tab, remote=False, gpu=None):
         super().__init__(master)
         # Build hidden, reveal once fully laid out: a Toplevel is mapped at a default size
         # first, which flashed a tiny square before our geometry + widgets applied.
         self.withdraw()
         self.tab = tab
         self.app = getattr(tab, "app", None)
-        self.title(f"{APP_TITLE} — Benchmark GPU")
+        # Remote mode (docs section 22): benchmark a rented pod GPU instead of the local
+        # card. `gpu` is the picker's selection ({id, name, memory_gb, price, stock}); its
+        # id IS the RunPod id the run reads its learned batch under, so no local detect.
+        self.remote = bool(remote)
+        self.remote_gpu = gpu or {}
+        self._remote_rate = None            # pod's billed $/h (RCOST); live accrued cost
+        self._run_start = None              # when the pod went live (billing clock)
+        self._funds_job = None              # after() id for the remote balance poller
+        self.title(f"{APP_TITLE} — Benchmark GPU" + (" (Remote)" if self.remote else ""))
         try:
             self.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
         except Exception:
@@ -136,10 +146,18 @@ class BenchmarkWindow(tk.Toplevel):
         tk.Label(self, textvariable=self.header_var, anchor="w",
                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="ew", pady=(10, 2), **pad)
 
-        info = ("Upscales a short generated clip at rising batch sizes until it runs out of "
-                "VRAM, to find the largest safe window per target on THIS card. Results are "
-                "saved and used automatically for local runs (batch sizing + time estimate). "
-                "Stopping is safe: it resumes where it left off.")
+        if self.remote:
+            info = ("Deploys a pod for the selected GPU and upscales a short generated clip at "
+                    "rising batch sizes until it runs out of VRAM, to find the largest safe "
+                    "window per target on THAT card. Results are saved and used automatically "
+                    "for remote runs on this GPU (batch sizing). The pod is billed while it "
+                    "runs; stopping is safe (it tears the pod down and resumes where it left "
+                    "off next time).")
+        else:
+            info = ("Upscales a short generated clip at rising batch sizes until it runs out of "
+                    "VRAM, to find the largest safe window per target on THIS card. Results are "
+                    "saved and used automatically for local runs (batch sizing + time estimate). "
+                    "Stopping is safe: it resumes where it left off.")
         tk.Message(self, text=info, width=680, anchor="w", justify="left",
                    fg="#7f8a99").grid(row=1, column=0, sticky="ew", **pad)
 
@@ -208,17 +226,51 @@ class BenchmarkWindow(tk.Toplevel):
         self.vram_warn_lbl.grid(row=4, column=0, sticky="ew", pady=(6, 0), **pad)
         self.vram_warn_lbl.grid_remove()
 
-        # Estimate + status.
+        # Estimate / live pod-cost (left) + the RunPod account balance (right), so the
+        # money picture is visible in one glance during a paid sweep, mirroring the
+        # bottom-bar "Funds" readout the remote-capable tabs use. Funds is REMOTE-only
+        # (a local sweep bills nothing) and colour-banded against the funds floor.
+        cost_row = ttk.Frame(self)
+        cost_row.grid(row=5, column=0, sticky="ew", pady=(6, 0), **pad)
+        cost_row.columnconfigure(0, weight=1)
         self.estimate_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self.estimate_var, anchor="w",
-                 fg="#2f6f3f").grid(row=5, column=0, sticky="ew", pady=(6, 0), **pad)
+        tk.Label(cost_row, textvariable=self.estimate_var, anchor="w",
+                 fg="#2f6f3f").grid(row=0, column=0, sticky="ew")
+        if self.remote:
+            self.funds_var = tk.StringVar(value="Funds: …")
+            self.funds_lbl = tk.Label(cost_row, textvariable=self.funds_var, anchor="e",
+                                      fg=_FUNDS_GREY, font=("Consolas", 9))
+            self.funds_lbl.grid(row=0, column=1, sticky="e", padx=(12, 0))
+            Tooltip(self.funds_lbl,
+                    "Your RunPod account balance, coloured by how far it sits above the "
+                    "configured funds floor. The funds guard auto-stops the sweep if it "
+                    "nears the floor. Unreadable balance never blocks a run (fail-safe).")
+            self.after(300, self._tick_funds)           # live from window-open, not just mid-run
         self.status_var = tk.StringVar(value="")
         tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
                  font=("Consolas", 9)).grid(row=6, column=0, sticky="ew", **pad)
 
+        # Live telemetry row, matching the Upscaler/Video tabs (Feature #3a/#4) and
+        # published to MQTT. LOCAL: this machine's CPU/RAM/GPU (App feeds it + system/*).
+        # REMOTE: the POD's readout, fed by the runner's RTELEM stream via
+        # App.apply_remote_telemetry (+ system/remote/*). Only the mode's row is created.
+        if self.remote:
+            self.remote_telemetry_row = TelemetryRow(self, prefix="Remote pod")
+            self.remote_telemetry_row.grid(row=7, column=0, sticky="ew", pady=(4, 0), **pad)
+            self.remote_telemetry_row.grid_remove()     # revealed on the first sample
+        else:
+            self.telemetry_row = TelemetryRow(self)
+            self.telemetry_row.grid(row=7, column=0, sticky="ew", pady=(4, 0), **pad)
+            # Register with the App so its sampler (idle + our faster in-run tick) feeds this
+            # row AND publishes system/*; unregistered on close so the destroyed widget leaks
+            # nothing. Kick one sample now so it is live immediately, not "sampling…".
+            if self.app is not None and self.telemetry_row not in self.app.telemetry_rows:
+                self.app.telemetry_rows.append(self.telemetry_row)
+                self.after(200, self.app.sample_telemetry)
+
         # Buttons.
         bf = ttk.Frame(self)
-        bf.grid(row=7, column=0, sticky="ew", pady=(8, 10), **pad)
+        bf.grid(row=8, column=0, sticky="ew", pady=(8, 10), **pad)
         bf.columnconfigure(2, weight=1)
         self.start_btn = ttk.Button(bf, text="Start", command=self._start, state="disabled")
         self.start_btn.grid(row=0, column=0)
@@ -234,6 +286,16 @@ class BenchmarkWindow(tk.Toplevel):
     # ── GPU detection + prior results ────────────────────────────────────────
 
     def _detect_gpu(self):
+        # Remote: the card is whatever the user picked in the GPU list, not a local probe.
+        # Shape it like sample_gpu's (used_mb, total_mb, temp) so _fill_gpu is unchanged;
+        # there is no live "used VRAM" for a pod that isn't deployed yet, so used=0.
+        if self.remote:
+            vram_gb = self.remote_gpu.get("memory_gb") or 0
+            g = (0, int(vram_gb) * 1024, None)
+            name = self.remote_gpu.get("id") or self.remote_gpu.get("name") or "remote GPU"
+            self.after(0, lambda: self._fill_gpu(g, name))
+            return
+
         def work():
             try:
                 import system_telemetry as st
@@ -334,7 +396,7 @@ class BenchmarkWindow(tk.Toplevel):
                 continue
             ceil = vb.cell_ceiling(probes)
             saved = vb.throughput_optimal_batch(probes)
-            done = vb.next_batch(probes, vb.batch_series()) is None
+            done = vb.cell_done(probes)
             self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)", saved=saved)
 
     @property
@@ -388,18 +450,20 @@ class BenchmarkWindow(tk.Toplevel):
         targets = self._selected_targets()
         if not targets:
             return
-        # Re-check VRAM occupancy at the last moment: warn (don't block) if other apps are
-        # holding VRAM, since a contended sweep records an artificially low ceiling.
-        used, _tot = self._sample_used_vram()
-        self._refresh_vram_warning()
-        if used is not None and used > self.VRAM_BUSY_WARN_GB:
-            if not messagebox.askyesno(
-                    APP_TITLE,
-                    f"{used:.1f} GB of VRAM is already in use by other applications.\n\n"
-                    "Close all non-essential applications for best benchmarking results. "
-                    "Running now will measure a lower ceiling than this card can really do.\n\n"
-                    "Benchmark anyway?", parent=self):
-                return
+        # LOCAL only: re-check VRAM occupancy at the last moment and warn (don't block) if
+        # other apps are holding VRAM, since a contended sweep records an artificially low
+        # ceiling. A pod is dedicated, so this never applies remotely.
+        if not self.remote:
+            used, _tot = self._sample_used_vram()
+            self._refresh_vram_warning()
+            if used is not None and used > self.VRAM_BUSY_WARN_GB:
+                if not messagebox.askyesno(
+                        APP_TITLE,
+                        f"{used:.1f} GB of VRAM is already in use by other applications.\n\n"
+                        "Close all non-essential applications for best benchmarking results. "
+                        "Running now will measure a lower ceiling than this card can really do.\n\n"
+                        "Benchmark anyway?", parent=self):
+                    return
         if self.restart_var.get():
             if not messagebox.askyesno(
                     APP_TITLE, "Discard this card's saved benchmark results and start over?",
@@ -407,6 +471,8 @@ class BenchmarkWindow(tk.Toplevel):
                 return
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "video_benchmark.py"),
                "--targets", ",".join(targets)]
+        if self.remote:
+            cmd.append("--remote")
         if self.restart_var.get():
             cmd.append("--restart")
             for t in targets:                          # clear the table rows we're redoing
@@ -414,6 +480,14 @@ class BenchmarkWindow(tk.Toplevel):
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        if self.remote:
+            # The runner keys the learned batch under this id (what a remote run reads),
+            # and RemoteSession deploys exactly this card (no substitution, 0.4.0).
+            env["IMGTBX_GPU_OVERRIDE"] = self.remote_gpu.get("id", "")
+            # The picked card's VRAM seeds the runner's VRAM-aware batch floor (skip the low
+            # rungs a big card obviously clears). Blank if the picker didn't carry it.
+            env["IMGTBX_GPU_VRAM_GB"] = str(self.remote_gpu.get("memory_gb") or "")
+            self._run_start = time.time()              # billing clock (refined by the POD event)
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=APP_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -431,9 +505,59 @@ class BenchmarkWindow(tk.Toplevel):
         self.close_btn.configure(state="disabled")
         for w in self._toggles:                        # the plan is fixed for the run
             w.configure(state="disabled")
-        self.status_var.set("Starting benchmark …")
+        self.status_var.set("Deploying pod …" if self.remote else "Starting benchmark …")
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
+        if self.remote:
+            self.after(1000, self._tick_cost)
+        else:
+            self.after(1000, self._telemetry_tick)
+
+    def _telemetry_tick(self):
+        """Faster LOCAL-GPU sampling while a local sweep runs (the App idle sampler is a
+        slow 60 s), so VRAM climbing with the batch is visible live. Self-cancels when the
+        run ends; the App's idle sampler keeps the row live afterwards. Remote pods report
+        through RTELEM instead, so this is local-only."""
+        if self.proc is None or self.remote or self.app is None:
+            return
+        try:
+            self.app.sample_telemetry()
+        except Exception:                              # noqa: BLE001
+            pass
+        self.after(5000, self._telemetry_tick)
+
+    def _tick_cost(self):
+        """Live accrued-cost readout for a remote sweep (no cap; the funds guard is the
+        safety net). Self-cancels when the run ends; the last value stays on screen."""
+        if self.proc is None or not self.remote:
+            return
+        if self._remote_rate and self._run_start:
+            spent = self._remote_rate * (time.time() - self._run_start) / 3600.0
+            self.estimate_var.set(f"Pod cost so far: ${spent:.2f}  (${self._remote_rate:.2f}/h)")
+        self.after(1000, self._tick_cost)
+
+    def _tick_funds(self):
+        """Live RunPod balance readout for a remote sweep, mirroring the bottom-bar 'Funds'.
+        Reads the App's SHARED balance cache (one fetch source for the whole app) and nudges a
+        refresh; the App's fetch is 30 s-gated + off-thread, so this never hammers the API.
+        Runs from window-open (the balance matters before you start a paid sweep) for the
+        window's lifetime; self-cancels once the window is gone. Fail-safe throughout."""
+        if not self.remote:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            if self.app is not None:
+                self.app._fetch_funds_async()          # 30 s-gated, off-thread, fail-safe
+            text, bal = fmt_funds(getattr(self.app, "_funds_cache", None))
+            self.funds_var.set(f"Funds: {text}")
+            self.funds_lbl.configure(fg=funds_color(bal, config_funds_floor()))
+        except Exception:                              # noqa: BLE001
+            pass
+        self._funds_job = self.after(5000, self._tick_funds)
 
     def _stop(self):
         if self.proc and self.proc.poll() is None:
@@ -518,9 +642,30 @@ class BenchmarkWindow(tk.Toplevel):
         self._handle_event(kind, data)
 
     def _handle_event(self, kind, data):
+        if kind == "RTELEM" and data and self.app is not None:
+            # Pod telemetry (remote sweep): render in the 'Remote pod' row + MQTT
+            # system/remote/*, exactly like a real remote run.
+            try:
+                self.app.apply_remote_telemetry(self, data)
+            except Exception:                          # noqa: BLE001
+                pass
+            return
+        if kind == "POD":
+            # Remote: pod id (non-empty) => live and billing; empty => torn down.
+            if data:
+                self._run_start = self._run_start or time.time()
+                self.status_var.set(f"Pod live ({data}); benchmarking …")
+            return
+        if kind == "RCOST":
+            try:
+                self._remote_rate = float(data)
+            except (TypeError, ValueError):
+                self._remote_rate = None
+            return
         if kind == "BSTART" and data:
             n = len(data.get("plan") or [])
-            self.status_var.set(f"Benchmarking {n} target(s) on {data.get('gpu')} …")
+            where = "a pod" if data.get("remote") else data.get("gpu")
+            self.status_var.set(f"Benchmarking {n} target(s) on {where} …")
         elif kind == "BCELL" and data:
             self._set_ceiling(data["name"], None, "benchmarking …")
         elif kind == "BPROBE" and data:
@@ -556,6 +701,14 @@ class BenchmarkWindow(tk.Toplevel):
         self.start_btn.configure(state="normal")
         for w in self._toggles:
             w.configure(state="normal")
+        # The pod is torn down when a remote sweep ends: hide its telemetry row and zero the
+        # retained system/remote/* topics so a gone pod leaves no stale readings in HA. A
+        # restart deploys a new pod and RTELEM reveals the row again.
+        if self.remote and self.app is not None:
+            try:
+                self.app.clear_remote_telemetry(self)
+            except Exception:                          # noqa: BLE001
+                pass
         self._apply_feasibility()                      # keep infeasible targets gated
         for t in self.ALL_TARGETS:                     # reflect the persisted final state
             box = vb.TARGETS[t]
@@ -564,7 +717,7 @@ class BenchmarkWindow(tk.Toplevel):
             if probes:
                 ceil = vb.cell_ceiling(probes)
                 saved = vb.throughput_optimal_batch(probes)
-                done = vb.next_batch(probes, vb.batch_series()) is None
+                done = vb.cell_done(probes)
                 cur = self.tree.set(self._rows.get(t, self._ensure_row(t)), "status")
                 if not cur.startswith("done") and not cur.startswith("can't"):
                     self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)",
@@ -612,5 +765,25 @@ class BenchmarkWindow(tk.Toplevel):
             self.console.remove_observer(self._on_console)
         except Exception:                              # noqa: BLE001
             pass
+        if self._funds_job is not None:                # stop the balance poller
+            try:
+                self.after_cancel(self._funds_job)
+            except Exception:                          # noqa: BLE001
+                pass
+            self._funds_job = None
+        # Detach telemetry so the destroyed widget leaks nothing and no stale pod readings
+        # linger: unregister the local row from the App's sampler; hide + zero the remote row.
+        if self.app is not None:
+            try:
+                row = getattr(self, "telemetry_row", None)
+                if row is not None and row in self.app.telemetry_rows:
+                    self.app.telemetry_rows.remove(row)
+            except Exception:                          # noqa: BLE001
+                pass
+            if self.remote:
+                try:
+                    self.app.clear_remote_telemetry(self)
+                except Exception:                      # noqa: BLE001
+                    pass
         self._restore_master()
         self.destroy()

@@ -494,7 +494,8 @@ transfer to the 3090, so a hand-fit curve can't be the source of truth):
   are untouched, and the sizer converges to each real card+model over time (exactly like the
   remote path self-improves `db.gpu_perf`). `get_learned_batch` is still free-VRAM-clamped.
 - **Overlap** is the quality-floored `auto_overlap` (>= 6, the measured seam-free minimum),
-  clamped below the batch (so bs5 -> ov4, bs9+ -> ov6).
+  capped at 15 (the seam is a local transition; batch/6 ran away to 80 at batch 480, redundant
+  compute for no visible gain), clamped below the batch (so bs5 -> ov4, bs9+ -> ov6, bs480 -> ov15).
 
 Wired into `LocalVideoEngine.__init__(conn=, gpu_id=)` and `process_segment`: on AUTO
 (`batch<=0`) the sizer picks the window from the output size; the OOM-retry loop remains a
@@ -662,21 +663,45 @@ with measurement. It is the sanctioned place to push UPWARD to failure, safe to 
 because each probe is an isolated subprocess (a failed probe's fragmented VRAM dies with its
 process instead of poisoning the next, 14.2/14.3).
 
-**Flow.** A modal (`gui/video_benchmark.py`, "Benchmark GPU…" button, Local mode only)
+**Flow.** A modal (`gui/video_benchmark.py`, "Benchmark GPU…" button; Local or Remote mode)
 detects the card, loads any prior results, shows a rough runtime estimate, and drives
-`scripts/video_benchmark.py`. For each selected target the runner sweeps batches **upward in
-4n+1 steps** (5, 9, ... up to a cap of 65 -- deliberately PAST the sizer's AUTO cap of 33,
-since a big card's true ceiling is higher) on a short clip, via
-**`LocalVideoEngine.probe_batch`** (a fixed-batch, no-step-down wrapper over the fresh-subprocess
-`local_video_worker.py`). It stops a target at the first OOM/thrash; the last clean batch is the
-ceiling.
+`scripts/video_benchmark.py`. For each selected target the runner searches for the batch
+ceiling on a short clip, via **`LocalVideoEngine.probe_batch`** (local: a fixed-batch,
+no-step-down wrapper over the fresh-subprocess `local_video_worker.py`) or
+**`RemoteVideoEngine.probe_batch`** (remote: the pod's resident engine, section 22).
+
+The search is a **VRAM-aware geometric climb**, not a linear rung-by-rung sweep (the latter is
+untenable now the cap is **3000**: a PRO 6000 at 0.4 MP never reached the old 513 wall, using
+only 42/96 GB). Two parts:
+
+- **Floor (VRAM-dependent):** `sizer.vram_floor_batch(total_gb, mp)` inverts the working-set
+  model to a starting rung that a big card obviously clears, so the sweep opens near the
+  interesting region instead of crawling from 5 (e.g. ~337 for 0.4 MP on 96 GB). Conservative
+  by construction (the 3090-offload model over-predicts on a resident big card), which is fine
+  because the climb reaches the wall from here in a few doublings.
+- **Ceiling (measured):** `next_batch` DOUBLES the largest ok batch until an OOM/thrash
+  overshoots the wall, then **binary-refines downward** between the last ok and the failure to
+  pin the exact max-fit 4n+1 rung. This is why the runner does NOT stop at the first OOM (the
+  overshoot is intentional); the cell ends when `next_batch` returns None. A ~1500 ceiling is
+  found in ~a dozen probes instead of ~370. `cell_done` exposes the same terminal test to the
+  GUI (floor-independent) so it can render saved vs partial.
+
+**Warm-up (remote only).** `torch.compile` is on by default and compiles per RESOLUTION, so the
+FIRST probe of each cell is cold (compile + kernel autotune) and its s/frame is inflated. Before
+a cell's measured probes the runner runs `WARMUP_PROBES` (2) discarded **bs9** upscales at the
+cell's resolution (`_warmup_cell`), so the cold cost is paid on 9 throwaway frames instead of the
+first (large, floor-sized) measured probe. It is REMOTE only: the local path reloads the model in
+a fresh subprocess per probe, so every probe is cold by design and there is no warm state to
+build. Warmups are best-effort (never fail a run) and are NOT persisted, so they can't pollute the
+ceiling or the throughput timing.
 
 **Persistence + resume.** Every probe is written to **`db.video_bench`** the instant it
 finishes (`gpu_id, model, out_w, out_h, batch -> outcome/frames/seconds/peak`). So a **Stop**
 (stdin `q`, which kills the in-flight probe's subprocess and discards only that partial) is
-graceful, and re-opening **resumes at the nearest untried batch** (`next_batch` skips recorded
-probes; a recorded failure ends the cell). The pure sweep logic (`build_plan`, `batch_series`,
-`next_batch`, `cell_ceiling`, `estimate_runtime`) is separated from the GPU driving and
+graceful, and re-opening **resumes the climb/refine** from the recorded probes (`next_batch`
+reconstructs the search state, floor-independent, from what's persisted). The pure search logic
+(`build_plan`, `vram_floor_batch`, `next_batch`, `cell_done`, `cell_ceiling`,
+`throughput_optimal_batch`, `estimate_runtime`) is separated from the GPU driving and
 unit-tested.
 
 **Outputs.** Per finished cell, `_record_cell_result` copies the ceiling into the sizer's
@@ -758,3 +783,126 @@ benchmark-raises-the-cap path, and the runner defer are unit-tested
 **Not yet:** the arbitrary explicit-resolution entry (the other half of section 6), and a
 VRAM-aware remote GPU-list pre-filter for ratio targets (the queue-grey + Start guard cover
 correctness meanwhile).
+
+## 22. Planned: extending the benchmark to remote pods (0.5.0-experimental)
+
+Sections 20/21 benchmark the LOCAL card. This extends the SAME suite to a rented RunPod GPU,
+so a user can measure the optimal batch (temporal window) for a card they intend to upscale
+ON, before paying for a real run. It is NOT a local-vs-remote comparison: Windows and Linux,
+resident vs offload, and the pod's `cudaMallocAsync` allocator all differ enough that
+cross-machine GPU-to-GPU numbers would be meaningless. The remote benchmark's only job is to
+learn "the best batch for THIS card, upscaling on a pod", and feed it back to remote runs.
+
+### 22.1 Method: mirror production, in-process on the pod (no probe isolation)
+
+The local suite isolates each probe in a fresh subprocess (20), because a failed probe's
+fragmented VRAM poisons the next one on Windows (14.2/14.3). That model does NOT carry to the
+pod, and it must not: a resident worker loads the 7B model once, and restarting it per probe
+would reload from the network volume (a minute-plus each) tens of times per sweep, all billed.
+So the remote benchmark runs each probe **in-process in the resident worker**, exactly the way
+a real segment runs (`process_video`), with `reset_peak_memory_stats` -> one window ->
+`max_memory_reserved` -> `empty_cache` between probes. This is what `pod/bench_video.py`'s
+inner loop already did (its Phase-1 measurement tool); the extension turns that loop into a
+worker endpoint the existing sweep orchestration can drive. On Linux + `cudaMallocAsync`, freed
+memory returns to the driver pool between probes, so an in-process upward sweep measures a
+representative ceiling; and since the goal is "what a real pod run does", mirroring the
+production path is the RIGHT measurement anyway, not a compromise.
+
+### 22.2 Reuse: the engine seam again
+
+`scripts/video_benchmark.py`'s `run_benchmark` already talks to the engine ONLY through
+`engine.probe_batch(clip, out, resolution=, batch=, frames=, should_stop=)` (20). So the
+extension is an **engine swap**, mirroring how "local video" was mostly swapping the injected
+engine (section 4):
+
+- **`pod/worker.py` gains `POST /video/probe`** (async, like `/video/submit`): upload a short
+  clip + `resolution` + `batch` + `overlap`, the worker runs ONE window in-process with **no
+  OOM step-down** (the sweep must SEE the OOM to find the ceiling, so the production recovery
+  is deliberately bypassed here), and reports `{outcome: ok|oom|error, seconds, frames,
+  peak_alloc_gb, peak_reserved_gb}` via `/video/status`. No `/video/fetch` (the upscaled
+  output is discarded; only the measurement matters).
+- **`remote_video_engine.py` gains `RemoteVideoEngine.probe_batch`** with the IDENTICAL
+  signature + return contract as `LocalVideoEngine.probe_batch` (never raises on OOM; returns
+  the outcome dict). It submits to `/video/probe`, polls, and returns the dict.
+- **`run_benchmark` becomes engine-agnostic**: a `--remote` path constructs the remote engine
+  (via a deployed pod, below) instead of `LocalVideoEngine`; the sweep, `next_batch`, resume,
+  `drop_collapsed`, `throughput_optimal_batch`, persistence and `@@TBX@@` events are reused
+  unchanged.
+
+The clip is generated **locally** (`benchmark_clip.ensure_source_clip`, unchanged) and uploaded
+per probe. It is small relative to the probe's GPU time (a few MB even at a big batch), so a
+per-probe upload is cheaper than the machinery to synthesise it pod-side, and it keeps
+`run_benchmark` identical across local/remote.
+
+### 22.3 Keying: write where the remote run reads (the linchpin)
+
+The remote RUN's adaptive batch tuner already CONSUMES learned batches, with no change needed:
+`process_job` reads `db.get_learned_batch_ge(IMGTBX_GPU_OVERRIDE, mp_bucket)` (the RunPod GPU
+id from the picker, `_mp_bucket` on the fine 0.05-MP grid) to seed the first segment. So the
+remote benchmark simply has to WRITE the learned batch under that same key:
+
+- **Learned batch:** `db.put_learned_batch(gpu_id, mp_bucket, saved)` with `gpu_id =
+  IMGTBX_GPU_OVERRIDE` (the RunPod id) and **NO `|model_tag` suffix** -- the remote run reads
+  the PLAIN id, whereas the local sizer reads `f"{gpu_id}|{tag}"`. `_record_cell_result` picks
+  the key by mode. Matching the run's *current* (un-model-qualified) behaviour is a deliberate
+  scaffolding decision: benchmarking with 7B then running 3B would cross-feed, exactly as the
+  run already behaves today; model-qualifying BOTH sides is a separate later cleanup, not part
+  of this.
+- **`gpu_id` for the sweep:** local uses `_query_gpu_name()`; remote uses `IMGTBX_GPU_OVERRIDE`
+  (the pod's card is not the local card). The per-probe resume rows (`db.video_bench`, keyed
+  `gpu_id, model, out_w, out_h, batch`) keep their own `model` column and are unaffected.
+- **Local vs remote never collide:** the id namespaces are disjoint (local nvidia-smi name vs
+  RunPod id, noted in `db.py`), so a card benchmarked both ways keeps two independent buckets,
+  which is correct (resident-remote and offload-local ceilings genuinely differ).
+
+**Known gap (rate, not batch):** `_record_cell_result` also records a rate into `db.gpu_perf`.
+The remote ESTIMATE reads that with a 300-MP trust floor (`seconds_per_mp`), which one short
+benchmark probe won't clear, so the estimate won't immediately pick up remote benchmark timing
+(the local path dropped its floor to 40 MP for exactly this reason). The BATCH -- the actual
+"optimal setting" this feature exists to learn -- is unaffected (the run's tuner has no such
+floor). Lowering the remote rate floor for benchmark-origin data is a documented follow-up, not
+scaffolding.
+
+### 22.4 Pod lifecycle, cost, and the UI flow
+
+The benchmark needs a deployed pod, wired the same way a run is (`remote_run.RemoteSession`,
+`mode="video"`):
+
+- **GPU choice comes from the picker.** On the Video tab: pick **Remote**, refresh the GPU
+  list, select the card, press **Benchmark GPU…**. The window opens with that selection, and
+  Start deploys a pod for THAT card (`IMGTBX_GPU_OVERRIDE` = the picked id). If the card is out
+  of stock at deploy time the run fails cleanly and the message lands in the benchmark log
+  (`RemoteSession` already emits "Pod start failed …"; no GPU substitution, 0.4.0).
+- **Cost = live accrual + funds guard**, no separate cap (a sweep runs to OOM so its runtime
+  is unpredictable; a cap would cut a sweep mid-cell). The same `funds_guard` + dead-man's
+  switch + `$/h` readout a run uses; teardown on completion, Stop, and failure via the run's
+  `close_session` semantics.
+- **GUI delta (small).** Today the "Benchmark GPU…" button is Local-only (hidden in Remote by
+  `_apply_mode_ui`) and `_open_benchmark` passes no GPU. The change: show the button in Remote
+  too, pass `_selected_gpu()` into `BenchmarkWindow`, and give the window a remote branch that
+  skips the local `system_telemetry` detect (using the picked card's name + VRAM), swaps the
+  local "other apps hold VRAM" warning for pod-deploy/cost status, and gates feasibility on the
+  picked card's VRAM (a rented 5090/H100 reaches 4K, which the local gate would forbid).
+- **Telemetry row (+ MQTT), for parity with the tabs.** The window carries a live `TelemetryRow`
+  just like the Upscaler/Video tabs: LOCAL shows this machine's CPU/RAM/GPU (registered with the
+  App's sampler, so it also publishes `system/*`); REMOTE shows the POD's readout, fed by the
+  runner streaming `RTELEM` events (`bv._start_remote_telemetry`, the same sampler a real run
+  uses) into `App.apply_remote_telemetry`, which also publishes `system/remote/*`. The remote row
+  and its retained MQTT topics are zeroed when the sweep ends / the pod is torn down
+  (`clear_remote_telemetry`), so Home Assistant sees no stale readings.
+
+### 22.5 Build order
+
+1. `pod/worker.py`: `POST /video/probe` (+ its status/outcome), in-process, no step-down.
+2. `remote_video_engine.py`: `RemoteVideoEngine.probe_batch` (submit/poll, outcome dict).
+3. `scripts/video_benchmark.py`: `--remote` / engine-agnostic `run_benchmark`; mode-aware
+   `gpu_id` + learned-batch key in `_record_cell_result`.
+4. Remote deploy/teardown + funds guard wiring in the remote benchmark path (reuse
+   `RemoteSession` + the run's session helpers).
+5. GUI: button visibility + pass the selected GPU + `BenchmarkWindow` remote branch.
+6. Tests (GPU-free): the remote key selection, the engine-agnostic sweep against a fake remote
+   engine, `probe_batch` outcome mapping.
+
+Public/shared benchmark aggregation (results surfaced in the GPU picker as expected
+performance) stays a later phase; this section is the scaffolding that makes a remote card
+benchmarkable and its result consumed by the user's own remote runs.
