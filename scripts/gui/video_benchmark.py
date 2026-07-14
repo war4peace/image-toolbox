@@ -191,17 +191,21 @@ class BenchmarkWindow(tk.Toplevel):
         self.rowconfigure(3, weight=1)
         rf.rowconfigure(1, weight=1)          # the log grows; the 5-row table stays put
         rf.columnconfigure(0, weight=1)
-        cols = ("ceiling", "saved", "overlap", "spf", "peak", "status")
+        cols = ("ceiling", "saved", "overlap", "spf", "peak", "status", "runtime")
         self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=5)
         self.tree.column("#0", width=110, stretch=False)
         self.tree.heading("#0", text="Target")
         # "Max batch" = how far the card pushed (the raw ceiling); "Used" = the batch AUTO
         # actually runs (the fastest window, which can be lower: the ceiling rides VRAM spill).
+        # "Runtime" = the GPU time this target's probes took (summed from the saved probes, so it
+        # persists and re-accumulates correctly on resume).
         for c, txt, w in (("ceiling", "Max batch", 84), ("saved", "Used", 60),
                           ("overlap", "Overlap", 66), ("spf", "s/frame", 74),
-                          ("peak", "Peak VRAM", 104), ("status", "Status", 180)):
+                          ("peak", "Peak VRAM", 104), ("status", "Status", 180),
+                          ("runtime", "Runtime", 78)):
             self.tree.heading(c, text=txt)
-            self.tree.column(c, width=w, stretch=(c == "status"), anchor="w")
+            self.tree.column(c, width=w, stretch=(c == "status"),
+                             anchor=("e" if c == "runtime" else "w"))
         self.tree.grid(row=0, column=0, sticky="ew")
         sb = ttk.Scrollbar(rf, orient="vertical", command=self.tree.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -213,8 +217,14 @@ class BenchmarkWindow(tk.Toplevel):
         logf.columnconfigure(0, weight=1)
         ttk.Label(logf, text="Program output (no engine diagnostics)",
                   foreground="#666").grid(row=0, column=0, sticky="w")
+        # Auto scroll: on (default) follows the newest line; off freezes the view so the user
+        # can read back through a running sweep without being yanked to the bottom. Mirrors the
+        # floating LogViewer's toggle.
+        self.autoscroll = tk.BooleanVar(value=True)
+        ttk.Checkbutton(logf, text="Auto scroll", variable=self.autoscroll).grid(
+            row=0, column=1, sticky="e")
         self.log_pane = LogPane(logf)
-        self.log_pane.grid(row=1, column=0, sticky="nsew")
+        self.log_pane.grid(row=1, column=0, columnspan=2, sticky="nsew")
         # Mirror the clean output stream into the embedded pane (same observer pattern the
         # old floating log window used).
         self.console.add_observer(self._on_console)
@@ -393,6 +403,7 @@ class BenchmarkWindow(tk.Toplevel):
                 self.conn, self.gpu_id, self.model_tag, box[0], box[1]))
             if not probes:
                 self.tree.set(self._rows[t], "status", "not benchmarked")
+                self._set_runtime(t)
                 continue
             ceil = vb.cell_ceiling(probes)
             saved = vb.throughput_optimal_batch(probes)
@@ -417,6 +428,21 @@ class BenchmarkWindow(tk.Toplevel):
         ov_b = saved or ceil
         self.tree.set(iid, "overlap", str(sizer.auto_overlap(ov_b)) if ov_b else "—")
         self.tree.set(iid, "status", status)
+        self._set_runtime(target)
+
+    def _cell_runtime_s(self, target):
+        """Total GPU time this target's probes took = the sum of the saved probes' seconds. Read
+        from the DB (the runner records each probe before signalling the GUI, and upserts a
+        re-probe), so it is correct live, persists, and re-accumulates on resume."""
+        if not self.gpu_id:
+            return 0.0
+        w, h = vb.TARGETS[target][:2]
+        probes = db.get_bench_probes(self.conn, self.gpu_id, self.model_tag, w, h)
+        return sum((p["seconds"] or 0) for p in probes)
+
+    def _set_runtime(self, target):
+        s = self._cell_runtime_s(target)
+        self.tree.set(self._ensure_row(target), "runtime", _fmt_hms(s) if s else "—")
 
     def _selected_targets(self):
         return [t for t in self.ALL_TARGETS if self.target_vars[t].get()]
@@ -505,6 +531,10 @@ class BenchmarkWindow(tk.Toplevel):
         self.close_btn.configure(state="disabled")
         for w in self._toggles:                        # the plan is fixed for the run
             w.configure(state="disabled")
+        # The "X GB already in use" warning is a pre-start hint; once a sweep is running that
+        # figure is stale (the benchmark itself now holds VRAM), so hide it.
+        self.vram_warn_var.set("")
+        self.vram_warn_lbl.grid_remove()
         self.status_var.set("Deploying pod …" if self.remote else "Starting benchmark …")
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
@@ -686,6 +716,7 @@ class BenchmarkWindow(tk.Toplevel):
                     self.tree.set(iid, "status", f"batch {data.get('batch')} ok")
                 else:
                     self.tree.set(iid, "status", f"batch {data.get('batch')} {oc}")
+                self._set_runtime(t)                   # probe recorded -> refresh the target's total
         elif kind == "BCEILING" and data:
             ceil = data.get("ceiling")
             saved = data.get("saved")
@@ -739,7 +770,8 @@ class BenchmarkWindow(tk.Toplevel):
             self.log_pane.clear()
         else:
             self.log_pane.feed(chunk)
-            self.log_pane.text.see("end")
+            if self.autoscroll.get():
+                self.log_pane.text.see("end")
 
     def _close(self):
         if self.proc is not None and self.proc.poll() is None:
