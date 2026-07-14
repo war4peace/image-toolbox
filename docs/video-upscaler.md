@@ -1170,6 +1170,14 @@ on that card uses ~2.08), but the static table should be treated as a floor, not
 prediction, until a few real runs season `gpu_perf`. Enabling `temporal_overlap` (below)
 also adds ~`overlap/(batch-overlap)` to the time, which self-calibration then absorbs.
 
+**Addressed in 0.5.0 (real benchmark footage, docs/local-video-upscaler.md section 22).** The
+root cause above -- benchmark rates measured on a tiny 320x240 synthetic clip, too fast because
+VAE encode scales with the (then unrealistically small) input -- is removed: the suite now feeds
+each cell a **native, aspect-matched real source** at a **real upscale factor** (e.g. the 1440p
+cell upscales a genuine 1280x720 clip), so the measured input->output ratio matches production.
+The 4:3/3:4 cells still feed from ~240px sources, but that IS their real native size (SD-revival
+work), not an artificial shrink.
+
 #### Two remaining estimator blind spots (documented 2026-07-08, not yet fixed)
 
 **Input resolution costs a little extra per output-MP, and it's mostly an OFFLOAD effect

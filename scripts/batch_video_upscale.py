@@ -497,13 +497,8 @@ def resolve_video_cfg(cfg, overrides=None):
         # source of the local "stall at first segment" hangs. Opt back in with
         # video.local_use_subprocess=true only if you specifically need the killable watchdog.
         "local_use_subprocess": bool(v.get("local_use_subprocess", False)),
-        # Per-card benchmark suite (#7, docs 16/20). Optional PINNED standard clip: set
-        # both to a published, hash-verified GitHub asset to benchmark against a real
-        # video; left empty (default), the suite SYNTHESISES its source with ffmpeg, so it
-        # works offline with no asset to publish (the clip CONTENT is irrelevant to the
-        # ceiling, docs 14). An unpinned URL is refused (integrity rule).
-        "benchmark_clip_url":    str(v.get("benchmark_clip_url", "") or ""),
-        "benchmark_clip_sha256": str(v.get("benchmark_clip_sha256", "") or ""),
+        # (The per-card benchmark suite's sources are now a fixed, SHA-256-pinned set baked into
+        # benchmark_clip.SOURCES, downloaded on demand; no config knob for them, docs 22.)
         # Adaptive batch tuning (item 9): on a multi-segment video, seed the batch from the
         # DB (or the pod's auto-pick), let the FIRST segment's real VRAM measurement refine
         # it up or down, then freeze + persist it (keyed by output-MP + card). Only active

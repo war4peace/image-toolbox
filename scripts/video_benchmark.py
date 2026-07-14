@@ -80,29 +80,34 @@ DEFAULT_BATCH_CAP = 3000            # "go stupid" on high-VRAM cards: a PRO 6000
 DEFAULT_FRAMES = 37
 DEFAULT_PROBES_PER_CELL = 6         # runtime-estimate heuristic (most cards break by ~bs29)
 
-# Target name -> OUTPUT box. Two groups:
-#   * a 4:3 ladder (the common old-camera aspect), one cell per 0.5-MP sizer bucket a small
+# Target name -> (OUTPUT box, standard source key). Each cell is upscaled from a NATIVE, aspect-
+# matched Creative-Commons source (benchmark_clip.SOURCES) with no rescale -- a real input->output
+# ratio, not a synthetic "half the output" placeholder -- so users benchmark identical footage.
+# Two groups:
+#   * a 4:3 / 3:4 ladder (the common old-camera aspects), one cell per 0.5-MP sizer bucket a small
 #     card can actually reach, each a size real runs produce -- so a 24 GB card has meaningful
 #     targets BELOW the 2.1-MP 1080p edge (which was the only feasible preset before);
 #   * the 16:9 presets (mirror video_estimate.TARGET_BOX) for widescreen sources / bigger cards.
 # The VAE-decode ceiling is set by OUTPUT megapixels, not aspect (docs 14), and the sizer keys
 # learned batch on the MP bucket -- so a PORTRAIT 3:4 target is the identical pixel count (hence
-# identical ceiling) as its 4:3 transpose, and benchmarking only the 4:3 side covers both.
+# identical ceiling) as its 4:3 transpose, and benchmarking only the 4:3 side covers both. The
+# small 4:3/3:4 sources are only ~240px, so their cells are large upscales (3-5x): that is real
+# SD-revival work, and the ceiling is output-bound regardless of factor.
 TARGETS = {
     # 4:3 landscape ladder + the two DISTINCT 3:4 portrait points. A portrait output is NOT the
     # transpose of a landscape one: box-fit height-caps a 3:4 source to a SMALLER area than a 4:3
     # source (e.g. into the 1080p box a 4:3 source -> 1440x1080 = 1.56 MP, a 3:4 source ->
     # 810x1080 = 0.87 MP), so its VAE-decode ceiling differs and it needs its own cell. (A TRUE
     # transpose like 960x1280 == 1280x960 in pixels, so THOSE aren't duplicated.)
-    "540x720":   (540, 720),      # 0.39 MP  portrait 3:4 (small box-fit output)
-    "960x720":   (960, 720),      # 0.69 MP  landscape 4:3 (2x of 480x360)
-    "810x1080":  (810, 1080),     # 0.87 MP  portrait 3:4 (1080p box-fit of a 3:4 source)
-    "1280x960":  (1280, 960),     # 1.23 MP  landscape 4:3 (2x of 640x480 / 4x of 320x240)
-    "1440x1080": (1440, 1080),    # 1.56 MP  landscape 4:3 (1080p box-fit of a 4:3 source)
-    "1600x1200": (1600, 1200),    # 1.92 MP  landscape 4:3 (tops the 24 GB band)
-    "1080p": (1920, 1080),        # 2.07 MP  (16:9)
-    "1440p": (2560, 1440),        # 3.69 MP  (16:9)
-    "4K":    (3840, 2160),        # 8.29 MP  (16:9)
+    "540x720":   (540, 720, "p3x4"),      # 0.39 MP  3:4     from 240x320 (2.25x)
+    "960x720":   (960, 720, "p4x3"),      # 0.69 MP  4:3     from 320x240 (3x)
+    "810x1080":  (810, 1080, "p3x4"),     # 0.87 MP  3:4     from 240x320 (3.375x)
+    "1280x960":  (1280, 960, "p4x3"),     # 1.23 MP  4:3     from 320x240 (4x)
+    "1440x1080": (1440, 1080, "p4x3"),    # 1.56 MP  4:3     from 320x240 (4.5x)
+    "1600x1200": (1600, 1200, "p4x3"),    # 1.92 MP  4:3     from 320x240 (5x)
+    "1080p": (1920, 1080, "w360"),        # 2.07 MP  16:9    from 640x360 (3x)
+    "1440p": (2560, 1440, "w720"),        # 3.69 MP  16:9    from 1280x720 (2x)
+    "4K":    (3840, 2160, "w1080"),       # 8.29 MP  16:9    from 1920x1080 (2x)
 }
 
 
@@ -111,14 +116,15 @@ def batch_series(floor=BATCH_FLOOR, cap=DEFAULT_BATCH_CAP):
     return [b for b in range(floor, cap + 1) if (b - 1) % 4 == 0]
 
 
-def build_cell(name, out_w, out_h, frames=DEFAULT_FRAMES):
-    """One benchmark cell: an OUTPUT size + the (2x) source it is upscaled from. The source
-    content is irrelevant to the ceiling (set by output size, docs 14); a clean 2x keeps the
-    source small/fast. Even dimensions for yuv420p."""
-    sw = max(2, (out_w // 2) & ~1)
-    sh = max(2, (out_h // 2) & ~1)
+def build_cell(name, out_w, out_h, source, frames=DEFAULT_FRAMES):
+    """One benchmark cell: an OUTPUT size + the NATIVE, aspect-matched standard source it is
+    upscaled from (a benchmark_clip.SOURCES key). The source content is irrelevant to the ceiling
+    (set by output size, docs 14); `src_w`/`src_h` are the source's native dims (what the engine
+    reads), and `resolution` is the output short side the engine scales that source up to."""
+    s = bclip.SOURCES[source]
     return {"name": name, "out_w": int(out_w), "out_h": int(out_h),
-            "src_w": sw, "src_h": sh, "resolution": int(min(out_w, out_h)),
+            "source": source, "src_w": int(s["w"]), "src_h": int(s["h"]),
+            "resolution": int(min(out_w, out_h)),
             "mp": out_w * out_h / 1_000_000.0, "frames": int(frames)}
 
 
@@ -128,7 +134,7 @@ def build_plan(targets, frames=DEFAULT_FRAMES):
     for t in targets:
         box = TARGETS.get(t)
         if box:
-            plan.append(build_cell(t, box[0], box[1], frames))
+            plan.append(build_cell(t, box[0], box[1], box[2], frames))
     return plan
 
 
@@ -222,15 +228,12 @@ WARMUP_BATCH = 9
 WARMUP_FRAMES = 9
 
 
-def _warmup_cell(engine, work, cell, vcfg, log, should_stop):
+def _warmup_cell(engine, work, cell, log, should_stop):
     """Run WARMUP_PROBES discarded bs9 upscales at the cell's resolution to warm the resident
     pod (compile/autotune) before its measured probes. Best-effort and fail-safe: any error just
     means the first real probe does the warming instead; a warmup must never fail a benchmark."""
     try:
-        clip = bclip.ensure_source_clip(
-            work, cell["src_w"], cell["src_h"], WARMUP_FRAMES,
-            base_url=vcfg.get("benchmark_clip_url"),
-            base_sha256=vcfg.get("benchmark_clip_sha256"), log=None)
+        clip = bclip.ensure_source_clip(work, cell["source"], WARMUP_FRAMES, log=None)
     except Exception as exc:                             # noqa: BLE001
         log(f"  (warmup skipped: could not prepare a clip: {exc})")
         return
@@ -556,7 +559,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             # Warm the resident pod for THIS resolution so the first measured probe isn't
             # cold-inflated (remote only; skip a cell already finished on resume).
             if remote and not stop_now() and not cell_done(cell_probes, cap):
-                _warmup_cell(engine, work, cell, vcfg, log, stop_now)
+                _warmup_cell(engine, work, cell, log, stop_now)
             while not stop_now():
                 # Free VRAM at probe start. LOCAL: read via nvidia-smi (parent stays GPU-free)
                 # to tag the probe AND allow a contended earlier failure to be re-tried. REMOTE:
@@ -573,10 +576,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 # distinct size is synthesised once and reused.
                 probe_frames = max(int(frames), int(b))
                 try:
-                    clip = bclip.ensure_source_clip(
-                        work, cell["src_w"], cell["src_h"], probe_frames,
-                        base_url=vcfg.get("benchmark_clip_url"),
-                        base_sha256=vcfg.get("benchmark_clip_sha256"), log=log)
+                    clip = bclip.ensure_source_clip(work, cell["source"], probe_frames, log=log)
                 except Exception as exc:                # noqa: BLE001 (can't source: stop this target)
                     log(f"  could not prepare a {probe_frames}-frame source clip ({exc}); "
                         f"stopping this target.")
@@ -615,8 +615,9 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell, learn_key)
             if saved:
                 extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
-                log(f"  {cell['name']}: saved batch {saved}{extra} — AUTO runs use {saved} "
-                    f"(the fastest window; the max that fits can be slower, riding VRAM spill).")
+                log(f"  {cell['name']}: saved batch {saved}{extra}. AUTO runs use {saved} "
+                    f"(the fastest window; the max that fits can be slower, from VRAM spill or "
+                    f"measurement noise).")
             else:
                 log(f"  {cell['name']}: no batch fit (card can't do this target)")
             gui_event("BCEILING", {"name": cell["name"], "ceiling": ceil, "saved": saved,

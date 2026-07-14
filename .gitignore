@@ -9,6 +9,7 @@ vlc/
 models/
 test_output/
 benchmark-videos/
+samples/videos/
 .imgtbx_video/
 *.log
 gui_settings.json

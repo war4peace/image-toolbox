@@ -712,13 +712,20 @@ above the AUTO cap** (a measurement beats the safety cap); the seed path stays c
 local estimate's read floor dropped to **40 MP** (`LOCAL_MIN_MP`) so one short benchmark clip
 registers.
 
-**The benchmark clip** (`benchmark_clip.py`) is either a **pinned** GitHub asset
-(config `video.benchmark_clip_url` + `benchmark_clip_sha256`, SHA-256 verified, unpinned
-refused) scaled to each cell's source, or -- by default, with no asset to publish -- an
-**ffmpeg-synthesised** `testsrc2` clip at the exact size. The content is irrelevant to the
-ceiling (set by OUTPUT size, section 14), so synthesis is a valid, offline, reproducible
-source; a download failure falls back to it. Source per cell = a clean 2x of the output
-(`resolution` = the output short side), cached by size.
+**The benchmark sources** (`benchmark_clip.py`) are a fixed set of **five Creative-Commons
+videos**, SHA-256 pinned in `benchmark_clip.SOURCES` and downloaded **on demand** (lazily, only
+the ones a run touches) into `samples/videos/`: Big Buck Bunny at 640x360 / 1280x720 / 1920x1080
+(16:9; the 1080p one is delivered as a `.zip` whose **extracted** mp4 is what the pin verifies)
+plus two Wikimedia clips at 320x240 (4:3) and 240x320 (3:4) for the aspects 16:9 Big Buck Bunny
+can't provide. Every cell is fed its **native, aspect-matched** source with NO rescale, and the
+engine upscales it to the cell's target (`resolution` = the output short side) -- a **real**
+input->output ratio (2x-5x depending on the cell), not a synthetic "half the output"
+placeholder, so every user benchmarks identical footage and the numbers are comparable
+machine-to-machine. Content is irrelevant to the ceiling (set by OUTPUT size, section 14), so:
+the first X frames are cut per probe and the short source is **looped** (`-stream_loop`) when a
+batch exceeds its frame count; a fetch failure falls back to an ffmpeg `testsrc2` clip at the
+native size with a loud warning (those numbers aren't comparable). Downloads use certifi trust
+(`net_ssl`) and a Wikimedia-policy User-Agent; an unpinned/mismatched download is refused.
 
 **VRAM-contention guard + tag.** Other GPU apps (a 3D tool, a slicer, a browser) holding VRAM
 would make a sweep OOM early and record an artificially LOW ceiling that then caps every real
@@ -731,7 +738,7 @@ it (it also doesn't cap the sweep below itself) -- a later clean run cleanly sup
 contended one instead of being permanently capped by it. The regular LOCAL upscale confirm also
 now advises closing non-essential apps + minimising machine use.
 
-**Tested** (GPU-free, `tests/test_video_benchmark.py`, 16 tests): the sweep logic
+**Tested** (GPU-free, `tests/test_video_benchmark.py`, 31 tests): the sweep logic
 (series/plan/cell/next-batch/ceiling/estimate), stale-contended-failure re-probe (incl. below a
 trustworthy failure), the `video_bench` round-trip + clear + `free_vram` tag, the clip download
 integrity (unpinned refused, hash verified/mismatch-deleted via a `file://` URL), an
@@ -829,8 +836,8 @@ engine (section 4):
   `drop_collapsed`, `throughput_optimal_batch`, persistence and `@@TBX@@` events are reused
   unchanged.
 
-The clip is generated **locally** (`benchmark_clip.ensure_source_clip`, unchanged) and uploaded
-per probe. It is small relative to the probe's GPU time (a few MB even at a big batch), so a
+The clip is prepared **locally** (`benchmark_clip.ensure_source_clip`: the pinned native source,
+downloaded + cached once, cut to the first X frames) and uploaded per probe. It is small relative to the probe's GPU time (a few MB even at a big batch), so a
 per-probe upload is cheaper than the machinery to synthesise it pod-side, and it keeps
 `run_benchmark` identical across local/remote.
 

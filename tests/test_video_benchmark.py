@@ -36,12 +36,16 @@ def test_batch_series_is_ascending_4n1():
     assert vb.batch_series(cap=65)[-1] == 65        # the suite probes past the AUTO cap
 
 
-def test_build_cell_source_is_even_half():
-    c = vb.build_cell("1080p", 1920, 1080)
+def test_build_cell_uses_native_aspect_matched_source():
+    c = vb.build_cell("1080p", *vb.TARGETS["1080p"])
     assert (c["out_w"], c["out_h"]) == (1920, 1080)
-    assert (c["src_w"], c["src_h"]) == (960, 540)   # 2x source, even dims
-    assert c["resolution"] == 1080                  # output short side
+    assert c["source"] == "w360"
+    assert (c["src_w"], c["src_h"]) == (640, 360)   # native 16:9 source, even dims (engine upscales)
+    assert c["resolution"] == 1080                  # output short side the source is scaled up to
     assert c["mp"] == pytest.approx(2.0736)
+    # A 3:4 cell draws from the native 240x320 portrait source (real upscale, not a synthetic half).
+    p = vb.build_cell("810x1080", *vb.TARGETS["810x1080"])
+    assert p["source"] == "p3x4" and (p["src_w"], p["src_h"]) == (240, 320)
 
 
 def test_build_plan_skips_unknown_targets():
@@ -60,14 +64,14 @@ def test_ladder_targets_are_benchmarkable_on_24gb():
         assert name in vb.TARGETS
         c = vb.build_cell(name, *vb.TARGETS[name])
         assert c["mp"] <= cap + 1e-6                             # benchmarkable on a 24 GB card
-        assert c["src_w"] % 2 == 0 and c["src_h"] % 2 == 0       # even 2x source (yuv420p)
+        assert c["src_w"] % 2 == 0 and c["src_h"] % 2 == 0       # even native source (yuv420p)
         keys.append(sizer.mp_bucket(c["mp"]))
     assert len(set(keys)) == len(keys)                           # distinct key per real size
     # A portrait box-fit output is smaller-area than its landscape counterpart at the same box,
     # so it is a genuinely distinct point (810x1080 = 0.87 MP vs 1440x1080 = 1.56 MP).
     assert sizer.mp_bucket(0.87) != sizer.mp_bucket(1.56)
     # 1280x960 is the 2x-of-640x480 / 4x-of-320x240 output — must be present and feasible.
-    assert vb.TARGETS["1280x960"] == (1280, 960)
+    assert vb.TARGETS["1280x960"][:2] == (1280, 960)
 
 
 def test_sizer_uses_nearest_benchmark_at_or_above(db_conn):
@@ -202,7 +206,7 @@ def test_bench_probe_free_vram_tag_roundtrips(db_conn):
 
 def test_record_cell_result_feeds_sizer_and_estimate(db_conn):
     gpu, model = "NVIDIA GeForce RTX 3090", "7b"
-    cell = vb.build_cell("1080p", 1920, 1080)
+    cell = vb.build_cell("1080p", *vb.TARGETS["1080p"])
     for b in (5, 9, 13, 17):
         db.record_bench_probe(db_conn, gpu, model, 1920, 1080, b, "ok",
                               frames=37, seconds=185.0, peak_alloc=20.9, peak_reserved=23.0)
@@ -226,7 +230,7 @@ def test_record_cell_result_feeds_sizer_and_estimate(db_conn):
 
 def test_record_cell_result_none_when_floor_fails(db_conn):
     gpu, model = "SmallCard", "7b"
-    cell = vb.build_cell("4K", 3840, 2160)
+    cell = vb.build_cell("4K", *vb.TARGETS["4K"])
     db.record_bench_probe(db_conn, gpu, model, 3840, 2160, 5, "oom")   # can't even do the floor
     assert vb._record_cell_result(db_conn, gpu, model, cell, f"{gpu}|{model}") == (None, None)
     # nothing learned for that bucket
@@ -251,7 +255,7 @@ def test_drop_collapsed_discards_phantom_ok_rows():
 def test_record_cell_result_ignores_collapsed_rows(db_conn):
     # Real ceiling is 33 (frames-correct); phantom 'ok' at 41/65 (only 37 frames) must not win.
     gpu, model = "NVIDIA GeForce RTX 3090", "7b"
-    cell = vb.build_cell("540x720", 540, 720)
+    cell = vb.build_cell("540x720", *vb.TARGETS["540x720"])
     for b in (5, 33):
         db.record_bench_probe(db_conn, gpu, model, 540, 720, b, "ok",
                               frames=max(b, 37), seconds=100.0, peak_alloc=10.0, peak_reserved=12.0)
@@ -281,7 +285,7 @@ def test_record_cell_result_saves_fastest_not_ceiling(db_conn):
     can be slower, riding VRAM spill). Mirrors the real 960x720 sweep: bs61 fastest, bs69 the
     ceiling but slower, bs73 oom."""
     gpu, model = "NVIDIA GeForce RTX 3090", "7b"
-    cell = vb.build_cell("960x720", 960, 720)
+    cell = vb.build_cell("960x720", *vb.TARGETS["960x720"])
     for b, spf in ((5, 4.25), (61, 0.93), (69, 1.22)):
         db.record_bench_probe(db_conn, gpu, model, 960, 720, b, "ok",
                               frames=max(b, 37), seconds=spf * max(b, 37),
@@ -364,7 +368,7 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
     >= its batch's frames, and the sweep must be able to climb PAST 37 to the real ceiling."""
     requested = []
 
-    def fake_ensure(work, w, h, frames, **k):
+    def fake_ensure(work, source, frames, **k):
         requested.append(int(frames))
         return str(tmp_path / f"c_{int(frames)}.mp4")
     monkeypatch.setattr(vb.bclip, "ensure_source_clip", fake_ensure)
