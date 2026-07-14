@@ -46,6 +46,7 @@ import runner_common
 runner_common.harden_stdout()
 
 import db
+import notifications
 import video_pipeline as vp
 import video_estimate as ve
 import video_vram_sizer as sizer
@@ -446,6 +447,37 @@ def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
     return ceil, saved
 
 
+def _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopped, elapsed):
+    """Send one completion notification (Discord / Telegram / ntfy) when a sweep ends, so a
+    long unattended benchmark (especially a remote pod running for hours) pings the user the
+    same way a real run does. `results` is [(name, ceiling, saved)] per finished cell. Fail-safe
+    (any error swallowed) and a no-op when no backend is configured."""
+    if not notify_settings:
+        return
+    try:
+        fitted = sum(1 for _n, _c, s in results if s)
+        total = len(results)
+        if stopped:
+            color, title = 0xE67E22, "Video benchmark stopped"      # orange: incomplete
+        else:
+            color, title = 0x2ECC71, "Video benchmark complete"     # green: all done
+        where = "remote pod" if remote else "local card"
+        desc = (f"{gpu_id} ({model_tag}) on the {where}: {fitted}/{total} target(s) "
+                f"measured in {fmt_hhmmss(elapsed)}.")
+        if stopped:
+            desc += f"\n{stopped}; finished probes are saved, re-run to continue."
+        fields = []
+        for name, ceil, saved in results:
+            if saved:
+                extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
+                fields.append({"name": name, "value": f"batch {saved}{extra}"})
+            else:
+                fields.append({"name": name, "value": "no batch fit"})
+        notifications.notify(notify_settings, title, desc, color, fields=fields)
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
 def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP,
                   remote=False):
     """Drive the sweep on the LOCAL card or (remote=True) a rented RunPod GPU. Persists every
@@ -455,6 +487,8 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     end. Returns a summary."""
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
+    notify_settings = notifications.resolve_settings(cfg)
+    t_start = time.monotonic()
     conn = db.get_conn()
     model_tag = sizer.model_tag(vcfg["dit_model"])
     work = os.path.join(vcfg["work_root"], "benchmark")
@@ -541,6 +575,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
 
     probe_out = os.path.join(work, "probe_out.mp4")
     stopped = None
+    results = []                                       # (name, ceiling, saved) per finished cell
     try:
         for cell in plan:
             if stop_now():
@@ -613,6 +648,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             if stop_now() and stopped is None:
                 stopped = "funds guard" if funds_tripped() else "stopped by user"
             ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell, learn_key)
+            results.append((cell["name"], ceil, saved))
             if saved:
                 extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
                 log(f"  {cell['name']}: saved batch {saved}{extra}. AUTO runs use {saved} "
@@ -651,6 +687,8 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             if not remote else
             "Results saved; remote runs on this card now seed from them.")
     log(f"\nBenchmark {'stopped' if stopped else 'complete'}: {len(plan)} target(s). " + tail)
+    _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopped,
+                      time.monotonic() - t_start)
     return summary
 
 

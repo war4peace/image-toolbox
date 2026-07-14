@@ -520,6 +520,49 @@ def test_run_benchmark_remote_stops_on_funds_guard(db_conn, tmp_path, monkeypatc
     assert session.closed is True
 
 
+# ── completion notification ──────────────────────────────────────────────────
+
+def _capture_notify(monkeypatch):
+    """Patch notifications.notify and return the list it records calls into."""
+    calls = []
+    monkeypatch.setattr(vb.notifications, "notify",
+                        lambda settings, title, desc, color, fields=None: calls.append(
+                            {"title": title, "desc": desc, "color": color, "fields": fields}))
+    return calls
+
+
+def test_notify_benchmark_complete(monkeypatch):
+    calls = _capture_notify(monkeypatch)
+    results = [("1080p", 33, 29), ("4K", 9, 9)]
+    vb._notify_benchmark({"discord_webhook_url": "x"}, "RTX 3090", "3B", False,
+                         results, stopped=None, elapsed=125.0)
+    assert len(calls) == 1
+    c = calls[0]
+    assert c["title"] == "Video benchmark complete"
+    assert c["color"] == 0x2ECC71
+    # a max-fit above the saved batch is annotated; an equal one is not
+    fields = {f["name"]: f["value"] for f in c["fields"]}
+    assert fields["1080p"] == "batch 29 (max fit 33)"
+    assert fields["4K"] == "batch 9"
+
+
+def test_notify_benchmark_stopped_is_orange(monkeypatch):
+    calls = _capture_notify(monkeypatch)
+    vb._notify_benchmark({"ntfy_topic": "t"}, "RTX 3090", "3B", True,
+                         [("1080p", None, None)], stopped="stopped by user", elapsed=10.0)
+    c = calls[0]
+    assert c["title"] == "Video benchmark stopped"
+    assert c["color"] == 0xE67E22
+    assert "re-run to continue" in c["desc"]
+    assert c["fields"][0]["value"] == "no batch fit"
+
+
+def test_notify_benchmark_noop_without_backend(monkeypatch):
+    calls = _capture_notify(monkeypatch)
+    vb._notify_benchmark({}, "RTX 3090", "3B", False, [], stopped=None, elapsed=1.0)
+    assert calls == []
+
+
 def test_download_verifies_hash(tmp_path):
     src = tmp_path / "clip.bin"
     src.write_bytes(b"benchmark-bytes")

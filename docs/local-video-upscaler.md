@@ -712,6 +712,13 @@ above the AUTO cap** (a measurement beats the safety cap); the seed path stays c
 local estimate's read floor dropped to **40 MP** (`LOCAL_MIN_MP`) so one short benchmark clip
 registers.
 
+**Completion notification.** When a sweep ends, `_notify_benchmark` fans out one alert through
+the shared `notifications` layer (Discord / Telegram / ntfy, whatever is configured in Settings),
+exactly like a real run: green **"Video benchmark complete"** or, on a Stop / funds-guard trip,
+orange **"Video benchmark stopped"** with a resume hint, plus one field per target giving the
+saved batch (and the max fit when it differs). This matters most for a **remote** sweep, which can
+run for hours on a rented pod. Fail-safe and a no-op when no backend is configured.
+
 **The benchmark sources** (`benchmark_clip.py`) are a fixed set of **five Creative-Commons
 videos**, SHA-256 pinned in `benchmark_clip.SOURCES` and downloaded **on demand** (lazily, only
 the ones a run touches) into `samples/videos/`: Big Buck Bunny at 640x360 / 1280x720 / 1920x1080
@@ -738,12 +745,13 @@ it (it also doesn't cap the sweep below itself) -- a later clean run cleanly sup
 contended one instead of being permanently capped by it. The regular LOCAL upscale confirm also
 now advises closing non-essential apps + minimising machine use.
 
-**Tested** (GPU-free, `tests/test_video_benchmark.py`, 32 tests): the sweep logic
+**Tested** (GPU-free, `tests/test_video_benchmark.py`, 35 tests): the sweep logic
 (series/plan/cell/next-batch/ceiling/estimate), stale-contended-failure re-probe (incl. below a
 trustworthy failure), the `video_bench` round-trip + clear + `free_vram` tag, the clip download
 integrity (unpinned refused, hash verified/mismatch-deleted via a `file://` URL), an
-**end-to-end sweep with a fake engine** (records 5/9/13 ok + 17 oom, learns 13), and a **resume**
-(pre-seeded 5/9, continues at 13). Full suite (513 tests) passes.
+**end-to-end sweep with a fake engine** (records 5/9/13 ok + 17 oom, learns 13), a **resume**
+(pre-seeded 5/9, continues at 13), and the **completion notification** (complete vs stopped
+title/colour, per-target fields, no-op without a backend). Full suite passes.
 
 ## 21. As built: dynamic ratio targets + the per-GPU feasibility guard
 
