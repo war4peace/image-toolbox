@@ -587,7 +587,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     log(f"Estimated runtime: ~{fmt_hhmmss(est)} (rough).")
     if remote:
         log("Note: the pod loads the model once from the network volume (a minute or two) before "
-            "the first probe; the sweep then runs in-process on the pod. $0-nothing-lost if you "
+            "the first probe; the sweep then runs in-process on the pod. So nothing lost if you "
             "Stop -- finished probes are saved and resume next time.")
     else:
         log("Note: every probe runs in a fresh process (isolated CUDA context per batch), so it "
