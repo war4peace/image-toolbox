@@ -92,18 +92,15 @@ class BenchmarkWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Configure>", self._track_geometry, add="+")
         self.deiconify()                    # reveal now that it's fully built (no flash)
-        # Modal: the log now lives INSIDE this window, so a local grab no longer freezes a
-        # needed helper. Modality also stops a second benchmark window being opened from the
-        # main app while this one is up. Deferred so the window is mapped before we grab.
-        self.after(60, self._grab)
+        # No modal grab_set(): an application grab makes Windows swallow the title-bar MINIMIZE
+        # and MAXIMIZE system commands (SC_MINIMIZE/SC_MAXIMIZE), so a long remote sweep (hours)
+        # could not be minimized out of the way -- only edge-drag resizing still worked. The grab
+        # was only a belt-and-suspenders guard against a second benchmark window (already blocked
+        # by the tab's _benchmark_win reuse guard) and a conflicting local GPU job (already
+        # blocked by _hide_master iconifying the main window + the Benchmark button's
+        # local_gpu_job_running() backstop), so dropping it costs no real protection.
         self.after(80, self._detect_gpu)
         self._hide_master()
-
-    def _grab(self):
-        try:
-            self.grab_set()
-        except tk.TclError:
-            pass
 
     def _hide_master(self):
         """Minimize the main app window for the benchmark's lifetime (restored in _close)."""
