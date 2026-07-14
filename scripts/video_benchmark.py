@@ -447,6 +447,54 @@ def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
     return ceil, saved
 
 
+def _log_summary_table(conn, gpu_id, model_tag, plan):
+    """Print a compact summary table to the terminal log when a sweep finishes, mirroring the
+    GUI Results table (target -> max fit / saved batch / overlap / best s-per-frame / peak VRAM /
+    runtime) so a user reading the log (headless, or scrolled back through a long sweep) gets the
+    same at-a-glance verdict without hunting the per-probe lines. Reads the persisted probes, the
+    same source of truth the GUI renders from. Fail-safe: any error just skips the table."""
+    try:
+        hdr = (f"{'Target':<10} {'Output':<11} {'MP':>5}  {'Fit':>4} {'Batch':>5} {'Ovl':>3}  "
+               f"{'s/frame':>8}  {'Peak GB':>11}  {'Runtime':>8}  Status")
+        lines = ["", "Summary:", hdr, "-" * len(hdr)]
+        for cell in plan:
+            probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+                                                        cell["out_w"], cell["out_h"]))
+            out = f"{cell['out_w']}x{cell['out_h']}"
+            if not probes:
+                lines.append(f"{cell['name']:<10} {out:<11} {cell['mp']:>5.2f}  "
+                             f"{'-':>4} {'-':>5} {'-':>3}  {'-':>8}  {'-':>11}  {'-':>8}  "
+                             f"not benchmarked")
+                continue
+            ceil = cell_ceiling(probes)
+            saved = throughput_optimal_batch(probes) or ceil
+            overlap = sizer.auto_overlap(saved) if saved else None
+            timed = [p for p in probes if p["outcome"] == "ok"
+                     and p.get("seconds") and p.get("frames")]
+            best = min((p["seconds"] / p["frames"] for p in timed), default=None)
+            peak = next((p for p in probes if p["outcome"] == "ok"
+                         and int(p["batch"]) == (saved or -1)), None)
+            runtime = sum((p["seconds"] or 0) for p in probes)
+            if not ceil:
+                status = "no fit (card can't do this target)"
+            elif cell_done(probes):
+                status = "saved"
+            else:
+                status = "partial (resumable)"
+            peak_s = (f"{peak['peak_alloc']}/{peak['peak_reserved']}"
+                      if peak and peak.get("peak_alloc") and peak.get("peak_reserved") else "-")
+            lines.append(
+                f"{cell['name']:<10} {out:<11} {cell['mp']:>5.2f}  "
+                f"{(str(ceil) if ceil else '-'):>4} {(str(saved) if saved else '-'):>5} "
+                f"{(str(overlap) if overlap is not None else '-'):>3}  "
+                f"{(f'{best:.2f}' if best else '-'):>8}  {peak_s:>11}  "
+                f"{fmt_hhmmss(runtime):>8}  {status}")
+        for ln in lines:
+            log(ln)
+    except Exception:                                  # noqa: BLE001 (a summary must never fail a run)
+        pass
+
+
 def _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopped, elapsed):
     """Send one completion notification (Discord / Telegram / ntfy) when a sweep ends, so a
     long unattended benchmark (especially a remote pod running for hours) pings the user the
@@ -683,6 +731,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
 
     summary = {"cells": len(plan), "stopped": stopped}
     gui_event("BDONE", summary)
+    _log_summary_table(conn, gpu_id, model_tag, plan)
     tail = ("Results saved; AUTO runs and the time estimate now use them."
             if not remote else
             "Results saved; remote runs on this card now seed from them.")

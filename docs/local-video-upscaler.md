@@ -719,6 +719,13 @@ orange **"Video benchmark stopped"** with a resume hint, plus one field per targ
 saved batch (and the max fit when it differs). This matters most for a **remote** sweep, which can
 run for hours on a rented pod. Fail-safe and a no-op when no backend is configured.
 
+**Terminal summary table.** On finish, `_log_summary_table` also prints a compact fixed-width
+table to the log, mirroring the GUI Results table (`target -> output / MP / max fit / saved batch /
+overlap / best s-per-frame / peak VRAM / runtime / status`), read from the persisted probes (the
+same source of truth the GUI renders from). So a user reading the log, headless or scrolled back
+through a long per-probe sweep, gets the same at-a-glance verdict without hunting the individual
+probe lines. Fail-safe: any error just skips the table.
+
 **The benchmark sources** (`benchmark_clip.py`) are a fixed set of **five Creative-Commons
 videos**, SHA-256 pinned in `benchmark_clip.SOURCES` and downloaded **on demand** (lazily, only
 the ones a run touches) into `samples/videos/`: Big Buck Bunny at 640x360 / 1280x720 / 1920x1080
@@ -745,13 +752,15 @@ it (it also doesn't cap the sweep below itself) -- a later clean run cleanly sup
 contended one instead of being permanently capped by it. The regular LOCAL upscale confirm also
 now advises closing non-essential apps + minimising machine use.
 
-**Tested** (GPU-free, `tests/test_video_benchmark.py`, 35 tests): the sweep logic
+**Tested** (GPU-free, `tests/test_video_benchmark.py`, 37 tests): the sweep logic
 (series/plan/cell/next-batch/ceiling/estimate), stale-contended-failure re-probe (incl. below a
 trustworthy failure), the `video_bench` round-trip + clear + `free_vram` tag, the clip download
 integrity (unpinned refused, hash verified/mismatch-deleted via a `file://` URL), an
 **end-to-end sweep with a fake engine** (records 5/9/13 ok + 17 oom, learns 13), a **resume**
-(pre-seeded 5/9, continues at 13), and the **completion notification** (complete vs stopped
-title/colour, per-target fields, no-op without a backend). Full suite passes.
+(pre-seeded 5/9, continues at 13), the **completion notification** (complete vs stopped
+title/colour, per-target fields, no-op without a backend), and the **terminal summary table**
+(max-fit vs saved-batch distinction, saved probe's peak, summed runtime, unbenchmarked row).
+Full suite passes.
 
 ## 21. As built: dynamic ratio targets + the per-GPU feasibility guard
 

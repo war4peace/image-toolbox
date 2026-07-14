@@ -520,6 +520,42 @@ def test_run_benchmark_remote_stops_on_funds_guard(db_conn, tmp_path, monkeypatc
     assert session.closed is True
 
 
+# ── terminal summary table ───────────────────────────────────────────────────
+
+def test_log_summary_table(db_conn, monkeypatch):
+    gpu, model = "RTX 3090", "7b"
+    # 540x720 cell: climb to a ceiling (max fit) of 41, but batch 33 is the FASTEST (2.48 s/f vs
+    # 41's 5.37), so the saved batch differs from the ceiling. Fail at 45 pins the ceiling.
+    peaks = {5: (20.1, 22.4), 9: (20.1, 22.4), 17: (20.1, 22.4),
+             33: (18.5, 21.0), 41: (23.0, 24.0)}
+    for b, secs in [(5, 100.0), (9, 90.0), (17, 74.0), (33, 82.0), (41, 220.0)]:
+        db.record_bench_probe(db_conn, gpu, model, 540, 720, b, "ok",
+                              frames=b, seconds=secs,
+                              peak_alloc=peaks[b][0], peak_reserved=peaks[b][1])
+    db.record_bench_probe(db_conn, gpu, model, 540, 720, 45, "oom")
+    lines = []
+    monkeypatch.setattr(vb, "log", lines.append)
+    vb._log_summary_table(db_conn, gpu, model, vb.build_plan(["540x720"]))
+    text = "\n".join(lines)
+    assert "Summary:" in text
+    assert "Target" in text and "Batch" in text and "Runtime" in text
+    row = next(l for l in lines if l.startswith("540x720"))
+    # Fit = ceiling 41; Batch = throughput-optimal 33; peak is the SAVED (33) probe's, not the
+    # last probe's; runtime = sum of every ok probe's seconds.
+    assert " 41 " in f" {row} "
+    assert " 33 " in row
+    assert "18.5/21.0" in row
+    # 100+90+74+82+220 = 566s -> 00:09:26
+    assert "00:09:26" in row
+
+
+def test_log_summary_table_marks_unbenchmarked(db_conn, monkeypatch):
+    lines = []
+    monkeypatch.setattr(vb, "log", lines.append)
+    vb._log_summary_table(db_conn, "RTX 3090", "7b", vb.build_plan(["4K"]))
+    assert any("not benchmarked" in l for l in lines)
+
+
 # ── completion notification ──────────────────────────────────────────────────
 
 def _capture_notify(monkeypatch):
