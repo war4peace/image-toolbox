@@ -68,8 +68,8 @@ class BenchmarkWindow(tk.Toplevel):
         except Exception:
             pass
         geo = self.app.settings.get("benchmark_geometry") if self.app is not None else None
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "720x560")
-        self.minsize(640, 480)
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "900x560")
+        self.minsize(900, 480)                             # match the main window's min width
         # NOT transient(master): while the benchmark is up we MINIMIZE the main window (see
         # _hide_master / _restore_master) so a non-technical user can't reach the tabs behind
         # it and start a conflicting GPU job. A transient child is auto-hidden when its master
