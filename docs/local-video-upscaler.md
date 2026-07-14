@@ -278,6 +278,21 @@ Real measurements from the `LocalVideoEngine` spike (`scripts/spike_local_video.
 recorded for future reference. This is the empirical basis for the local tier table
 (sections 6-8): it replaces guessed VRAM floors with what the hardware actually does.
 
+**Resident vs phased is per-mode (video threshold is separate and higher).** The engine keeps
+DiT+VAE resident in VRAM on cards at/above a threshold, else it PHASES them (offloads the DiT to
+system RAM before the VAE decode, freeing ~14 GB exactly when the decode needs it, quality-neutral,
+just a PCIe round trip). A video temporal-window decode is far heavier than a single image, so the
+**video** path uses its own `video.vram_resident_threshold_gb` (default **90**), distinct from the
+image `upscale.vram_resident_threshold_gb` (default **40**). At 90 the 40-80 GB cards (A100/H100/
+A6000/L40) phase for video, where resident would thrash near the ceiling; PRO 6000 (96 GB) and up
+stay resident. Measured on a PRO 6000 (96 GB, 7B): 4K OOMs resident but FITS phased (at 99% / batch
+5 / ~123 s/frame, so "fits but impractical" without a bigger card); a 6.22 MP target thrashes
+resident (99% / batch 5 / 54.6 s/frame) and has headroom phased. `0` = always phase. NB this is a
+per-CARD choice, not per-target: a resident card can still thrash/OOM on a high target, so the 4K
+feasibility gate is complementary, not replaced by it. The video builders inject the value into the
+key `upscale_engine._resident_offload_device` reads, so the pod engine (and the benchmark, so its
+ceilings match the run) see the video number.
+
 **Rig / method.** RTX 3090 (24 GB), PyTorch 2.11 CUDA, **SDPA** attention (SageAttention
 / FlashAttention not installed), **CPU offload** (resident=False: 24 GB < the 40 GB
 resident threshold, so DiT+VAE park in system RAM between passes), `opencv` writer, no

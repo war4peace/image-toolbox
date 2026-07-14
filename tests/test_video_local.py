@@ -51,6 +51,28 @@ def test_resolve_video_cfg_local_overrides():
     assert v["local_use_subprocess"] is True
 
 
+def test_video_resident_threshold_default_and_overrides():
+    # Separate from the image knob (upscale.vram_resident_threshold_gb, default 40): video
+    # defaults higher (90) because a temporal decode is far heavier than a single image.
+    assert bv.resolve_video_cfg({})["vram_resident_threshold_gb"] == 90.0
+    assert bv.resolve_video_cfg(
+        {"video": {"vram_resident_threshold_gb": 120}})["vram_resident_threshold_gb"] == 120.0
+    # 0 is meaningful (always phase) and must NOT be coerced to the default; null falls back.
+    assert bv.resolve_video_cfg(
+        {"video": {"vram_resident_threshold_gb": 0}})["vram_resident_threshold_gb"] == 0.0
+    assert bv.resolve_video_cfg(
+        {"video": {"vram_resident_threshold_gb": None}})["vram_resident_threshold_gb"] == 90.0
+
+
+def test_video_resident_threshold_is_independent_of_image():
+    # The video threshold does not disturb the image one, and the video worker settings inject
+    # the video value over the image default so the pod engine reads the right number.
+    cfg = {"upscale": {"vram_resident_threshold_gb": 40}, "video": {}}
+    vcfg = bv.resolve_video_cfg(cfg)
+    assert cfg["upscale"]["vram_resident_threshold_gb"] == 40      # image untouched
+    assert vcfg["vram_resident_threshold_gb"] == 90.0             # video default
+
+
 # ── shared compile-capability gate (runner AND benchmark) ────────────────────
 
 def test_gate_local_compile_disables_without_compiler(monkeypatch):

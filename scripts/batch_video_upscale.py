@@ -512,6 +512,16 @@ def resolve_video_cfg(cfg, overrides=None):
         # linked (their "source" is a virtual sub-range, not a replaceable file).
         "record_lineage":      bool(v.get("record_lineage", True)),
     }
+    # Resident-vs-phase VRAM threshold for the VIDEO path, SEPARATE from the image one
+    # (upscale.vram_resident_threshold_gb, default 40). A video temporal window's VAE decode is
+    # far heavier than a single image, so keeping DiT+VAE resident is only safe on a much bigger
+    # card; below the threshold the engine PHASES them (offloads the DiT to RAM before the decode,
+    # freeing ~14 GB exactly when the decode needs it). Default 90 keeps PRO 6000 (96 GB) and up
+    # resident and phases the 40-80 GB cards for video, where resident thrashes near the ceiling.
+    # 0 = always phase. Injected into the worker settings so upscale_engine._resident_offload_device
+    # reads it on the video pod (the image path keeps its own 40 GB value).
+    _vrt = v.get("vram_resident_threshold_gb", 90)
+    out["vram_resident_threshold_gb"] = float(90 if _vrt is None else _vrt)
     if out["use_10bit"]:
         out["video_backend"] = "ffmpeg"
     for k, val in (overrides or {}).items():
@@ -540,6 +550,8 @@ def log_video_settings(vcfg):
     log(f"    staging '{vcfg.get('work_root') or '(beside output)'}'")
     noise = float(vcfg.get("input_noise_scale", 0.0) or 0.0)
     log(f"    model {vcfg.get('dit_model', 'seedvr2_ema_7b_fp16.safetensors')}")
+    log(f"    resident VRAM threshold {vcfg.get('vram_resident_threshold_gb', 90):.0f} GB "
+        f"(cards >= this keep DiT+VAE resident; smaller cards phase the DiT to RAM for the decode)")
     log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
         f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
         f"input noise {noise if noise > 0 else 'off'}")
@@ -2144,6 +2156,9 @@ def main(argv=None):
         wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
         wc["input_noise_scale"]  = vcfg["input_noise_scale"]
         wc["dit_model"]          = vcfg["dit_model"]
+        # Video-specific resident threshold overrides the image one (default 40) so a video
+        # temporal decode phases the DiT out on cards too small to hold it resident safely.
+        wc["vram_resident_threshold_gb"] = vcfg["vram_resident_threshold_gb"]
         return wc
 
     def make_session(first=True):

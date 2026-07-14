@@ -386,6 +386,10 @@ def _worker_settings(cfg, vcfg):
     wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
     wc["input_noise_scale"] = vcfg["input_noise_scale"]
     wc["dit_model"] = vcfg["dit_model"]
+    # Use the VIDEO resident threshold (not the image 40) so the benchmark measures ceilings in
+    # the SAME resident/phased mode a real video run will use (a benchmark measured resident
+    # would under-report a card that runs phased in production).
+    wc["vram_resident_threshold_gb"] = vcfg["vram_resident_threshold_gb"]
     return wc
 
 
