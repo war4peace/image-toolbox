@@ -53,6 +53,18 @@ def test_build_plan_skips_unknown_targets():
     assert [c["name"] for c in plan] == ["1080p", "4K"]
 
 
+def test_gui_target_labels_build_for_every_target():
+    """Guard the 3-tuple TARGETS regression: the Benchmark window builds a checkbox label for
+    EVERY target on open (BenchmarkWindow._target_label unpacks TARGETS[t]). When TARGETS grew a
+    source key, a `w, h = TARGETS[t]` there crashed window open ('too many values to unpack').
+    The staticmethod needs no Tk root, so exercise it for every target so that can't regress."""
+    pytest.importorskip("tkinter")
+    from gui.video_benchmark import BenchmarkWindow
+    for t in vb.TARGETS:
+        label = BenchmarkWindow._target_label(t)
+        assert str(vb.TARGETS[t][0]) in label or t in label
+
+
 def test_ladder_targets_are_benchmarkable_on_24gb():
     """The 4:3 + 3:4 ladder gives a 24 GB card real targets BELOW the 2.1-MP 1080p edge. Each
     cell must fit under the 24 GB cap and get a DISTINCT fine sizer key (its own learned-batch

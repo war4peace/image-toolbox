@@ -128,7 +128,7 @@ class BenchmarkWindow(tk.Toplevel):
         """Checkbox text: dims-named ladder cells show the dimensions (with ×) + aspect, preset
         names keep their name; both carry the output megapixels so the VRAM cost is visible at a
         glance (the ceiling scales with output MP)."""
-        w, h = vb.TARGETS[t]
+        w, h = vb.TARGETS[t][:2]
         mp = w * h / 1_000_000.0
         if "x" in t:
             return f"{w}×{h} {'3:4' if h > w else '4:3'} · {mp:.1f} MP"
@@ -321,7 +321,7 @@ class BenchmarkWindow(tk.Toplevel):
         max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
         for t in self.ALL_TARGETS:
             if self._is_ladder(t):
-                w, h = vb.TARGETS[t]
+                w, h = vb.TARGETS[t][:2]
                 if max_mp and w >= h and (w * h / 1_000_000.0) <= max_mp + 1e-6:
                     self.target_vars[t].set(True)
         if self.total_vram_gb >= 40:
@@ -343,7 +343,7 @@ class BenchmarkWindow(tk.Toplevel):
         if not max_mp:
             return
         for t in self.ALL_TARGETS:
-            w, h = vb.TARGETS[t]
+            w, h = vb.TARGETS[t][:2]
             box_mp = w * h / 1_000_000.0
             cb = self._target_cb.get(t)
             if box_mp > max_mp + 1e-6:

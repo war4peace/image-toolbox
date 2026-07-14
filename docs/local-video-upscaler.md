@@ -738,7 +738,7 @@ it (it also doesn't cap the sweep below itself) -- a later clean run cleanly sup
 contended one instead of being permanently capped by it. The regular LOCAL upscale confirm also
 now advises closing non-essential apps + minimising machine use.
 
-**Tested** (GPU-free, `tests/test_video_benchmark.py`, 31 tests): the sweep logic
+**Tested** (GPU-free, `tests/test_video_benchmark.py`, 32 tests): the sweep logic
 (series/plan/cell/next-batch/ceiling/estimate), stale-contended-failure re-probe (incl. below a
 trustworthy failure), the `video_bench` round-trip + clear + `free_vram` tag, the clip download
 integrity (unpinned refused, hash verified/mismatch-deleted via a `file://` URL), an
