@@ -64,6 +64,23 @@ def test_video_resident_threshold_default_and_overrides():
         {"video": {"vram_resident_threshold_gb": None}})["vram_resident_threshold_gb"] == 90.0
 
 
+def test_initial_load_restores_defaults_before_loading_queue():
+    # Regression: when the Video Upscaler is the restored startup tab, the durable queue showed
+    # blank because the startup _load_queue ran before the folder fields were filled from the
+    # pinned defaults (so it early-returned on an empty source, leaving previously-cut segments
+    # invisible until the user acted). _initial_load must restore defaults FIRST, then load.
+    import types
+    pytest.importorskip("tkinter")
+    from gui.tab_video import VideoTab
+    calls = []
+    fake = types.SimpleNamespace(
+        restore_defaults_if_empty=lambda: calls.append("restore"),
+        _load_queue=lambda: calls.append("load"),
+    )
+    VideoTab._initial_load(fake)
+    assert calls == ["restore", "load"]
+
+
 def test_video_resident_threshold_is_independent_of_image():
     # The video threshold does not disturb the image one, and the video worker settings inject
     # the video value over the image default so the pod engine reads the right number.

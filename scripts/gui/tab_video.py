@@ -402,7 +402,7 @@ class VideoTab(ttk.Frame):
         self._run_tick_job = None
         self._build()
         self.after(200, self._check_readiness)
-        self.after(300, self._load_queue)
+        self.after(300, self._initial_load)
 
     # ── config / db ──────────────────────────────────────────────────────────
 
@@ -708,6 +708,16 @@ class VideoTab(ttk.Frame):
             d = get_default_folder("video_output")
             if d:
                 self.out_var.set(os.path.normpath(d))
+
+    def _initial_load(self):
+        """Startup population of the durable queue (scheduled from __init__). Restore the
+        folder fields from the pinned defaults FIRST, then load: when the Video Upscaler is the
+        RESTORED last tab, on_enter's default-restore is not guaranteed to have run before this
+        fires, and _load_queue early-returns on an empty source field, which left previously-cut
+        segments invisible until the user acted (they only appeared once a NEW segment was added
+        and forced a reload). Idempotent with on_enter (both restore-if-empty + reload)."""
+        self.restore_defaults_if_empty()
+        self._load_queue()
 
     def on_enter(self):
         """Called when the tab is entered (not only at startup): re-check remote
