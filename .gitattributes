@@ -1,3 +1,7 @@
 # Shell scripts run on the Linux pod (remote upscaling #1) — they must stay LF
 # or bash chokes on the \r. Force LF regardless of the checkout's autocrlf.
 *.sh text eol=lf
+
+# Markdown is authored on Windows; keep CRLF in the working tree so editing it
+# never mixes endings. Git still stores LF in the repo (text), checks out CRLF.
+*.md text eol=crlf

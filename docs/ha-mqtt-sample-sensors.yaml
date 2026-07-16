@@ -1,0 +1,112 @@
+# ================================================
+# Image Toolbox MQTT
+# ================================================
+
+  - name: "Image Toolbox Version"
+    state_topic: image-toolbox/version
+    unique_id: image_toolbox_version
+
+  - name: "Image Toolbox Update Available"
+    state_topic: image-toolbox/update
+    unique_id: image_toolbox_update_available
+
+  - name: "Image Toolbox Latest Version"
+    state_topic: image-toolbox/latest_version
+    unique_id: image_toolbox_latest_version
+
+  - name: "Image Toolbox Availability"
+    state_topic: image-toolbox/availability
+    unique_id: image_toolbox_availability
+
+  - name: "Image Toolbox Task Details"
+    state_topic: image-toolbox/task/details
+    unique_id: image_toolbox_task_details
+
+  - name: "Image Toolbox Task Name"
+    state_topic: image-toolbox/task/name
+    unique_id: image_toolbox_task_name
+
+  - name: "Image Toolbox Task Runtime"
+    state_topic: image-toolbox/task/runtime
+    unique_id: image_toolbox_task_runtime
+    unit_of_measurement: "s"
+
+  - name: "Image Toolbox Average Processing Time"
+    state_topic: image-toolbox/task/average_processing_time
+    unique_id: image_toolbox_average_processing_time
+    unit_of_measurement: "s"
+
+  - name: "Image Toolbox Last Processing Time"
+    state_topic: image-toolbox/task/last_processing_time
+    unique_id: image_toolbox_last_processing_time
+    unit_of_measurement: "s"
+
+  - name: "Image Toolbox Last Run Summary"
+    state_topic: image-toolbox/last_run
+    unique_id: image_toolbox_last_run_summary
+
+  - name: "Image Toolbox Last Exit Timestamp"
+    state_topic: image-toolbox/last_used
+    unique_id: image_toolbox_last_exit_timestamp
+
+  - name: "Image Toolbox CPU Usage"
+    state_topic: image-toolbox/system/cpu
+    unique_id: image_toolbox_cpu_usage
+    unit_of_measurement: "%"
+
+  - name: "Image Toolbox RAM Used"
+    state_topic: image-toolbox/system/ram
+    unique_id: image_toolbox_ram_used
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox RAM Total"
+    state_topic: image-toolbox/system/ram_total
+    unique_id: image_toolbox_ram_total
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox GPU VRAM Used"
+    state_topic: image-toolbox/system/gpu_vram
+    unique_id: image_toolbox_gpu_vram_used
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox GPU VRAM Total"
+    state_topic: image-toolbox/system/gpu_vram_total
+    unique_id: image_toolbox_gpu_vram_total
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox GPU Temperature"
+    state_topic: image-toolbox/system/gpu_temp
+    unique_id: image_toolbox_gpu_temperature
+    unit_of_measurement: "°C"
+
+# === Image Toolbox REMOTE Pod sensors ===
+
+  - name: "Image Toolbox Remote CPU Usage"
+    state_topic: image-toolbox/system/remote/cpu
+    unique_id: image_toolbox_remote_cpu_usage
+    unit_of_measurement: "%"
+
+  - name: "Image Toolbox Remote RAM Used"
+    state_topic: image-toolbox/system/remote/ram
+    unique_id: image_toolbox_remote_ram_used
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox Remote RAM Total"
+    state_topic: image-toolbox/system/remote/ram_total
+    unique_id: image_toolbox_remote_ram_total
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox Remote GPU VRAM Used"
+    state_topic: image-toolbox/system/remote/gpu_vram
+    unique_id: image_toolbox_remote_gpu_vram_used
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox Remote GPU VRAM Total"
+    state_topic: image-toolbox/system/remote/gpu_vram_total
+    unique_id: image_toolbox_remote_gpu_vram_total
+    unit_of_measurement: "MB"
+
+  - name: "Image Toolbox Remote GPU Temperature"
+    state_topic: image-toolbox/system/remote/gpu_temp
+    unique_id: image_toolbox_remote_gpu_temperature
+    unit_of_measurement: "°C"
