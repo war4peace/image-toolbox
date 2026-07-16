@@ -15,6 +15,8 @@ import os
 import json
 import time
 
+import pytest
+
 from pod import deadman as d
 from pod import worker as w
 
@@ -135,7 +137,19 @@ def test_stalled_for_falls_back_to_the_job_start(tmp_path, monkeypatch):
 # from config and nothing ever asked the POD whether it could. On a rented pod that is a
 # silent, billing, undiagnosable stall.
 
-def test_pod_gate_disables_compile_when_no_compiler(monkeypatch):
+@pytest.fixture
+def triton_present(monkeypatch):
+    """Pin Triton as importable so these tests exercise the COMPILER branch, not the
+    machine's Triton state. Without it the gate's own `find_spec('triton')` decides the
+    result, so they passed or failed on whether the environment happened to have the wheel
+    (green locally where the .venv has triton-windows, red in CI where it doesn't)."""
+    import importlib.util as ilu
+    real = ilu.find_spec
+    monkeypatch.setattr(ilu, "find_spec",
+                        lambda n, *a, **k: object() if n == "triton" else real(n, *a, **k))
+
+
+def test_pod_gate_disables_compile_when_no_compiler(monkeypatch, triton_present):
     monkeypatch.setattr(w.shutil, "which", lambda n: None)
     s = {"compile_dit": True, "compile_vae": True}
     on, why = w._gate_compile(s)
@@ -143,7 +157,7 @@ def test_pod_gate_disables_compile_when_no_compiler(monkeypatch):
     assert s["compile_dit"] is False and s["compile_vae"] is False
 
 
-def test_pod_gate_keeps_compile_when_the_toolchain_is_there(monkeypatch):
+def test_pod_gate_keeps_compile_when_the_toolchain_is_there(monkeypatch, triton_present):
     monkeypatch.setattr(w.shutil, "which", lambda n: "/usr/bin/cc" if n == "cc" else None)
     s = {"compile_dit": True, "compile_vae": True}
     on, why = w._gate_compile(s)
