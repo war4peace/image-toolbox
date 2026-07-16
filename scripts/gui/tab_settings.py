@@ -403,10 +403,16 @@ class SettingsTab(ttk.Frame):
         cmp_cb = ttk.Checkbutton(sec, text="Speed up with torch.compile (recommended)",
                                  variable=self.video_compile_var)
         cmp_cb.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        Tooltip(cmp_cb, "Compiles the SeedVR2 model the first time the pod runs a segment "
-                        "(that one segment is slower), then every later segment is 20-40% "
-                        "faster. A big win on long videos. Turn off only if a run fails at "
-                        "compile.")
+        Tooltip(cmp_cb, "Compiles the SeedVR2 model on the first segment of a run (that "
+                        "segment is slower), then later segments run faster. Best on long "
+                        "videos, where the one-time cost is spread over many segments.\n\n"
+                        "It is not free: compiling raises VRAM use, so the largest batch "
+                        "that still fits gets smaller (measured on a 24 GB card: about half "
+                        "the frames per window). A smaller window can cost more speed than "
+                        "compiling gains, so on a small card it can be a net loss. Benchmark "
+                        "your card both ways if you care.\n\n"
+                        "Local runs also need a C compiler and Triton; without them the run "
+                        "goes ahead uncompiled and the log says so.")
         self.video_uniform_var = tk.BooleanVar(value=bool(vid.get("uniform_batch_size", True)))
         uni_cb = ttk.Checkbutton(sec, text="Uniform batch size (cleaner seams)",
                                  variable=self.video_uniform_var)
@@ -432,9 +438,12 @@ class SettingsTab(ttk.Frame):
                        "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
                        "try 0.02 if your 4K output looks plasticky.")
         self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
+        # row 12, NOT 11: row 11 already holds the work-folder row above. Two widgets in one
+        # grid cell do not push each other aside, they DRAW ON TOP of each other, so this
+        # checkbox silently covered the "Work folder (staging)" label and its entry.
         ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
                         variable=self.video_confirm_var).grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
         Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
                      "output subfolder mirrors the source tree (like Batch Upscaler).")
 

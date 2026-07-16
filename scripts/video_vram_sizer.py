@@ -110,6 +110,99 @@ def model_tag(model):
     return "7b"
 
 
+def tile_tag(settings):
+    """Learned-batch key SUFFIX for the VAE-tiling state.
+
+    A batch ceiling measured WITH VAE tiling must never be handed to an untiled run (or the
+    reverse): tiling bounds the VAE peak that the ceiling is largely made of, so the same
+    card at the same output size fits a very different window with it on. They are two
+    different measurements and cannot share a row. Without this, one tiled benchmark cell
+    silently poisons every untiled run at that output size AND (via get_learned_batch_ge,
+    which treats a bigger output as a safe bound) every smaller one too.
+
+    Returns "" when nothing is tiled, so the key stays byte-identical to the pre-tiling one
+    and every already-learned row keeps its meaning (it WAS measured untiled). Both phases
+    are encoded, with their tile sizes: a 512 tile bounds the peak lower than a 1024 one, so
+    they are not interchangeable either.
+    """
+    s = settings or {}
+    parts = []
+    if s.get("encode_tiled"):
+        parts.append(f"e{int(s.get('encode_tile_size', 1024) or 1024)}")
+    if s.get("decode_tiled"):
+        parts.append(f"d{int(s.get('decode_tile_size', 1024) or 1024)}")
+    return ("|t" + "_".join(parts)) if parts else ""
+
+
+def compile_tag(settings):
+    """Key SUFFIX for the torch.compile state (same idea as [tile_tag]).
+
+    torch.compile moves the RATE a lot AND the VRAM ceiling a lot, and the two stores carry
+    one each (video_bench the rate, video_batch_learn the ceiling), so BOTH need this tag.
+    See [learn_tag] for the measurement that settled the ceiling half.
+
+    Without this the key cannot tell a compiled measurement from an uncompiled one, which
+    breaks the store in two ways at once:
+      * resume sees an uncompiled rung as "done" and skips it, so a compiled sweep silently
+        REPORTS the uncompiled numbers as compiled;
+      * the only way to force a re-measure (resume=False) calls clear_bench(gpu_id, model),
+        which is not per-cell -- it wipes every target for that card.
+
+    "" means UNCOMPILED, matching tile_tag's convention that the key is unchanged when the
+    feature is off. That choice is deliberate and is the safe direction: a local run had no
+    compiler (see batch_video_upscale.gate_local_compile), so every LOCAL row on disk really
+    was measured uncompiled and keeps its meaning. The reverse convention would make a
+    compiled sweep resume those rows and report them as its own.
+
+    KNOWN WART: pre-existing REMOTE rows are compiled but carry "" too, because pods never
+    gate compile and the flag defaults on. They are mislabelled and cannot be fixed by
+    inference alone; a compiled remote sweep will re-probe them once rather than trust them.
+    That is the price of never quietly comparing a compiled rate to an uncompiled one.
+
+    Static and dynamic get DIFFERENT tags: a dynamic graph trades steady-state speed for one
+    compile instead of one per rung, so their rates are not interchangeable either (and
+    telling them apart is the whole point of measuring the two).
+    """
+    s = settings or {}
+    if not (s.get("compile_dit") or s.get("compile_vae")):
+        return ""
+    return "|cd" if s.get("compile_dynamic") else "|c"
+
+
+def learn_tag(settings):
+    """The FULL learned-batch key suffix: EVERY setting that moves the VRAM ceiling.
+
+    video_batch_learn holds a measured batch CEILING, so its key must name every setting that
+    moves one. tile_tag used to be the only one here, on the reasoning that compile "does not
+    move the VRAM ceiling much -- the peak is activations, not kernel fusion". That reasoning
+    asked to be revisited by measurement. It was, on a 3090 at 540x720 (7B), and it was wrong:
+
+        ceiling      125 uncompiled  ->   53 compiled     (2.4x lower)
+        peak_alloc     b5   b9   b17   b33
+          uncompiled 15.80 16.00 16.40 17.20  (+0.049 GB/batch)
+          compiled   16.60 17.20 18.30 20.60  (+0.143 GB/batch, ~2.9x steeper)
+
+    Not contention: the compiled sweep OOM'd at b57 with MORE free VRAM (23.05 GB) than the
+    uncompiled one had while running b125 clean (20.1 GB).
+
+    Sharing one row let the two regimes silently overwrite each other. It is not theoretical:
+    a compiled sweep dropped this card's learned 540x720 batch from 113 to 49, which no error
+    and no log line would ever have reported -- just every later uncompiled run pinned ~2x
+    below its real ceiling. The reverse direction hands a compiled run an uncompiled ceiling
+    and buys an OOM + step-down on the first segment of every video.
+
+    The cost of tagging is real but bounded, and it is not the "orphan every row on every
+    card" it was feared to be. LOCAL rows keep working untouched: local compile was gated off
+    until a verified toolchain existed, so those rows really were measured uncompiled and ""
+    still names them correctly. REMOTE rows do re-discover once, because a pod never gates
+    compile and the flag defaults on, so they were compiled while labelled "" (the same
+    mislabelling [compile_tag] already documents for video_bench). Re-discovery there is the
+    already-accepted price of never silently mixing the two regimes, and it self-corrects
+    through the auto-tuner's OOM step-down rather than through a wrong answer.
+    """
+    return tile_tag(settings) + compile_tag(settings)
+
+
 def vram_tier(total_gb):
     """The largest seed tier <= the card's total VRAM (so a 24 GB card uses the 24 tier,
     a 20 GB card falls to 16). None if total is unknown."""
@@ -201,11 +294,16 @@ def _fit_to_free(batch, mp, free_gb):
     return b
 
 
-def pick(model, out_w, out_h, conn=None, gpu_id=None, free_gb=None, total_gb=None):
+def pick(model, out_w, out_h, conn=None, gpu_id=None, free_gb=None, total_gb=None,
+         tags=""):
     """Return (batch, overlap): the largest window predicted to fit on the FIRST try for
-    this (model, output size, card). Precedence: a LEARNED value (per gpu|model + MP
+    this (model, output size, card). Precedence: a LEARNED value (per gpu|model[|tags] + MP
     bucket) if present, else the tier SEED; then a live free-VRAM step-DOWN. `free_gb` /
     `total_gb` may be injected (tests / a cached probe); otherwise they are read live.
+
+    `tags` is learn_tag(engine settings): it keeps a ceiling measured under one VRAM regime
+    (VAE tiling, torch.compile) out of a run seeing another. Default "" = untiled+uncompiled,
+    which is the historical key.
 
     Never raises; on any uncertainty it errs low (a smaller window runs, a too-big one
     OOMs). Overlap is the quality-floored auto value for the chosen batch."""
@@ -228,7 +326,7 @@ def pick(model, out_w, out_h, conn=None, gpu_id=None, free_gb=None, total_gb=Non
             # NEAREST recorded key >= this run's MP: a ceiling measured at a LARGER output is a
             # safe bound here (decode memory rises with MP), so each benchmarked size serves
             # nearby smaller runs without a coarse bucket merging distinct sizes.
-            learned = _db.get_learned_batch_ge(conn, f"{gpu_id}|{tag}", mp_bucket(mp))
+            learned = _db.get_learned_batch_ge(conn, f"{gpu_id}|{tag}{tags}", mp_bucket(mp))
             if learned and learned > 0:
                 batch = int(learned)
                 is_learned = True
@@ -250,18 +348,21 @@ def pick(model, out_w, out_h, conn=None, gpu_id=None, free_gb=None, total_gb=Non
     return batch, auto_overlap(batch)
 
 
-def record_result(conn, gpu_id, model, out_w, out_h, batch, ok=True):
+def record_result(conn, gpu_id, model, out_w, out_h, batch, ok=True, tags=""):
     """Persist the outcome of a segment so the sizer self-calibrates: on success, record
-    `batch` as the known-good window for (gpu|model, MP bucket); the learned value then
-    supersedes the seed next time. On a failure (an OOM that recovered to a smaller
+    `batch` as the known-good window for (gpu|model[|tags], MP bucket); the learned value
+    then supersedes the seed next time. On a failure (an OOM that recovered to a smaller
     batch), pass the RECOVERED batch as `batch` with ok=True -- it is the new known-good.
-    Best-effort; a missing db/args is a silent no-op."""
+    `tags` is learn_tag(engine settings), so a result measured under VAE tiling or
+    torch.compile is stored apart from a plain one (it is a different ceiling, see
+    [learn_tag]). Best-effort; a missing db/args is a silent no-op."""
     if not ok or conn is None or not gpu_id or _db is None or not batch or batch <= 0:
         return
     mp = (float(out_w) * float(out_h) / 1_000_000.0) if (out_w and out_h) else 0.0
     if mp <= 0:
         return
     try:
-        _db.put_learned_batch(conn, f"{gpu_id}|{model_tag(model)}", mp_bucket(mp), int(batch))
+        _db.put_learned_batch(conn, f"{gpu_id}|{model_tag(model)}{tags}",
+                              mp_bucket(mp), int(batch))
     except Exception:                                # noqa: BLE001 (fail-safe)
         pass

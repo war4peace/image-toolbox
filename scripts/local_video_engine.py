@@ -66,6 +66,13 @@ _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_video_
 _RESULT_MARK = "@@LVW-RESULT@@"
 _OOM_MARK = "@@LVW-OOM@@"
 _OOM_EXIT = 42                                        # local_video_worker.py OOM exit code
+# Throwaway passes a benchmark probe runs before its TIMED one. 1 is enough: it loads the
+# model and compiles this rung's shape, so the timed pass measures the steady-state cost a
+# real segment pays. Applies to BOTH regimes -- the model load is not compile's fault, and
+# it alone was inflating short probes by ~2x. Costs one extra pass per rung; that is the
+# price of a rate that means what video_estimate thinks it means. Probe-only: a production
+# run never warms (it loads and compiles ONCE, then amortises over every segment).
+PROBE_WARMUP_PASSES = 1
 # Default: a segment with NO pipeline progress for this many seconds is thrashing
 # (VRAM soft-spilled to sysmem: a healthy decode batch is seconds, a thrashing one was
 # ~25 min, docs 14). Generous so a legitimately heavy step never false-trips; low enough
@@ -256,7 +263,8 @@ class LocalVideoEngine:
             free_gb, total_gb = _sizer.free_vram_gb(prefer_smi=self.use_subprocess)
             picked_b, picked_o = _sizer.pick(self.model, out_w, out_h,
                                              conn=self.conn, gpu_id=self.gpu_id,
-                                             free_gb=free_gb, total_gb=total_gb)
+                                             free_gb=free_gb, total_gb=total_gb,
+                                             tags=_sizer.learn_tag(self._settings))
             batch, overlap, chunk = self._resolve_window(
                 picked_b, chunk_size, picked_o, frames_total)
         else:
@@ -333,7 +341,8 @@ class LocalVideoEngine:
         if _sizer is not None and out_w and out_h:
             try:
                 _sizer.record_result(self.conn, self.gpu_id, self.model,
-                                     out_w, out_h, batch, ok=True)
+                                     out_w, out_h, batch, ok=True,
+                                     tags=_sizer.learn_tag(self._settings))
             except Exception:                        # noqa: BLE001 (fail-safe)
                 pass
 
@@ -371,8 +380,10 @@ class LocalVideoEngine:
         peak_reserved_gb). Raises a CUDA-OOM error (caller retries smaller) or
         ThrashDetected (caller must not retry)."""
         if self.use_subprocess:
-            return self._run_subprocess_attempt(src, dest, resolution, batch, chunk,
-                                                overlap, seed, backend, use_10bit, should_stop)
+            out = self._run_subprocess_attempt(
+                src, dest, resolution, batch, chunk, overlap, seed, backend,
+                use_10bit, should_stop)
+            return out["frames"], out["alloc"], out["reserved"]
         n = self._engine.process_video(
             src, dest, resolution=int(resolution), batch_size=batch, chunk_size=chunk,
             temporal_overlap=overlap, seed=seed, video_backend=backend,
@@ -400,13 +411,25 @@ class LocalVideoEngine:
         return path
 
     def _run_subprocess_attempt(self, src, dest, resolution, batch, chunk, overlap,
-                                seed, backend, use_10bit, should_stop):
+                                seed, backend, use_10bit, should_stop, warmup_passes=0,
+                                warmup_src=None):
         """Upscale one attempt in a FRESH child process, watched for thrash. The parent
         reads the child's stdout: every line is a liveness heartbeat, so a gap longer than
         `thrash_stall_seconds` (a healthy step is seconds; a thrashing one was ~25 min)
         means the GPU is thrashing/hung -> kill the tree and raise ThrashDetected. A CUDA
         OOM (marker / exit 42) becomes a normal OOM error so the caller retries smaller in
-        a NEW clean process. Pipeline progress is forwarded to our stdout for the GUI log."""
+        a NEW clean process. Pipeline progress is forwarded to our stdout for the GUI log.
+
+        Returns a dict: `frames`, `alloc`/`reserved` (peak GB, the WORST case over every pass
+        -- what a ceiling is made of), `steady_alloc`/`steady_reserved` (the warm pass alone,
+        None when the probe ran a single pass), and `seconds` (the child's own timing of its
+        TIMED pass, None when it reported none -- an older worker -- so the caller falls back
+        to wall time). `warmup_passes` > 0 asks the child to absorb the model load and
+        torch.compile's per-process cost first, so `seconds` is a WARM rate and the steady
+        peaks are separable from the cold ones. `warmup_src` (optional) points those warmup
+        passes at a SHORT clip instead of `src`: the compile + peak a warmup reproduces are
+        set by the window (batch), not the clip length, so a batch+1-frame clip warms the same
+        graphs at the same ceiling far cheaper. See local_video_worker's docstring."""
         cmd = [sys.executable, "-u", _WORKER,
                "--repo-dir", self._repo_dir, "--model-dir", self._model_dir,
                "--settings", self._settings_json(),
@@ -414,6 +437,10 @@ class LocalVideoEngine:
                "--resolution", str(int(resolution)), "--batch", str(int(batch)),
                "--chunk", str(int(chunk)), "--overlap", str(int(overlap)),
                "--video-backend", backend]
+        if warmup_passes > 0:
+            cmd += ["--warmup-passes", str(int(warmup_passes))]
+            if warmup_src and os.path.abspath(warmup_src) != os.path.abspath(src):
+                cmd += ["--warmup-input", warmup_src]
         if seed is not None:
             cmd += ["--seed", str(int(seed))]
         if use_10bit:
@@ -448,7 +475,10 @@ class LocalVideoEngine:
         threading.Thread(target=_reader, daemon=True).start()
 
         frames = alloc = reserved = None
+        steady_alloc = steady_reserved = None         # the warm pass alone (warmed probes only)
+        worker_seconds = None
         oom = False
+        oom_pass = None                               # 'warmup' | 'timed' (see the OOM marker)
         tail = []
         last = time.monotonic()
         stall = max(_STALL_FLOOR, int(self.thrash_stall_seconds))
@@ -478,9 +508,18 @@ class LocalVideoEngine:
                         alloc = float(tok[len("alloc="):] or 0)
                     elif tok.startswith("reserved="):
                         reserved = float(tok[len("reserved="):] or 0)
+                    elif tok.startswith("seconds="):
+                        worker_seconds = float(tok[len("seconds="):] or 0)
+                    elif tok.startswith("alloc_steady="):
+                        steady_alloc = float(tok[len("alloc_steady="):] or 0)
+                    elif tok.startswith("reserved_steady="):
+                        steady_reserved = float(tok[len("reserved_steady="):] or 0)
                 continue
             if _OOM_MARK in s:
                 oom = True
+                for tok in s.split():
+                    if tok.startswith("pass="):
+                        oom_pass = tok[len("pass="):]
                 continue
             print(s, flush=True)                      # forward pipeline progress to the GUI log
             tail.append(s)
@@ -489,14 +528,21 @@ class LocalVideoEngine:
 
         rc = proc.wait()
         if oom or rc == _OOM_EXIT:
-            raise RuntimeError(f"CUDA out of memory (worker) at batch {batch}")
+            # Name the pass in the message: an OOM in the TIMED pass of a warmed probe is
+            # suspect (it fit while cold, then not in the warmup's leftover pool), whereas an
+            # OOM in the warmup is the batch genuinely not fitting. The sweep treats both as
+            # 'oom'; this is what lets a human tell them apart afterwards in the log.
+            raise RuntimeError(f"CUDA out of memory (worker) at batch {batch}"
+                               + (f" [{oom_pass} pass]" if oom_pass else ""))
         if frames is None:
             raise RuntimeError(
                 f"local video worker failed (exit {rc}): " + " | ".join(tail[-6:]))
-        return frames, alloc, reserved
+        return {"frames": frames, "alloc": alloc, "reserved": reserved,
+                "seconds": worker_seconds,
+                "steady_alloc": steady_alloc, "steady_reserved": steady_reserved}
 
     def probe_batch(self, src_path, dest_path, *, resolution, batch, overlap=None,
-                    frames=None, should_stop=None):
+                    frames=None, should_stop=None, on_progress=None, warmup_src=None):
         """Benchmark primitive (feature #7, docs 16/20): run ONE upscale attempt at a FIXED
         batch and report the outcome, WITHOUT the process_segment OOM step-down (the benchmark
         sweeps UPWARD to failure, so a failed probe must fail, not silently shrink). Requires
@@ -506,7 +552,17 @@ class LocalVideoEngine:
         Returns a dict {outcome, batch, overlap, frames, seconds, peak_alloc_gb,
         peak_reserved_gb} where outcome is 'ok' | 'oom' | 'thrash' | 'stopped' | 'error'.
         Never raises for an OOM/thrash (they are expected sweep outcomes); a genuine
-        bad-setup error is returned as 'error' with the message in `error`."""
+        bad-setup error is returned as 'error' with the message in `error`.
+
+        `on_progress` is ACCEPTED AND IGNORED, so the local and remote engines keep one
+        `probe_batch` contract for video_benchmark's single code path. There is no status
+        channel to report from: the probe is an isolated subprocess whose output the parent
+        only reads once it exits. Remote needs the callback (it polls a live pod).
+
+        `warmup_src` (optional) is a SHORT clip the warmup pass(es) run on instead of the timed
+        `src_path`, absorbing the model load + torch.compile at the same per-window ceiling for
+        a fraction of the work (see local_video_worker). The caller sizes it (>= batch+1 frames);
+        None warms on the full clip."""
         if not self.use_subprocess:
             raise RuntimeError("probe_batch requires use_subprocess=True (fresh CUDA context "
                                "per probe is mandatory for an honest upward sweep)")
@@ -520,9 +576,10 @@ class LocalVideoEngine:
         _b, ov, chunk = self._resolve_window(b, 0, ov, frames)
         t0 = time.time()
         try:
-            n, alloc, reserved = self._run_subprocess_attempt(
+            out = self._run_subprocess_attempt(
                 src_path, dest_path, resolution, b, chunk, ov, None,
-                "opencv", False, should_stop)
+                "opencv", False, should_stop, warmup_passes=PROBE_WARMUP_PASSES,
+                warmup_src=warmup_src)
         except ThrashDetected as exc:
             return {"outcome": "thrash", "batch": b, "overlap": ov,
                     "seconds": time.time() - t0, "error": str(exc)}
@@ -534,9 +591,16 @@ class LocalVideoEngine:
                 return {"outcome": "oom", "batch": b, "overlap": ov,
                         "seconds": time.time() - t0}
             return {"outcome": "error", "batch": b, "overlap": ov, "error": str(exc)}
-        dt = time.time() - t0
-        return {"outcome": "ok", "batch": b, "overlap": ov, "frames": int(n or 0),
-                "seconds": dt, "peak_alloc_gb": alloc, "peak_reserved_gb": reserved}
+        # Prefer the worker's own timing of its WARM pass. Wall time here would also carry
+        # process spawn + torch import + the 16 GB model load + torch.compile, none of which
+        # a real run pays per segment; the worker's `seconds` is the pass alone.
+        wsecs = out["seconds"]
+        dt = wsecs if wsecs is not None else (time.time() - t0)
+        return {"outcome": "ok", "batch": b, "overlap": ov, "frames": int(out["frames"] or 0),
+                "seconds": dt,
+                "peak_alloc_gb": out["alloc"], "peak_reserved_gb": out["reserved"],
+                "peak_alloc_steady_gb": out["steady_alloc"],
+                "peak_reserved_steady_gb": out["steady_reserved"]}
 
     def telemetry(self):
         """Interface parity. Local GPU telemetry is sampled by the GUI's own

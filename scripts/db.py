@@ -419,6 +419,17 @@ def _ensure_video_columns(conn):
         cols = [r[1] for r in conn.execute("PRAGMA table_info(video_bench)")]
         if cols and "free_vram" not in cols:       # #7: free-VRAM tag for contended probes
             conn.execute("ALTER TABLE video_bench ADD COLUMN free_vram REAL")
+        # Split peaks: peak_alloc/peak_reserved stay the WORST CASE over the probe (what the
+        # ceiling is made of); these are the STEADY-STATE pass alone. A warmed probe fuses two
+        # very different costs into one number -- the cold pass pays torch.compile, whose
+        # inductor autotuning allocates at the compiled shape and varies run to run, while the
+        # warm pass is what every segment after the first actually costs. Fused, we could not
+        # tell a compile-bound ceiling from an inference-bound one, and the measured peak
+        # stopped tracking output megapixels (0.69 MP -> 21.4 GB but 1.23 MP -> 18.4 GB).
+        # NULL on an un-warmed probe / an older row: there was only ever one pass.
+        for _c in ("peak_alloc_steady", "peak_reserved_steady"):
+            if cols and _c not in cols:
+                conn.execute(f"ALTER TABLE video_bench ADD COLUMN {_c} REAL")
     except Exception as exc:
         debug_log("db._ensure_video_columns(video_bench)", exc=exc)
 
@@ -571,28 +582,35 @@ def put_learned_batch(conn, gpu_id, mp_key, batch):
 @_locked
 def record_bench_probe(conn, gpu_id, model, out_w, out_h, batch, outcome,
                        frames=None, seconds=None, peak_alloc=None, peak_reserved=None,
-                       free_vram=None):
+                       free_vram=None, peak_alloc_steady=None, peak_reserved_steady=None):
     """Persist ONE benchmark probe (a fixed batch at an output size on this card+model).
     Upserts, so re-running a probe overwrites the prior outcome (the newest run wins).
     `free_vram` (GB free at probe start) tags a probe run under other-app VRAM contention,
     so resume can re-try a failure that happened with less headroom than is free now.
+
+    `peak_alloc`/`peak_reserved` are the WORST CASE over the whole probe (the ceiling: a real
+    run's first segment pays the cold+compile peak too). `peak_*_steady` are the warm pass
+    alone -- what every later segment costs. Keeping both is what distinguishes a
+    compile-bound ceiling from an inference-bound one; None when the probe ran a single pass.
     Best-effort: bad args are ignored. Commits so a crash/kill can't lose finished probes."""
     if not gpu_id or not model or not out_w or not out_h or not batch or not outcome:
         return
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    def _f(x):
+        return float(x) if x is not None else None
     conn.execute(
         "INSERT INTO video_bench (gpu_id, model, out_w, out_h, batch, outcome, frames, "
-        "seconds, peak_alloc, peak_reserved, free_vram, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "seconds, peak_alloc, peak_reserved, free_vram, peak_alloc_steady, "
+        "peak_reserved_steady, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(gpu_id, model, out_w, out_h, batch) DO UPDATE SET "
         "outcome=excluded.outcome, frames=excluded.frames, seconds=excluded.seconds, "
         "peak_alloc=excluded.peak_alloc, peak_reserved=excluded.peak_reserved, "
-        "free_vram=excluded.free_vram, updated_at=excluded.updated_at",
+        "free_vram=excluded.free_vram, peak_alloc_steady=excluded.peak_alloc_steady, "
+        "peak_reserved_steady=excluded.peak_reserved_steady, updated_at=excluded.updated_at",
         (gpu_id, model, int(out_w), int(out_h), int(batch), str(outcome),
          (int(frames) if frames is not None else None),
-         (float(seconds) if seconds is not None else None),
-         (float(peak_alloc) if peak_alloc is not None else None),
-         (float(peak_reserved) if peak_reserved is not None else None),
-         (float(free_vram) if free_vram is not None else None), now))
+         _f(seconds), _f(peak_alloc), _f(peak_reserved), _f(free_vram),
+         _f(peak_alloc_steady), _f(peak_reserved_steady), now))
     conn.commit()
 
 
@@ -643,16 +661,36 @@ def max_feasible_output_mp(conn, gpu_id):
 
 
 @_locked
-def clear_bench(conn, gpu_id, model=None):
-    """Delete benchmark probes for a card (all models, or one model). For a 'restart'
-    from the GUI. Commits. The derived video_batch_learn / gpu_perf rows are left alone
-    (a re-run overwrites them); only the raw probe/resume rows are cleared."""
+def clear_bench(conn, gpu_id, model=None, cells=None):
+    """Delete benchmark probes for a card (all models, or one model), optionally scoped
+    to specific (out_w, out_h) targets. For a 'restart' from the GUI. Commits. The derived
+    video_batch_learn / gpu_perf rows are left alone (a re-run overwrites them); only the
+    raw probe/resume rows are cleared.
+
+    `cells` exists because a card-wide wipe is almost never what a restart means. Ticking
+    'Restart' to re-measure ONE target used to discard every target measured on that card:
+    the 3090 carried 40 rows across 7 targets, each cell 10+ minutes of GPU time (and a
+    remote cell is billed), and the loss was silent until the next sweep found nothing to
+    resume. Callers that mean "only the targets I picked" MUST pass them.
+
+    `cells=None` = unscoped (every target). `cells=[]` = an explicitly empty scope and
+    clears NOTHING, so a caller that computes a target list can never fall through to the
+    card-wide delete by handing over an empty one."""
     if not gpu_id:
         return
+    sql = "DELETE FROM video_bench WHERE gpu_id=?"
+    params = [gpu_id]
     if model:
-        conn.execute("DELETE FROM video_bench WHERE gpu_id=? AND model=?", (gpu_id, model))
-    else:
-        conn.execute("DELETE FROM video_bench WHERE gpu_id=?", (gpu_id,))
+        sql += " AND model=?"
+        params.append(model)
+    if cells is not None:
+        pairs = [(int(w), int(h)) for w, h in cells]
+        if not pairs:
+            return
+        sql += " AND (" + " OR ".join(["(out_w=? AND out_h=?)"] * len(pairs)) + ")"
+        for w, h in pairs:
+            params += [w, h]
+    conn.execute(sql, params)
     conn.commit()
 
 

@@ -82,8 +82,9 @@ class BenchmarkWindow(tk.Toplevel):
         self._hold = ""
         self._marker_buf = None
         self.gpu_id = None
-        self.model_tag = sizer.model_tag(CFG.get("video", {}).get(
-            "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
+        # The regime-tagged video_bench key the RUNNER will write under, resolved by the runner's
+        # own helper so the two can never disagree. Read _resolve_bench_key before changing this.
+        self.model_tag = self._resolve_bench_key()
         self.total_vram_gb = 0
         self.target_vars = {}
         self._rows = {}                     # target -> tree iid
@@ -119,6 +120,25 @@ class BenchmarkWindow(tk.Toplevel):
             pass
 
     # ── layout ───────────────────────────────────────────────────────────────
+
+    def _resolve_bench_key(self):
+        """The video_bench key this window must READ, which is whatever the runner will WRITE:
+        the model tag plus a tag per setting that moves the numbers (VAE tiling, torch.compile).
+
+        A bare model tag was wrong whenever either feature was on. With compile enabled the
+        runner wrote "7b|c" while this window read "7b", so the results table showed the STALE
+        UNCOMPILED cell (ceiling 125, 0.54 s/f) for the entire compiled sweep, and the resume
+        estimate counted those rows as work already done.
+
+        Resolved ONCE at open, not per refresh: the local branch runs the compile gate, which
+        verifies the toolchain by actually compiling. That is cached per process but costs a
+        second on first call, and _refresh_estimate fires on every checkbox tick. Fail-safe: any
+        problem falls back to the bare display tag (a wrong table beats no window)."""
+        try:
+            return vb.resolve_bench_key(remote=self.remote, log_fn=lambda *_a, **_k: None)
+        except Exception:
+            return sizer.model_tag(CFG.get("video", {}).get(
+                "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
 
     @staticmethod
     def _target_label(t):
@@ -174,13 +194,14 @@ class BenchmarkWindow(tk.Toplevel):
             self._toggles.append(cb)
             self._target_cb[t] = cb
         self.restart_var = tk.BooleanVar(value=False)
-        rb = ttk.Checkbutton(tf, text="Restart (discard saved results for this card)",
+        rb = ttk.Checkbutton(tf, text="Restart (discard saved results for the ticked targets)",
                              variable=self.restart_var, command=self._refresh_estimate)
         rb.grid(row=(len(self.ALL_TARGETS) + cols - 1) // cols, column=0, columnspan=cols,
                 sticky="w", pady=(6, 0))
         self._toggles.append(rb)
         Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
-                    "On: clears this card+model's saved probes and benchmarks from scratch.")
+                    "On: clears the saved probes for the TICKED targets only and measures\n"
+                    "them from scratch. Targets you did not tick keep their results.")
 
         # Results table (fixed 5 rows) + the program-output log below it, filling the rest.
         rf = ttk.LabelFrame(self, text=" Results & log ", padding=4)
@@ -488,8 +509,15 @@ class BenchmarkWindow(tk.Toplevel):
                         "Benchmark anyway?", parent=self):
                     return
         if self.restart_var.get():
+            # Name the targets. The old wording ("this card's saved results") described a
+            # card-wide wipe and would have been an accurate warning for the old behaviour;
+            # spelling out the list is what makes the narrowed scope checkable by the user.
+            names = "\n".join(f"  - {self._target_label(t)}" for t in targets)
             if not messagebox.askyesno(
-                    APP_TITLE, "Discard this card's saved benchmark results and start over?",
+                    APP_TITLE,
+                    f"Discard the saved benchmark results for these {len(targets)} target(s) "
+                    f"and measure them from scratch?\n\n{names}\n\n"
+                    "Any other target measured on this card keeps its results.",
                     parent=self):
                 return
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "video_benchmark.py"),

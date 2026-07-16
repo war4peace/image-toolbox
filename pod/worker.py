@@ -43,9 +43,14 @@ Endpoints:
                                       body = a short clip (>= batch frames)
                                       -> {"id":...}  (poll /video/status for the
                                          outcome: ok / oom / error + peak VRAM; no fetch)
-  The heartbeat is refreshed on every line of pipeline progress (a tee over the
-  SeedVR2 tqdm output), so a long segment that is genuinely working stays alive
-  while a HUNG GPU goes stale and the dead-man's switch can reclaim the pod.
+  The heartbeat is refreshed on every /video/status poll: the client polls while it
+  is waiting on a job, so the dead-man's switch reclaims the pod when the CLIENT
+  dies (its real purpose), which is precisely when the polls stop.
+  It used to be refreshed only per line of pipeline output, on the theory that a
+  working segment stays alive while a hung GPU goes stale. That theory is FALSE at
+  4K: a tiled decode is one atomic silent step of many minutes, indistinguishable
+  from a hang, and the switch duly terminated a pod mid-probe. Pipeline output is
+  still reported (`stalled_for`) as diagnostics, but it no longer gates the pod.
 """
 import os
 import re
@@ -553,10 +558,12 @@ def _time_fill_frames(job):
 
 class _HeartbeatTee:
     """A stdout/stderr proxy that forwards to the real stream AND touches the
-    heartbeat on every non-blank write. Wrapping the SeedVR2 pipeline's tqdm
-    progress in this turns each per-batch redraw into a liveness signal, so the
-    dead-man's switch sees a working segment as alive yet a hung GPU (no progress
-    output) as idle and reclaims the pod.
+    heartbeat on every non-blank write, recording the time as `last_output_t`.
+
+    NOT the primary liveness signal (that is the /video/status poll). Pipeline output
+    was tried as one and it is unfit: it cannot separate a working GPU from a hung one,
+    because a 4K tiled decode emits nothing for longer than the idle timeout. Kept
+    because it is still a genuine "the pipeline moved" mark, reported as `stalled_for`.
 
     It also opportunistically extracts WITHIN-SEGMENT frame progress for the GUI's
     progress bar (15.8): any tqdm `n/total` whose total matches the segment's known
@@ -860,7 +867,14 @@ def _run_probe_job(job, params):
     loaded, and each probe measures the way a real segment runs (process_video), with
     peak VRAM read from a fresh reset. The output is discarded (no /video/fetch); only
     outcome / seconds / frames / peak matter. The clip is sized by the client to hold the
-    batch (>= b frames), so no frame-collapse fit is needed here."""
+    batch (>= b frames), so no frame-collapse fit is needed here.
+
+    `warmup` runs a throwaway pass first and times only the second. The resident worker
+    spares us the model load that the LOCAL probe pays, but NOT torch.compile: every rung is
+    a new shape under static compile, so each measured probe was charging itself ~30s of
+    dynamo/inductor work that a real run pays once per shape and amortises over every
+    segment. Peak VRAM deliberately spans BOTH passes (compile allocates, and a real run's
+    first segment pays that), so the ceiling stays worst-case while the rate goes warm."""
     job["state"] = "running"
     _touch(_HEARTBEAT)
     tee = _HeartbeatTee(sys.stdout, job)
@@ -886,15 +900,26 @@ def _run_probe_job(job, params):
             with _GPU_LOCK:
                 try:
                     import torch
-                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.reset_peak_memory_stats()   # spans the warmup too, on purpose
                 except Exception:
                     pass
+
+                def _pass():
+                    return _ENGINE.process_video(
+                        job["input"], job["output"], resolution=params["resolution"],
+                        batch_size=b, chunk_size=chunk, temporal_overlap=o,
+                        seed=params["seed"], video_backend=params["video_backend"],
+                        use_10bit=params["use_10bit"])
+
+                # Defaults ON here too, not just in the HTTP layer: a probe is a request for
+                # a benchmark number, and the un-warmed one is the wrong number. An omitted
+                # key must not silently opt out of the fix.
+                if params.get("warmup", True):
+                    _log(f"probe {job['id'][:8]} bs={b}: warmup pass (discarded; absorbs "
+                         f"torch.compile for this shape)")
+                    _pass()
                 t0 = time.time()
-                n = _ENGINE.process_video(
-                    job["input"], job["output"], resolution=params["resolution"],
-                    batch_size=b, chunk_size=chunk, temporal_overlap=o,
-                    seed=params["seed"], video_backend=params["video_backend"],
-                    use_10bit=params["use_10bit"])
+                n = _pass()
                 job["seconds"] = time.time() - t0
         try:                                  # ground-truth working set vs the allocator pool
             import torch
@@ -924,6 +949,45 @@ def _run_probe_job(job, params):
             _log(f"probe {job['id'][:8]} bs={b}: ERROR {exc}")
     finally:
         _touch(_HEARTBEAT)
+
+
+def _gate_compile(settings):
+    """Pod-side mirror of batch_video_upscale.gate_local_compile: never ASK for a
+    torch.compile this pod cannot perform.
+
+    Inductor shells out to a C compiler to build kernels, so Triton alone is not enough.
+    With compile requested and no compiler the first VAE compile HANGS with no output --
+    on a rented pod that is a silent, billing, undiagnosable stall (locally the same bug
+    is the known "stuck at first segment" symptom). The local gate has existed for a while;
+    the pod was never gated, because _worker_cfg / _worker_settings ship compile_dit and
+    compile_vae straight from config and nothing ever asked the pod whether it could.
+
+    Today's RunPod pytorch image does have a compiler, so this is insurance, not a fix for
+    a live failure. It also LOGS the answer, so "is it compiling or is it hung?" stops
+    being inferred from a GPU temperature graph. Mutates `settings` in place; never raises.
+    Returns (compile_on, detail)."""
+    if not (settings.get("compile_dit") or settings.get("compile_vae")):
+        return False, "not requested"
+    try:
+        import importlib.util as _ilu
+        triton = _ilu.find_spec("triton") is not None
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        if triton and cc:
+            dyn = " dynamic" if settings.get("compile_dynamic") else " static"
+            _log(f"torch.compile ON ({dyn.strip()}; compiler={cc}). The first pass pays a "
+                 f"one-time compile with NO output; a cold pod has an empty Triton cache, "
+                 f"so expect minutes of silence before the GPU wakes.")
+            return True, cc
+        why = "Triton is not installed" if not triton else "no C compiler (cc/gcc/clang) on PATH"
+        settings["compile_dit"] = False
+        settings["compile_vae"] = False
+        _log(f"WARNING: torch.compile requested but DISABLED on this pod: {why}. It would "
+             f"otherwise hang the first pass with no output. Running uncompiled: speed only, "
+             f"not quality.")
+        return False, why
+    except Exception as exc:                              # noqa: BLE001 (never block a run)
+        _log(f"compile gate check failed ({exc}); leaving the setting as configured.")
+        return bool(settings.get("compile_dit")), "gate check failed"
 
 
 def _cleanup_job(job):
@@ -1176,6 +1240,10 @@ class Handler(BaseHTTPRequestHandler):
                 "seed":             int(q["seed"][0]) if q.get("seed") else None,
                 "video_backend":    q.get("video_backend", ["opencv"])[0],
                 "use_10bit":        q.get("use_10bit", ["0"])[0] in ("1", "true", "True"),
+                # Throwaway pass before the timed one, so the rate is the warm/steady-state
+                # cost a real segment pays. Defaults ON: anyone asking for a probe wants a
+                # benchmark number, and the un-warmed one is the wrong number.
+                "warmup":           q.get("warmup", ["1"])[0] in ("1", "true", "True"),
             }
         except ValueError as exc:
             self._send(400, f"bad parameter: {exc}".encode(), "text/plain")
@@ -1221,6 +1289,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, "application/json")
 
     def _handle_video_status(self, q):
+        # A CLIENT POLL IS THE LIVENESS SIGNAL, not the pipeline's stdout. The client
+        # polls this every ~5s for as long as it is waiting on the job, so touching the
+        # heartbeat here means "the app is still alive and still wants this result".
+        # The tee's per-output-line touch (the only signal before this) CANNOT tell a
+        # working GPU from a hung one: a 4K tiled decode is one atomic, silent, >15-min
+        # step, so it went stale and the dead-man's switch terminated a pod that was
+        # computing flat out. The switch's real job is reclaiming a pod whose client
+        # died, and that is exactly what this signal measures: the polls stop, the
+        # heartbeat goes stale, the idle timeout fires. See _run_probe_job / _HeartbeatTee.
+        _touch(_HEARTBEAT)
         job = _VIDEO_JOB
         jid = (q.get("id") or [None])[0]
         if job is None or job["id"] != jid:
@@ -1264,6 +1342,12 @@ class Handler(BaseHTTPRequestHandler):
             "suggested_batch":  job.get("suggested_batch"),  # measured-anchored next batch
             "phase_trace":      job.get("phase_trace"),     # diagnostic: real phase cadence
             "phase_count":      job.get("phase_count"),
+            # Seconds since the pipeline last wrote ANY output. No longer a liveness
+            # signal (see the _touch above), but it is the one number that says how long
+            # the opaque stretches really are: whether a 4K probe sits silent in the DiT
+            # compile or in the tiled decode is currently a guess.
+            "stalled_for":      round(time.time() - (job.get("last_output_t")
+                                                     or job["started"]), 1),
         }).encode()
         self._send(200, body, "application/json")
 
@@ -1333,6 +1417,8 @@ def main(argv=None):
         from upscale_engine import UpscaleEngine
         with open(args.settings, encoding="utf-8") as f:
             settings = json.load(f)
+        # Never request a compile this pod can't do (and say what it decided).
+        _gate_compile(settings)
         # Trusted-volume cold-start guard (item 11): make the engine's weight
         # validation hit its fast cache instead of re-hashing 16 GB on a miss.
         _seed_validation_cache(

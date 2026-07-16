@@ -219,44 +219,68 @@ def cell_done(cell_probes, cap=DEFAULT_BATCH_CAP):
     return next_batch(cell_probes, BATCH_FLOOR, cap, free_now=None) is None
 
 
-# A couple of tiny THROWAWAY upscales before a cell's measured sweep, so the pod's cold
-# first-forward cost (kernel autotune / JIT, and the per-RESOLUTION torch.compile that is on by
-# default) is paid on 9 discarded frames instead of inflating the first real probe's s/frame (a
-# slow first batch, flagged by the user). Remote ONLY: the local path reloads the model per probe
-# in a fresh subprocess, so there is no warm state to build (every probe is cold by design).
-WARMUP_PROBES = 2
-WARMUP_BATCH = 9
-WARMUP_FRAMES = 9
+# Warming lives in the ENGINES now (LocalVideoEngine.PROBE_WARMUP_PASSES / the pod's
+# /video/probe `warmup`), not here. A cell-level warmup could not do the job:
+#
+#   * it warmed ONE batch, and under static compile every rung is a different shape, so
+#     every other rung still paid ~30s of torch.compile inside its own measurement;
+#   * it was remote-only, on the reasoning that a local probe is "cold by design" (fresh
+#     subprocess per probe). True, and precisely the bug: cold by design is not cold in
+#     PRODUCTION, which loads the model and compiles ONCE per run and amortises both over
+#     every segment. The sweep was charging per rung what a real run pays per video.
+#   * a warmup in a SEPARATE process cannot help a local probe at all: the model load and
+#     compile's dynamo/guard work are per-process, and the compile charge survived an
+#     already-warm on-disk inductor cache.
+#
+# So each probe now warms ITSELF, in the process that measures it, on the clip and batch it
+# is about to time. That also makes the old warmup's two hard-won constraints structural
+# rather than remembered: it necessarily runs the probes' code path at the probe's own
+# shape, so it can neither warm a graph no probe uses nor pick a rung that OOMs.
+
+# How often a running probe reports in. A 4K probe can run 20+ minutes, and the pipeline
+# goes fully silent for long stretches inside it (the DiT compile, then each atomic tiled
+# decode), so with no heartbeat line the log is indistinguishable from a hang. It was, in
+# fact, mistaken for one.
+PROBE_PING_SEC = 60
 
 
-def _warmup_cell(engine, work, cell, log, should_stop):
-    """Run WARMUP_PROBES discarded bs9 upscales at the cell's resolution to warm the resident
-    pod (compile/autotune) before its measured probes. Best-effort and fail-safe: any error just
-    means the first real probe does the warming instead; a warmup must never fail a benchmark."""
-    try:
-        clip = bclip.ensure_source_clip(work, cell["source"], WARMUP_FRAMES, log=None)
-    except Exception as exc:                             # noqa: BLE001
-        log(f"  (warmup skipped: could not prepare a clip: {exc})")
-        return
-    out = os.path.join(work, "warmup_out.mp4")
-    # The first warmup pass absorbs the one-time torch.compile for this resolution, which can
-    # take a few minutes with no output; say so, or it reads as a hang (it is NOT).
-    log(f"  warming up ({WARMUP_PROBES} throwaway bs{WARMUP_BATCH} passes, discarded); the first "
-        f"absorbs a one-time compile for this resolution and can take a few minutes …")
-    for i in range(WARMUP_PROBES):
-        if should_stop():
+def _probe_pinger(log, label):
+    """Build an on_progress callback that logs at most one line per PROBE_PING_SEC.
+
+    Reports the worker's `stalled_for`: seconds since the SeedVR2 pipeline last emitted
+    ANY output. That number used to be the pod's liveness signal (>15 min of it had the
+    dead-man's switch terminate a working pod); it is now purely diagnostic, and it is the
+    only way to see whether a silent 4K probe is sitting in the compile or in a decode.
+    Fail-safe: the caller already swallows exceptions, but a status field can be missing
+    on an older worker, so nothing here is required."""
+    state = {"last": 0.0}
+
+    def _ping(st):
+        now = time.time()
+        if now - state["last"] < PROBE_PING_SEC:
             return
-        try:
-            engine.probe_batch(clip, out, resolution=cell["resolution"], batch=WARMUP_BATCH,
-                               overlap=0, frames=WARMUP_FRAMES, should_stop=should_stop)
-        except Exception as exc:                         # noqa: BLE001 (never fail a run)
-            log(f"  (warmup pass {i + 1} failed, continuing cold: {exc})")
-            return
+        state["last"] = now
+        el = st.get("elapsed")
+        stalled = st.get("stalled_for")
+        bits = [f"{label}: running {_fmt_secs(el)}"]
+        if stalled is not None:
+            bits.append(f"no pipeline output for {_fmt_secs(stalled)}")
+        fp, tf = st.get("frames_processed"), st.get("total_frames")
+        if fp and tf:
+            bits.append(f"~{fp}/{tf} frames")
+        log("    " + ", ".join(bits))
+
+    return _ping
+
+
+def _fmt_secs(s):
+    """m:ss for a probe-scale duration; '?' when the worker did not report one."""
     try:
-        if os.path.exists(out):
-            os.remove(out)
-    except OSError:
-        pass
+        s = int(float(s))
+    except (TypeError, ValueError):
+        return "?"
+    return f"{s // 60}m{s % 60:02d}s"
+
 
 
 def drop_collapsed(rows):
@@ -386,6 +410,26 @@ def _worker_settings(cfg, vcfg):
     wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
     wc["input_noise_scale"] = vcfg["input_noise_scale"]
     wc["dit_model"] = vcfg["dit_model"]
+    # VAE tiling from the resolved video config, exactly as _worker_cfg does, so the
+    # benchmark measures the ceiling the real run will actually get. Inheriting it
+    # implicitly from cfg["upscale"] would let the image tab move these numbers.
+    for _k in ("encode_tiled", "decode_tiled", "encode_tile_size", "decode_tile_size",
+               "encode_tile_overlap", "decode_tile_overlap"):
+        wc[_k] = vcfg[_k]
+    # compile_dynamic comes from the resolved video config (video.*, else the image upscale.*
+    # value, else off), exactly as _worker_cfg takes it, so the benchmark cannot measure a
+    # different graph mode than the run. It defaults OFF: it was tried (one graph serving every
+    # batch, so a sweep's per-rung recompiles vanish and one warmup warms them all) and
+    # REVERTED after it cost a rented PRO 6000 a >32-minute, still-unfinished, single-threaded
+    # compile on a cold pod -- against a ~9-minute static baseline. Two reasons it was a bad
+    # trade:
+    #   * its benefit is making rates COMPARABLE across rungs that SUCCEED, and a 4K cell has
+    #     exactly ONE (batch 5). It solved a problem that cell does not have.
+    #   * the cost is unbounded and unmeasured; static's is known.
+    # The engine still supports it (upscale_engine._build_args passes --compile_dynamic when
+    # `compile_dynamic` is set), so it stays reachable from config for measuring, but nothing
+    # turns it on by default. Measure it LOCALLY before ever paying for it on a pod again.
+    wc["compile_dynamic"] = vcfg["compile_dynamic"]
     # Use the VIDEO resident threshold (not the image 40) so the benchmark measures ceilings in
     # the SAME resident/phased mode a real video run will use (a benchmark measured resident
     # would under-report a card that runs phased in production).
@@ -393,13 +437,55 @@ def _worker_settings(cfg, vcfg):
     return wc
 
 
-def _engine_settings(cfg, vcfg):
+def _engine_settings(cfg, vcfg, log_fn=None):
     """LOCAL engine settings: _worker_settings plus the compile-capability gate the local
     RUNNER applies. Without the gate a machine with no C compiler HANGS on the first probe's
-    VAE compile under piped stdio (the "stuck at first segment" deadlock)."""
+    VAE compile under piped stdio (the "stuck at first segment" deadlock).
+
+    `log_fn` overrides the runner's log for callers with nowhere to write it (the GUI resolves
+    the same settings just to name the key, and must not narrate the gate into a log file it
+    does not own)."""
     wc = _worker_settings(cfg, vcfg)
-    bv.gate_local_compile(wc, log)
+    bv.gate_local_compile(wc, log_fn or log)
     return wc
+
+
+def effective_settings(cfg, vcfg, remote=False, log_fn=None):
+    """The settings the engine will ACTUALLY run under, which is NOT the config: the LOCAL path
+    routes through the compile gate, so a machine with no usable C compiler runs uncompiled no
+    matter what config says. Remote is ungated here because the POD owns that decision (it runs
+    its own _gate_compile and logs it); today's RunPod image has a compiler."""
+    if remote:
+        return _worker_settings(cfg, vcfg)
+    return _engine_settings(cfg, vcfg, log_fn=log_fn)
+
+
+def bench_key(vcfg, eff_settings):
+    """The video_bench PROBE key. A probe's outcome ('ok' at batch N / 'oom') and its SECONDS
+    are only true for the regime it ran under, so every setting that moves them joins the model
+    tag. Each tag is "" when its feature is off, so existing probes keep their identity.
+    `sizer.model_tag` alone stays the DISPLAY name.
+      * tiling  -> moves the VRAM ceiling (an untiled OOM and a tiled OK at the same
+                   (card, size, batch) are two different facts).
+      * compile -> moves the RATE. Without it a compiled sweep resumes uncompiled rungs and
+                   publishes their seconds as compiled ones.
+    Derive it ONLY from effective_settings, never the raw config: the gate can turn compile off,
+    and tagging such a run "|c" would file uncompiled seconds under the compiled key, exactly
+    the lie the tag exists to prevent."""
+    return (sizer.model_tag(vcfg["dit_model"])
+            + sizer.tile_tag(eff_settings)
+            + sizer.compile_tag(eff_settings))
+
+
+def resolve_bench_key(remote=False, log_fn=None):
+    """The key the NEXT sweep on this machine will WRITE under, config loaded fresh. For callers
+    OUTSIDE the runner (the GUI's results table + resume estimate) that must read the rows the
+    runner is going to produce. The GUI used to derive a bare model tag instead, so a compiled
+    sweep wrote "7b|c" while the window read "7b": it showed the stale uncompiled baseline for
+    the entire run and counted those rows as work already done."""
+    cfg = bv._load_config()
+    vcfg = bv.resolve_video_cfg(cfg)
+    return bench_key(vcfg, effective_settings(cfg, vcfg, remote=remote, log_fn=log_fn))
 
 
 def _deploy_remote_engine(cfg, vcfg):
@@ -424,7 +510,7 @@ def _deploy_remote_engine(cfg, vcfg):
     return engine, sess
 
 
-def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
+def _record_cell_result(conn, gpu_id, bench_model, cell, learn_key):
     """After a cell's sweep, save the THROUGHPUT-OPTIMAL batch (not the raw ceiling) into the
     sizer's learned store and record ITS rate into the estimate store, so AUTO runs use the
     fastest window and the estimate reflects it. `learn_key` is the video_batch_learn key the
@@ -432,7 +518,7 @@ def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
     for a REMOTE run (process_job reads the un-model-qualified IMGTBX_GPU_OVERRIDE, section 22.3).
     The raw ceiling (max fit) is still returned for display. Returns (ceiling, saved) -- both
     None if the card can't do this output."""
-    probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+    probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, bench_model,
                                                 cell["out_w"], cell["out_h"]))
     ceil = cell_ceiling(probes)
     if not ceil:
@@ -451,7 +537,7 @@ def _record_cell_result(conn, gpu_id, model_tag, cell, learn_key):
     return ceil, saved
 
 
-def _log_summary_table(conn, gpu_id, model_tag, plan):
+def _log_summary_table(conn, gpu_id, bench_model, plan):
     """Print a compact summary table to the terminal log when a sweep finishes, mirroring the
     GUI Results table (target -> max fit / saved batch / overlap / best s-per-frame / peak VRAM /
     runtime) so a user reading the log (headless, or scrolled back through a long sweep) gets the
@@ -462,7 +548,7 @@ def _log_summary_table(conn, gpu_id, model_tag, plan):
                f"{'s/frame':>8}  {'Peak GB':>11}  {'Runtime':>8}  Status")
         lines = ["", "Summary:", hdr, "-" * len(hdr)]
         for cell in plan:
-            probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+            probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, bench_model,
                                                         cell["out_w"], cell["out_h"]))
             out = f"{cell['out_w']}x{cell['out_h']}"
             if not probes:
@@ -542,7 +628,12 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     notify_settings = notifications.resolve_settings(cfg)
     t_start = time.monotonic()
     conn = db.get_conn()
-    model_tag = sizer.model_tag(vcfg["dit_model"])
+    model_tag = sizer.model_tag(vcfg["dit_model"])          # the DISPLAY name
+    # The regime-tagged probe key (see bench_key) + the settings it is derived from. The GUI
+    # resolves the identical key via resolve_bench_key, so its table reads the rows this run
+    # writes; keep the two on this one derivation.
+    eff_settings = effective_settings(cfg, vcfg, remote=remote)
+    bench_model = bench_key(vcfg, eff_settings)
     work = os.path.join(vcfg["work_root"], "benchmark")
     os.makedirs(work, exist_ok=True)
 
@@ -576,11 +667,24 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
         from local_video_engine import _query_gpu_name
         gpu_id = _query_gpu_name() or "local"
         learn_key = f"{gpu_id}|{model_tag}"
+    # A ceiling measured under one VRAM regime is not the same measurement as one under
+    # another, so it is stored under its own key and can never seed a run seeing the other
+    # setting. Everything off tags to "" = the historical key. Both VAE tiling and
+    # torch.compile move the ceiling, so learn_tag carries both (compile used to be omitted
+    # here on the theory that it "barely" moved it; this card's own rows disproved that and
+    # the story is in sizer.learn_tag). The sweep writes the OPTIMAL batch to this key, so a
+    # missing tag does not just mislabel a row: it OVERWRITES the other regime's row with a
+    # number measured under settings that run never saw.
+    learn_key += sizer.learn_tag(eff_settings)
 
     if not resume:
-        db.clear_bench(conn, gpu_id, model_tag)
+        # Scope the wipe to the targets in THIS plan. A restart means "re-measure what I
+        # picked", never "discard every cell on this card": the other targets are hours of
+        # GPU time (billed, when remote) and nothing would announce their loss.
+        db.clear_bench(conn, gpu_id, bench_model,
+                       cells=[(c["out_w"], c["out_h"]) for c in plan])
 
-    done = sum(len(db.get_bench_probes(conn, gpu_id, model_tag, c["out_w"], c["out_h"]))
+    done = sum(len(db.get_bench_probes(conn, gpu_id, bench_model, c["out_w"], c["out_h"]))
                for c in plan) if resume else 0
     est = estimate_runtime(plan, gpu_id, conn, done=done)
     where = "on a RunPod pod" if remote else "locally"
@@ -588,6 +692,16 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                  else "VRAM unknown -> climbing from the base floor")
     log(f"Benchmarking {gpu_id} ({model_tag}) {where}: {len(plan)} target(s), frames={frames}, "
         f"geometric climb to a measured ceiling (cap {cap}, {vram_note}).")
+    # The one setting these numbers are meaningless without: tiling moves the VRAM ceiling,
+    # so a batch/rate result only compares against another run with the SAME tiling state.
+    log(f"VAE tiling: {bv.describe_tiling(vcfg)}")
+    # Compile state, stated up front. A compiling pod is SILENT for minutes with an idle GPU,
+    # which reads exactly like a hang; not knowing whether compile was even on cost a rented
+    # PRO 6000 a 35-minute diagnosis. Remote also reports its own gate decision (_gate_compile).
+    log(f"torch.compile: {'on' if eff_settings.get('compile_dit') else 'off'}"
+        f"{' (dynamic)' if eff_settings.get('compile_dynamic') else ''}"
+        + (" -- expect a silent, GPU-idle compile before the first pass (cold pod = empty "
+           "Triton cache)" if (remote and eff_settings.get("compile_dit")) else ""))
     log(f"Estimated runtime: ~{fmt_hhmmss(est)} (rough).")
     if remote:
         log("Note: the pod loads the model once from the network volume (a minute or two) before "
@@ -616,7 +730,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     else:
         from local_video_engine import LocalVideoEngine
         repo_dir, model_dir = bv._local_seedvr2_paths(cfg)
-        engine = LocalVideoEngine(repo_dir, model_dir, _engine_settings(cfg, vcfg),
+        engine = LocalVideoEngine(repo_dir, model_dir, eff_settings,
                                   use_subprocess=True, conn=conn, gpu_id=gpu_id)
 
     def funds_tripped():
@@ -640,13 +754,9 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
 
             # Drop collapsed phantom rows (frames < batch) so they are neither trusted as tried
             # nor as a ceiling; the affected batches get re-probed with correctly-sized clips.
-            cell_probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, model_tag,
+            cell_probes = drop_collapsed(db.get_bench_probes(conn, gpu_id, bench_model,
                                                              cell["out_w"], cell["out_h"]))
             floor = sizer.vram_floor_batch(total_gb, cell["mp"])   # VRAM-aware start rung
-            # Warm the resident pod for THIS resolution so the first measured probe isn't
-            # cold-inflated (remote only; skip a cell already finished on resume).
-            if remote and not stop_now() and not cell_done(cell_probes, cap):
-                _warmup_cell(engine, work, cell, log, stop_now)
             while not stop_now():
                 # Free VRAM at probe start. LOCAL: read via nvidia-smi (parent stays GPU-free)
                 # to tag the probe AND allow a contended earlier failure to be re-tried. REMOTE:
@@ -668,24 +778,56 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                     log(f"  could not prepare a {probe_frames}-frame source clip ({exc}); "
                         f"stopping this target.")
                     break
+                # Warm on the SHORTEST clip that still slides the temporal window (batch+1
+                # frames), not the full probe clip. The compiled graphs and the per-window VRAM
+                # peak are set by the WINDOW (batch), not the clip length (docs 14: content is
+                # irrelevant to the ceiling), so a batch+1 warmup absorbs the model load +
+                # torch.compile at the SAME ceiling while running ~1-2 windows instead of dozens
+                # -- nearly halving a small-batch probe. min() with probe_frames means a large
+                # batch (whose probe clip is already ~1 window) reuses the full clip, so no extra
+                # file is cut and there is no speedup to chase there. Fail-safe: if the short cut
+                # fails, warm on the full clip (correct, just slower). NB the warmup's compile is
+                # fully reused by the timed pass only when the timed pass has no differently-shaped
+                # ragged final batch; uniform_batch_size (on for benchmarking) guarantees that.
+                warmup_frames = min(probe_frames, int(b) + 1)
+                warmup_clip = clip
+                if warmup_frames < probe_frames:
+                    try:
+                        warmup_clip = bclip.ensure_source_clip(
+                            work, cell["source"], warmup_frames, log=None)
+                    except Exception:                   # noqa: BLE001 (warm on the full clip instead)
+                        warmup_clip = clip
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running"})
                 log(f"  probing batch {b} …")
                 res = engine.probe_batch(clip, probe_out, resolution=cell["resolution"],
-                                         batch=b, frames=probe_frames, should_stop=stop_now)
+                                         batch=b, frames=probe_frames, should_stop=stop_now,
+                                         on_progress=_probe_pinger(log, f"batch {b}"),
+                                         warmup_src=warmup_clip)
                 if res["outcome"] == "stopped":
                     stopped = "funds guard" if funds_tripped() else "stopped by user"
                     break
                 db.record_bench_probe(
-                    conn, gpu_id, model_tag, cell["out_w"], cell["out_h"], b,
+                    conn, gpu_id, bench_model, cell["out_w"], cell["out_h"], b,
                     res["outcome"], frames=res.get("frames"), seconds=res.get("seconds"),
                     peak_alloc=res.get("peak_alloc_gb"), peak_reserved=res.get("peak_reserved_gb"),
-                    free_vram=free_now)
+                    free_vram=free_now,
+                    peak_alloc_steady=res.get("peak_alloc_steady_gb"),
+                    peak_reserved_steady=res.get("peak_reserved_steady_gb"))
                 cell_probes = [p for p in cell_probes if int(p["batch"]) != b]
                 cell_probes.append({"batch": b, "outcome": res["outcome"], "free_vram": free_now})
                 spf = (res["seconds"] / res["frames"]) if res.get("frames") else None
+                # Show BOTH peaks when the probe warmed: "peak X/Y GB (steady A/B)". They are
+                # different questions -- the first is the ceiling (a real run's first segment
+                # pays the cold+compile peak too), the second is what every later segment
+                # costs. Fused into one number, a compile-bound ceiling is indistinguishable
+                # from an inference-bound one.
+                steady = ""
+                if res.get("peak_alloc_steady_gb") is not None:
+                    steady = (f" (steady {res['peak_alloc_steady_gb']}/"
+                              f"{res['peak_reserved_steady_gb']})")
                 log(f"    batch {b}: {res['outcome']}"
                     + (f", {res['seconds']:.0f}s ({spf:.2f} s/frame), "
-                       f"peak {res.get('peak_alloc_gb')}/{res.get('peak_reserved_gb')} GB"
+                       f"peak {res.get('peak_alloc_gb')}/{res.get('peak_reserved_gb')} GB{steady}"
                        if res["outcome"] == "ok" else ""))
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "done",
                                      "outcome": res["outcome"],
@@ -699,7 +841,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 # would stop at the first (overshot) failure and mis-record the ceiling.
             if stop_now() and stopped is None:
                 stopped = "funds guard" if funds_tripped() else "stopped by user"
-            ceil, saved = _record_cell_result(conn, gpu_id, model_tag, cell, learn_key)
+            ceil, saved = _record_cell_result(conn, gpu_id, bench_model, cell, learn_key)
             results.append((cell["name"], ceil, saved))
             if saved:
                 extra = f" (max fit {ceil})" if ceil and ceil != saved else ""
@@ -735,7 +877,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
 
     summary = {"cells": len(plan), "stopped": stopped}
     gui_event("BDONE", summary)
-    _log_summary_table(conn, gpu_id, model_tag, plan)
+    _log_summary_table(conn, gpu_id, bench_model, plan)
     tail = ("Results saved; AUTO runs and the time estimate now use them."
             if not remote else
             "Results saved; remote runs on this card now seed from them.")

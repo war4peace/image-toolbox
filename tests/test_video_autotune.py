@@ -154,6 +154,16 @@ def _bucket_for(src_root, rel, target):
     return bv._mp_bucket(ve.output_megapixels(info.width, info.height, target))
 
 
+def _learn_key(vcfg, gpu="GPU-TEST"):
+    """The video_batch_learn key the runner will read for this config, derived the way
+    process_job derives it rather than spelled out here. A literal "GPU-TEST" used to work
+    only because the key happened to be the bare card id; it stopped the moment the VRAM
+    regime joined the key, and a test that hardcodes a key cannot notice that it moved.
+    """
+    import video_vram_sizer as sizer
+    return gpu + sizer.learn_tag(bv._engine_flags(vcfg))
+
+
 @needs_ffmpeg
 def test_autotune_converges_freezes_and_persists(db_conn, tmp_path, monkeypatch):
     monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "GPU-TEST")
@@ -177,9 +187,9 @@ def test_autotune_converges_freezes_and_persists(db_conn, tmp_path, monkeypatch)
     assert eng.requested[0] == 0
     assert all(b == 17 for b in eng.requested[1:])
 
-    # ...and it was persisted for next time, keyed by card + output-MP bucket.
+    # ...and it was persisted for next time, keyed by card + VRAM regime + output-MP bucket.
     bucket = _bucket_for(src_root, "long.avi", "1080p")
-    assert db.get_learned_batch(db_conn, "GPU-TEST", bucket) == 17
+    assert db.get_learned_batch(db_conn, _learn_key(vcfg), bucket) == 17
 
 
 @needs_ffmpeg
@@ -195,7 +205,7 @@ def test_autotune_seeds_first_segment_from_db(db_conn, tmp_path, monkeypatch):
     vcfg["max_segment_seconds"] = 10
 
     bucket = _bucket_for(src_root, "long.avi", "1080p")
-    db.put_learned_batch(db_conn, "GPU-TEST", bucket, 9)   # a prior learned value
+    db.put_learned_batch(db_conn, _learn_key(vcfg), bucket, 9)   # a prior learned value
 
     bv.prepare_job(db_conn, root, src_root, out_root, "long.avi", "1080p", vcfg)
     eng = _FakeTuningEngine(suggested=9)                   # measurement confirms 9

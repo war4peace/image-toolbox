@@ -124,7 +124,8 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         return frames
 
     def probe_batch(self, src_path, dest_path, *, resolution, batch, overlap=None,
-                    frames=None, poll_interval=5, should_stop=None):
+                    frames=None, poll_interval=5, should_stop=None, on_progress=None,
+                    warmup_src=None):
         """Benchmark primitive (feature #7, docs/local-video-upscaler.md section 22):
         stream one short clip to the pod's /video/probe, measure ONE fixed-batch window,
         and return the outcome dict. This is the SAME contract as
@@ -136,12 +137,23 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         raises for an OOM (an expected sweep outcome); a lost pod / dropped tunnel raises
         RemoteVideoError so the benchmark reports the pod died. `dest_path` and `frames`
         are ignored (the pod discards the upscaled output and counts frames itself; the
-        client-generated clip already holds the batch)."""
+        client-generated clip already holds the batch).
+
+        `on_progress(status_dict)` (optional) is called after each status poll, mirroring
+        process_segment: a 4K probe can run 20+ minutes with nothing to show, and the
+        status carries `stalled_for` (seconds since the pipeline last emitted output).
+
+        `warmup_src` is ACCEPTED AND IGNORED so video_benchmark drives the local and remote
+        sweeps through one code path. The pod warms IN-PROCESS on the uploaded probe clip (the
+        resident worker already spares us the per-rung model load; only torch.compile is per
+        shape), so a short warmup clip would have to be cut and uploaded per rung -- not worth
+        the transfer against the pod's smaller warmup cost. The local short-warmup lives where
+        the saving is large (a fresh process per rung)."""
         ext = os.path.splitext(src_path)[1] or ".mkv"
         b = int(batch)
         ov = -1 if overlap is None else int(overlap)         # -1 = the pod's AUTO overlap
         job_id = self._submit_probe(src_path, ext, resolution, b, ov)
-        return self._await_probe(job_id, b, poll_interval, should_stop)
+        return self._await_probe(job_id, b, poll_interval, should_stop, on_progress)
 
     # ── protocol steps ──────────────────────────────────────────────────────
 
@@ -257,12 +269,17 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
             raise RemoteVideoError(f"worker returned no probe id: {info}")
         return job_id
 
-    def _await_probe(self, job_id, batch, poll_interval, should_stop=None):
+    def _await_probe(self, job_id, batch, poll_interval, should_stop=None,
+                     on_progress=None):
         """Poll /video/status until the probe leaves the running state, then return the
         outcome dict (never raising for an 'oom'/'error' RESULT -- those are the sweep's
         own outcomes). A `should_stop` that turns True returns {'outcome': 'stopped'}; a
         sustained poll outage or a job the worker forgot raises RemoteVideoError (a pod
-        loss the benchmark surfaces, not a probe result)."""
+        loss the benchmark surfaces, not a probe result).
+
+        The poll itself is also what keeps the pod alive: the worker touches its
+        heartbeat here, so the dead-man's switch measures "is the client still waiting"
+        rather than "did the pipeline print" (which a silent 4K decode fails)."""
         url = self._url(f"/video/status?id={job_id}")
         misses = 0
         while True:
@@ -279,6 +296,11 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
                         f"lost contact with the worker while probing batch {batch}: {exc}")
                 time.sleep(poll_interval)
                 continue
+            if on_progress:
+                try:
+                    on_progress(st)
+                except Exception:                      # noqa: BLE001 (never fail a probe)
+                    pass
             state = st.get("state")
             if state in ("done", "error"):
                 # The worker tags the probe result explicitly; fall back by state for an

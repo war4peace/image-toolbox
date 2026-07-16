@@ -28,6 +28,39 @@ def db_conn(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "_conn", None)
 
 
+def _bench_key(remote=False, cfg=None):
+    """The video_bench model key run_benchmark will use, derived the way it derives it.
+
+    Not a hardcoded "7b": the key carries the tiling AND compile tags, and the compile tag
+    comes from the settings the engine ACTUALLY runs under -- which on the LOCAL path means
+    AFTER gate_local_compile, so it depends on whether the machine running these tests has a
+    C compiler. Recomputing it here keeps the tests honest on any machine instead of asserting
+    a literal that is right on one laptop.
+    """
+    import batch_video_upscale as bv
+    cfg = cfg or {"upscale": {}, "video": {}}
+    vcfg = bv.resolve_video_cfg(cfg)
+    ws = vb.effective_settings(cfg, vcfg, remote=remote, log_fn=lambda *_a, **_k: None)
+    return vb.bench_key(vcfg, ws)
+
+
+def _learn_key(gpu, remote=False, cfg=None):
+    """The video_batch_learn key run_benchmark writes, derived the way it derives it.
+
+    Same reasoning as [_bench_key], and the same trap: this key carries the VRAM regime too
+    (see video_vram_sizer.learn_tag), so a hardcoded "FakeGPU|7b" silently stops describing
+    what the runner writes the moment a regime tag applies. Remote keys the plain card id;
+    local qualifies it with the model family.
+    """
+    import batch_video_upscale as bv
+    import video_vram_sizer as sizer
+    cfg = cfg or {"upscale": {}, "video": {}}
+    vcfg = bv.resolve_video_cfg(cfg)
+    ws = vb.effective_settings(cfg, vcfg, remote=remote, log_fn=lambda *_a, **_k: None)
+    base = gpu if remote else f"{gpu}|{sizer.model_tag(vcfg['dit_model'])}"
+    return base + sizer.learn_tag(ws)
+
+
 # ── pure plan / sweep logic ──────────────────────────────────────────────────
 
 def test_batch_series_is_ascending_4n1():
@@ -326,7 +359,7 @@ class _FakeEngine:
         self.asked = []
 
     def probe_batch(self, src, dest, *, resolution, batch, overlap=None, frames=None,
-                    should_stop=None):
+                    should_stop=None, on_progress=None, warmup_src=None):
         self.asked.append(batch)
         if batch <= 13:
             return {"outcome": "ok", "batch": batch, "overlap": 6, "frames": frames,
@@ -359,16 +392,37 @@ def test_run_benchmark_sweeps_records_and_learns(fake_run, db_conn):
     vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
     # Geometric climb 5->9->17(oom), then binary-refine mid(9,17)=13; ceiling 13 pinned.
     assert fake_run.asked == [5, 9, 17, 13]                 # climb 5,9,17(oom); refine mid->13
-    rows = db.get_bench_probes(db_conn, "FakeGPU", "7b", 1920, 1080)   # returned sorted by batch
+    rows = db.get_bench_probes(db_conn, "FakeGPU", _bench_key(), 1920, 1080)  # sorted by batch
     assert [(r["batch"], r["outcome"]) for r in rows] == [(5, "ok"), (9, "ok"), (13, "ok"), (17, "oom")]
     # ceiling 13 landed in the sizer's learned store
-    assert db.get_learned_batch(db_conn, "FakeGPU|7b", sizer.mp_bucket(2.0736)) == 13
+    assert db.get_learned_batch(db_conn, _learn_key("FakeGPU"), sizer.mp_bucket(2.0736)) == 13
+
+
+def test_restart_run_only_wipes_the_targets_it_was_asked_for(fake_run, db_conn):
+    """End-to-end through run_benchmark, not just the db helper: a resume=False sweep of one
+    target must leave every other measured target on the card intact. This is the path the
+    GUI's 'Restart' tick drives, and the one that used to wipe the whole card."""
+    key = _bench_key()
+    # A finished 4K cell the user is NOT re-running, plus a 1080p cell they are.
+    db.record_bench_probe(db_conn, "FakeGPU", key, 3840, 2160, 5, "ok", frames=37, seconds=900.0)
+    db.record_bench_probe(db_conn, "FakeGPU", key, 1920, 1080, 5, "ok", frames=37, seconds=111.0)
+
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
+
+    assert len(db.get_bench_probes(db_conn, "FakeGPU", key, 3840, 2160)) == 1, \
+        "the 4K cell was never ticked and must survive the restart"
+    # The 1080p cell was re-measured from scratch: the stale 111.0s probe is gone, replaced by
+    # the fresh sweep (the fake engine OOMs at 17, so the climb lands 5, 9, 13, 17).
+    rows = db.get_bench_probes(db_conn, "FakeGPU", key, 1920, 1080)
+    assert [(r["batch"], r["outcome"]) for r in rows] == \
+        [(5, "ok"), (9, "ok"), (13, "ok"), (17, "oom")]
+    assert rows[0]["seconds"] != 111.0, "the ticked cell really was re-measured, not resumed"
 
 
 def test_run_benchmark_resumes_from_saved(fake_run, db_conn):
     # Pre-seed a partial sweep (5, 9 already clean); a resume must continue the climb, not redo.
     for b in (5, 9):
-        db.record_bench_probe(db_conn, "FakeGPU", "7b", 1920, 1080, b, "ok",
+        db.record_bench_probe(db_conn, "FakeGPU", _bench_key(), 1920, 1080, b, "ok",
                               frames=37, seconds=100.0)
     vb.run_benchmark(["1080p"], frames=37, resume=True, batch_cap=33)
     assert fake_run.asked == [17, 13]                       # skipped the saved 5, 9; climb+refine
@@ -389,7 +443,8 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
         def __init__(self, *a, **k):
             self.asked = []
 
-        def probe_batch(self, src, dest, *, resolution, batch, frames=None, should_stop=None):
+        def probe_batch(self, src, dest, *, resolution, batch, frames=None,
+                        should_stop=None, on_progress=None, warmup_src=None):
             self.asked.append((batch, frames))
             oc = "ok" if batch <= 45 else "oom"             # real ceiling ABOVE the old 37/65 fog
             return {"outcome": oc, "batch": batch, "overlap": 6, "frames": frames,
@@ -416,6 +471,55 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
     assert max(b for b, _ in eng.asked) > 37
     assert vb.cell_ceiling([{"batch": b, "outcome": ("ok" if b <= 45 else "oom")}
                             for b, _ in eng.asked]) == 45
+
+
+def test_the_sweep_warms_each_probe_on_a_batch_plus_one_clip(db_conn, tmp_path, monkeypatch):
+    """The short-warmup plumbing end to end: for each probed batch b the runner cuts a
+    (b+1)-frame clip and passes it as warmup_src, distinct from the full probe clip. The full
+    clip is what gets timed (frames=probe_frames); the short one only absorbs the compile."""
+    cuts = []
+
+    def fake_ensure(work, source, frames, **k):
+        cuts.append(int(frames))
+        return str(tmp_path / f"c_{int(frames)}.mp4")
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", fake_ensure)
+
+    seen = []
+
+    class _Eng:
+        def __init__(self, *a, **k):
+            self.asked = []
+
+        def probe_batch(self, src, dest, *, resolution, batch, frames=None,
+                        should_stop=None, on_progress=None, warmup_src=None):
+            self.asked.append(batch)
+            seen.append((batch, src, warmup_src))
+            return {"outcome": "ok" if batch <= 13 else "oom", "batch": batch, "overlap": 6,
+                    "frames": frames, "seconds": 10.0, "peak_alloc_gb": 1.0,
+                    "peak_reserved_gb": 1.0}
+
+        def close(self):
+            pass
+
+    eng = _Eng()
+    import local_video_engine as lve
+    monkeypatch.setattr(lve, "LocalVideoEngine", lambda *a, **k: eng)
+    monkeypatch.setattr(lve, "_query_gpu_name", lambda: "FakeGPU")
+    monkeypatch.setattr(sizer, "free_vram_gb", lambda *a, **k: (None, None))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: {
+        "video": {"work_root": str(tmp_path / "work"),
+                  "dit_model": "seedvr2_ema_7b_fp16.safetensors"},
+        "upscale": {}, "seedvr2": {}})
+
+    vb.run_benchmark(["540x720"], frames=37, resume=False, batch_cap=25)
+
+    # Every probe's warmup clip was the timed clip's SHORTER sibling (b+1 frames), not itself.
+    for batch, src, warmup_src in seen:
+        assert warmup_src == str(tmp_path / f"c_{batch + 1}.mp4")
+        assert src == str(tmp_path / "c_37.mp4")
+        assert warmup_src != src
+    # And the runner actually asked ffmpeg for those short clips.
+    assert all((b + 1) in cuts for b, _, _ in seen)
 
 
 # ── remote sweep (fake pod: no RunPod, no GPU) ───────────────────────────────
@@ -452,25 +556,31 @@ def test_run_benchmark_remote_keys_plain_id_and_tears_down(db_conn, tmp_path, mo
 
     summary = vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33, remote=True)
     assert summary["stopped"] is None
-    # A remote sweep warms the pod first (WARMUP_PROBES bs9 throwaways), then the measured
-    # climb 5,9,17(oom) + binary-refine mid->13.
-    assert engine.asked[:vb.WARMUP_PROBES] == [vb.WARMUP_BATCH] * vb.WARMUP_PROBES
-    assert engine.asked[vb.WARMUP_PROBES:] == [5, 9, 17, 13]
+    # The measured climb 5,9,17(oom) + binary-refine mid->13, and nothing else: warming is the
+    # ENGINE's job now (inside the process that times the probe), so the sweep asks only for
+    # the rungs it records.
+    assert engine.asked == [5, 9, 17, 13]
     # probes stored under the RunPod id (returned sorted by batch; 17 is the recorded oom)
-    rows = db.get_bench_probes(db_conn, gpu, "7b", 1920, 1080)
+    rows = db.get_bench_probes(db_conn, gpu, _bench_key(remote=True), 1920, 1080)
     assert (17, "oom") in [(r["batch"], r["outcome"]) for r in rows]
-    # learned batch stored under the PLAIN id (the remote run's read key), NOT gpu|model
-    assert db.get_learned_batch(db_conn, gpu, sizer.mp_bucket(2.0736)) == 13
+    # learned batch stored under the PLAIN id (the remote run's read key), NOT gpu|model.
+    # The VRAM-regime tag still applies (a pod compiles), so the key is the id + that tag.
+    learn = _learn_key(gpu, remote=True)
+    assert db.get_learned_batch(db_conn, learn, sizer.mp_bucket(2.0736)) == 13
     assert db.get_learned_batch(db_conn, f"{gpu}|7b", sizer.mp_bucket(2.0736)) is None
-    # the remote RUN's auto-tuner seed (get_learned_batch_ge on the plain id) now finds it
-    assert db.get_learned_batch_ge(db_conn, gpu, sizer.mp_bucket(2.0736)) == 13
+    # the remote RUN's auto-tuner seed (get_learned_batch_ge on the same key) now finds it
+    assert db.get_learned_batch_ge(db_conn, learn, sizer.mp_bucket(2.0736)) == 13
     assert session.closed is True                            # pod torn down (billing stops)
 
 
-def test_remote_warmup_runs_but_is_not_recorded(db_conn, tmp_path, monkeypatch):
-    """The pod's cold first-forward cost is absorbed by throwaway bs9 warmups (a slow first
-    batch the user flagged). They run before the measured sweep but are NOT persisted, so they
-    can't pollute the ceiling or the throughput timing. Remote only."""
+def test_the_sweep_itself_never_warms_up(db_conn, tmp_path, monkeypatch):
+    """Warming moved INTO the engines (each probe warms its own shape in the process that
+    times it), so the sweep asks for exactly the rungs it measures -- no warmup prefix, on
+    either path. The cell-level warmup that used to sit here could only ever warm ONE batch,
+    while static compile makes every rung a distinct shape; and being a separate call, it
+    could not warm a LOCAL probe at all (fresh subprocess: the model load and compile's
+    dynamo work are per-process). See video_vram_sizer/local_video_worker + the dedicated
+    tests in test_video_probe_warmup.py."""
     engine = _FakeEngine()
     session = _FakeSession()
     monkeypatch.setattr(vb, "_deploy_remote_engine", lambda cfg, vcfg: (engine, session))
@@ -479,16 +589,13 @@ def test_remote_warmup_runs_but_is_not_recorded(db_conn, tmp_path, monkeypatch):
     monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "GPU-warm")
 
     vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33, remote=True)
-    rows = db.get_bench_probes(db_conn, "GPU-warm", "7b", 1920, 1080)
-    # Every asked batch = WARMUP_PROBES warmups + the measured probes; only the measured ones
-    # are in the DB, so the warmups added exactly WARMUP_PROBES un-recorded passes.
-    assert len(engine.asked) == vb.WARMUP_PROBES + len(rows)
-    assert engine.asked[:vb.WARMUP_PROBES] == [vb.WARMUP_BATCH] * vb.WARMUP_PROBES
+
+    rows = db.get_bench_probes(db_conn, "GPU-warm", _bench_key(remote=True), 1920, 1080)
+    assert len(engine.asked) == len(rows), "every asked probe is a measured, recorded one"
+    assert engine.asked == [5, 9, 17, 13]
 
 
-def test_local_sweep_does_not_warm_up(fake_run, db_conn):
-    """The LOCAL path reloads the model per probe (fresh subprocess), so there is no warm state
-    to build -- warmup must be skipped, and the measured sweep starts immediately."""
+def test_local_sweep_asks_only_for_the_rungs_it_measures(fake_run, db_conn):
     vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
     assert fake_run.asked == [5, 9, 17, 13]                  # measured sweep, no warmup prefix
 
@@ -612,3 +719,379 @@ def test_download_verifies_hash(tmp_path):
     with pytest.raises(ValueError):
         bclip.download_base_clip(url, "0" * 64, str(bad_dest))
     assert not bad_dest.exists()
+
+
+# ── VAE tiling: learned-batch key isolation ──────────────────────────────────
+#
+# A batch ceiling measured WITH VAE tiling is a different measurement from one measured
+# without: tiling bounds the VAE peak that the ceiling is largely made of. If both land on
+# one key, a tiled benchmark's (much larger) ceiling gets handed to an untiled run and OOMs
+# it -- and via get_learned_batch_ge, which treats a bigger output as a safe bound for a
+# smaller one, a single tiled 4K cell poisons every smaller untiled output too.
+
+def test_tile_tag_untiled_is_the_historical_key():
+    """Untiled MUST tag to "" so pre-tiling learned rows keep their meaning (they were
+    measured untiled) instead of being orphaned by a key change."""
+    assert sizer.tile_tag({}) == ""
+    assert sizer.tile_tag(None) == ""
+    assert sizer.tile_tag({"encode_tiled": False, "decode_tiled": False}) == ""
+
+
+def test_tile_tag_distinguishes_phase_and_size():
+    assert sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 1024}) == "|td1024"
+    # tile SIZE changes the peak, so 512 and 1024 are not interchangeable measurements
+    assert sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 512}) == "|td512"
+    assert sizer.tile_tag({"encode_tiled": True, "encode_tile_size": 1024}) == "|te1024"
+    both = sizer.tile_tag({"encode_tiled": True, "decode_tiled": True})
+    assert both == "|te1024_d1024"
+
+
+def test_tiled_ceiling_never_seeds_an_untiled_run(db_conn):
+    """The poisoning guard: a tiled run's learned batch is invisible to an untiled lookup."""
+    gpu = "NVIDIA RTX PRO 6000"
+    tiled = gpu + sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 1024})
+    mp_key = sizer.mp_bucket(8.29)                     # 4K landscape output
+
+    db.put_learned_batch(db_conn, tiled, mp_key, 33)   # tiling let a big window fit
+    # the untiled run must NOT see it (it would OOM on 33)
+    assert db.get_learned_batch(db_conn, gpu, mp_key) is None
+    assert db.get_learned_batch_ge(db_conn, gpu, mp_key) is None
+    # ... while the tiled run still gets its own value back
+    assert db.get_learned_batch(db_conn, tiled, mp_key) == 33
+
+
+def test_tiled_4k_does_not_poison_smaller_untiled_outputs(db_conn):
+    """get_learned_batch_ge treats a LARGER output as a safe bound, so an unkeyed tiled 4K
+    row would leak down into 1440p/1080p untiled runs. It must not."""
+    gpu = "NVIDIA RTX PRO 6000"
+    tiled = gpu + sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 1024})
+    db.put_learned_batch(db_conn, tiled, sizer.mp_bucket(8.29), 33)      # tiled 4K
+    # an untiled 1440p run looks up a SMALLER key; the tiled 4K row is >= it and would match
+    assert db.get_learned_batch_ge(db_conn, gpu, sizer.mp_bucket(3.69)) is None
+    # both regimes coexist independently at the same output size
+    db.put_learned_batch(db_conn, gpu, sizer.mp_bucket(3.69), 5)         # untiled 1440p
+    assert db.get_learned_batch_ge(db_conn, gpu, sizer.mp_bucket(3.69)) == 5
+    assert db.get_learned_batch_ge(db_conn, tiled, sizer.mp_bucket(3.69)) == 33
+
+
+def test_sizer_pick_honours_the_tiling_namespace(db_conn):
+    """pick() reads the learned value only under the matching tiling state. Uses a 1440p
+    output so the live free-VRAM step-down can't trim the learned value and confound the
+    comparison (at 4K with 90 GB free it would step 33 -> 29)."""
+    gpu, model = "NVIDIA RTX PRO 6000", "seedvr2_ema_7b_fp16.safetensors"
+    tags = sizer.learn_tag({"decode_tiled": True, "decode_tile_size": 1024})
+    sizer.record_result(db_conn, gpu, model, 2560, 1440, 33, ok=True, tags=tags)
+
+    tiled_b, _ = sizer.pick(model, 2560, 1440, conn=db_conn, gpu_id=gpu,
+                            free_gb=90.0, total_gb=96.0, tags=tags)
+    plain_b, _ = sizer.pick(model, 2560, 1440, conn=db_conn, gpu_id=gpu,
+                            free_gb=90.0, total_gb=96.0)
+    assert tiled_b == 33            # the tiled run gets its own learned ceiling
+    assert plain_b == 17            # the untiled run falls back to the conservative seed
+
+
+def test_sizer_pick_honours_the_compile_namespace(db_conn):
+    """The same guard for torch.compile, which is NOT a small effect: on a 3090 at 540x720
+    the 7B ceiling is 125 uncompiled and 53 compiled. Sharing one row let a compiled sweep
+    overwrite this card's uncompiled learned batch (113 -> 49), silently pinning every later
+    uncompiled run ~2x below its real ceiling. Mirrors the tiling test's 1440p setup so the
+    free-VRAM step-down can't confound it."""
+    gpu, model = "NVIDIA RTX PRO 6000", "seedvr2_ema_7b_fp16.safetensors"
+    tags = sizer.learn_tag({"compile_dit": True, "compile_vae": True})
+    assert tags == "|c"
+    sizer.record_result(db_conn, gpu, model, 2560, 1440, 33, ok=True, tags=tags)
+
+    compiled_b, _ = sizer.pick(model, 2560, 1440, conn=db_conn, gpu_id=gpu,
+                               free_gb=90.0, total_gb=96.0, tags=tags)
+    plain_b, _ = sizer.pick(model, 2560, 1440, conn=db_conn, gpu_id=gpu,
+                            free_gb=90.0, total_gb=96.0)
+    assert compiled_b == 33         # the compiled run gets its own learned ceiling
+    assert plain_b == 17            # the uncompiled run must NOT inherit it
+
+
+def test_learn_tag_composes_tiling_and_compile_independently():
+    """Both regimes move the ceiling, so a row measured under one must never serve the other,
+    and a row measured under BOTH must serve only that pair. All-off stays "" so every row
+    written before either tag existed keeps its meaning."""
+    assert sizer.learn_tag({}) == ""
+    assert sizer.learn_tag({"compile_dit": True}) == "|c"
+    assert sizer.learn_tag({"compile_dit": True, "compile_dynamic": True}) == "|cd"
+    assert sizer.learn_tag({"decode_tiled": True, "decode_tile_size": 1024}) == "|td1024"
+    both = sizer.learn_tag({"decode_tiled": True, "decode_tile_size": 1024,
+                            "compile_dit": True})
+    assert both == "|td1024|c"
+    assert len({sizer.learn_tag({}), sizer.learn_tag({"compile_dit": True}),
+                sizer.learn_tag({"decode_tiled": True, "decode_tile_size": 1024}),
+                both}) == 4, "each regime combination needs its own row"
+
+
+def test_tiled_probes_do_not_collide_with_untiled_history(db_conn):
+    """The probe store (video_bench) must namespace on tiling too, or the sweep breaks BOTH
+    ways: `resume` reads the previous regime's OOMs and declares the cell infeasible without
+    probing anything, and `resume=False` clears the other regime's history to make room.
+
+    Regression for the real case: a PRO 6000 with untiled 4K OOMs at batch 5 and 13 in the DB
+    would have refused to run a single TILED 4K probe and reported '4K infeasible' -- after
+    deploying and billing the pod."""
+    gpu, untiled = "NVIDIA RTX PRO 6000", "7b"
+    tiled = untiled + sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 1024})
+    for b in (5, 13):
+        db.record_bench_probe(db_conn, gpu, untiled, 3840, 2160, b, "oom")
+
+    floor = sizer.vram_floor_batch(96.0, 3840 * 2160 / 1_000_000.0)
+    # untiled: history says the floor already failed -> nothing left to try
+    assert vb.next_batch(vb.drop_collapsed(
+        db.get_bench_probes(db_conn, gpu, untiled, 3840, 2160)), floor, 3000) is None
+    # tiled: a clean slate, so the sweep opens at the floor and actually measures
+    assert vb.next_batch(vb.drop_collapsed(
+        db.get_bench_probes(db_conn, gpu, tiled, 3840, 2160)), floor, 3000) == floor
+
+    # a tiled probe must not overwrite the untiled row at the same (card, size, batch)
+    db.record_bench_probe(db_conn, gpu, tiled, 3840, 2160, 13, "ok", frames=9, seconds=100.0)
+    untiled_rows = {p["batch"]: p["outcome"]
+                    for p in db.get_bench_probes(db_conn, gpu, untiled, 3840, 2160)}
+    assert untiled_rows == {5: "oom", 13: "oom"}      # control arm intact
+    tiled_rows = {p["batch"]: p["outcome"]
+                  for p in db.get_bench_probes(db_conn, gpu, tiled, 3840, 2160)}
+    assert tiled_rows == {13: "ok"}
+
+
+def test_clearing_a_tiled_benchmark_keeps_untiled_history(db_conn):
+    """resume=False clears only the regime being re-run, so re-benchmarking tiled can't
+    destroy the untiled baseline it is meant to be compared against."""
+    gpu, untiled = "NVIDIA RTX PRO 6000", "7b"
+    tiled = untiled + sizer.tile_tag({"decode_tiled": True, "decode_tile_size": 1024})
+    db.record_bench_probe(db_conn, gpu, untiled, 2560, 1440, 45, "ok", frames=9, seconds=50.0)
+    db.record_bench_probe(db_conn, gpu, tiled, 2560, 1440, 45, "ok", frames=9, seconds=60.0)
+
+    db.clear_bench(db_conn, gpu, tiled)
+    assert db.get_bench_probes(db_conn, gpu, tiled, 2560, 1440) == []
+    assert len(db.get_bench_probes(db_conn, gpu, untiled, 2560, 1440)) == 1
+
+
+# ── warmup shape + benchmark compile mode ────────────────────────────────────
+
+def test_benchmark_does_not_force_compile_dynamic():
+    """REVERTED. compile_dynamic (one graph for every batch) was set by the benchmark and cost a
+    rented PRO 6000 a >32-min unfinished single-threaded cold compile, against a ~9-min static
+    baseline. Its benefit is comparable rates across rungs that SUCCEED, and a 4K cell has
+    exactly one -- so it solved a problem that cell does not have, at an unbounded price.
+    Nothing may turn it on by default again without a measurement."""
+    import batch_video_upscale as bv
+    cfg = {"upscale": {}, "video": {}}
+    ws = vb._worker_settings(cfg, bv.resolve_video_cfg(cfg))
+    assert ws["compile_dit"] and ws["compile_vae"], "compile itself stays on"
+    assert not ws.get("compile_dynamic"), "the benchmark must not force dynamic compile"
+
+
+def test_compile_dynamic_stays_reachable_from_config():
+    """Reverted, not removed: it must stay measurable without a code edit, or the next person
+    re-litigates it from opinion instead of a number."""
+    import batch_video_upscale as bv
+    cfg = {"upscale": {"compile_dynamic": True}, "video": {}}
+    ws = vb._worker_settings(cfg, bv.resolve_video_cfg(cfg))
+    assert ws.get("compile_dynamic") is True, "an explicit config opt-in must survive"
+
+
+def test_the_benchmark_no_longer_owns_a_warmup():
+    """The cell-level warmup is GONE, and its three lessons are now structural or live with
+    the mechanism that replaced it:
+
+      * "warm the probes' CODE PATH at a batch that survives" -- a probe now warms itself, on
+        its own clip at its own batch, so it cannot warm a graph no probe runs (the old
+        "bs9 warmup fine" above "batch 9: oom") nor pick a rung that OOMs.
+      * "a warmup OOM must not read as success" -- an OOM while warming now IS the probe's
+        outcome: the batch does not fit, which is the answer the sweep wanted anyway. Pinned
+        in test_video_probe_warmup.py for both engines.
+      * "one warmup per cell is enough" -- it never was. Static compile makes every rung a
+        distinct shape, so one warmed batch left every other rung paying ~30s of compile
+        inside its own measurement.
+
+    This test exists so the removal is deliberate: re-adding a sweep-level warmup would put
+    back a mechanism that cannot warm a local probe (fresh subprocess per probe) and only
+    ever warmed one shape of many.
+    """
+    assert not hasattr(vb, "_warmup_cell")
+    assert not hasattr(vb, "WARMUP_PROBES")
+
+
+# ── compile namespacing (video_bench) ────────────────────────────────────────
+
+def test_compile_tag_separates_uncompiled_static_and_dynamic():
+    """torch.compile moves the RATE, and video_bench rows carry rates. "" MUST mean
+    uncompiled: every local row on disk was measured with compile gated off (no C compiler),
+    so the reverse convention would make a compiled sweep RESUME those rungs and publish
+    their seconds as its own."""
+    assert sizer.compile_tag({}) == ""
+    assert sizer.compile_tag({"compile_dit": False, "compile_vae": False}) == ""
+    assert sizer.compile_tag({"compile_dit": True}) == "|c"
+    assert sizer.compile_tag({"compile_vae": True}) == "|c"
+    # static and dynamic are different measurements; telling them apart is the point.
+    assert sizer.compile_tag({"compile_dit": True, "compile_dynamic": True}) == "|cd"
+    # dynamic is meaningless with compile off and must not invent a namespace
+    assert sizer.compile_tag({"compile_dynamic": True}) == ""
+
+
+def test_bench_key_carries_both_tiling_and_compile():
+    import batch_video_upscale as bv
+    cfg = {"upscale": {"decode_tiled": True, "decode_tile_size": 1024}, "video": {}}
+    ws = vb._worker_settings(cfg, bv.resolve_video_cfg(cfg))
+    key = sizer.model_tag(ws["dit_model"]) + sizer.tile_tag(ws) + sizer.compile_tag(ws)
+    assert key == "7b|td1024|c"
+
+
+def test_a_compiled_sweep_cannot_resume_uncompiled_rows(db_conn):
+    """THE regression, with the real numbers. The 3090's 540x720 cell is finished and
+    UNCOMPILED (10:21 of probes, ceiling 125). Under one shared key a compiled re-run would
+    skip the cell as done (resume) or clear it to re-measure. Separate keys give the compiled
+    run a clean namespace and leave the baseline. (The other half of that protection, scoping
+    a restart to the ticked targets, is covered by the clear_bench cell tests below.)"""
+    gpu = "NVIDIA GeForce RTX 3090"
+    plain = sizer.model_tag("seedvr2_ema_7b_fp16.safetensors")          # uncompiled: "7b"
+    comp = plain + sizer.compile_tag({"compile_dit": True})             # compiled:   "7b|c"
+    for b, oc, secs in ((5, "ok", 113.0), (125, "ok", 93.9), (129, "oom", 27.5)):
+        db.record_bench_probe(db_conn, gpu, plain, 540, 720, b, oc, frames=37, seconds=secs)
+
+    assert db.get_bench_probes(db_conn, gpu, comp, 540, 720) == [], "compiled starts empty"
+    assert len(db.get_bench_probes(db_conn, gpu, plain, 540, 720)) == 3
+
+    # Forcing a re-measure of the compiled regime must not touch the uncompiled baseline.
+    db.clear_bench(db_conn, gpu, comp)
+    assert len(db.get_bench_probes(db_conn, gpu, plain, 540, 720)) == 3, \
+        "the uncompiled 10:21 baseline must survive a compiled resume=False run"
+
+
+# ── the GUI must read the key the runner writes ───────────────────────────────
+
+def _quiet(*_a, **_k):
+    pass
+
+
+def test_resolve_bench_key_finds_the_rows_the_runner_wrote(fake_run, db_conn):
+    """THE contract. The benchmark window reads its results table with resolve_bench_key(); the
+    runner writes with bench_key(). Diverge and the window shows another regime's rows, which is
+    exactly what a bare model tag did: it read "7b" while a compiled sweep wrote "7b|c", so the
+    table showed the stale uncompiled baseline for the whole run."""
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33)
+
+    key = vb.resolve_bench_key(remote=False, log_fn=_quiet)
+    assert db.get_bench_probes(db_conn, "FakeGPU", key, 1920, 1080), \
+        "the GUI's key must find the rows the runner just wrote"
+
+
+def test_resolve_bench_key_follows_the_gate_not_the_config(monkeypatch, tmp_path):
+    """The compile tag must describe the RUN, not the wish. config compile=True on a machine the
+    gate disables means an UNCOMPILED run, and tagging it "|c" would file uncompiled seconds
+    under the compiled key: the precise lie the tag exists to prevent."""
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: {
+        "video": {"work_root": str(tmp_path), "compile": True,
+                  "dit_model": "seedvr2_ema_7b_fp16.safetensors"},
+        "upscale": {}, "seedvr2": {}})
+
+    monkeypatch.setattr(vb.bv, "gate_local_compile", lambda s, log=None: (False, None))
+    assert vb.resolve_bench_key(log_fn=_quiet) == "7b|c", "gate allows compile -> tagged"
+
+    def _deny(settings, log=None):
+        settings["compile_dit"] = settings["compile_vae"] = False
+        return True, "no C compiler"
+    monkeypatch.setattr(vb.bv, "gate_local_compile", _deny)
+    assert vb.resolve_bench_key(log_fn=_quiet) == "7b", "gate denies compile -> untagged"
+
+
+def test_resolve_bench_key_remote_ignores_the_local_compiler_gate(monkeypatch, tmp_path):
+    """Remote must never apply THIS machine's compiler gate: the pod has its own compiler and
+    runs its own _gate_compile. A dev box with no MSVC would otherwise label a compiled POD
+    sweep "7b" and read the wrong rows for a run it is paying for."""
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: {
+        "video": {"work_root": str(tmp_path), "compile": True,
+                  "dit_model": "seedvr2_ema_7b_fp16.safetensors"},
+        "upscale": {}, "seedvr2": {}})
+
+    def _boom(settings, log=None):
+        raise AssertionError("the local gate must not run for a remote benchmark")
+    monkeypatch.setattr(vb.bv, "gate_local_compile", _boom)
+
+    assert vb.resolve_bench_key(remote=True, log_fn=_quiet) == "7b|c"
+
+
+def test_bench_key_is_bare_when_both_features_are_off():
+    """The historical key. Every existing probe was measured untiled + uncompiled, so both tags
+    must stay "" or 40 rows across 7 targets silently orphan."""
+    vcfg = {"dit_model": "seedvr2_ema_7b_fp16.safetensors"}
+    assert vb.bench_key(vcfg, {"compile_dit": False, "decode_tiled": False}) == "7b"
+
+
+# ── restart scoping: a wipe must reach only the ticked targets ────────────────
+
+def _seed_seven_targets(conn, gpu, model="7b"):
+    """The 3090's real shape: several finished cells on one card+model."""
+    cells = [(540, 720), (720, 540), (1920, 1080), (1440, 1080),
+             (2560, 1440), (1080, 1440), (3840, 2160)]
+    for w, h in cells:
+        db.record_bench_probe(conn, gpu, model, w, h, 5, "ok", frames=37, seconds=113.0)
+    return cells
+
+
+def test_restart_of_one_target_keeps_every_other_cell(db_conn):
+    """THE bug this fix exists for. Re-measuring 540x720 used to discard all 7 targets on
+    the card: hours of GPU time, silently, with nothing to resume next sweep."""
+    gpu = "NVIDIA GeForce RTX 3090"
+    cells = _seed_seven_targets(db_conn, gpu)
+    assert len(cells) == 7
+
+    db.clear_bench(db_conn, gpu, "7b", cells=[(540, 720)])
+
+    assert db.get_bench_probes(db_conn, gpu, "7b", 540, 720) == [], "the ticked cell is cleared"
+    for w, h in cells[1:]:
+        assert len(db.get_bench_probes(db_conn, gpu, "7b", w, h)) == 1, \
+            f"{w}x{h} was not ticked and must survive"
+
+
+def test_restart_clears_exactly_the_ticked_targets(db_conn):
+    """A multi-target restart scopes to the whole selection, not just its first entry."""
+    gpu = "NVIDIA GeForce RTX 3090"
+    cells = _seed_seven_targets(db_conn, gpu)
+    picked = [(540, 720), (2560, 1440)]
+
+    db.clear_bench(db_conn, gpu, "7b", cells=picked)
+
+    for w, h in picked:
+        assert db.get_bench_probes(db_conn, gpu, "7b", w, h) == []
+    for w, h in [c for c in cells if c not in picked]:
+        assert len(db.get_bench_probes(db_conn, gpu, "7b", w, h)) == 1
+
+
+def test_restart_scope_respects_the_model_key_too(db_conn):
+    """Cell scoping stacks with model scoping: re-measuring compiled 540x720 leaves both the
+    uncompiled 540x720 baseline AND the compiled other targets alone."""
+    gpu = "NVIDIA GeForce RTX 3090"
+    db.record_bench_probe(db_conn, gpu, "7b", 540, 720, 125, "ok", frames=125, seconds=93.9)
+    db.record_bench_probe(db_conn, gpu, "7b|c", 540, 720, 73, "ok", frames=73, seconds=113.1)
+    db.record_bench_probe(db_conn, gpu, "7b|c", 1920, 1080, 9, "ok", frames=37, seconds=60.0)
+
+    db.clear_bench(db_conn, gpu, "7b|c", cells=[(540, 720)])
+
+    assert db.get_bench_probes(db_conn, gpu, "7b|c", 540, 720) == []
+    assert len(db.get_bench_probes(db_conn, gpu, "7b", 540, 720)) == 1, "uncompiled baseline"
+    assert len(db.get_bench_probes(db_conn, gpu, "7b|c", 1920, 1080)) == 1, "other target"
+
+
+def test_empty_cell_scope_clears_nothing(db_conn):
+    """cells=[] is an explicitly empty selection. It must NOT fall through to the card-wide
+    delete, or a caller computing a target list would wipe the card on an empty one."""
+    gpu = "NVIDIA GeForce RTX 3090"
+    _seed_seven_targets(db_conn, gpu)
+
+    db.clear_bench(db_conn, gpu, "7b", cells=[])
+
+    assert len(db.get_bench_probes(db_conn, gpu, "7b")) == 7
+
+
+def test_unscoped_clear_still_wipes_the_card(db_conn):
+    """cells=None keeps the old card-wide behaviour for callers that really mean it."""
+    gpu = "NVIDIA GeForce RTX 3090"
+    _seed_seven_targets(db_conn, gpu)
+
+    db.clear_bench(db_conn, gpu, "7b")
+
+    assert db.get_bench_probes(db_conn, gpu, "7b") == []

@@ -81,6 +81,101 @@ def compile_ready():
     return triton_installed() and compiler_available()
 
 
+# ── compile cache location (a SPACE in the path breaks inductor) ─────────────
+
+def _short_path(path):
+    """The Windows 8.3 short name of an EXISTING path, or `path` unchanged.
+
+    8.3 names never contain spaces, which is the only property we need. Not guaranteed:
+    8.3 generation can be disabled per volume (`fsutil 8dot3name query`), in which case
+    Windows returns the long name and the caller must fall back."""
+    if os.name != "nt":
+        return path
+    try:
+        import ctypes
+        from ctypes import wintypes
+        fn = ctypes.windll.kernel32.GetShortPathNameW
+        fn.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        fn.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(1024)
+        n = fn(path, buf, len(buf))
+        if 0 < n < len(buf) and buf.value:
+            return buf.value
+    except Exception:                                  # noqa: BLE001 (fail-safe)
+        pass
+    return path
+
+
+def compile_cache_root(app_root=None):
+    """A writable, SPACE-FREE directory to hold the inductor + Triton caches, or None.
+
+    WHY THE SPACE MATTERS -- this is a PyTorch bug, not a preference. In
+    torch/_inductor/cpp_builder.py the compile command is assembled as a STRING and then
+    re-split with `shlex.split` (~line 614). Include dirs are quoted for that trip
+    (`f'/I "{inc_dir}" '`, ~line 2023) but THE SOURCE PATH IS NOT (`" ".join(sources)`,
+    ~line 1998). So any space in the cache path splits the .cpp argument in half and cl.exe
+    dies with:
+
+        warning D9024: unrecognized source file type '...torchinductor_Eduard'
+        fatal error C1083: Cannot open source file: 'Baniceru/fh/....main.cpp'
+
+    The default location is `%TEMP%/torchinductor_<username>`, so EVERY user whose Windows
+    account name contains a space (very common) cannot torch.compile at all. Note Windows
+    already short-names the TEMP root (`C:\\Users\\EDUARD~1\\...`); torch re-introduces the
+    space by appending the full username to it.
+
+    Candidates in order: the app root (no space on a normal install), then ProgramData. Each
+    is 8.3-shortened if needed. None => the caller must not enable compile.
+    """
+    cands = []
+    if app_root:
+        cands.append(os.path.join(app_root, "cache"))
+    cands.append(os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                              "ImageToolbox", "cache"))
+    for c in cands:
+        try:
+            os.makedirs(c, exist_ok=True)
+        except OSError:
+            continue
+        if " " not in c:
+            return c
+        short = _short_path(c)                          # needs the dir to exist, hence after mkdir
+        if " " not in short:
+            return short
+    return None
+
+
+def ensure_cache_env(app_root=None, log=None):
+    """Point inductor + Triton at a space-free cache dir for THIS process. (ok, detail).
+
+    Sets TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR in os.environ, which the probe/segment
+    worker subprocesses inherit. Two wins from one change: it dodges the unquoted-source bug
+    above, AND it moves the caches out of %TEMP% into a stable, app-owned location, so they
+    survive a temp sweep and a compile is paid once rather than once per run.
+
+    An existing space-free setting is respected (the user knows better); an existing setting
+    WITH a space is overridden, because it cannot work. Fail-safe: never raises.
+    """
+    try:
+        cur = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
+        if cur and " " not in cur:
+            return True, f"using the configured cache dir {cur}"
+        root = compile_cache_root(app_root)
+        if not root:
+            return False, ("no space-free compile-cache directory is available (PyTorch does "
+                           "not quote the source path, so a space in it breaks every build)")
+        ind, tri = os.path.join(root, "inductor"), os.path.join(root, "triton")
+        for d in (ind, tri):
+            os.makedirs(d, exist_ok=True)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = ind
+        os.environ["TRITON_CACHE_DIR"] = tri
+        if log:
+            log(f"    compile cache: {root} (space-free; kept across runs)")
+        return True, root
+    except Exception as exc:                            # noqa: BLE001 (fail-safe)
+        return False, f"could not set the compile cache dir: {exc}"
+
+
 def python_tag():
     """The CPython ABI tag for this interpreter, e.g. 'cp312'."""
     return f"cp{sys.version_info.major}{sys.version_info.minor}"

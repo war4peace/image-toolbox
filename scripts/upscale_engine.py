@@ -34,6 +34,60 @@ import sys
 import random
 import contextlib
 
+try:
+    from debug_log import debug_log
+except Exception:                                  # noqa: BLE001 (old install)
+    def debug_log(*_a, **_k):
+        pass
+
+_TRUTHINESS_FIXED = False
+
+
+def _fix_compiled_dit_truthiness():
+    """Give seedvr2's CompatibleDiT a __len__ so a torch.compile'd DiT survives a truthiness
+    test. Without this, a COMPILED local video run dies on its SECOND chunk with
+    "CompatibleDiT does not support len()".
+
+    The chain: with compile_dit, runner.dit is a torch._dynamo OptimizedModule wrapping
+    CompatibleDiT. seedvr2's cache-reuse path (model_configuration._initialize_cache_context)
+    asks `if cached_model:`. Python resolves truthiness as __bool__, then __len__, then
+    "always true". A bare nn.Module has neither dunder, so it is simply truthy and the check
+    means "is it there". But OptimizedModule DEFINES __len__ (proxying to the wrapped module),
+    so the check now calls it, and OptimizedModule.__len__ raises for any wrapped module that
+    is not Sized. torch.compile does not break the DiT: it gives it a __len__ it cannot honour,
+    and a plain `if x:` silently changes meaning from "exists" to "is non-empty".
+
+    Fixed HERE, not in seedvr2/, because seedvr2/ is .gitignore'd and bootstrap-downloaded: an
+    edit there works on one machine, reaches no user, and dies at the next bootstrap. Upstream's
+    real fix is `if cached_model is not None:`.
+
+    __len__ = 1 restores EXACTLY the pre-compile behaviour (a bare CompatibleDiT was
+    unconditionally truthy) and is what OptimizedModule.__len__ proxies to. Nothing calls len()
+    on a DiT for a count. Chosen over patching torch's OptimizedModule.__bool__ (which would fix
+    the whole class of bug, but reaches into a dependency we do not control on a hot upgrade
+    path, to repair a defect that is seedvr2's missing dunder). Idempotent, fail-safe, and never
+    overrides a __len__ upstream may add.
+
+    The Sized.register call is NOT redundant. OptimizedModule.__len__ gates on
+    `isinstance(self._orig_mod, Sized)`, and Sized answers via __subclasshook__, whose result
+    ABCMeta CACHES per class. A negative cached before we attach __len__ is never rechecked, so
+    the patch would silently do nothing depending on import order. register() bumps abc's
+    invalidation counter, which clears those caches, and makes the isinstance true outright
+    instead of relying on a hook re-run.
+    """
+    global _TRUTHINESS_FIXED
+    if _TRUTHINESS_FIXED:
+        return
+    _TRUTHINESS_FIXED = True
+    try:
+        from collections.abc import Sized
+        from src.optimization.compatibility import CompatibleDiT
+        if getattr(CompatibleDiT, "__len__", None) is None:
+            CompatibleDiT.__len__ = lambda _self: 1
+        Sized.register(CompatibleDiT)
+    except Exception as exc:                       # noqa: BLE001 (upstream moved/renamed it)
+        debug_log("upscale_engine._fix_compiled_dit_truthiness", exc=exc)
+
 
 class UpscaleEngine:
     """
@@ -66,6 +120,7 @@ class UpscaleEngine:
 
         import inference_cli as _cli            # heavy: imports torch, cv2
         self._cli = _cli
+        _fix_compiled_dit_truthiness()
         _cli.debug.enabled = debug
         self.debug    = debug
         self.log_sink = None   # optional file object; receives captured pipeline output
@@ -186,12 +241,19 @@ class UpscaleEngine:
         blocks_to_swap = 0 if resident else int(settings.get("blocks_to_swap", 0))
         if blocks_to_swap > 0:
             argv += ["--blocks_to_swap", str(blocks_to_swap)]
+        # VAE tiling. The tile OVERLAP is passed too (it used to fall back to the CLI's own
+        # 128 default): it is the width of the cosine cross-fade that hides each tile seam,
+        # so it is the quality knob of tiling and has to be tunable and recorded, not
+        # implicit. The engine itself skips tiling per frame when the frame already fits one
+        # tile, so a tile size >= the output is a no-op rather than a cost.
         if settings.get("encode_tiled", False):
             argv += ["--vae_encode_tiled",
-                     "--vae_encode_tile_size", str(settings.get("encode_tile_size", 1024))]
+                     "--vae_encode_tile_size", str(settings.get("encode_tile_size", 1024)),
+                     "--vae_encode_tile_overlap", str(settings.get("encode_tile_overlap", 128))]
         if settings.get("decode_tiled", False):
             argv += ["--vae_decode_tiled",
-                     "--vae_decode_tile_size", str(settings.get("decode_tile_size", 1024))]
+                     "--vae_decode_tile_size", str(settings.get("decode_tile_size", 1024)),
+                     "--vae_decode_tile_overlap", str(settings.get("decode_tile_overlap", 128))]
         # Video-path quality/speed knobs (set only on the Video Upscaler's pod, so
         # the image path is unaffected). torch.compile: a one-time compile cost on
         # the first segment, then 20-40% faster DiT every segment after — worth it
@@ -203,6 +265,16 @@ class UpscaleEngine:
             argv += ["--compile_dit"]
         if settings.get("compile_vae"):
             argv += ["--compile_vae"]
+        # compile_dynamic: compile ONE graph that serves every batch size, instead of
+        # specialising per shape. Off in production ON PURPOSE (a run has ONE fixed batch
+        # forever, so the static graph is both free and faster); ON for the BENCHMARK, whose
+        # whole job is sweeping many batches -- there, static specialisation recompiles at
+        # EVERY rung and the compile can never amortise, which inflates s/frame worst at
+        # small batches (fewest frames to spread it over) and so corrupts the batch ranking
+        # itself. A dynamic graph is slightly slower than a static one, but that bias is
+        # uniform across rungs, which a per-rung compile is not.
+        if settings.get("compile_dynamic"):
+            argv += ["--compile_dynamic"]
         if settings.get("uniform_batch_size"):
             argv += ["--uniform_batch_size"]
         noise = float(settings.get("input_noise_scale", 0.0) or 0.0)

@@ -92,15 +92,26 @@ def test_video_resident_threshold_is_independent_of_image():
 
 # ── shared compile-capability gate (runner AND benchmark) ────────────────────
 
+# The gate's capability seam is msvc_setup.verify_toolchain, NOT shutil.which("cl").
+# `which` was the old contract and it is provably wrong in BOTH directions:
+#   * false NEGATIVE: Visual Studio never puts cl.exe on PATH (it lives in a Developer
+#     Command Prompt), so a perfect toolchain looked absent to the Explorer-launched GUI.
+#     msvc_setup activates it via vcvarsall instead of giving up.
+#   * false POSITIVE: a real machine had cl.exe on disk, launching, reporting 19.41.34120,
+#     with no CRT headers and no Windows SDK -- `which` said yes and the compile would have
+#     hung. Only compiling a hello world can tell the difference.
+# See tests/test_msvc_setup.py for the discovery/activation/verification logic itself.
+
 def test_gate_local_compile_disables_without_compiler(monkeypatch):
-    # Triton present but NO C compiler = the exact "stuck at first segment/probe" hang the
-    # gate prevents (inductor shells out to a missing cl.exe under piped stdio). Both the
-    # local runner and the benchmark route their engine settings through here, so the
-    # benchmark can no longer trip the hang the runner already guarded against.
+    # Triton present but no USABLE compiler = the exact "stuck at first segment/probe" hang
+    # the gate prevents (inductor shells out to cl.exe under piped stdio). Both the local
+    # runner and the benchmark route their engine settings through here, so the benchmark
+    # can no longer trip the hang the runner already guarded against.
     import importlib.util as ilu
-    import shutil as sh
+    import msvc_setup
     monkeypatch.setattr(ilu, "find_spec", lambda name: object() if name == "triton" else None)
-    monkeypatch.setattr(sh, "which", lambda name: None)          # no compiler on PATH
+    monkeypatch.setattr(msvc_setup, "verify_toolchain",
+                        lambda *a, **k: (False, "no C compiler (MSVC) is usable"))
     s = {"compile_dit": True, "compile_vae": True}
     disabled, why = bv.gate_local_compile(s)
     assert disabled is True and "compiler" in why.lower()
@@ -109,9 +120,10 @@ def test_gate_local_compile_disables_without_compiler(monkeypatch):
 
 def test_gate_local_compile_keeps_compile_when_capable(monkeypatch):
     import importlib.util as ilu
-    import shutil as sh
+    import msvc_setup
     monkeypatch.setattr(ilu, "find_spec", lambda name: object())  # triton present
-    monkeypatch.setattr(sh, "which", lambda name: r"C:\cl.exe" if name == "cl" else None)
+    monkeypatch.setattr(msvc_setup, "verify_toolchain",
+                        lambda *a, **k: (True, "cl.exe compiled a test file"))
     s = {"compile_dit": True, "compile_vae": True}
     disabled, why = bv.gate_local_compile(s)
     assert disabled is False and why is None
@@ -129,6 +141,52 @@ def test_gate_local_compile_noop_when_compile_off(monkeypatch):
     s = {"compile_dit": False, "compile_vae": False}
     assert bv.gate_local_compile(s) == (False, None)
     assert called["probe"] is False
+
+
+# ── inductor's CPU vector-ISA probe deadlocks an in-process local run ─────────
+
+def _capable(monkeypatch):
+    """Gate sees Triton + a verified compiler, i.e. it is about to enable compile."""
+    import importlib.util as ilu
+    import msvc_setup
+    monkeypatch.setattr(ilu, "find_spec", lambda name: object())
+    monkeypatch.setattr(msvc_setup, "verify_toolchain",
+                        lambda *a, **k: (True, "cl.exe compiled a test file"))
+
+
+def test_enabling_compile_disarms_the_vec_isa_probe(monkeypatch):
+    """THE hang. inductor verifies its AVX probe by spawning a subprocess with stdout
+    INHERITED; under an in-process --local run that child deadlocks at interpreter startup
+    and check_call blocks forever (observed: 16m20s on "Encoding batch 1/3", only released
+    by killing the probe). Setting the env var skips the subprocess."""
+    monkeypatch.delenv("TORCHINDUCTOR_VEC_ISA_OK", raising=False)
+    _capable(monkeypatch)
+    s = {"compile_dit": True, "compile_vae": True}
+    assert bv.gate_local_compile(s) == (False, None)
+    assert os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "1"
+
+
+def test_an_explicit_vec_isa_value_is_never_overridden(monkeypatch):
+    """setdefault, not assignment: a user/dev who set the var deliberately (including to 0 to
+    re-enable the probe while debugging it) must win over our default."""
+    monkeypatch.setenv("TORCHINDUCTOR_VEC_ISA_OK", "0")
+    _capable(monkeypatch)
+    bv.gate_local_compile({"compile_dit": True, "compile_vae": True})
+    assert os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "0"
+
+
+def test_vec_isa_probe_is_left_alone_when_compile_is_disabled(monkeypatch):
+    """No compile means no inductor, so there is no probe to disarm and no reason to touch
+    the environment of a run that will never call it."""
+    monkeypatch.delenv("TORCHINDUCTOR_VEC_ISA_OK", raising=False)
+    import importlib.util as ilu
+    import msvc_setup
+    monkeypatch.setattr(ilu, "find_spec", lambda name: object())
+    monkeypatch.setattr(msvc_setup, "verify_toolchain", lambda *a, **k: (False, "no compiler"))
+    s = {"compile_dit": True, "compile_vae": True}
+    bv.gate_local_compile(s)
+    assert s["compile_dit"] is False
+    assert "TORCHINDUCTOR_VEC_ISA_OK" not in os.environ
 
 
 # ── seedvr2 path resolution ──────────────────────────────────────────────────

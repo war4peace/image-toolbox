@@ -117,6 +117,31 @@ def _local_seedvr2_paths(cfg):
     return repo, model
 
 
+def _disarm_vec_isa_probe():
+    """Stop inductor's CPU vector-ISA probe from DEADLOCKING an in-process local run.
+
+    torch/_inductor/cpu_vec_isa.py `VecISA.check_build` verifies its AVX probe by spawning
+    `python -c "import torch; cdll.LoadLibrary(<probe>.pyd)"` through subprocess.check_call
+    with stdout INHERITED. In an in-process local run (batch_video_upscale --local) that child
+    inherits the GUI's raw pipes + CREATE_NO_WINDOW console state and hangs at interpreter
+    startup -- 15 ms of CPU, one thread in an Executive wait, torch never imported -- so
+    check_call blocks forever. Observed: a first segment sat on "Encoding batch 1/3" for
+    16m20s and only moved when the probe was killed by hand. The benchmark never hit it
+    because it runs the engine in a local_video_worker CHILD whose stdio is captured.
+
+    TORCHINDUCTOR_VEC_ISA_OK=1 makes VecISA.__bool__ return True without the subprocess.
+    This is safe, and specifically NOT "assume the CPU has AVX512": valid_vec_isa_list()
+    still filters the ISA list by the REAL cpu flags via x86_isa_checker(). All that is
+    skipped is the build-and-load VERIFICATION -- and this gate only calls us once
+    msvc_setup.verify_toolchain() has already compiled and linked a real test file, so the
+    check is redundant here, not lost. Worst case degrades from an unkillable hang to a
+    visible compile error.
+
+    Only set when we are about to enable compile, and never over an explicit user value.
+    """
+    os.environ.setdefault("TORCHINDUCTOR_VEC_ISA_OK", "1")
+
+
 def gate_local_compile(settings, log=None):
     """Gate torch.compile on a real compile-capability probe, for ANY local SeedVR2 run
     (the batch runner AND the benchmark, which share this venv). torch.compile needs BOTH
@@ -128,30 +153,68 @@ def gate_local_compile(settings, log=None):
     here, not just the batch runner's, or the benchmark trips the same hang.
 
     Mutates `settings` in place (compile_dit/compile_vae -> False when it can't compile) and
-    returns (disabled: bool, reason: str|None). A user with triton-windows + an activated
-    MSVC toolchain keeps the pod-grade speedup; everyone else runs fine without compile
-    (speed only, not quality)."""
+    returns (disabled: bool, reason: str|None). A user with triton-windows + a working MSVC
+    toolchain keeps the pod-grade speedup; everyone else runs fine without compile (speed
+    only, not quality).
+
+    Two things this must NOT do, both learned from real machines:
+      * give up because cl.exe isn't on PATH. Visual Studio never puts it there -- it lives
+        inside a Developer Command Prompt -- so the GUI (launched from Explorer) sees no
+        compiler even when a perfect toolchain is installed. msvc_setup.ensure_msvc_env
+        runs vcvarsall and merges the result into THIS process, which is what inductor's
+        child cl.exe inherits.
+      * trust cl.exe once it IS on PATH. One machine had cl.exe present and launching with
+        no CRT headers and no Windows SDK: every cheap check passed and the compile would
+        have hung. msvc_setup.verify_toolchain compiles a hello world instead of guessing.
+    """
     want_compile = bool(settings.get("compile_dit") or settings.get("compile_vae"))
     if not want_compile:
         return False, None
     import importlib.util as _ilu
-    import shutil as _sh
     triton_ok = _ilu.find_spec("triton") is not None
-    compiler_ok = bool(_sh.which("cl") or _sh.which("cc") or _sh.which("gcc")
-                       or _sh.which("clang"))
+    if triton_ok:
+        try:
+            import msvc_setup
+            compiler_ok, why_cc = msvc_setup.verify_toolchain()
+        except Exception as exc:                        # noqa: BLE001 (old install / any error)
+            import shutil as _sh
+            compiler_ok = bool(_sh.which("cl") or _sh.which("cc") or _sh.which("gcc")
+                               or _sh.which("clang"))
+            why_cc = f"compiler probe unavailable ({exc})"
+    else:
+        compiler_ok, why_cc = False, "Triton is not installed"
+    # A compile cache path containing a SPACE fails every build: inductor does not quote the
+    # source file (torch/_inductor/cpp_builder.py ~1998) before shlex.split-ing the command,
+    # and the default dir is %TEMP%/torchinductor_<username> -- so any Windows account name
+    # with a space in it (e.g. "Eduard Baniceru") cannot compile at all. Redirect the cache to
+    # a space-free dir; if that is impossible, compile must be OFF rather than fail mid-run.
     if triton_ok and compiler_ok:
+        try:
+            import triton_setup
+            cache_ok, why_cache = triton_setup.ensure_cache_env(APP_ROOT, log)
+            if not cache_ok:
+                compiler_ok, why_cc = False, why_cache
+        except Exception as exc:                        # noqa: BLE001 (old install / any error)
+            debug_log("gate_local_compile: ensure_cache_env", exc=exc)
+    if triton_ok and compiler_ok:
+        _disarm_vec_isa_probe()
         if log:
-            log("    torch.compile ON (Triton + compiler present): the first segment pays "
+            log("    torch.compile ON (Triton + a verified compiler): the first segment pays "
                 "a one-time compile cost, then the rest runs faster (shared fixed shape).")
         return False, None
-    why = ("Triton is not installed" if not triton_ok
-           else "no C compiler (MSVC cl.exe) is on PATH")
+    why = "Triton is not installed" if not triton_ok else why_cc
     settings["compile_dit"] = False
     settings["compile_vae"] = False
     if log:
         log(f"    torch.compile disabled: {why}. It would otherwise stall the first "
             f"segment (compiling with no output) or fail. Local runs continue without "
             f"compile; only speed is affected, not quality.")
+        try:
+            import msvc_setup
+            if triton_ok:
+                log(f"    To enable it: {msvc_setup.install_hint()}")
+        except Exception:                               # noqa: BLE001 (advice is optional)
+            pass
     return True, why
 
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common (0.4.3
@@ -466,8 +529,32 @@ def resolve_video_cfg(cfg, overrides=None):
         # uniform_batch_size: pad the ragged final batch so it can't flicker.
         # input_noise_scale: >0 counters 4K over-smoothing (default 0 = off).
         "compile":             bool(v.get("compile", True)),
+        # compile_dynamic: one graph serving every batch size instead of one per shape.
+        # Resolved here (video.*, else the image upscale.* value, else off) rather than left
+        # to _worker_cfg's blanket copy of cfg["upscale"], for the same reason the tiling keys
+        # below are explicit: it changes the VRAM/rate profile the learned batch is keyed on
+        # (see video_vram_sizer.compile_tag), so it must not reach the video path invisibly.
+        "compile_dynamic":     bool(v.get("compile_dynamic", u.get("compile_dynamic", False))),
         "uniform_batch_size":  bool(v.get("uniform_batch_size", True)),
         "input_noise_scale":   float(v.get("input_noise_scale", 0.0) or 0.0),
+        # VAE tiling. Splits the VAE encode/decode into overlapping spatial tiles, bounding
+        # its VRAM peak at the cost of a blended seam per tile boundary. Defaults follow the
+        # image upscale.* keys (the watchdog_* precedent) so a user who set it once gets
+        # consistent behaviour, and video.* overrides it when the two paths should differ:
+        # video output sizes are far larger than the image path's, so the right answer here
+        # is not necessarily the right answer there. The engine self-disables tiling per
+        # frame when the frame already fits one tile (attn_video_vae.tiled_encode /
+        # tiled_decode), so a tile size >= the output size is a no-op, not a cost.
+        "encode_tiled":        bool(v.get("encode_tiled", u.get("encode_tiled", False))),
+        "decode_tiled":        bool(v.get("decode_tiled", u.get("decode_tiled", False))),
+        "encode_tile_size":    int(v.get("encode_tile_size",
+                                         u.get("encode_tile_size", 1024)) or 1024),
+        "decode_tile_size":    int(v.get("decode_tile_size",
+                                         u.get("decode_tile_size", 1024)) or 1024),
+        "encode_tile_overlap": int(v.get("encode_tile_overlap",
+                                         u.get("encode_tile_overlap", 128)) or 128),
+        "decode_tile_overlap": int(v.get("decode_tile_overlap",
+                                         u.get("decode_tile_overlap", 128)) or 128),
         # SeedVR2 weights the pod loads (video path only; the Batch Upscaler keeps its
         # own). 7B fp16 = best detail (default); 3B-Q8 = smaller + more VRAM headroom for
         # bigger windows. The pod auto-downloads the file to the volume on first use, so
@@ -530,6 +617,22 @@ def resolve_video_cfg(cfg, overrides=None):
     return out
 
 
+def describe_tiling(cfg):
+    """One-line human description of the VAE-tiling state, for the run/benchmark banner.
+
+    Tiling changes BOTH the VRAM ceiling (so the batch a run can use) and the output (a
+    blended seam per tile boundary), which makes it the one setting a benchmark result is
+    meaningless without. It used to be invisible: inherited from the image config and
+    logged nowhere, so two runs could differ on it with nothing in the record to say so.
+    """
+    parts = []
+    for phase in ("encode", "decode"):
+        if cfg.get(f"{phase}_tiled"):
+            parts.append(f"{phase} {int(cfg.get(f'{phase}_tile_size', 1024) or 1024)}px"
+                         f"/{int(cfg.get(f'{phase}_tile_overlap', 128) or 128)} overlap")
+    return ", ".join(parts) if parts else "off (whole-frame VAE)"
+
+
 def log_video_settings(vcfg):
     """Echo the SeedVR2 / pipeline settings this run uses, to the log window and
     file, so a run (especially a failed one) records exactly what it was given.
@@ -555,6 +658,7 @@ def log_video_settings(vcfg):
     log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
         f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
         f"input noise {noise if noise > 0 else 'off'}")
+    log(f"    VAE tiling: {describe_tiling(vcfg)}")
     if vcfg.get("watchdog_enabled", True):
         log(f"    slow-segment watchdog on (warn at >={vcfg.get('watchdog_factor', 3.0):g}x "
             f"the run's healthy rate; notify-only, no auto-stop)")
@@ -610,6 +714,18 @@ _MP_KEY_MP = 0.05           # fine MP DB-key grid (matches db.MP_KEY_UNIT + size
 def _mp_bucket(mp):
     """Stable integer DB key for a per-frame output-megapixel value (fine _MP_KEY_MP grid)."""
     return int(round(max(0.0, float(mp or 0)) / _MP_KEY_MP))
+
+
+def _engine_flags(vcfg):
+    """A resolved video config in the ENGINE's flag names, for the sizer's key helpers.
+
+    The two vocabularies differ on exactly one thing: the video config says `compile`, the
+    engine says `compile_dit` + `compile_vae` (main()._worker_cfg does this same fan-out when
+    it builds the pod's settings). process_job needs the learned-batch key but cannot call
+    _worker_cfg -- it is a closure inside main() -- so translate the flags the tag reads.
+    Everything else the tags look at (the tiling keys, compile_dynamic) already carries its
+    engine name through resolve_video_cfg. Keep in step with _worker_cfg."""
+    return dict(vcfg, compile_dit=vcfg.get("compile"), compile_vae=vcfg.get("compile"))
 
 
 def _request_batch(explicit_batch, tuned, learned):
@@ -1335,9 +1451,15 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # suggestion then refines + freezes it (all segments share one output size, so one
     # converged value serves the whole video AND respects torch.compile's single shape).
     gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+    # The learned-batch key. A measured ceiling is only valid for the VRAM regime it was
+    # measured under -- VAE tiling and torch.compile both move it (see sizer.learn_tag) -- so
+    # their tags join the card id. Everything off tags to "" (the historical key), so rows
+    # learned before this landed keep working and keep meaning what they said.
+    import video_vram_sizer as _sizer
+    learn_key = (gpu_id + _sizer.learn_tag(_engine_flags(vcfg))) if gpu_id else ""
     seg_out_mp = ve.output_megapixels(info.width, info.height, target)
     mp_bucket = _mp_bucket(seg_out_mp)
-    tuning = bool(vcfg.get("auto_tune_batch", True) and gpu_id and not batch
+    tuning = bool(vcfg.get("auto_tune_batch", True) and learn_key and not batch
                   and len(segs) >= MIN_TUNE_SEGMENTS)
     tuned = [None]               # frozen tuned batch (seed, then the converged measurement)
     converged = [False]
@@ -1345,7 +1467,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         try:
             # Nearest recorded key >= this segment's MP (safe bound: a batch that fit a bigger
             # output fits a smaller one), so the fine key grid still seeds across nearby sizes.
-            tuned[0] = db.get_learned_batch_ge(conn, gpu_id, mp_bucket)
+            tuned[0] = db.get_learned_batch_ge(conn, learn_key, mp_bucket)
         except Exception as exc:                       # noqa: BLE001 (fail-safe)
             debug_log("batch_video_upscale get_learned_batch", exc=exc)
         if tuned[0]:
@@ -1486,7 +1608,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                     f"card for ~{seg_out_mp:.1f}MP output); frozen for this video.")
             tuned[0] = sug or tuned[0]
             try:
-                db.put_learned_batch(conn, gpu_id, mp_bucket, tuned[0])
+                db.put_learned_batch(conn, learn_key, mp_bucket, tuned[0])
             except Exception as exc:                   # noqa: BLE001 (fail-safe)
                 debug_log("batch_video_upscale put_learned_batch", exc=exc)
         # Phase breakdown (per-segment overhead beyond the pod time): submit=upload,
@@ -1777,6 +1899,11 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
                               done_frames=done_frames) from exc
             failed += 1
             reason = str(exc)[:300]
+            # The traceback, to logs/debug.log. `str(exc)` alone is often the LEAST useful
+            # part of an engine failure: "CompatibleDiT does not support len()" named neither
+            # the caller nor the file, and the frames existed only in a dead process. The GUI
+            # line stays a one-liner (the user does not want a stack); the trail goes to disk.
+            debug_log(f"video job failed: {rel} -> {target}", exc=exc, tb=True)
             n = db.bump_video_fail_count(conn, root_id, rel, target, clip_id=clip_id)
             status, skip_reason = _failure_disposition(n, reason)
             db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
@@ -2153,9 +2280,16 @@ def main(argv=None):
         wc = dict(cfg.get("upscale", {}))
         wc["compile_dit"]        = vcfg["compile"]
         wc["compile_vae"]        = vcfg["compile"]
+        wc["compile_dynamic"]    = vcfg["compile_dynamic"]
         wc["uniform_batch_size"] = vcfg["uniform_batch_size"]
         wc["input_noise_scale"]  = vcfg["input_noise_scale"]
         wc["dit_model"]          = vcfg["dit_model"]
+        # VAE tiling: set EXPLICITLY from the resolved video config. Copying cfg["upscale"]
+        # alone would let the image tab's tiling silently decide the video path's VRAM
+        # profile (and so its batch ceiling), which is invisible in the log and untestable.
+        for _k in ("encode_tiled", "decode_tiled", "encode_tile_size", "decode_tile_size",
+                   "encode_tile_overlap", "decode_tile_overlap"):
+            wc[_k] = vcfg[_k]
         # Video-specific resident threshold overrides the image one (default 40) so a video
         # temporal decode phases the DiT out on cards too small to hold it resident safely.
         wc["vram_resident_threshold_gb"] = vcfg["vram_resident_threshold_gb"]
