@@ -22,3 +22,13 @@ installer/Output/
 
 # Internal-only working copy of the benchmark data (the .csv is the tracked source)
 docs/Benchmarks.xlsx
+
+# torch.compile caches (inductor + Triton), redirected here by triton_setup.ensure_cache_env.
+# Kept OUT of %TEMP% on purpose: the default %TEMP%/torchinductor_<username> contains a space
+# for any account whose name has one, and inductor does not quote the source path (see
+# triton_setup.compile_cache_root). Machine- and version-specific; never commit it.
+/cache/
+
+# Unstructured personal dev notes / brain-dumps (not release docs; the structured
+# notes in docs/*.md are tracked). Too loose to version.
+docs/coarse*
