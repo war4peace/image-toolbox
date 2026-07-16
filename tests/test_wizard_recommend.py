@@ -84,6 +84,34 @@ def test_every_recommended_model_is_a_listed_option():
         assert rec.ollama_model in oll_ids, f"{rec.ollama_model} not in OLLAMA_OPTIONS"
 
 
+# ── recommend_compile: the torch.compile speedup advice by card size ─────────
+
+def test_compile_recommended_on_big_cards():
+    for gb in (24, 32, 48, 80):
+        adv = wr.recommend_compile(gb)
+        assert adv.verdict == "recommended"
+        assert adv.blurb                      # non-empty reason for the wizard to show
+
+
+def test_compile_optional_at_16gb():
+    assert wr.recommend_compile(16).verdict == "optional"
+    assert wr.recommend_compile(23).verdict == "optional"   # just under the big-card line
+
+
+def test_compile_not_recommended_on_small_or_no_gpu():
+    for gb in (0, 8, 10, 12, 15):
+        assert wr.recommend_compile(gb).verdict == "not_recommended"
+
+
+def test_compile_boundaries_match_the_model_tiers():
+    # 16 is the first "optional" GB; 24 the first "recommended" GB, same cut points
+    # the model recommendation uses, so the two steps tell a consistent story.
+    assert wr.recommend_compile(15).verdict == "not_recommended"
+    assert wr.recommend_compile(16).verdict == "optional"
+    assert wr.recommend_compile(23).verdict == "optional"
+    assert wr.recommend_compile(24).verdict == "recommended"
+
+
 def test_label_for_returns_label_or_raw_id():
     assert wr.label_for(wr.OLLAMA_OPTIONS, "qwen2.5vl:7b").startswith("qwen2.5vl:7b")
     assert wr.label_for(wr.SEEDVR_OPTIONS, "seedvr2_ema_3b-Q8_0.gguf").startswith("3B Q8")

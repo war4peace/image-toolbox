@@ -9,12 +9,20 @@ model that fit the card's VRAM (see gui/wizard_recommend.py for the pure tier
 logic and docs/first-start-wizard.md for the design). The recommendation is a
 suggestion, not a gate: every model stays selectable.
 
-SKELETON (step 1 of the build): the navigation scaffold, GPU detection and the
-recommendation step are functional and Finish writes the chosen models to config.
-The Ollama one-click pull step and the remote-setup step are placeholders wired
-into the flow but implemented in later steps of the build.
+Flow (local/both): welcome -> GPU + models -> Ollama one-click pull -> optional
+torch.compile speedup -> [remote setup on a "both" install] -> finish. Remote-only
+installs get welcome -> remote setup -> finish (no local GPU to size for). Every
+step is functional; navigation, GPU detection, the Ollama pull and the compile probe
+all run off the UI thread.
+
+The compile-speedup step (0.5.0, feature #7, local video) is OPTIONAL and shown only
+when a pinned triton-windows wheel exists for this Python/torch. It explains the
+size / speed / VRAM trade, installs the Triton half in-app (verified ~50 MB wheel),
+and links to Microsoft's page for the C++ Build Tools half (~2-3 GB). It writes no
+config: compile stays gated at runtime by batch_video_upscale.gate_local_compile.
 """
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import ttk
 
@@ -68,6 +76,15 @@ class FirstStartWizard(tk.Toplevel):
         self._oll_progress_var = None
         self._oll_status_lbl = None
 
+        # Compile-speedup step state (feature #7, local video). Probed off-thread the
+        # first time the step is shown (verify_toolchain COMPILES a hello-world, and
+        # triton_setup imports torch: neither belongs on the UI thread):
+        #   None -> checking -> ready | unsupported | unavailable
+        self._cmp_state = None
+        self._cmp_triton = False        # Triton wheel importable
+        self._cmp_compiler = False      # a C compiler that actually compiles
+        self._cmp_hint = ""             # msvc_setup.status_line() for the log/detail
+
         self.title("Welcome to Image Toolbox")
         self.transient(app)
         self.resizable(True, True)
@@ -76,11 +93,13 @@ class FirstStartWizard(tk.Toplevel):
 
         # Step order depends on install mode:
         #   remote-only  : welcome -> remote setup -> finish  (no local GPU)
-        #   local/both   : welcome -> GPU + models -> Ollama pull -> [remote] -> finish
+        #   local/both   : welcome -> GPU + models -> Ollama pull -> compile speedup
+        #                  -> [remote] -> finish
         if self.install_mode == "remote":
             self._steps = [self._step_welcome, self._step_remote, self._step_finish]
         else:
-            self._steps = [self._step_welcome, self._step_gpu, self._step_ollama_pull]
+            self._steps = [self._step_welcome, self._step_gpu, self._step_ollama_pull,
+                           self._step_compile]
             if self.install_mode == "both":
                 self._steps.append(self._step_remote)
             self._steps.append(self._step_finish)
@@ -428,6 +447,154 @@ class FirstStartWizard(tk.Toplevel):
             if self.winfo_exists():
                 self.after(0, fn)
         except Exception:
+            pass
+
+    # ── compile speedup (feature #7, local video) ────────────────────────────
+
+    _MSVC_DOWNLOAD_URL = "https://visualstudio.microsoft.com/downloads/"
+
+    def _step_compile(self, parent):
+        """Optional torch.compile speedup for LOCAL video runs. Explains the size /
+        pros / cons, recommends by card size, installs the Triton half in-app (verified
+        ~50 MB wheel), and points at Microsoft's page for the C++ Build Tools half. Never
+        writes config: compile stays a runtime-gated default (gate_local_compile), so this
+        step only helps the user get the two pieces in place. Fail-safe throughout."""
+        ttk.Label(parent, text="Optional: speed up local video",
+                  font=("Segoe UI", 12, "bold")).grid(row=0, column=0, sticky="w")
+
+        # First view: probe Triton + the compiler off-thread (both are slow / heavy).
+        if self._cmp_state is None:
+            self._cmp_state = "checking"
+            threading.Thread(target=self._detect_compile, daemon=True).start()
+
+        state = self._cmp_state
+        if state == "checking":
+            ttk.Label(parent, foreground="#666",
+                      text="Checking your compiler and Triton …").grid(
+                row=1, column=0, sticky="w", pady=(8, 0))
+            return
+
+        if state in ("unsupported", "unavailable"):
+            note = ("The compile speedup isn't available for this Python/PyTorch build, "
+                    "so there's nothing to set up here. Local runs work fine without it "
+                    "(only speed is affected, not quality).")
+            ttk.Label(parent, wraplength=520, justify="left", foreground="#666",
+                      text=note).grid(row=1, column=0, sticky="w", pady=(8, 0))
+            return
+
+        # state == "ready": show the explainer, the recommendation, and the two actions.
+        adv = wr.recommend_compile(wr.vram_mb_to_gb(self.vram_total_mb))
+        intro = ("torch.compile makes local video runs about 20-40% faster after the "
+                 "first segment: the same speedup the rented-pod runs use. It's optional "
+                 "and speed-only. It needs two pieces:")
+        ttk.Label(parent, wraplength=520, justify="left",
+                  text=intro).grid(row=1, column=0, sticky="w", pady=(8, 6))
+
+        box = ttk.LabelFrame(parent, text="  What it needs  ", padding=10)
+        box.grid(row=2, column=0, sticky="ew")
+        box.columnconfigure(1, weight=1)
+
+        # Triton row (~50 MB, installable in-app).
+        ttk.Label(box, text="Triton (~50 MB):").grid(row=0, column=0, sticky="w", pady=2)
+        if self._cmp_triton:
+            ttk.Label(box, text="✓ installed", foreground="#1a7f37").grid(
+                row=0, column=1, sticky="w", padx=(8, 0))
+        else:
+            ttk.Button(box, text="Install Triton (verified)",
+                       command=self._wizard_install_triton).grid(
+                row=0, column=1, sticky="w", padx=(8, 0))
+
+        # C++ Build Tools row (~2-3 GB, Microsoft's own installer).
+        ttk.Label(box, text="C++ Build Tools\n(~2-3 GB, Microsoft):",
+                  justify="left").grid(row=1, column=0, sticky="w", pady=2)
+        if self._cmp_compiler:
+            ttk.Label(box, text="✓ found and working", foreground="#1a7f37").grid(
+                row=1, column=1, sticky="w", padx=(8, 0))
+        else:
+            ttk.Button(box, text="Get C++ Build Tools …",
+                       command=self._open_msvc_page).grid(
+                row=1, column=1, sticky="w", padx=(8, 0))
+
+        # If the compiler is missing, spell out the minimal component picks so the user
+        # grabs ~2-3 GB, not the ~7 GB full "Desktop development with C++" workload.
+        if not self._cmp_compiler:
+            ttk.Label(parent, wraplength=520, justify="left", foreground="#666",
+                      text=("On Microsoft's page choose 'Build Tools for Visual Studio "
+                            "2022'. Under Individual components tick only 'MSVC v143 - VS "
+                            "2022 C++ x64/x86 build tools' and 'Windows 11 SDK' (~2-3 GB, "
+                            "not the ~7 GB full workload). The app finds and uses it "
+                            "automatically afterwards.")).grid(
+                row=3, column=0, sticky="w", pady=(8, 0))
+
+        # Recommendation + the honest trade-off, coloured by verdict.
+        colour = {"recommended": "#1a7f37", "optional": "#8a6d00",
+                  "not_recommended": "#b3261e"}.get(adv.verdict, "#666")
+        head = {"recommended": "Recommended for your card.",
+                "optional": "Optional for your card.",
+                "not_recommended": "Not recommended for your card."}.get(
+                    adv.verdict, "")
+        ttk.Label(parent, wraplength=520, justify="left", foreground=colour,
+                  text=f"{head} {adv.blurb}").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(parent, wraplength=520, justify="left", foreground="#888",
+                  text=("Trade-off: the first segment of a run is slower (it compiles "
+                        "once), and compiling uses more VRAM so the batch shrinks. You "
+                        "can turn it off any time in Settings > Video.")).grid(
+            row=5, column=0, sticky="w", pady=(6, 0))
+
+    def _detect_compile(self):
+        """Probe both halves off the UI thread. Guarded imports: an install predating
+        triton_setup / msvc_setup must degrade to 'unavailable', not crash first launch."""
+        try:
+            import triton_setup
+        except Exception:                                   # noqa: BLE001 (old install)
+            self._ui(lambda: self._on_compile_detected("unavailable", False, False, ""))
+            return
+        try:
+            if not triton_setup.is_supported():
+                self._ui(lambda: self._on_compile_detected("unsupported", False, False, ""))
+                return
+            triton = triton_setup.triton_installed()
+        except Exception:                                   # noqa: BLE001
+            self._ui(lambda: self._on_compile_detected("unavailable", False, False, ""))
+            return
+        compiler_ok, hint = False, ""
+        try:
+            import msvc_setup
+            compiler_ok, _ = msvc_setup.verify_toolchain()  # actually compiles a test file
+            hint = msvc_setup.status_line()
+        except Exception:                                   # noqa: BLE001 (old install / any error)
+            pass
+        self._ui(lambda: self._on_compile_detected("ready", triton, compiler_ok, hint))
+
+    def _on_compile_detected(self, state, triton, compiler_ok, hint):
+        self._cmp_state = state
+        self._cmp_triton = triton
+        self._cmp_compiler = compiler_ok
+        self._cmp_hint = hint
+        if self._showing(self._step_compile):
+            self._render()
+
+    def _wizard_install_triton(self):
+        """Install the verified triton-windows wheel (~50 MB), then re-probe so the row
+        flips to '✓ installed'. Reuses the shared dialog; fail-safe."""
+        try:
+            from gui.dialogs import prompt_install_triton
+        except Exception:                                   # noqa: BLE001
+            return
+
+        def done(_ok):
+            # Re-run the full probe: a fresh Triton install may now pair with a compiler.
+            self._cmp_state = None
+            if self._showing(self._step_compile):
+                self._render()
+        prompt_install_triton(self, on_done=done)
+
+    def _open_msvc_page(self):
+        """Open Microsoft's download page for the C++ Build Tools. The user runs
+        Microsoft's own installer (license + elevation stay with Microsoft)."""
+        try:
+            webbrowser.open(self._MSVC_DOWNLOAD_URL)
+        except Exception:                                   # noqa: BLE001
             pass
 
     def _step_remote(self, parent):

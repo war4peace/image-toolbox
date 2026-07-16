@@ -39,6 +39,12 @@ OLLAMA_OPTIONS = [
 # pick it, and the two recommended model identifiers.
 Recommendation = namedtuple("Recommendation", "tier vram_gb dit_model ollama_model")
 
+# Advice for the optional torch.compile speedup (feature #7, local video). The
+# verdict is one of "recommended" | "optional" | "not_recommended"; blurb is a short
+# reason for the wizard to show. Kept here (pure) so it is unit-tested alongside the
+# model tiers.
+CompileAdvice = namedtuple("CompileAdvice", "verdict blurb")
+
 
 def vram_mb_to_gb(vram_total_mb):
     """Round a MiB VRAM total to nominal GB. Rounding (not floor) is deliberate: a
@@ -71,6 +77,30 @@ def recommend_models(vram_total_mb):
                               "minicpm-v:latest")
     return Recommendation("<=12GB", gb,
                           "seedvr2_ema_3b-Q8_0.gguf", "gemma3:4b")
+
+
+def recommend_compile(vram_gb):
+    """Advice on the optional torch.compile speedup for LOCAL video runs, by card size.
+
+    compile makes local runs ~20-40% faster after the first (compiling) segment, but
+    it raises VRAM use, so the largest safe batch shrinks. That trade tips on card
+    size: a clear win on a big card (esp. long videos), marginal at 16 GB, and a
+    likely NET LOSS on a small card where the smaller batch costs more than compile
+    saves (see tab_settings' compile tooltip and gate_local_compile). This only
+    guides the wizard's copy; runtime still gates compile on Triton + a real compiler.
+
+    Takes rounded GB (as vram_mb_to_gb yields); 0 / no GPU -> not recommended.
+    """
+    if vram_gb >= 24:
+        return CompileAdvice("recommended",
+                             "A clear win on your card, especially on long videos.")
+    if vram_gb >= 16:
+        return CompileAdvice("optional",
+                             "Marginal on 16 GB: the smaller batch can eat the gain. "
+                             "Benchmark both ways if you care.")
+    return CompileAdvice("not_recommended",
+                         "On a smaller card the extra VRAM shrinks the batch, so it "
+                         "often ends up slower. Leave it off unless you've measured a win.")
 
 
 def label_for(options, model_id):

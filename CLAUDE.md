@@ -190,6 +190,16 @@ defaults. As a safety net, a **local Tag & Rename run re-checks the model on Sta
 and offers to pull it if missing (`TagTab._ensure_ollama_model` + `OllamaPullDialog`),
 since Ollama never auto-pulls. The GPU-blind `ollama pull qwen2.5vl:7b` was removed
 from `bootstrap.ps1` (Ollama is still installed; the wizard now owns model choice).
+An **optional compile-speedup step** (0.5.0, local/both, feature #7) helps set up the
+local video engine's `torch.compile`: shown only when a pinned `triton-windows` wheel
+exists for this Python/torch (`triton_setup.is_supported()`), it probes both halves
+off the UI thread (`_detect_compile`; `msvc_setup.verify_toolchain()` actually
+compiles, `triton_setup` imports torch), states the size / speed / VRAM trade, gives a
+card-sized verdict (`wizard_recommend.recommend_compile`: recommended ≥24 GB, optional
+≥16 GB, else not), then **installs the Triton half in-app** (verified ~50 MB wheel via
+`prompt_install_triton`) and **links to Microsoft's page for the C++ Build Tools half**
+(~2-3 GB, minimal `MSVC v143` + `Windows 11 SDK` components spelled out). It writes no
+config: compile stays gated at runtime by `batch_video_upscale.gate_local_compile`.
 See `gui/wizard.py`, `gui/wizard_recommend.py`, and `docs/first-start-wizard.md`.
 
 **Performance watchdog** (0.3.0, experimental) — guards long upscale runs against

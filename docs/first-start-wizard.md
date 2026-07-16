@@ -8,8 +8,10 @@ fast configuration without knowing what "7B fp16" or "qwen2.5vl" mean.
 Status: IMPLEMENTED (0.4.6-experimental). The wizard, its tiers, the Ollama
 one-click pull, the remote-tab router, the Settings re-run button, the bootstrap
 pre-pull removal, and the Tag & Rename pull-on-Start safety net are all built and
-tested (full suite 330). Remaining before release: the module-table / feature-list
-/ README updates on the release checklist.
+tested. **0.5.0 added an optional compile-speedup step** (feature #7, local video):
+it recommends and helps install the two halves `torch.compile` needs (Triton +
+MSVC), being explicit about download size and the speed/VRAM trade (step 5 in the
+flow below).
 
 ## Decisions (agreed)
 
@@ -99,14 +101,31 @@ Notes:
    and missing --Download--> pulling -> pulled | error. Navigation stays enabled
    during a pull (it continues server-side; the `_ui()` guard keeps a late callback
    off a closed wizard).
-5. **Remote path:** rather than duplicate the RunPod tab's stateful SSH/volume UI,
+5. **Compile speedup** (local/both, 0.5.0): an OPTIONAL step for the local video
+   engine's `torch.compile` (feature #7). Shown only when a pinned `triton-windows`
+   wheel exists for this Python/torch (`triton_setup.is_supported()`); otherwise it
+   self-skips with a one-line note. It probes both halves OFF the UI thread
+   (`_detect_compile`: `verify_toolchain()` compiles a hello-world, and `triton_setup`
+   imports torch), states `checking -> ready | unsupported | unavailable`, then
+   explains the trade in plain terms: ~20-40% faster after the first (compiling)
+   segment, at the cost of a slower first segment and more VRAM (smaller batch). It
+   shows the two pieces with their SIZES (Triton ~50 MB, C++ Build Tools ~2-3 GB), a
+   card-sized verdict (`wizard_recommend.recommend_compile`: recommended >=24 GB,
+   optional >=16 GB, not-recommended below), and two actions: **Install Triton**
+   (reuses the verified `prompt_install_triton`) and **Get C++ Build Tools ...**
+   (opens Microsoft's download page, with the minimal component picks spelled out:
+   "MSVC v143" + "Windows 11 SDK", ~2-3 GB not the ~7 GB workload). It writes NO
+   config: compile stays a runtime-gated default (`gate_local_compile`), so the step
+   only helps the user get the pieces in place. Guarded imports so an install
+   predating `triton_setup` / `msvc_setup` degrades to "unavailable", never crashes.
+6. **Remote path:** rather than duplicate the RunPod tab's stateful SSH/volume UI,
    the remote step ROUTES to it: an "Open the RunPod tab" button selects that tab
    and closes the wizard. For remote-only it is the main path (replacing steps 2-4);
    for a **both** install it is an optional final step. Remote-only installs do NOT
    have their model config rewritten (the GPU/model steps are skipped, so the
    shipped 7B FP16 + qwen2.5vl:7b defaults are left for the big pod GPU the user
    picks per-run).
-6. **Finish:** write config via `config_store.save` (through `gui.common.save_config`),
+7. **Finish:** write config via `config_store.save` (through `gui.common.save_config`),
    set `wizard_done`.
 
 The wizard does NOT touch the Resolution Target: it stays at the 4K default (the
@@ -115,9 +134,12 @@ tiers already size for 4K, so no separate choice is needed here).
 ## Files touched (as built)
 
 - `scripts/gui/wizard_recommend.py` (new): the pure, tkinter-free tier logic
-  (`recommend_models`, `vram_mb_to_gb`, the SEEDVR/OLLAMA option lists, `label_for`).
+  (`recommend_models`, `vram_mb_to_gb`, the SEEDVR/OLLAMA option lists, `label_for`,
+  and 0.5.0's `recommend_compile` / `CompileAdvice`).
 - `scripts/gui/wizard.py` (new): the `FirstStartWizard` `Toplevel`, its steps, the
-  off-thread GPU detection and Ollama pull, the remote-tab router, `should_show`.
+  off-thread GPU detection and Ollama pull, the remote-tab router, `should_show`, and
+  0.5.0's off-thread compile-speedup step (`_step_compile` / `_detect_compile` /
+  `_wizard_install_triton` / `_open_msvc_page`).
 - `scripts/gui/common.py`: `wizard_completed` / `mark_wizard_completed` (the
   `wizard_done` flag), plus the Ollama helpers `ollama_model_present`
   (+ `_ollama_tag_matches`) and the streaming `ollama_pull`.
@@ -125,8 +147,10 @@ tiers already size for 4K, so no separate choice is needed here).
   fail-safe `_maybe_show_wizard`.
 - `scripts/gui/tab_settings.py`: the "Setup" section with the
   "Re-run first-start wizard" button (`_rerun_wizard`).
-- `tests/test_wizard_recommend.py` (10) + `tests/test_wizard_ollama.py` (5): pin the
-  tier logic and the Ollama presence matcher (stdlib only, no GPU / server / tkinter).
+- `tests/test_wizard_recommend.py` + `tests/test_wizard_ollama.py`: pin the tier
+  logic (incl. `recommend_compile`) and the Ollama presence matcher (stdlib only, no
+  GPU / server / tkinter). `tests/test_wizard_compile.py` (0.5.0): the compile step's
+  off-thread state routing (unsupported / degrade-on-raise / ready +/- a compiler).
 - Docs: this file + a feature-list entry in `CLAUDE.md` / `README.md` at release.
 
 ## Follow-up: stopped the GPU-blind model pre-download (DONE)
@@ -157,3 +181,9 @@ reports Ollama problems itself) and covered by `tests/test_tag_ensure_ollama.py`
 1. VRAM tier boundaries: calibrated (see the tier table above).
 2. Default Resolution Target: NOT set by the wizard; stays at 4K.
 3. Remote setup on a **both** install: offered as an optional final step.
+4. Compile-speedup C++ compiler (0.5.0): the wizard **links to Microsoft's download
+   page**, it does not auto-install the ~2-3 GB toolchain. Licensing + elevation stay
+   with Microsoft's own installer, and the base install isn't bloated for an optional
+   speedup most image-only users never need. The Triton half (~50 MB) IS installed
+   in-app (a verified, hash-pinned wheel). The step writes no config: runtime
+   `gate_local_compile` remains the single source of truth for whether compile runs.
