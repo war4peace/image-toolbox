@@ -91,17 +91,27 @@ frame is cleared when a run ends (`FilmStrip.clear_current`, called from
 `ToolTab.on_exit`) so the last image shows its own green/red outcome instead of
 staying highlighted.
 
-**Conciliation** (experimental, 0.2.1) — replaces original photos with their
-processed (upscaled, optionally tagged & renamed) counterparts. Two phases:
-**Scan/Preview** builds a per-folder plan (replaced / no-match / non-image-kept
-counts, and lists the kept non-image files by path) and touches nothing; **Run**
-then either archives originals into an `__Archive__` subfolder or deletes them
-(delete needs an extra confirmation), moving the processed files into the
-original tree. Matching prefers the **content-hash lineage** (0.2.1) recorded as
-files are produced, so a source still matches its processed counterpart after
-folders are moved or renamed; it falls back to mirrored-name matching for files
-with no recorded lineage. Originals without a processed counterpart, and
-non-image files, are never touched.
+**Conciliation** (experimental, 0.2.1; videos 0.5.1, future-features #5) — replaces
+original photos **and videos** with their processed (upscaled, optionally tagged &
+renamed) counterparts. Two phases: **Scan/Preview** builds a per-folder plan
+(replaced / no-match / non-media-kept counts, and lists the kept non-media files by
+path) and touches nothing; **Run** then either archives originals into an
+`__Archive__` subfolder or deletes them (delete needs an extra confirmation), moving
+the processed files into the original tree. Matching prefers the **content-hash
+lineage** (0.2.1; recorded for whole-video outputs too since 0.4.9 item 10), so a
+source still matches its processed counterpart after folders are moved or renamed.
+**Images** additionally fall back to mirrored-name matching when no lineage exists;
+**videos are matched by lineage ONLY** (0.5.1) — deliberately no `<stem>_<target>`
+name fallback, because a *clip* extract records no lineage yet shares the source's
+`<base>_` prefix, so a name guess could replace a whole source with a short clip (a
+loss the counts-only preview would not reveal). An un-lineaged video (a clip, or one
+upscaled with `record_lineage` off) simply has no match and is left untouched.
+**Video conciliation** reuses the exact same scan/run pipeline: `MEDIA_EXTS =
+IMAGE_EXTS | VIDEO_EXTS` widens the walk and the processed hash-index; a video is
+only ever acted on when its output is actually present in the chosen processed tree
+(so pointing it at an image-only processed folder never touches a video, and the
+non-destructive preview shows every action first). Originals without a processed
+counterpart, and non-media files, are never touched.
 
 **Video Upscaler** (experimental, future-features #2) — upscales a folder of
 videos with the same SeedVR2 engine the Batch Upscaler uses for stills, to a
@@ -119,9 +129,18 @@ holds every output frame uncompressed; the worker uses the streaming
 a stopped run resumes at the first unfinished **segment**, not the first
 unfinished video, and a per-run minute/cost cap ends a run cleanly after the
 current segment (the rest stay `pending` for the next run, so a big job is paid in
-affordable installments). A **cost/duration estimator** (`video_estimate.py`)
-picks the cheapest live-available card that clears the target's VRAM floor,
-seeded from the benchmark and refined by the user's own `db.gpu_perf` history.
+affordable installments). The scan is **destination-reconciled** (0.5.1): besides
+dropping DB rows for outputs deleted off disk (`reconcile_video_outputs`), it
+**adopts** outputs that exist in the destination but are absent from THIS install's
+`db/cache.db` (`reconcile_outputs_from_disk`, checking the exact `_output_path` of
+each of the five canonical whole-video targets), so the "already upscaled" state
+comes from the shared **output folder**, not just the local cache. This fixes a
+cross-install gap: a second install (e.g. a laptop upscaling via a remote pod while
+the desktop GPU is busy) that shares the same source + destination no longer offers
+to redo videos another install already produced. A **cost/duration estimator**
+(`video_estimate.py`) picks the cheapest live-available card that clears the
+target's VRAM floor, seeded from the benchmark and refined by the user's own
+`db.gpu_perf` history.
 **Local runs** upscale each segment through the in-process `LocalVideoEngine`
 instead of streaming to a pod, sizing the batch predictively from the card's VRAM
 (`video_vram_sizer.py`) with OOM back-off and the degraded-GPU watchdog. A
@@ -129,7 +148,23 @@ one-click **Benchmark GPU** window (`gui/video_benchmark.py` driving
 `video_benchmark.py`) sweeps each target to its measured VRAM ceiling on the actual
 card (local OR a rented pod), persists per-probe rows to db.py `video_bench`, and
 calibrates the AUTO batch, the offered targets and the time/cost estimate; it is
-resumable.
+resumable. It can benchmark **both torch.compile modes in one run** (0.5.1): a
+**"Torch Compile" column** (ON/OFF) fronts the results table with a row per
+(target, mode), and an **"Also use Torch Compile"** checkbox (default ticked when
+the local toolchain verifies via `gate_local_compile`, disabled + a "why" tooltip
+otherwise, and for remote) sweeps the compiled AND uncompiled regimes back to back.
+The two are stored under separate regime-tagged keys (`bench_key`: model + tile +
+compile), so they never overwrite each other and AUTO reads whichever matches the
+real run's compile state. This is **independent of the Settings compile checkbox**:
+the window always benchmarks the no-compile baseline and *adds* the compiled sweep
+when ticked. `run_benchmark(compile_modes=[...])` loops the modes (each a full
+`_sweep_one_mode`); `resolve_bench_keys()` gives the GUI both keys + availability;
+`--compile-modes off,on` drives it headless. Remote stays single-mode (the pod owns
+its compile). The results table has the **same filter + column-sort UX as the Video
+Upscaler lists** (0.5.1): a Filter bar (Torch Compile ON/OFF + Target) detaches/reattaches
+rows view-only, and clicking any header view-sorts by that column's underlying value
+(compile mode, output pixels, parsed batch/spf/VRAM numbers, runtime seconds), never
+touching the saved probes.
 Two SeedVR2 limits are inherent (architectural, not tunable), documented in
 `docs/video-upscaler.md`: **temporal jitter** of fine detail on slow pans/slow-mo
 (the 4x causal temporal VAE) and **text/plate/logo distortion** (generative SR,
@@ -205,8 +240,10 @@ local video engine's `torch.compile`: shown only when a pinned `triton-windows` 
 exists for this Python/torch (`triton_setup.is_supported()`), it probes both halves
 off the UI thread (`_detect_compile`; `msvc_setup.verify_toolchain()` actually
 compiles, `triton_setup` imports torch), states the size / speed / VRAM trade, gives a
-card-sized verdict (`wizard_recommend.recommend_compile`: recommended ≥24 GB, optional
-≥16 GB, else not), then **installs the Triton half in-app** (verified ~50 MB wheel via
+card-sized verdict (`wizard_recommend.recommend_compile`: recommended ≥32 GB, optional
+≥16 GB, else not; the ≥32 GB line reflects a measured 24 GB 3090 sweep where compile
+was a net loss at every real 1080p+ target because it halves the batch, see
+`docs/local-video-upscaler.md` 14.4), then **installs the Triton half in-app** (verified ~50 MB wheel via
 `prompt_install_triton`) and **links to Microsoft's page for the C++ Build Tools half**
 (~2-3 GB, minimal `MSVC v143` + `Windows 11 SDK` components spelled out). It writes no
 config: compile stays gated at runtime by `batch_video_upscale.gate_local_compile`.
@@ -411,7 +448,7 @@ counts give a sense of weight:
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
-| `conciliate.py` (~430 lines) | Conciliation runner (CLI + GUI-driven). Two phases over stdin (`run`/`q`): scan builds the original→processed plan (matching by content-hash lineage first — path-independent, survives folder moves — then falling back to mirrored-name matching), then run archives/deletes originals and moves processed files into the original tree. No GPU/heavy imports — pure file I/O. |
+| `conciliate.py` (~460 lines) | Conciliation runner (CLI + GUI-driven), images **and videos** (#5, 0.5.1). Two phases over stdin (`run`/`q`): scan builds the original→processed plan over `MEDIA_EXTS` (matching by content-hash lineage first — path-independent, survives folder moves — then a mirrored-name fallback for images only; videos are lineage-only so a partial clip can't be mistaken for a whole-video match), then run archives/deletes originals and moves processed files into the original tree. No GPU/heavy imports — pure file I/O. |
 | **Video Upscaler cluster** (`batch_video_upscale.py`, `video_pipeline.py`, `video_estimate.py`, `remote_video_engine.py`, `local_video_engine.py`, `local_video_worker.py`, `video_benchmark.py`, `video_vram_sizer.py`, `gui/video_benchmark.py`; plus `pod/bench_video.py`, `pod/ram_probe.py`) | The Video Upscaler (future-features #2, remote; local GPU path #7 added 0.5.0). `batch_video_upscale.py` (~1.4k lines) is the orchestrator (CLI + GUI-driven): walk → split → stream each segment to the pod → reassemble → drift check, with resume/installments from the db.py `video_*` tables and an injected engine (`--passthrough` runs the whole pipeline with a local stream-copy no-pod engine for testing). When the pod **OOM-recovers** a segment's batch (e.g. 33→9), that corrected batch is **carried forward** to the same video's later segments (`updated_learned_batch`, 0.4.8) so they start at the safe size instead of re-discovering it (a failed forward pass + VRAM churn) on every segment; an explicit config batch stays the ceiling. **Self-healing (0.5.0, future-features #6, video only):** with the GUI's opt-in `IMGTBX_AUTO_RESUME`, `_run_supervised` wraps deploy + `run_queue` in a heal loop, `run_queue(auto_resume=True)` re-raises a pod-liveness failure as `PodLost` (not a source `fail_count` bump), and the loop reconnects a surviving pod (`_pod_still_running`) or waits unbounded for the identical card (`_wait_for_gpu_stock`) and redeploys it; the funds guard / user Stop / completed queue are the only non-redeploy stops. `video_pipeline.py` (~700 lines) is ALL the local ffmpeg container work (probe / plan_split / split / CFR-normalize / forced-keyframe re-encode / **deinterlace** / concat / audio-mux / duration-drift), stdlib + bundled ffmpeg, torch-free, never touches the source. An **interlaced source** (`detect_interlaced`: idet when `field_order` is unknown, e.g. a MiniDV 576i WMV) forces a `bwdif=mode=0` deinterlacing re-encode: interlaced fields upscale combed AND NVENC has no interlaced-HEVC path, which had produced an all-black deliverable (0.4.8 fix). A **black-output guard** (`mean_luma_head` / `is_black_reencode`) aborts a video whose first segment is black while the source isn't, *before* it is streamed to the pod. `video_estimate.py` (~200 lines) is the GUI cost/duration estimator (`recommend_gpus` intersects the live GPU list with a per-(target,GPU) rate table, drops cards below the target's VRAM floor, sorts by cheapest total queue cost). `remote_video_engine.py` (~200 lines, `RemoteVideoEngine`) subclasses `RemoteUpscaleEngine` to reuse its ssh-tunnel/health/telemetry/close machinery but streams a segment **async** (submit/poll/fetch) since a segment takes minutes to hours. On the pod, `pod/bench_video.py` (Phase-1 per-frame + max-batch/VRAM benchmark) and `pod/ram_probe.py` (validates streaming bounds RAM vs. load-all) answer the GPU questions in `docs/video-upscaler.md`. `local_video_engine.py` / `local_video_worker.py` run SeedVR2 **in-process on the local GPU** (feature #7, 0.5.0): `video_vram_sizer.py` sizes the batch predictively from the card's VRAM (OOM back-off + the degraded-GPU watchdog), and the default in-process path avoids a per-segment subprocess. `video_benchmark.py` + `gui/video_benchmark.py` are the one-click **Benchmark GPU** sweep (VRAM-aware geometric-climb + binary-refine, warm-up) that measures each target's real ceiling and s/frame on the actual card (LOCAL or a rented pod), persisting per-probe rows to db.py `video_bench` and calibrating the AUTO batch, the offered targets and the estimate; resumable. Runs through the same `@@TBX@@`/runner_common seam and `pod/worker.py --mode video`. |
 | **torch.compile enablement** (`triton_setup.py`, `msvc_setup.py`) | Local video `torch.compile` needs BOTH halves (feature #7, 0.5.0): Triton AND a C compiler. `triton_setup.py` installs the pinned, SHA-verified `triton-windows` wheel on demand and redirects the inductor/Triton caches to a space-free dir (PyTorch doesn't quote the compile source path, so the default `%TEMP%/torchinductor_<user>` breaks any account name with a space). `msvc_setup.py` finds and ACTIVATES MSVC (runs vcvarsall/VsDevCmd, or builds the INCLUDE/LIB/PATH env straight from disk) and **verifies it by compiling a hello-world** (Visual Studio never puts cl.exe on PATH, and a stub cl.exe with no SDK passes every cheap check). `batch_video_upscale.gate_local_compile` probes both halves and runs uncompiled if either is missing, preventing the piped-stdio first-segment hang; the first-start wizard offers the Triton install + a link to Microsoft's C++ Build Tools page. Stdlib + pip; fail-safe. |
 | `funds_guard.py` (~150 lines) | Money safety-net for remote runs (roadmap #1, item 3). Two independent, OFF-by-default, fail-safe protections: a **start floor** (refuse to start a run if finishing the estimate would drop the account balance below a configured floor) and a **session cap** (auto-stop the pod once this run's accrued cost crosses a cap, or the live balance falls below the floor). Balance comes from `runpod_client.account_balance` (GraphQL `myself{clientBalance}`, not in REST); this module keeps only the pure, unit-tested decision logic plus a small background poller (the fetch is injected so it stays offline-testable). Complements the on-pod dead-man's switch (that guards a *forgotten* pod; this guards a *working* one draining the account). Stdlib only. |

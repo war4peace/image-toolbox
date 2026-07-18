@@ -105,8 +105,9 @@ def test_ensure_split_discards_an_incomplete_split_and_re_splits(tmp_path, monke
     monkeypatch.setattr(bv.vp, "plan_split",
                         lambda *a, **k: vp.SplitPlan("copy", "x", 60, vp.Fraction(30)))
     monkeypatch.setattr(bv.vp, "split", lambda info, plan, in_dir, **k: fresh)
+    # The discard is developer detail, so it is recorded FILE-ONLY (out of the GUI terminal).
     logged = []
-    monkeypatch.setattr(bv, "log", lambda m: logged.append(m))
+    monkeypatch.setattr(bv, "log_file_only", lambda m: logged.append(m))
     out, mode = bv.ensure_split(object(), d,
                                 {"segment_seconds": 60, "max_segment_seconds": 120})
     assert out is fresh and mode == "copy"

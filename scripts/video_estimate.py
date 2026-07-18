@@ -221,6 +221,10 @@ def max_output_mp(total_vram_gb, gpu_id=None, conn=None):
 # All candidate targets, small output first: the ratio targets then the named presets. The
 # feasible/eligible helpers filter this by "is it an upscale" and "does it fit the GPU".
 _ALL_TARGETS = list(RATIO_TARGETS) + list(SHORT_SIDE)   # ["2X","4X","1080p","1440p","4K"]
+# Public alias: the complete, canonical set of whole-video target tokens. Used by the scan's
+# disk-reconcile (batch_video_upscale.reconcile_outputs_from_disk) to check every target a
+# producing install could have written, independent of THIS install's feasibility/cutoff config.
+ALL_TARGETS = _ALL_TARGETS
 
 # Ratio targets are for LOW-RES sources: never offer a ratio whose output exceeds the largest
 # preset (4K, ~8.3 MP), so a 4K source isn't offered an 8K "2x" (and still counts as

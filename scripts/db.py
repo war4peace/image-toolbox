@@ -632,6 +632,26 @@ def get_bench_probes(conn, gpu_id, model, out_w=None, out_h=None):
 
 
 @_locked
+def bench_gpu_ids(conn):
+    """Every distinct card present in video_bench, regardless of current live stock. Drives
+    the benchmark-share card picker so an out-of-stock remote card's past results can still
+    be contributed. Ordered by name."""
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT gpu_id FROM video_bench ORDER BY gpu_id")]
+
+
+@_locked
+def bench_models(conn, gpu_id):
+    """Every distinct regime-tagged `model` key present in video_bench for this card
+    (e.g. '7b', '7b|c', '7b|td1024|c'). Used by the benchmark-share exporter to walk
+    all of a card's measured regimes. Empty list on no history."""
+    if not gpu_id:
+        return []
+    return [r[0] for r in conn.execute(
+        "SELECT DISTINCT model FROM video_bench WHERE gpu_id=?", (gpu_id,))]
+
+
+@_locked
 def max_feasible_output_mp(conn, gpu_id):
     """The largest OUTPUT megapixels PROVEN feasible for this card (feature #7 feasibility
     guard): the biggest 'ok' probe in video_bench plus the biggest learned key in

@@ -149,20 +149,29 @@ def _newest_crash_log():
         return None
 
 
-def _issue_url():
+def _issue_url(attach_path=None, attach_desc=None):
     """
     Build a GitHub "new issue" URL pre-filled with the app version and basic
     environment, so reports arrive actionable. The GPU name is best-effort (it
-    shells out to nvidia-smi) and the newest crash log, if any, is pointed at so
-    the user knows what to attach. All fields fail safe to "unknown".
+    shells out to nvidia-smi) and a log file, if any, is pointed at so the user
+    knows what to attach. All fields fail safe to "unknown".
+
+    By default the newest crash log is the suggested attachment. A caller with a
+    more relevant log (e.g. the Benchmark window pointing at video_benchmark.log)
+    passes `attach_path` + a human `attach_desc`; the line is dropped when that
+    path does not exist yet (nothing to attach).
     """
     try:
         gpu = system_telemetry.gpu_name() or "unknown"
     except Exception:
         gpu = "unknown"
-    crash = _newest_crash_log()
-    crash_line = (f"- Newest crash log (please attach): {crash}\n"
-                  if crash else "")
+    if attach_path is not None:
+        attach = attach_path if os.path.exists(attach_path) else None
+        label = attach_desc or "log"
+    else:
+        attach = _newest_crash_log()
+        label = "Newest crash log"
+    attach_line = (f"- {label} (please attach): {attach}\n" if attach else "")
     body = (
         "**What happened?**\n\n\n"
         "**Steps to reproduce:**\n\n\n"
@@ -172,22 +181,62 @@ def _issue_url():
         f"- OS: {platform.platform()}\n"
         f"- Python: {sys.version.split()[0]}\n"
         f"- GPU: {gpu}\n"
-        f"{crash_line}"
+        f"{attach_line}"
     )
     params = urllib.parse.urlencode({"title": "", "body": body})
     return f"https://github.com/{updater.GITHUB_REPO}/issues/new?{params}"
 
 
-def report_issue():
+def report_issue(attach_path=None, attach_desc=None):
     """Open a pre-filled GitHub new-issue page in the browser. Fail-safe: on any
-    error, fall back to the plain issues page."""
+    error, fall back to the plain issues page. `attach_path`/`attach_desc` override
+    the default crash-log attachment hint (see `_issue_url`)."""
     try:
-        webbrowser.open(_issue_url())
+        webbrowser.open(_issue_url(attach_path, attach_desc))
     except Exception:
         try:
             webbrowser.open(f"https://github.com/{updater.GITHUB_REPO}/issues/new")
         except Exception:
             pass
+
+
+# A pre-filled new-issue URL must fit the browser/GitHub cap (~8 KB). Below this we
+# inline the CSV in the body; above it we fall back to an attach hint (a URL cannot
+# pre-attach a file), pointing the user at the file the app already wrote to disk.
+_MAX_ISSUE_URL = 7800
+
+
+def _benchmark_issue_url(gpu_name, csv_text=None, attach_path=None):
+    """New-issue URL for a benchmark contribution (future-features #8): labelled
+    'benchmark', titled by card. Body carries the CSV inline when `csv_text` is given,
+    else an attach hint pointing at `attach_path`."""
+    title = f"Benchmark: {gpu_name or 'unknown GPU'}"
+    lines = ["Benchmark results contributed from the app. Thank you!", "",
+             "*(Please keep the data below intact so it can be merged.)*", ""]
+    if csv_text is not None:
+        lines += ["```", csv_text.rstrip("\n"), "```"]
+    else:
+        lines.append(f"- Benchmark CSV (please drag the file in to attach): {attach_path}")
+    params = urllib.parse.urlencode(
+        {"title": title, "labels": "benchmark", "body": "\n".join(lines)})
+    return f"https://github.com/{updater.GITHUB_REPO}/issues/new?{params}"
+
+
+def contribute_benchmark(gpu_name, csv_text, csv_path):
+    """Open a pre-filled 'benchmark' GitHub issue for a contribution, reusing the user's
+    own GitHub account in the browser (no token, no infra). Inlines `csv_text` when the
+    URL fits; otherwise falls back to an attach hint pointing at `csv_path`. Returns
+    'inline' | 'attach' | 'failed'. Fail-safe: never raises."""
+    try:
+        url = _benchmark_issue_url(gpu_name, csv_text=csv_text)
+        mode = "inline"
+        if len(url) > _MAX_ISSUE_URL:
+            url = _benchmark_issue_url(gpu_name, attach_path=csv_path)
+            mode = "attach"
+        webbrowser.open(url)
+        return mode
+    except Exception:
+        return "failed"
 
 
 # ─────────────────────────────────────────────

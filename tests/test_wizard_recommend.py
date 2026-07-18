@@ -87,15 +87,19 @@ def test_every_recommended_model_is_a_listed_option():
 # ── recommend_compile: the torch.compile speedup advice by card size ─────────
 
 def test_compile_recommended_on_big_cards():
-    for gb in (24, 32, 48, 80):
+    # Only >=32 GB now: a measured 24 GB sweep (3090, 7B) showed compile losing at
+    # every real 1080p+ target because the halved batch outweighs the per-frame gain,
+    # so the "clear win" tier starts where the VRAM absorbs the batch halving.
+    for gb in (32, 48, 80):
         adv = wr.recommend_compile(gb)
         assert adv.verdict == "recommended"
         assert adv.blurb                      # non-empty reason for the wizard to show
 
 
-def test_compile_optional_at_16gb():
-    assert wr.recommend_compile(16).verdict == "optional"
-    assert wr.recommend_compile(23).verdict == "optional"   # just under the big-card line
+def test_compile_optional_from_16_to_31gb():
+    # 24 GB moved down from "recommended" to "optional" on the measured net loss.
+    for gb in (16, 23, 24, 31):
+        assert wr.recommend_compile(gb).verdict == "optional"
 
 
 def test_compile_not_recommended_on_small_or_no_gpu():
@@ -103,13 +107,12 @@ def test_compile_not_recommended_on_small_or_no_gpu():
         assert wr.recommend_compile(gb).verdict == "not_recommended"
 
 
-def test_compile_boundaries_match_the_model_tiers():
-    # 16 is the first "optional" GB; 24 the first "recommended" GB, same cut points
-    # the model recommendation uses, so the two steps tell a consistent story.
+def test_compile_boundaries():
+    # 16 is the first "optional" GB; 32 the first "recommended" GB.
     assert wr.recommend_compile(15).verdict == "not_recommended"
     assert wr.recommend_compile(16).verdict == "optional"
-    assert wr.recommend_compile(23).verdict == "optional"
-    assert wr.recommend_compile(24).verdict == "recommended"
+    assert wr.recommend_compile(31).verdict == "optional"
+    assert wr.recommend_compile(32).verdict == "recommended"
 
 
 def test_label_for_returns_label_or_raw_id():

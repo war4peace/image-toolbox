@@ -325,6 +325,33 @@ def test_throughput_optimal_batch_picks_knee_not_ceiling():
         [{"batch": 5, "outcome": "ok", "frames": None, "seconds": None}]) is None
 
 
+def test_saved_metrics_reconstructs_spf_and_peak_from_persisted_probes():
+    # The GUI bug: s/frame + Peak VRAM read blank on reopen because they were only ever set
+    # from live events. saved_metrics rebuilds them from the persisted probes, at the SAVED
+    # (throughput-optimal) batch. These rows are the user's real RTX 3090 540x720 compile-ON
+    # ('7b|c') sweep: fastest is batch 73 @ 0.394 s/frame (~the 0.39 they remembered).
+    probes = [
+        {"batch": 5,  "outcome": "ok",  "frames": 37, "seconds": 80.58,  "peak_alloc": 16.6, "peak_reserved": 16.6},
+        {"batch": 9,  "outcome": "ok",  "frames": 37, "seconds": 71.776, "peak_alloc": 22.8, "peak_reserved": 22.9},
+        {"batch": 17, "outcome": "ok",  "frames": 37, "seconds": 22.834, "peak_alloc": 17.9, "peak_reserved": 18.1},
+        {"batch": 33, "outcome": "ok",  "frames": 37, "seconds": 26.652, "peak_alloc": 19.1, "peak_reserved": 19.2},
+        {"batch": 65, "outcome": "ok",  "frames": 65, "seconds": 26.031, "peak_alloc": 22.2, "peak_reserved": 22.3},
+        {"batch": 73, "outcome": "ok",  "frames": 73, "seconds": 28.737, "peak_alloc": 23.1, "peak_reserved": 23.1},
+        {"batch": 77, "outcome": "oom", "frames": None, "seconds": 74.98, "peak_alloc": None, "peak_reserved": None},
+    ]
+    saved = vb.throughput_optimal_batch(probes)
+    assert saved == 73
+    m = vb.saved_metrics(probes)
+    assert round(m["spf"], 3) == 0.394
+    assert (m["peak_alloc"], m["peak_reserved"]) == (23.1, 23.1)
+
+
+def test_saved_metrics_none_without_timed_probe():
+    # Only failures / untimed probes -> nothing to show (columns stay blank, fail-safe).
+    assert vb.saved_metrics([{"batch": 5, "outcome": "oom", "frames": None, "seconds": 3.0}]) is None
+    assert vb.saved_metrics([]) is None
+
+
 def test_record_cell_result_saves_fastest_not_ceiling(db_conn):
     """The user's directive: save + use the MOST EFFICIENT batch, not the raw ceiling (which
     can be slower, riding VRAM spill). Mirrors the real 960x720 sweep: bs61 fastest, bs69 the
@@ -396,6 +423,79 @@ def test_run_benchmark_sweeps_records_and_learns(fake_run, db_conn):
     assert [(r["batch"], r["outcome"]) for r in rows] == [(5, "ok"), (9, "ok"), (13, "ok"), (17, "oom")]
     # ceiling 13 landed in the sizer's learned store
     assert db.get_learned_batch(db_conn, _learn_key("FakeGPU"), sizer.mp_bucket(2.0736)) == 13
+
+
+# ── dual torch.compile-mode benchmarking (Also use Torch Compile) ────────────
+
+def test_resolve_modes_dedup_and_default():
+    assert vb._resolve_modes({"compile": False}, None) == [False]     # config-derived (CLI default)
+    assert vb._resolve_modes({"compile": True}, None) == [True]
+    assert vb._resolve_modes({}, [False, True]) == [False, True]      # explicit both
+    assert vb._resolve_modes({}, [False, False]) == [False]           # de-duplicated
+    assert vb._resolve_modes({}, []) == [False]                       # empty -> off baseline
+
+
+def test_resolve_bench_keys_available(monkeypatch):
+    # Gate keeps compile on -> ON is offered, and its key is the OFF key + the compile suffix.
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: {"upscale": {}, "video": {}})
+    monkeypatch.setattr(vb.bv, "gate_local_compile", lambda s, log=None: (False, None))
+    keys = vb.resolve_bench_keys(remote=False)
+    assert keys["compile_available"] is True
+    assert keys["on"] == keys["off"] + "|c"
+    assert keys["compile_why"] is None
+
+
+def test_resolve_bench_keys_unavailable(monkeypatch):
+    # Gate disables compile -> ON is not offered, and the reason is surfaced for the tooltip.
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: {"upscale": {}, "video": {}})
+
+    def _gate(s, log=None):
+        s["compile_dit"] = False
+        s["compile_vae"] = False
+        return True, "Triton is not installed"
+    monkeypatch.setattr(vb.bv, "gate_local_compile", _gate)
+    keys = vb.resolve_bench_keys(remote=False)
+    assert keys["compile_available"] is False
+    assert keys["on"] is None
+    assert "Triton" in (keys["compile_why"] or "")
+
+
+def test_run_benchmark_both_modes_write_separate_keys(fake_run, db_conn, monkeypatch):
+    """The 'Also use Torch Compile' path: one run sweeps BOTH compile modes, each persisted under
+    its own regime-tagged key, so the with- and without-compile results never overwrite each other."""
+    # Force the toolchain "available" so the compile-ON sweep actually runs (CI has no compiler).
+    monkeypatch.setattr(vb.bv, "gate_local_compile", lambda s, log=None: (False, None))
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33,
+                               compile_modes=[False, True])
+    assert summary["modes"] == 2
+    off_cfg = {"upscale": {}, "video": {"compile": False}}
+    on_cfg = {"upscale": {}, "video": {"compile": True}}
+    off_key = _bench_key(cfg=off_cfg)                       # compile OFF baseline
+    on_key = _bench_key(cfg=on_cfg)                         # compile ON
+    assert off_key != on_key and on_key == off_key + "|c"
+    for key in (off_key, on_key):
+        rows = db.get_bench_probes(db_conn, "FakeGPU", key, 1920, 1080)
+        assert [(r["batch"], r["outcome"]) for r in rows] == \
+            [(5, "ok"), (9, "ok"), (13, "ok"), (17, "oom")], f"key {key} not swept"
+    # Each mode wrote its OWN learned batch under its own regime key (they do not collide).
+    bucket = sizer.mp_bucket(2.0736)
+    assert db.get_learned_batch(db_conn, _learn_key("FakeGPU", cfg=off_cfg), bucket) == 13
+    assert db.get_learned_batch(db_conn, _learn_key("FakeGPU", cfg=on_cfg), bucket) == 13
+
+
+def test_run_benchmark_skips_on_mode_when_compile_unavailable(fake_run, db_conn, monkeypatch):
+    # Asked for both modes, but the toolchain can't compile -> only the OFF baseline is swept.
+    def _gate(s, log=None):
+        s["compile_dit"] = False
+        s["compile_vae"] = False
+        return True, "no compiler"
+    monkeypatch.setattr(vb.bv, "gate_local_compile", _gate)
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33,
+                               compile_modes=[False, True])
+    assert summary["modes"] == 1                            # ON dropped
+    off_key = _bench_key(cfg={"upscale": {}, "video": {"compile": False}})
+    assert db.get_bench_probes(db_conn, "FakeGPU", off_key, 1920, 1080)          # OFF still swept
+    assert db.get_bench_probes(db_conn, "FakeGPU", off_key + "|c", 1920, 1080) == []  # no ON rows
 
 
 def test_restart_run_only_wipes_the_targets_it_was_asked_for(fake_run, db_conn):

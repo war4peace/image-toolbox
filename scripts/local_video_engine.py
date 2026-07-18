@@ -35,6 +35,7 @@ Must run inside the toolbox venv (PyTorch CUDA + seedvr2/requirements.txt).
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -42,6 +43,7 @@ import queue
 import tempfile
 import threading
 import subprocess
+import contextlib
 
 # OOM detection is shared with the runners; fall back to a string match so this
 # module still loads on an older tree without runner_common.
@@ -130,6 +132,59 @@ def _to_4n1(x):
     return ((n - 1) // 4) * 4 + 1
 
 
+# SeedVR2's per-chunk streaming marker, e.g. "Chunk 3/12: 98 new + 8 context frames"
+# (inference_cli._stream_video_chunks, force-logged once per chunk). We parse it to print a
+# clean, live per-chunk progress line so a long multi-chunk segment isn't silent for minutes.
+_CHUNK_RE = re.compile(r"Chunk\s+(\d+)\s*/\s*(\d+)")
+
+
+class _LiveEngineOutput:
+    """redirect_stdout/stderr target that processes the SeedVR2 engine's output LIVE, one
+    line at a time, instead of buffering it all until the segment ends (UpscaleEngine's own
+    capture=True drains only in a `finally`, so nothing appears for the whole 20-minute run).
+
+    Each completed line is handed to `on_line` -- carriage-return redraws (tqdm bars) collapse
+    to their final text, blank lines are dropped. The runner points `on_line` at the file-only
+    logger (setup banners / tqdm tails -> logs/video_<hash>.log, never the terminal) and, for a
+    segment, also at the chunk detector so a live per-chunk progress line can be printed.
+
+    The trailing (un-terminated) partial is collapsed on each write to bound memory: a tqdm bar
+    redraws with \\r hundreds of times before a \\n, and we only ever want its latest state."""
+
+    def __init__(self, on_line):
+        self._on_line = on_line
+        self._buf = ""
+
+    def write(self, text):
+        self._buf += str(text)
+        while True:
+            nl = self._buf.find("\n")
+            if nl < 0:
+                break
+            line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+            self._emit(line)
+        if "\r" in self._buf:                            # keep only the latest redraw of a bar
+            self._buf = self._buf.rsplit("\r", 1)[-1]
+        return len(text)
+
+    def _emit(self, line):
+        line = line.rsplit("\r", 1)[-1]                  # collapse an in-line \r redraw
+        if line.strip():
+            try:
+                self._on_line(line)
+            except Exception:                            # noqa: BLE001 (logging is best-effort)
+                pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        """Flush any trailing partial line (no terminating newline)."""
+        if self._buf:
+            self._emit(self._buf)
+            self._buf = ""
+
+
 class LocalVideoEngine:
     """In-process SeedVR2 video engine. Implements the injected-engine contract
     `batch_video_upscale.process_job` expects: `process_segment(...)`,
@@ -147,7 +202,8 @@ class LocalVideoEngine:
 
     def __init__(self, repo_dir, model_dir, settings, debug=False,
                  auto_batch=None, conn=None, gpu_id=None,
-                 use_subprocess=False, thrash_stall_seconds=DEFAULT_STALL_SECONDS):
+                 use_subprocess=False, thrash_stall_seconds=DEFAULT_STALL_SECONDS,
+                 diag_sink=None):
         """repo_dir / model_dir / settings mirror UpscaleEngine (the "upscale" config
         section merged with the "video" knobs).
 
@@ -162,7 +218,13 @@ class LocalVideoEngine:
         attempt gets a clean CUDA context (no fragmentation carryover across OOM
         retries). Its cost is a model reload per attempt; the parent stays GPU-free.
         Left OFF (default) the engine runs in-process, reusing one cached model (the
-        spike / simple path)."""
+        spike / simple path).
+
+        `diag_sink` (optional callable(str)) receives the SeedVR2 engine's own stdout --
+        the setup banners / tqdm tails -- one line at a time, so the runner can send them
+        to logs/video_<hash>.log ONLY, keeping the GUI terminal to the clean run narrative.
+        When None (e.g. the benchmark), the engine prints those diagnostics to stdout as
+        before."""
         self._repo_dir = os.path.abspath(repo_dir)
         self._model_dir = os.path.abspath(model_dir)
         self._settings = dict(settings or {})
@@ -170,6 +232,8 @@ class LocalVideoEngine:
         self.use_subprocess = bool(use_subprocess)
         self.thrash_stall_seconds = int(thrash_stall_seconds or DEFAULT_STALL_SECONDS)
         self._settings_path = None                   # lazily written temp JSON (subprocess mode)
+        # Route engine diagnostics to the runner's file log (never the terminal) when given.
+        self._diag_sink = diag_sink
 
         self.model = self._settings.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
         if self.use_subprocess:
@@ -180,8 +244,22 @@ class LocalVideoEngine:
             self.resident = False                    # a <40 GB local card offloads (child confirms)
         else:
             from upscale_engine import UpscaleEngine
-            self._engine = UpscaleEngine(self._repo_dir, self._model_dir, self._settings,
-                                         debug=self._debug)
+            # Capture the engine's stdout to the file-only sink so the in-process path stops
+            # leaking SeedVR2 diagnostics into the GUI terminal. Construction is captured too,
+            # not just process_video: the "SeedVR2 optimizations check…" / "Conv3d workaround…"
+            # banners print once at seedvr2's first IMPORT, which happens while UpscaleEngine
+            # loads -- before any per-segment capture window.
+            if self._diag_sink is not None:
+                live = _LiveEngineOutput(self._diag_sink)
+                try:
+                    with contextlib.redirect_stdout(live), contextlib.redirect_stderr(live):
+                        self._engine = UpscaleEngine(self._repo_dir, self._model_dir,
+                                                     self._settings, debug=self._debug)
+                finally:
+                    live.close()
+            else:
+                self._engine = UpscaleEngine(self._repo_dir, self._model_dir,
+                                             self._settings, debug=self._debug)
             self.device_name = getattr(self._engine, "device_name", "local")
             self.resident = getattr(self._engine, "resident", False)
             self.model = getattr(getattr(self._engine, "args", None), "dit_model", "") or self.model
@@ -195,6 +273,48 @@ class LocalVideoEngine:
         # benchmark harness / report so a fell-back run records its true ceiling.
         self.last_resolved_batch = None
         self.last_overlap = None
+        # Per-segment context for the live per-chunk progress line, set in process_segment.
+        self._seg_ctx = (None, None, 0)      # (seg_index 0-based, seg_total, frames_total)
+        self._chunk_state = {"last": 0}      # last chunk index we announced (per segment)
+        self._real_stdout = None             # the runner's stdout, saved before any redirect
+
+    # ── live per-chunk progress ──────────────────────────────────────────────
+
+    def _emit_progress(self, msg):
+        """Print a clean progress line to the runner's REAL stdout (so the GUI terminal shows
+        it) AND to the file log. Writing to the saved real stdout is what makes this safe to
+        call while the engine's own stdout is redirected to the file sink: the message bypasses
+        that redirect instead of being captured back into the file. Fail-safe."""
+        out = self._real_stdout or sys.stdout
+        try:
+            out.write(msg + "\n")
+            out.flush()
+        except Exception:                                # noqa: BLE001
+            pass
+        if self._diag_sink is not None:
+            try:
+                self._diag_sink(msg)
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def _maybe_emit_chunk(self, line):
+        """If `line` is a SeedVR2 'Chunk X/N' marker for a NOT-yet-announced chunk, print a
+        clean per-chunk progress line (segment context + frames), so a long multi-chunk segment
+        reports steadily instead of going silent for the whole run."""
+        m = _CHUNK_RE.search(line)
+        if not m:
+            return
+        idx, tot = int(m.group(1)), int(m.group(2))
+        state = getattr(self, "_chunk_state", None)
+        if state is None:
+            state = self._chunk_state = {"last": 0}
+        if idx == state.get("last"):
+            return
+        state["last"] = idx
+        seg_i, seg_n, frames = getattr(self, "_seg_ctx", (None, None, 0))
+        where = f"segment {seg_i + 1}/{seg_n}, " if (seg_i is not None and seg_n) else ""
+        self._emit_progress(f"    {where}chunk {idx}/{tot}"
+                            + (f" of {frames} frames" if frames else "") + " …")
 
     # ── window sizing (spike-grade; see module docstring) ────────────────────
 
@@ -231,16 +351,25 @@ class LocalVideoEngine:
     def process_segment(self, src_path, dest_path, *, resolution, batch_size,
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
-                        poll_interval=0, on_progress=None, should_stop=None):
+                        poll_interval=0, on_progress=None, should_stop=None,
+                        seg_index=None, seg_total=None):
         """Upscale one segment file to dest_path on the LOCAL GPU and return the frame
         count written. Emits runner-compatible `on_progress` status dicts. On a CUDA
         OOM it retries at a smaller window (down to BATCH_FLOOR) so an optimistic batch
         self-corrects instead of failing the whole run, mirroring the pod worker.
 
+        `seg_index` / `seg_total` (0-based index, count) are used only to label the live
+        per-chunk progress line ("segment 2/5, chunk 3/12 …"); they are optional so the
+        other engines' identical call is unaffected.
+
         `should_stop` is accepted for interface parity; a local segment runs
         synchronously, so it is only checked before the (uninterruptible) GPU call."""
         self.last_segment_seconds = None
         self.last_phase = {}
+        # Save the runner's real stdout NOW, before any redirect, so the live per-chunk line
+        # can bypass the engine-output capture and reach the terminal. Reset the chunk counter.
+        self._real_stdout = sys.stdout
+        self._chunk_state = {"last": 0}
 
         # Probe frames AND source dims in one pass; derive the OUTPUT size (box-fit to the
         # short-side `resolution`) so the sizer can budget by output megapixels.
@@ -254,6 +383,7 @@ class LocalVideoEngine:
                 out_w, out_h = round(sw * scale), round(sh * scale)
         except Exception:                            # noqa: BLE001 (best-effort)
             pass
+        self._seg_ctx = (seg_index, seg_total, frames_total)   # for the per-chunk line
 
         # AUTO (batch<=0): the predictive VRAM sizer picks the largest window that should
         # fit on the FIRST try (per model + free VRAM + learned history), so we never
@@ -384,10 +514,32 @@ class LocalVideoEngine:
                 src, dest, resolution, batch, chunk, overlap, seed, backend,
                 use_10bit, should_stop)
             return out["frames"], out["alloc"], out["reserved"]
-        n = self._engine.process_video(
-            src, dest, resolution=int(resolution), batch_size=batch, chunk_size=chunk,
-            temporal_overlap=overlap, seed=seed, video_backend=backend,
-            use_10bit=bool(use_10bit), capture=False)
+        # With a diag sink, redirect the engine's stdout/stderr to a LIVE line processor: each
+        # line streams to the file log as it happens (not all at segment end, as the engine's
+        # own capture=True would), and the 'Chunk X/N' markers drive a live per-chunk progress
+        # line on the terminal. Without a sink (the benchmark), keep the engine printing live to
+        # stdout. _maybe_emit_chunk writes to the SAVED real stdout, so it isn't captured back.
+        if getattr(self, "_diag_sink", None) is not None:
+            def _on_line(line):
+                try:
+                    self._diag_sink(line)                # every engine line -> file log
+                except Exception:                        # noqa: BLE001
+                    pass
+                self._maybe_emit_chunk(line)             # 'Chunk X/N' -> clean terminal line
+            live = _LiveEngineOutput(_on_line)
+            try:
+                with contextlib.redirect_stdout(live), contextlib.redirect_stderr(live):
+                    n = self._engine.process_video(
+                        src, dest, resolution=int(resolution), batch_size=batch,
+                        chunk_size=chunk, temporal_overlap=overlap, seed=seed,
+                        video_backend=backend, use_10bit=bool(use_10bit), capture=False)
+            finally:
+                live.close()
+        else:
+            n = self._engine.process_video(
+                src, dest, resolution=int(resolution), batch_size=batch, chunk_size=chunk,
+                temporal_overlap=overlap, seed=seed, video_backend=backend,
+                use_10bit=bool(use_10bit), capture=False)
         alloc = reserved = None
         try:
             import torch
@@ -521,7 +673,20 @@ class LocalVideoEngine:
                     if tok.startswith("pass="):
                         oom_pass = tok[len("pass="):]
                 continue
-            print(s, flush=True)                      # forward pipeline progress to the GUI log
+            # With a file-only diag sink, the worker's engine stdout goes to the run log
+            # (whitespace-only lines dropped), not the GUI terminal, but the 'Chunk X/N' markers
+            # still drive a clean per-chunk progress line; otherwise forward it live.
+            # getattr: some harnesses build the engine via __new__ and never set _diag_sink.
+            diag_sink = getattr(self, "_diag_sink", None)
+            if diag_sink is not None:
+                if s.strip():
+                    try:
+                        diag_sink(s)
+                    except Exception:                 # noqa: BLE001 (logging is best-effort)
+                        pass
+                    self._maybe_emit_chunk(s)         # 'Chunk X/N' -> clean terminal line
+            else:
+                print(s, flush=True)                  # forward pipeline progress to the GUI log
             tail.append(s)
             if len(tail) > 40:
                 tail.pop(0)

@@ -634,40 +634,41 @@ def describe_tiling(cfg):
 
 
 def log_video_settings(vcfg):
-    """Echo the SeedVR2 / pipeline settings this run uses, to the log window and
-    file, so a run (especially a failed one) records exactly what it was given.
-    0/None knobs are shown as 'auto'/'per-video' (their effective value is resolved
-    per job and logged there too)."""
+    """Echo the SeedVR2 / pipeline settings this run uses. FILE ONLY (log_file_only):
+    this is developer detail (batch/chunk/tiling/threshold internals) that clutters the
+    GUI terminal but must still be on disk so a run (especially a failed one) records
+    exactly what it was given. 0/None knobs are shown as 'auto'/'per-video' (their
+    effective value is resolved per job and logged there too)."""
     batch = vcfg.get("batch_size", 0) or 0
     chunk = vcfg.get("chunk_size", 0) or 0
     seed = vcfg.get("seed")
-    log("Run settings (SeedVR2 / pipeline):")
-    log(f"    default target {vcfg['target']}, skip-cutoff {vcfg['skip_cutoff_pct']:.0f}%, "
+    log_file_only("Run settings (SeedVR2 / pipeline):")
+    log_file_only(f"    default target {vcfg['target']}, skip-cutoff {vcfg['skip_cutoff_pct']:.0f}%, "
         f"segments ~{vcfg['segment_seconds']:.0f}s (max {vcfg['max_segment_seconds']:.0f}s)")
-    log(f"    batch_size {batch or 'auto'}, chunk_size {chunk or 'auto'}, "
+    log_file_only(f"    batch_size {batch or 'auto'}, chunk_size {chunk or 'auto'}, "
         f"temporal_overlap {vcfg['temporal_overlap']}, "
         f"seed {seed if seed is not None else 'per-video'}")
-    log(f"    backend {vcfg['video_backend']}, "
+    log_file_only(f"    backend {vcfg['video_backend']}, "
         f"10-bit {'on' if vcfg['use_10bit'] else 'off'}, "
         f"output subdir '{vcfg['output_subdir']}'")
-    log(f"    staging '{vcfg.get('work_root') or '(beside output)'}'")
+    log_file_only(f"    staging '{vcfg.get('work_root') or '(beside output)'}'")
     noise = float(vcfg.get("input_noise_scale", 0.0) or 0.0)
-    log(f"    model {vcfg.get('dit_model', 'seedvr2_ema_7b_fp16.safetensors')}")
-    log(f"    resident VRAM threshold {vcfg.get('vram_resident_threshold_gb', 90):.0f} GB "
+    log_file_only(f"    model {vcfg.get('dit_model', 'seedvr2_ema_7b_fp16.safetensors')}")
+    log_file_only(f"    resident VRAM threshold {vcfg.get('vram_resident_threshold_gb', 90):.0f} GB "
         f"(cards >= this keep DiT+VAE resident; smaller cards phase the DiT to RAM for the decode)")
-    log(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
+    log_file_only(f"    torch.compile {'on' if vcfg.get('compile', True) else 'off'}, "
         f"uniform batch {'on' if vcfg.get('uniform_batch_size', True) else 'off'}, "
         f"input noise {noise if noise > 0 else 'off'}")
-    log(f"    VAE tiling: {describe_tiling(vcfg)}")
+    log_file_only(f"    VAE tiling: {describe_tiling(vcfg)}")
     if vcfg.get("watchdog_enabled", True):
-        log(f"    slow-segment watchdog on (warn at >={vcfg.get('watchdog_factor', 3.0):g}x "
+        log_file_only(f"    slow-segment watchdog on (warn at >={vcfg.get('watchdog_factor', 3.0):g}x "
             f"the run's healthy rate; notify-only, no auto-stop)")
     else:
-        log("    slow-segment watchdog off")
-    log(f"    auto-tune batch {'on' if vcfg.get('auto_tune_batch', True) else 'off'}"
+        log_file_only("    slow-segment watchdog off")
+    log_file_only(f"    auto-tune batch {'on' if vcfg.get('auto_tune_batch', True) else 'off'}"
         + (" (multi-segment auto-batch videos; seeds + freezes per card+output size)"
            if vcfg.get("auto_tune_batch", True) else ""))
-    log(f"    record lineage {'on' if vcfg.get('record_lineage', True) else 'off'}"
+    log_file_only(f"    record lineage {'on' if vcfg.get('record_lineage', True) else 'off'}"
         + (" (link source <-> output by content hash on completion)"
            if vcfg.get("record_lineage", True) else ""))
 
@@ -929,7 +930,7 @@ def ensure_split(info, in_dir, vcfg):
         ok, why = split_is_complete(in_dir, existing)
         if ok:
             return existing, "reused"
-        log(f"    discarding an incomplete split in the work area ({why}); re-splitting.")
+        log_file_only(f"    discarding an incomplete split in the work area ({why}); re-splitting.")
         _clear_split_dir(in_dir)
     plan = vp.plan_split(info, vcfg["segment_seconds"], vcfg["max_segment_seconds"])
     segs = vp.split(info, plan, in_dir)
@@ -956,7 +957,8 @@ class PassthroughVideoEngine:
     def process_segment(self, src_path, dest_path, *, resolution, batch_size,
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
-                        poll_interval=0, on_progress=None, should_stop=None):
+                        poll_interval=0, on_progress=None, should_stop=None,
+                        seg_index=None, seg_total=None):
         ffmpeg, _ = vp.find_ffmpeg()
         t0 = time.time()
         # mjpeg/h264 -> mp4 with -c copy keeps it lossless and fast; the real
@@ -1229,6 +1231,40 @@ def reconcile_video_outputs(conn, root_id):
     return removed
 
 
+def reconcile_outputs_from_disk(conn, root_id, output_root, rel):
+    """Adopt upscaled outputs that EXIST ON DISK in the destination but have NO record in THIS
+    install's DB, registering each as a 'done' job. The mirror of reconcile_video_outputs (which
+    DROPS DB rows for outputs deleted off disk): together they make the scan reflect the
+    DESTINATION FOLDER, not merely the local cache.
+
+    Why (cross-install consistency): the per-target "already upscaled" state lives only in each
+    install's local db/cache.db. So a SECOND install sharing the same source + destination (e.g.
+    a laptop that upscales via a remote pod while the desktop GPU is busy) had an empty DB and
+    showed nothing as done -- offering to redo videos another install already produced. Reading
+    the destination back fixes that: any install converges to the same view from the shared
+    output folder.
+
+    Deterministic and safe: for each of the five canonical whole-video targets it checks the ONE
+    exact path _output_path() would have written and adopts it only if the file is really there
+    and this DB has no row for it. A clip (clip_id>0, differently named) is never matched, and no
+    target is ever guessed from a filename. Returns the [(rel, target), ...] adopted. Best-effort:
+    a per-target error is logged and skipped, never raised into the scan."""
+    import video_estimate as ve
+    adopted = []
+    for target in ve.ALL_TARGETS:
+        try:
+            if db.get_video_output(conn, root_id, rel, target, clip_id=0) is not None:
+                continue                              # already known to this DB (done or queued)
+            out_path = _output_path(output_root, rel, target)
+            if os.path.isfile(out_path):
+                db.upsert_video_output(conn, root_id, rel, target, clip_id=0,
+                                       status="done", output_path=out_path)
+                adopted.append((rel, target))
+        except Exception as exc:                      # noqa: BLE001 (discovery must never fail a scan)
+            debug_log("batch_video_upscale.reconcile_outputs_from_disk", exc=exc)
+    return adopted
+
+
 def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
     """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
     CLI: do the EXACT pass for this (file, target) (counted frames — the header
@@ -1435,7 +1471,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # batches without a ragged tail. See worker _resolve_auto_params / _fit_batch_to_frames.
     chunk = 0
     seed = per_video_seed(vcfg, rel)
-    log(f"    SeedVR2: short-side {resolution}px, "
+    log_file_only(f"    SeedVR2: short-side {resolution}px, "
         f"batch_size {batch if batch > 0 else 'auto'}, "
         f"chunk_size {chunk if chunk > 0 else 'auto'}, "
         f"temporal_overlap {overlap if overlap >= 0 else 'auto'}, "
@@ -1471,7 +1507,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         except Exception as exc:                       # noqa: BLE001 (fail-safe)
             debug_log("batch_video_upscale get_learned_batch", exc=exc)
         if tuned[0]:
-            log(f"    auto-tune: seeding batch {tuned[0]} (learned for ~{seg_out_mp:.1f}MP "
+            log_file_only(f"    auto-tune: seeding batch {tuned[0]} (learned for ~{seg_out_mp:.1f}MP "
                 f"output on this card); the first segment refines it.")
     total_secs = 0.0
 
@@ -1524,7 +1560,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                 else:
                     _nb = max(1, -(-(_tot - _ov) // _stride))
                 _btxt = f", ~{_nb} batch(es) over {_tot}f" if _nb else ""
-                log(f"    (pod resolved: batch_size {rb}, "
+                log_file_only(f"    (pod resolved: batch_size {rb}, "
                     f"temporal_overlap {st.get('resolved_overlap')}{_btxt}, "
                     f"attention {st.get('resolved_attention') or '?'}, "
                     f"compile {'on' if st.get('compile_dit') else 'off'}, "
@@ -1564,7 +1600,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         req_batch = _request_batch(batch, tuned[0], _learned_batch[0])
         if _learned_batch[0] and not tuned[0] and not _learn_logged[0]:
             _learn_logged[0] = True
-            log(f"    reusing batch_size {req_batch} for the remaining segments "
+            log_file_only(f"    reusing batch_size {req_batch} for the remaining segments "
                 f"(OOM-corrected earlier in this video; skips re-discovery)")
         _progress({"state": "running"})
         n = engine.process_segment(
@@ -1572,7 +1608,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             chunk_size=chunk, temporal_overlap=overlap,
             seed=seed, video_backend=vcfg["video_backend"],
             use_10bit=vcfg["use_10bit"], on_progress=_progress,
-            should_stop=_STOP.is_set)        # responsive Stop: abort the poll mid-segment
+            should_stop=_STOP.is_set,        # responsive Stop: abort the poll mid-segment
+            seg_index=s.index, seg_total=len(segs))   # labels the live per-chunk progress line
         secs = getattr(engine, "last_segment_seconds", None)
         db.upsert_video_segment(conn, root_id, rel, target, s.index, clip_id=clip_id,
                                 status="done", out_frames=n, output_path=up_path,
@@ -1604,7 +1641,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             converged[0] = True
             sug = _seg_stats.get("suggested") or b or tuned[0]
             if sug and sug != tuned[0]:
-                log(f"    auto-tune: batch {tuned[0] or 'auto'} -> {sug} (measured on this "
+                log_file_only(f"    auto-tune: batch {tuned[0] or 'auto'} -> {sug} (measured on this "
                     f"card for ~{seg_out_mp:.1f}MP output); frozen for this video.")
             tuned[0] = sug or tuned[0]
             try:
@@ -1626,9 +1663,13 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             phase_txt = (f" [submit {ph.get('submit', 0):.0f}s · wait {ph.get('wait', 0):.0f}s"
                          f" (gap {gap:+.0f}s) · fetch {ph.get('fetch', 0):.0f}s ({mb:.0f}MB)"
                          f" · finalize {ph.get('finalize', 0):.1f}s]")
+        # On screen: the plain per-segment progress (which segment, frame count, wall time).
+        # The VRAM / OOM-recovery / phase-timing detail is engine diagnostics: file only.
         log(f"    segment {s.index + 1}/{len(segs)}: {n} frames"
-            + (f" in {fmt_hhmmss(secs)}" if secs else "")
-            + vram_txt + drop_txt + phase_txt)
+            + (f" in {fmt_hhmmss(secs)}" if secs else ""))
+        if vram_txt or drop_txt or phase_txt:
+            log_file_only(f"    segment {s.index + 1}/{len(segs)} detail"
+                          + vram_txt + drop_txt + phase_txt)
 
         # Self-calibrate future estimates: record this segment's real OUTPUT
         # megapixels vs seconds against the GPU that ran it. Megapixels, not frames, so
@@ -1735,7 +1776,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # whole, so a src->clip link would be wrong for conciliation. src_abs is the untouched
     # source (never mux_source, which is the temp clip for a clip job).
     if not clip_id and vcfg.get("record_lineage", True):
-        _record_video_lineage(conn, src_abs, out_video, log=log)
+        _record_video_lineage(conn, src_abs, out_video, log=log_file_only)  # file only
     shutil.rmtree(work_root, ignore_errors=True)
     try:
         os.rmdir(os.path.dirname(work_root))      # tidy the empty work parent
@@ -2364,12 +2405,13 @@ def main(argv=None):
             # benchmark): without a C compiler it would HANG the first VAE compile under the
             # GUI's piped stdio ("stuck at first segment"). See gate_local_compile.
             local_cfg = _worker_cfg()
-            gate_local_compile(local_cfg, log)
+            gate_local_compile(local_cfg, log_file_only)   # compile-gate detail: file only
             engine = LocalVideoEngine(
                 repo_dir, model_dir, local_cfg,
                 conn=conn, gpu_id=None,
                 use_subprocess=vcfg["local_use_subprocess"],
-                thrash_stall_seconds=vcfg["thrash_stall_seconds"])
+                thrash_stall_seconds=vcfg["thrash_stall_seconds"],
+                diag_sink=log_file_only)     # SeedVR2 engine banners -> run log only, not the terminal
             run_queue(engine, conn, root_id, src_root, vcfg, budget,
                       notify_settings=notify_settings)
         elif auto_resume:

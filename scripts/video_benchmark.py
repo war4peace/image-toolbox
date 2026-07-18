@@ -262,13 +262,16 @@ def _probe_pinger(log, label):
         state["last"] = now
         el = st.get("elapsed")
         stalled = st.get("stalled_for")
-        bits = [f"{label}: running {_fmt_secs(el)}"]
-        if stalled is not None:
-            bits.append(f"no pipeline output for {_fmt_secs(stalled)}")
         fp, tf = st.get("frames_processed"), st.get("total_frames")
+        # On screen: a plain "still alive" line (elapsed + frame progress if the worker
+        # reports it). The "no pipeline output for X" figure is a developer-facing liveness
+        # diagnostic (compile vs decode), so it stays in the log file only.
+        scr = f"    {label}: running {_fmt_secs(el)}"
         if fp and tf:
-            bits.append(f"~{fp}/{tf} frames")
-        log("    " + ", ".join(bits))
+            scr += f", ~{fp}/{tf} frames"
+        log(scr)
+        if stalled is not None:
+            log(f"      (no pipeline output for {_fmt_secs(stalled)})", screen=False)
 
     return _ping
 
@@ -303,14 +306,28 @@ def cell_ceiling(cell_probes):
     return max(oks) if oks else None
 
 
-def throughput_optimal_batch(cell_probes, tol=0.01):
+# Throughput tie-band: a probe within this fraction of the best measured s/frame counts as
+# "the same speed", so the LARGER window wins (more temporal continuity for no real cost). Set
+# WIDE (10%) on purpose: a single s/frame probe carries far more than 1% noise -- shared-infra
+# contention on a rented pod, or the user's own machine getting busy mid-benchmark (a YouTube
+# video, a background build) inflates one rung by seconds. Measured proof this is real: on the
+# A100-PCIe 540x720 sweep, batch 769 clocked 0.210 s/frame while the LARGER batch 897 clocked
+# 0.187 -- a 12% inversion that cannot be true throughput, only noise. A 1% band chased that
+# noise and saved batch 513 while the card cleanly ran 897 at the same speed; 10% keeps the
+# bigger window whenever the tail is that flat, and still rejects a genuine spill (which slows
+# by far more than 10%).
+THROUGHPUT_TOL = 0.10
+
+
+def throughput_optimal_batch(cell_probes, tol=THROUGHPUT_TOL):
     """The batch AUTO should USE: the one with the best measured throughput (min seconds per
     frame) among the clean 'ok' probes -- NOT the raw ceiling. As batch grows, s/frame falls
     (fixed costs amortise) until the working set overflows VRAM and spills to system RAM, which
     makes a BIGGER batch SLOWER. So the fastest batch is the LARGEST window that runs WITHOUT
     spill: best speed AND as much temporal continuity as the card sustains cleanly. The raw
     ceiling sits one step into that spill zone (it fits, but crawls). Within `tol` of the best
-    s/frame the LARGER batch wins (equal speed -> favour the bigger window). None if no ok probe
+    s/frame the LARGER batch wins (equal speed -> favour the bigger window; `tol` is wide, see
+    THROUGHPUT_TOL, so per-probe measurement noise can't shrink the window). None if no ok probe
     carries timing (the caller then falls back to the ceiling)."""
     timed = [p for p in cell_probes if p.get("outcome") == "ok"
              and p.get("seconds") and p.get("frames")]
@@ -320,6 +337,132 @@ def throughput_optimal_batch(cell_probes, tol=0.01):
         return p["seconds"] / p["frames"]
     best = min(spf(p) for p in timed)
     return max(int(p["batch"]) for p in timed if spf(p) <= best * (1.0 + tol))
+
+
+def saved_metrics(cell_probes, tol=THROUGHPUT_TOL):
+    """The (s/frame, peak VRAM) of a cell's SAVED batch — the throughput-optimal one AUTO
+    runs (throughput_optimal_batch), else the fastest timed 'ok' probe. Returns a dict
+    {spf, peak_alloc, peak_reserved} (peak fields may be None if a probe recorded no VRAM),
+    or None when the cell has no timed 'ok' probe at all.
+
+    Exists so the GUI can render the s/frame + Peak VRAM columns from PERSISTED probes: those
+    two columns used to be filled only from live BPROBE events, so a reopened benchmark window
+    showed them blank even though db.video_bench had the data. Pure, so it is unit-tested."""
+    timed = [p for p in cell_probes if p.get("outcome") == "ok"
+             and p.get("seconds") and p.get("frames")]
+    if not timed:
+        return None
+    saved = throughput_optimal_batch(cell_probes, tol=tol)
+    row = None
+    if saved is not None:
+        row = next((p for p in timed if int(p["batch"]) == saved), None)
+    if row is None:
+        row = min(timed, key=lambda p: p["seconds"] / p["frames"])
+    return {"spf": row["seconds"] / row["frames"],
+            "peak_alloc": row.get("peak_alloc"),
+            "peak_reserved": row.get("peak_reserved")}
+
+
+# ── benchmark sharing (future-features #8) ───────────────────────────────────
+
+def _decompose_bench_model(model_key):
+    """Split a stored video_bench `model` key (bench_key = model_tag + tile_tag +
+    compile_tag, '|'-delimited) into (model, compile_on, tile) for the share CSV:
+      '7b'             -> ('7b', False, 'off')
+      '7b|c'           -> ('7b', True,  'off')
+      '7b|td1024|c'    -> ('7b', True,  'd1024')
+      '7b|te1024_d512' -> ('7b', False, 'e1024_d512')
+    """
+    parts = (model_key or "").split("|")
+    base = parts[0] or "7b"
+    compile_on, tile = False, "off"
+    for seg in parts[1:]:
+        if seg in ("c", "cd"):
+            compile_on = True
+        elif seg.startswith("t"):
+            tile = seg[1:] or "off"
+    return base, compile_on, tile
+
+
+def _norm_gpu(name):
+    """Lower-case + drop vendor noise so 'NVIDIA GeForce RTX 3090' == 'RTX 3090' (mirrors
+    benchmarks._normalize_gpu)."""
+    s = (name or "").lower()
+    for junk in ("nvidia", "geforce"):
+        s = s.replace(junk, " ")
+    return " ".join(s.split())
+
+
+def infer_run_on(gpu_id, local_name=None):
+    """Best-effort local/remote for a card being contributed when the caller's own mode
+    doesn't apply (the benchmark-share card picker can pick a card OTHER than the window's):
+    'local' when gpu_id matches the machine's detected card, else 'remote'. `local_name`
+    lets a caller pass a once-queried name instead of shelling nvidia-smi per card."""
+    if local_name is None:
+        try:
+            from local_video_engine import _query_gpu_name
+            local_name = _query_gpu_name()
+        except Exception:                                  # noqa: BLE001 (no local card -> remote)
+            local_name = None
+    return "local" if (local_name and _norm_gpu(local_name) == _norm_gpu(gpu_id)) else "remote"
+
+
+def build_share_rows(conn, gpu_id, *, run_on, price_usd_hr=None):
+    """Summary rows for ONE card's video_bench data in the bench_share CSV shape: one
+    row per (regime x target) that has a usable 'ok' ceiling. Reuses the same
+    throughput_optimal_batch / saved_metrics the results table renders, so the shared
+    numbers match the window. `run_on` ('local'/'remote') and `price_usd_hr` are stamped
+    from the caller's context (the benchmark window's mode + the picker's live price);
+    price is a snapshot only. A cell with no fit is skipped. Pure read; fail-safe per
+    cell.
+
+    REMOTE contributions drop compile-OFF regimes: a rented pod runs torch.compile ON only,
+    so its OFF rows are no longer representative (and old remote '7b' rows are mislabelled
+    compile state anyway, see sizer.compile_tag). Local keeps both modes."""
+    dims = {(w, h): name for name, (w, h, _s) in TARGETS.items()}
+    rows = []
+    for model_key in db.bench_models(conn, gpu_id):
+        base, compile_on, tile = _decompose_bench_model(model_key)
+        if run_on == "remote" and not compile_on:
+            continue
+        cells = {}
+        for p in db.get_bench_probes(conn, gpu_id, model_key):
+            cells.setdefault((p["out_w"], p["out_h"]), []).append(p)
+        for (w, h), cp in cells.items():
+            oks = [p for p in cp if p.get("outcome") == "ok"]
+            if not oks:
+                continue
+            ceiling = max(int(p["batch"]) for p in oks)
+            used = throughput_optimal_batch(cp) or ceiling
+            metrics = saved_metrics(cp) or {}
+            free = next((p.get("free_vram") for p in cp
+                         if int(p["batch"]) == used and p.get("free_vram") is not None), None)
+            date = max((p.get("updated_at") or "") for p in cp)
+            rows.append({
+                "gpu_id": gpu_id, "run_on": run_on, "model": base,
+                "compile": "ON" if compile_on else "OFF", "tile": tile,
+                "target": dims.get((w, h), f"{w}x{h}"), "out_w": w, "out_h": h,
+                "max_batch": ceiling, "used_batch": used,
+                "overlap": sizer.auto_overlap(used),
+                "spf": (round(metrics["spf"], 4) if metrics.get("spf") is not None else None),
+                "peak_vram": metrics.get("peak_alloc"),
+                "free_vram": (round(free, 2) if free is not None else None),
+                "price_usd_hr": (price_usd_hr if run_on == "remote" else None),
+                "source": "local", "date": (date[:10] if date else ""),
+            })
+    return rows
+
+
+def export_share_csv(path, gpu_id, *, run_on, price_usd_hr=None, conn=None):
+    """Build a card's summary rows and write them to a bench-share CSV. Returns the row
+    count (0 = nothing measured yet). Used by the GUI and the --export-csv headless flag."""
+    import bench_share
+    if conn is None:
+        conn = db.get_conn()
+    rows = build_share_rows(conn, gpu_id, run_on=run_on, price_usd_hr=price_usd_hr)
+    if not rows:
+        return 0
+    return bench_share.write_csv(path, rows)
 
 
 def _probe_seconds_estimate(cell, gpu_id, conn, default_spf=4.0):
@@ -366,9 +509,15 @@ def _open_log():
         _LOG_FH = None
 
 
-def log(msg):
-    sys.stdout.write(f"{msg}\n")
-    sys.stdout.flush()
+def log(msg, screen=True):
+    """Write one line to the on-disk log, and (unless `screen=False`) to stdout so the
+    GUI's benchmark terminal shows it. Technical detail (VRAM peaks, tiling/compile
+    config, the probe-liveness diagnostic) passes `screen=False` so it is kept in the
+    file but off the user-facing terminal, which then reads as a friendly progress feed.
+    The GUI results table is unaffected: it renders from the @@TBX@@ events, not this text."""
+    if screen:
+        sys.stdout.write(f"{msg}\n")
+        sys.stdout.flush()
     if _LOG_FH is not None:
         try:
             _LOG_FH.write(msg + "\n")
@@ -486,6 +635,36 @@ def resolve_bench_key(remote=False, log_fn=None):
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
     return bench_key(vcfg, effective_settings(cfg, vcfg, remote=remote, log_fn=log_fn))
+
+
+def resolve_bench_keys(remote=False, log_fn=None):
+    """Both regime-tagged probe keys the benchmark can write -- one per torch.compile mode -- plus
+    whether the compile-ON mode can actually run on THIS machine. The GUI reads these so its results
+    table shows the right per-mode rows and knows whether to offer the "Also use Torch Compile"
+    toggle (feature: benchmark both compile modes from one window, no Settings round-trip).
+
+    Returns {"off": <key>, "on": <key or None>, "compile_available": bool, "compile_why": str|None}.
+    The two keys differ only by the compile suffix (bench_key = model + tile + compile). OFF is
+    always available; ON is offered only when the local compile toolchain verifies
+    (gate_local_compile), or always for a remote pod (pods compile). Derived EXACTLY as the runner
+    derives them, so the table and the data can never disagree. `compile_why` gives the tooltip a
+    reason when ON is unavailable. Fail-safe is the CALLER's job (the GUI falls back to a single
+    key), so a genuinely broken config still raises here rather than hiding it."""
+    cfg = bv._load_config()
+    vcfg = bv.resolve_video_cfg(cfg)
+    key_off = bench_key({**vcfg, "compile": False},
+                        effective_settings(cfg, {**vcfg, "compile": False},
+                                           remote=remote, log_fn=log_fn))
+    on_eff = effective_settings(cfg, {**vcfg, "compile": True}, remote=remote, log_fn=log_fn)
+    # Remote pods always compile; locally, availability = did the gate KEEP compile on?
+    available = True if remote else bool(on_eff.get("compile_dit") or on_eff.get("compile_vae"))
+    if available:
+        return {"off": key_off, "on": bench_key({**vcfg, "compile": True}, on_eff),
+                "compile_available": True, "compile_why": None}
+    # Unavailable: fetch the human reason from the gate (cheap; verify_toolchain is cached).
+    _disabled, why = bv.gate_local_compile(_worker_settings(cfg, {**vcfg, "compile": True}),
+                                           log=None)
+    return {"off": key_off, "on": None, "compile_available": False, "compile_why": why}
 
 
 def _deploy_remote_engine(cfg, vcfg):
@@ -616,93 +795,52 @@ def _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopp
         pass
 
 
-def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP,
-                  remote=False):
-    """Drive the sweep on the LOCAL card or (remote=True) a rented RunPod GPU. Persists every
-    probe, honours a Stop (stdin 'q') between and DURING a probe, and writes the learned batch +
-    rate per finished cell. On the REMOTE path the sweep runs in-process on the pod (section 22),
-    keys the learned batch under the PLAIN RunPod id the run reads, and tears the pod down at the
-    end. Returns a summary."""
-    cfg = bv._load_config()
-    vcfg = bv.resolve_video_cfg(cfg)
-    notify_settings = notifications.resolve_settings(cfg)
-    t_start = time.monotonic()
-    conn = db.get_conn()
-    model_tag = sizer.model_tag(vcfg["dit_model"])          # the DISPLAY name
-    # The regime-tagged probe key (see bench_key) + the settings it is derived from. The GUI
-    # resolves the identical key via resolve_bench_key, so its table reads the rows this run
-    # writes; keep the two on this one derivation.
-    eff_settings = effective_settings(cfg, vcfg, remote=remote)
-    bench_model = bench_key(vcfg, eff_settings)
-    work = os.path.join(vcfg["work_root"], "benchmark")
-    os.makedirs(work, exist_ok=True)
+def _resolve_modes(vcfg, compile_modes):
+    """Ordered, de-duplicated torch.compile modes (bool) to sweep. `compile_modes` is the GUI's
+    explicit choice ([False] or [False, True]); None (the headless default) falls back to the
+    config's single compile setting, so the CLI keeps its pre-feature behaviour."""
+    raw = [bool(vcfg.get("compile"))] if compile_modes is None else [bool(m) for m in compile_modes]
+    out = []
+    for m in raw:
+        if m not in out:
+            out.append(m)
+    return out or [False]
 
-    cap = int(batch_cap or DEFAULT_BATCH_CAP)
-    plan = build_plan(targets, frames)
-    if not plan:
-        log("No valid benchmark targets selected; nothing to do.")
-        return {"cells": 0, "stopped": None}
 
-    # Total VRAM drives the per-cell starting FLOOR (skip the low rungs a big card obviously
-    # clears). Remote: the pod's card, passed by the GUI from the picker; local: read live.
-    if remote:
-        try:
-            total_gb = float(os.environ.get("IMGTBX_GPU_VRAM_GB", "") or 0) or None
-        except ValueError:
-            total_gb = None
-    else:
-        total_gb = sizer.free_vram_gb(prefer_smi=True)[1]
-
-    # Identify the card + the learned-batch key the CONSUMING run reads (section 22.3):
-    #   local  -> the sizer's `gpu|model` key;
-    #   remote -> the PLAIN RunPod id (process_job reads the un-model-qualified override).
-    if remote:
-        gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip().split(",")[0].strip()
-        if not gpu_id:
-            log("Remote benchmark needs a selected GPU (none passed). Pick a GPU on the "
-                "Video tab (Remote), then press Benchmark GPU.")
-            return {"cells": 0, "stopped": "no GPU selected"}
-        learn_key = gpu_id
-    else:
-        from local_video_engine import _query_gpu_name
-        gpu_id = _query_gpu_name() or "local"
-        learn_key = f"{gpu_id}|{model_tag}"
-    # A ceiling measured under one VRAM regime is not the same measurement as one under
-    # another, so it is stored under its own key and can never seed a run seeing the other
-    # setting. Everything off tags to "" = the historical key. Both VAE tiling and
-    # torch.compile move the ceiling, so learn_tag carries both (compile used to be omitted
-    # here on the theory that it "barely" moved it; this card's own rows disproved that and
-    # the story is in sizer.learn_tag). The sweep writes the OPTIMAL batch to this key, so a
-    # missing tag does not just mislabel a row: it OVERWRITES the other regime's row with a
-    # number measured under settings that run never saw.
-    learn_key += sizer.learn_tag(eff_settings)
+def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote, plan, conn,
+                    gpu_id, total_gb, cap, frames, work, resume, compile_on, multi):
+    """Sweep every target in `plan` for ONE torch.compile mode, writing probes under this mode's
+    regime-tagged `bench_model` key (see bench_key) and the learned batch/rate under `learn_key`.
+    Factored out of run_benchmark so the with- and without-compile passes share one code path and
+    the compile-OFF / compile-ON results never overwrite each other. Emits mode-tagged BCELL /
+    BPROBE / BCEILING so the GUI routes each to its (target, mode) row. Returns (stopped, results),
+    results = [(name, ceiling, saved)] per finished cell."""
+    if multi:
+        log(f"\n{'=' * 56}\ntorch.compile {'ON' if compile_on else 'OFF'}\n{'=' * 56}")
+    vram_note = (f"{total_gb:.0f} GB VRAM -> floor scales per target" if total_gb
+                 else "VRAM unknown -> climbing from the base floor")
+    log(f"  frames={frames}, geometric climb to a measured ceiling (cap {cap}, {vram_note}).",
+        screen=False)
+    # The one setting these numbers are meaningless without: tiling moves the VRAM ceiling,
+    # so a batch/rate result only compares against another run with the SAME tiling state.
+    log(f"  VAE tiling: {bv.describe_tiling(vcfg_m)}", screen=False)
+    # Compile state. A compiling pod is SILENT for minutes with an idle GPU, which reads exactly
+    # like a hang; not knowing whether compile was even on cost a rented PRO 6000 a 35-minute
+    # diagnosis. Keep the file record always, but ALSO surface it on screen in the one case the
+    # silence alarms a watching user: a remote pod with compile on (cold = empty Triton cache).
+    compile_warns = bool(remote and eff_settings.get("compile_dit"))
+    log(f"  torch.compile: {'on' if eff_settings.get('compile_dit') else 'off'}"
+        f"{' (dynamic)' if eff_settings.get('compile_dynamic') else ''}"
+        + (" -- expect a silent, GPU-idle compile before the first pass (cold pod = empty "
+           "Triton cache)" if compile_warns else ""), screen=compile_warns)
 
     if not resume:
-        # Scope the wipe to the targets in THIS plan. A restart means "re-measure what I
-        # picked", never "discard every cell on this card": the other targets are hours of
-        # GPU time (billed, when remote) and nothing would announce their loss.
+        # Scope the wipe to the targets in THIS plan AND this mode's key: a restart re-measures
+        # what was picked, never the other targets (hours of GPU time, billed when remote) nor
+        # the other compile mode (its key differs).
         db.clear_bench(conn, gpu_id, bench_model,
                        cells=[(c["out_w"], c["out_h"]) for c in plan])
 
-    done = sum(len(db.get_bench_probes(conn, gpu_id, bench_model, c["out_w"], c["out_h"]))
-               for c in plan) if resume else 0
-    est = estimate_runtime(plan, gpu_id, conn, done=done)
-    where = "on a RunPod pod" if remote else "locally"
-    vram_note = (f"{total_gb:.0f} GB VRAM -> floor scales per target" if total_gb
-                 else "VRAM unknown -> climbing from the base floor")
-    log(f"Benchmarking {gpu_id} ({model_tag}) {where}: {len(plan)} target(s), frames={frames}, "
-        f"geometric climb to a measured ceiling (cap {cap}, {vram_note}).")
-    # The one setting these numbers are meaningless without: tiling moves the VRAM ceiling,
-    # so a batch/rate result only compares against another run with the SAME tiling state.
-    log(f"VAE tiling: {bv.describe_tiling(vcfg)}")
-    # Compile state, stated up front. A compiling pod is SILENT for minutes with an idle GPU,
-    # which reads exactly like a hang; not knowing whether compile was even on cost a rented
-    # PRO 6000 a 35-minute diagnosis. Remote also reports its own gate decision (_gate_compile).
-    log(f"torch.compile: {'on' if eff_settings.get('compile_dit') else 'off'}"
-        f"{' (dynamic)' if eff_settings.get('compile_dynamic') else ''}"
-        + (" -- expect a silent, GPU-idle compile before the first pass (cold pod = empty "
-           "Triton cache)" if (remote and eff_settings.get("compile_dit")) else ""))
-    log(f"Estimated runtime: ~{fmt_hhmmss(est)} (rough).")
     if remote:
         log("Note: the pod loads the model once from the network volume (a minute or two) before "
             "the first probe; the sweep then runs in-process on the pod. So nothing lost if you "
@@ -711,17 +849,14 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
         log("Note: every probe runs in a fresh process (isolated CUDA context per batch), so it "
             "opens with a brief silent model load (a few seconds locally) before any progress. "
             "That is normal, not a hang.")
-    gui_event("BSTART", {"gpu": gpu_id, "model": model_tag, "remote": bool(remote),
-                         "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
-                                   "mp": round(c["mp"], 2)} for c in plan],
-                         "batch_cap": cap, "frames": frames, "estimate_seconds": round(est)})
 
+    mode = "on" if compile_on else "off"
     session = None
     tele_stop = None
     if remote:
         # Deploy the pod for the picked card. A capacity failure (stock empty, no substitution)
         # raises here and lands cleanly in the benchmark log (RemoteSession emits the reason).
-        engine, session = _deploy_remote_engine(cfg, vcfg)
+        engine, session = _deploy_remote_engine(cfg, vcfg_m)
         # Stream the pod's CPU/RAM/VRAM/temp to the GUI (RTELEM events) exactly like a real
         # remote run, so the benchmark window shows the same "Remote pod" row and MQTT gets
         # the system/remote/* topics. Best-effort; stopped at teardown.
@@ -748,7 +883,7 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 stopped = "funds guard" if funds_tripped() else "stopped by user"
                 break
             gui_event("BCELL", {"name": cell["name"], "out_w": cell["out_w"],
-                                "out_h": cell["out_h"]})
+                                "out_h": cell["out_h"], "compile": mode})
             log(f"\n[{cell['name']}] output {cell['out_w']}x{cell['out_h']} "
                 f"({cell['mp']:.2f} MP), source {cell['src_w']}x{cell['src_h']}:")
 
@@ -797,7 +932,8 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                             work, cell["source"], warmup_frames, log=None)
                     except Exception:                   # noqa: BLE001 (warm on the full clip instead)
                         warmup_clip = clip
-                gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running"})
+                gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running",
+                                     "compile": mode})
                 log(f"  probing batch {b} …")
                 res = engine.probe_batch(clip, probe_out, resolution=cell["resolution"],
                                          batch=b, frames=probe_frames, should_stop=stop_now,
@@ -816,21 +952,26 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                 cell_probes = [p for p in cell_probes if int(p["batch"]) != b]
                 cell_probes.append({"batch": b, "outcome": res["outcome"], "free_vram": free_now})
                 spf = (res["seconds"] / res["frames"]) if res.get("frames") else None
-                # Show BOTH peaks when the probe warmed: "peak X/Y GB (steady A/B)". They are
-                # different questions -- the first is the ceiling (a real run's first segment
-                # pays the cold+compile peak too), the second is what every later segment
-                # costs. Fused into one number, a compile-bound ceiling is indistinguishable
-                # from an inference-bound one.
-                steady = ""
-                if res.get("peak_alloc_steady_gb") is not None:
-                    steady = (f" (steady {res['peak_alloc_steady_gb']}/"
-                              f"{res['peak_reserved_steady_gb']})")
-                log(f"    batch {b}: {res['outcome']}"
-                    + (f", {res['seconds']:.0f}s ({spf:.2f} s/frame), "
-                       f"peak {res.get('peak_alloc_gb')}/{res.get('peak_reserved_gb')} GB{steady}"
-                       if res["outcome"] == "ok" else ""))
+                # Screen: outcome + speed (what a user reads down the run). The VRAM peaks are
+                # technical and go to the log file only; they still reach the GUI results table
+                # via the BPROBE event below, so nothing is lost there.
+                if res["outcome"] == "ok":
+                    log(f"    batch {b}: ok, {res['seconds']:.0f}s ({spf:.2f} s/frame)")
+                    # Show BOTH peaks when the probe warmed: "peak X/Y GB (steady A/B)". They are
+                    # different questions -- the first is the ceiling (a real run's first segment
+                    # pays the cold+compile peak too), the second is what every later segment
+                    # costs. Fused into one number, a compile-bound ceiling is indistinguishable
+                    # from an inference-bound one.
+                    steady = ""
+                    if res.get("peak_alloc_steady_gb") is not None:
+                        steady = (f" (steady {res['peak_alloc_steady_gb']}/"
+                                  f"{res['peak_reserved_steady_gb']})")
+                    log(f"      peak {res.get('peak_alloc_gb')}/"
+                        f"{res.get('peak_reserved_gb')} GB{steady}", screen=False)
+                else:
+                    log(f"    batch {b}: {res['outcome']}")
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "done",
-                                     "outcome": res["outcome"],
+                                     "compile": mode, "outcome": res["outcome"],
                                      "seconds": round(res.get("seconds") or 0, 1),
                                      "spf": round(spf, 2) if spf else None,
                                      "peak_alloc": res.get("peak_alloc_gb"),
@@ -850,7 +991,8 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
                     f"measurement noise).")
             else:
                 log(f"  {cell['name']}: no batch fit (card can't do this target)")
-            gui_event("BCEILING", {"name": cell["name"], "ceiling": ceil, "saved": saved,
+            gui_event("BCEILING", {"name": cell["name"], "compile": mode, "ceiling": ceil,
+                                   "saved": saved,
                                    "overlap": sizer.auto_overlap(saved) if saved else None})
             if stopped:
                 break
@@ -875,16 +1017,125 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
         except OSError:
             pass
 
-    summary = {"cells": len(plan), "stopped": stopped}
-    gui_event("BDONE", summary)
     _log_summary_table(conn, gpu_id, bench_model, plan)
+    return stopped, results
+
+
+def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP,
+                  remote=False, compile_modes=None):
+    """Drive the benchmark on the LOCAL card or (remote=True) a rented RunPod GPU, sweeping ONE or
+    BOTH torch.compile modes in a single run. `compile_modes` (list of bool, GUI-supplied) selects
+    the modes; each is measured under its own regime-tagged key (see bench_key) so with- and
+    without-compile results never overwrite each other. None (headless default) keeps the
+    pre-feature behaviour: a single sweep at the config's compile setting. Persists every probe,
+    honours a Stop (stdin 'q') between and DURING a probe, writes the learned batch + rate per
+    finished cell, and (remote) tears the pod down. Returns a summary."""
+    cfg = bv._load_config()
+    vcfg = bv.resolve_video_cfg(cfg)
+    notify_settings = notifications.resolve_settings(cfg)
+    t_start = time.monotonic()
+    conn = db.get_conn()
+    model_tag = sizer.model_tag(vcfg["dit_model"])          # the DISPLAY name
+    work = os.path.join(vcfg["work_root"], "benchmark")
+    os.makedirs(work, exist_ok=True)
+
+    cap = int(batch_cap or DEFAULT_BATCH_CAP)
+    plan = build_plan(targets, frames)
+    if not plan:
+        log("No valid benchmark targets selected; nothing to do.")
+        return {"cells": 0, "stopped": None}
+
+    # Total VRAM drives the per-cell starting FLOOR (skip the low rungs a big card obviously
+    # clears). Remote: the pod's card, passed by the GUI from the picker; local: read live.
+    if remote:
+        try:
+            total_gb = float(os.environ.get("IMGTBX_GPU_VRAM_GB", "") or 0) or None
+        except ValueError:
+            total_gb = None
+    else:
+        total_gb = sizer.free_vram_gb(prefer_smi=True)[1]
+
+    # Identify the card (section 22.3): local uses the detected name; remote uses the PLAIN
+    # RunPod id the run reads its learned batch under.
+    if remote:
+        gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip().split(",")[0].strip()
+        if not gpu_id:
+            log("Remote benchmark needs a selected GPU (none passed). Pick a GPU on the "
+                "Video tab (Remote), then press Benchmark GPU.")
+            return {"cells": 0, "stopped": "no GPU selected"}
+    else:
+        from local_video_engine import _query_gpu_name
+        gpu_id = _query_gpu_name() or "local"
+
+    # Resolve each compile mode's settings + regime-tagged key up front, so BSTART can report the
+    # modes and the estimate can sum them. A LOCAL compile-ON mode the toolchain can't actually run
+    # is dropped here with a note (the GUI only offers it when available, but never trust that
+    # alone: the runner is the last gate). The learn_key carries the FULL regime tag (VAE tiling +
+    # compile) so a compiled sweep's ceiling can never overwrite the uncompiled one's, or vice
+    # versa (sizer.learn_tag); the bench_model does the same for the per-probe rows (bench_key).
+    mode_plans = []
+    for compile_on in _resolve_modes(vcfg, compile_modes):
+        vcfg_m = {**vcfg, "compile": compile_on}
+        eff = effective_settings(cfg, vcfg_m, remote=remote)
+        if compile_on and not remote and not (eff.get("compile_dit") or eff.get("compile_vae")):
+            log("torch.compile is not available on this machine (needs Triton + a verified C "
+                "compiler); skipping the compile-ON sweep.")
+            continue
+        bench_model = bench_key(vcfg_m, eff)
+        learn_key = (gpu_id if remote else f"{gpu_id}|{model_tag}") + sizer.learn_tag(eff)
+        done = sum(len(db.get_bench_probes(conn, gpu_id, bench_model, c["out_w"], c["out_h"]))
+                   for c in plan) if resume else 0
+        mode_plans.append({"compile_on": compile_on, "vcfg_m": vcfg_m, "eff": eff,
+                           "bench_model": bench_model, "learn_key": learn_key,
+                           "est": estimate_runtime(plan, gpu_id, conn, done=done)})
+    if not mode_plans:
+        log("Nothing to benchmark.")
+        return {"cells": 0, "stopped": None}
+
+    multi = len(mode_plans) > 1
+    total_est = sum(mp["est"] for mp in mode_plans)
+    where = "on a RunPod pod" if remote else "locally"
+    gui_event("BSTART", {"gpu": gpu_id, "model": model_tag, "remote": bool(remote),
+                         "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
+                                   "mp": round(c["mp"], 2)} for c in plan],
+                         "batch_cap": cap, "frames": frames, "estimate_seconds": round(total_est),
+                         "modes": [("on" if mp["compile_on"] else "off") for mp in mode_plans]})
+    log(f"Benchmarking {gpu_id} ({model_tag}) {where}: {len(plan)} target(s)"
+        + (f", torch.compile "
+           + " + ".join("ON" if mp["compile_on"] else "OFF" for mp in mode_plans)
+           if multi else "") + ".")
+    log(f"Estimated runtime: ~{fmt_hhmmss(total_est)} (rough).")
+
+    overall_stopped = None
+    all_results = []                                   # [(compile_on, [(name, ceil, saved), ...])]
+    for mp in mode_plans:
+        if overall_stopped:
+            break
+        stopped, results = _sweep_one_mode(
+            cfg, mp["vcfg_m"], mp["eff"], mp["bench_model"], mp["learn_key"],
+            remote=remote, plan=plan, conn=conn, gpu_id=gpu_id, total_gb=total_gb, cap=cap,
+            frames=frames, work=work, resume=resume, compile_on=mp["compile_on"], multi=multi)
+        all_results.append((mp["compile_on"], results))
+        if stopped:
+            overall_stopped = stopped
+
+    gui_event("BDONE", {"cells": len(plan), "stopped": overall_stopped})
     tail = ("Results saved; AUTO runs and the time estimate now use them."
             if not remote else
             "Results saved; remote runs on this card now seed from them.")
-    log(f"\nBenchmark {'stopped' if stopped else 'complete'}: {len(plan)} target(s). " + tail)
-    _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopped,
+    log(f"\nBenchmark {'stopped' if overall_stopped else 'complete'}: {len(plan)} "
+        f"target(s). " + tail)
+    # One completion notification. When both modes ran, label each target field with its mode.
+    if multi:
+        merged = []
+        for con, res in all_results:
+            tag = "compile ON" if con else "compile OFF"
+            merged += [(f"{n} · {tag}", c, s) for n, c, s in res]
+    else:
+        merged = all_results[0][1] if all_results else []
+    _notify_benchmark(notify_settings, gpu_id, model_tag, remote, merged, overall_stopped,
                       time.monotonic() - t_start)
-    return summary
+    return {"cells": len(plan), "stopped": overall_stopped, "modes": len(mode_plans)}
 
 
 def main(argv=None):
@@ -899,15 +1150,50 @@ def main(argv=None):
     p.add_argument("--remote", action="store_true",
                    help="benchmark a rented RunPod GPU (the card in IMGTBX_GPU_OVERRIDE) "
                         "instead of the local card (feature #7, docs section 22).")
+    p.add_argument("--compile-modes", default=None,
+                   help="comma list of torch.compile modes to benchmark: 'off', 'on', or "
+                        "'off,on' (both). Each writes its own regime-tagged key. Omit to use "
+                        "the config's compile setting (the pre-feature default).")
+    p.add_argument("--export-csv", metavar="PATH", default=None,
+                   help="export this card's benchmark summary to a bench-share CSV and exit "
+                        "(no sweep). Local card by default; --remote uses IMGTBX_GPU_OVERRIDE "
+                        "(feature #8).")
     args = p.parse_args(argv)
+
+    if args.export_csv:
+        if args.remote:
+            gpu_id = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip().split(",")[0].strip()
+            run_on = "remote"
+        else:
+            from local_video_engine import _query_gpu_name
+            gpu_id = _query_gpu_name() or "local"
+            run_on = "local"
+        if not gpu_id:
+            print("No GPU to export (pass --remote with a selected card, or run locally).")
+            return 1
+        n = export_share_csv(args.export_csv, gpu_id, run_on=run_on)
+        print(f"Exported {n} benchmark row(s) for {gpu_id} to {args.export_csv}"
+              if n else f"No benchmark results to export for {gpu_id}.")
+        return 0
 
     _open_log()
     if GUI_MODE:
         threading.Thread(target=_watch_stdin_for_stop, daemon=True).start()
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    compile_modes = None
+    if args.compile_modes:
+        cm = []
+        for tok in args.compile_modes.split(","):
+            t = tok.strip().lower()
+            if t in ("off", "0", "false", "no"):
+                cm.append(False)
+            elif t in ("on", "1", "true", "yes"):
+                cm.append(True)
+        compile_modes = cm or None
     try:
         run_benchmark(targets, frames=args.frames, resume=not args.restart,
-                      batch_cap=args.batch_cap, remote=args.remote)
+                      batch_cap=args.batch_cap, remote=args.remote,
+                      compile_modes=compile_modes)
     except Exception as exc:                            # noqa: BLE001
         import traceback
         log(f"Benchmark failed: {exc}")

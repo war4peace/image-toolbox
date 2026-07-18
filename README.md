@@ -125,13 +125,13 @@ Analyses each image with a local or remote Ollama vision model, writes a descrip
 
 ### Conciliation
 
-Once you're happy with the upscaled (and optionally tagged & renamed) results, **Conciliation** moves them back into your original folder tree so the originals are replaced by their high-quality versions. No manual shuffling required.
+Once you're happy with the upscaled (and optionally tagged & renamed) results, **Conciliation** moves them back into your original folder tree so the originals are replaced by their high-quality versions. No manual shuffling required. It handles **photos and videos**.
 
-- Pick an **Original Photos** folder and a **Processed Photos** folder, then **Scan / Preview**. Nothing is touched until you click **Run**: the preview shows a per-folder summary (how many will be *replaced*, how many images have *no match*, and how many non-image files are *kept*).
-- Each original is matched to its processed counterpart using the cache database, falling back to filename matching when there's no cache. It works for both upscaled-only and upscaled-then-tagged/renamed files.
-- Two operations: **Archive originals** (default; moves each original into an `__Archive__` subfolder) or **Delete originals** (permanent, with an extra confirmation). The processed file then takes the original's place, keeping its descriptive name if it was tagged.
-- **Safety first:** an original with no processed counterpart is never touched, and non-image files are never touched. After a run, emptied processed folders (e.g. a leftover `__upscaled__`) are cleaned up. The tab is locked while the Batch Upscaler or Tag & Rename is running, since they may share the same folders.
-- **Images only (for now):** Conciliation does not conciliate videos yet. A video counts as a non-image file, so both the source and the Video Upscaler's output are left untouched (nothing is lost); move upscaled videos into place manually for now.
+- Pick an **Original Files** folder and a **Processed Files** folder, then **Scan / Preview**. Nothing is touched until you click **Run**: the preview shows a per-folder summary (how many will be *replaced*, how many files have *no match*, and how many non-media files are *kept*).
+- Each original is matched to its processed counterpart using the cache database, falling back to filename matching when there's no cache. It works for upscaled-only, upscaled-then-tagged/renamed, and upscaled videos.
+- Two operations: **Archive originals** (default; moves each original into an `__Archive__` subfolder) or **Delete originals** (permanent, with an extra confirmation). The processed file then takes the original's place, keeping its own name (a photo's descriptive name if it was tagged, or a video's `name_4K.mp4` output name).
+- **Videos too:** a video original (e.g. `clip.avi`) is matched to its upscaled output (e.g. `clip_4K.mp4`) by content-hash lineage, so it still matches after folders are moved or renamed. A video is only ever acted on when its output is actually present in the Processed folder you chose, so pointing Conciliation at a photo-only output folder never touches your videos (and vice versa) and the preview always shows exactly what will happen first.
+- **Safety first:** an original with no processed counterpart is never touched, and non-media files are never touched. After a run, emptied processed folders (e.g. a leftover `__upscaled__`) are cleaned up. The tab is locked while the Batch Upscaler or Tag & Rename is running, since they may share the same folders.
 
 ### Video Upscaler
 
