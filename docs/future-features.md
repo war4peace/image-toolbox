@@ -45,8 +45,8 @@ back. The goal is to stop duplicating slow (and, on a rented pod, billed) sweeps
 across machines. Covers `db.video_bench` only (the per-probe video ceilings); the
 image-task `docs/Benchmarks.csv` stays a separate, author-maintained file.
 
-**Status (0.5.1-experimental): the CONTRIBUTE half is built and proven** (real
-submissions sent). Shipped so far:
+**Status (0.5.1-experimental): BOTH halves are built.** The contribute half is
+proven (real submissions sent + curated). Shipped:
 - The serializer `scripts/bench_share.py` (`write_csv` / `read_csv` / `to_text`),
   torch-free and fail-safe, with the `# imgtbx-bench v1` sentinel.
 - `video_benchmark.build_share_rows` (summary rows from real probes, reusing the
@@ -59,12 +59,25 @@ submissions sent). Shipped so far:
   browser-delegated pre-filled GitHub issue, inline-CSV or attach fallback).
 - The **maintainer merge tool** `bench_share.py --merge` (dedupe + sanity gate +
   curated-master export). See "Maintainer merge tool" at the end of this section.
+- **Download half:** the `source` column migration on `video_bench`
+  (`_ensure_video_columns`, existing rows default `'local'`; `record_bench_probe`
+  now stamps `'local'`), `db.import_bench_rows` (local-precedence, writes synthetic
+  `ok` probes + the sizer's learned batch, tagged `'imported'`),
+  `bench_share.fetch_community` (anonymous GitHub GET via `net_ssl`),
+  `video_benchmark.import_rows` / `import_share_csv` / `import_community` (reconstruct
+  the regime-tagged `model` + learned key from the CSV's model+compile+tile), the
+  `--import-csv PATH|community` headless flag, the Benchmark window's **Download
+  community…** and **Import file…** buttons, the seeded `docs/video-benchmarks.csv`
+  + its installer `[Files]` line.
 
-**Still pending (the DOWNLOAD half):** the `source` column migration on
-`video_bench` + `db.import_bench_rows` (local precedence), `bench_share.fetch_community`,
-the **Download community benchmarks** and **Import file…** buttons, the seeded
-`docs/video-benchmarks.csv` + its installer `[Files]` line, and the `--import-csv`
-headless flag.
+**Import scope (deliberate):** import seeds `video_bench` (so the window shows the
+card as characterised and `max_feasible_output_mp` benefits) AND `video_batch_learn`
+(so a real AUTO run uses the shared ceiling and self-corrects via the OOM back-off).
+It does NOT seed `gpu_perf` (the time/cost estimate rate): that is an ACCUMULATING
+store, so injecting an imported rate risks polluting the user's own measured average,
+and the estimator already falls back to the author `RATES` table for an unmeasured
+card. Seeding `gpu_perf` from imports (with its own precedence) is a possible
+follow-on if imported time estimates prove worth it.
 
 The exported shape is the **summary table the Benchmark GPU window already shows**:
 one row per (target x `torch.compile` mode), not the raw per-batch probe rows. That
@@ -197,12 +210,13 @@ the user is already signed in, instead of teaching the app to authenticate.)
   live in a new torch-free, fail-safe `scripts/bench_share.py` (`write_csv` /
   `read_csv` / `fetch_community`, plus the maintainer-side `--merge` that dedupes +
   sanity-checks submissions into the curated master CSV).
-- **Work needed:** DONE: the serializer, `build_share_rows` + `--export-csv`, the
-  Export/Contribute buttons + card picker, `contribute_benchmark`, and the
-  maintainer `--merge`. REMAINING (download half): the Download/Import buttons +
-  file dialog, `bench_share.fetch_community`, `db.import_bench_rows` + the `source`
-  column migration, the seeded `docs/video-benchmarks.csv` + its installer `[Files]`
-  line, and the `--import-csv` headless flag.
+- **Work needed:** DONE (feature complete, experimental): the serializer,
+  `build_share_rows` + `--export-csv`, the Export/Contribute buttons + card picker,
+  `contribute_benchmark`, the maintainer `--merge`, and the whole download half
+  (`fetch_community`, `import_bench_rows` + the `source` migration, the
+  Download/Import buttons, `--import-csv`, the seeded master + its installer line).
+  Possible follow-on: seed `gpu_perf` from imports so shared TIME estimates apply
+  to unmeasured cards (see "Import scope" above).
 - **Risks:** low. Fail-safe on a malformed CSV or a failed download (skip bad
   rows, return None, never raise into the GUI); local precedence protects measured
   data; it only writes cache rows the user can re-measure.

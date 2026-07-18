@@ -465,6 +465,79 @@ def export_share_csv(path, gpu_id, *, run_on, price_usd_hr=None, conn=None):
     return bench_share.write_csv(path, rows)
 
 
+def _compose_bench_model(base, compile_on, tile):
+    """Reverse of _decompose_bench_model: rebuild the video_bench `model` key (model_tag +
+    tile_tag + compile_tag) from the share CSV's separate model/compile/tile columns. Compile
+    ON maps to the static '|c' tag: the CSV does not carry the static/dynamic distinction, and
+    imports are advisory (the run's real compile state owns the authoritative key)."""
+    key = base or "7b"
+    if tile and tile != "off":
+        key += "|t" + tile
+    if compile_on:
+        key += "|c"
+    return key
+
+
+def _int_or(v, default):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def import_rows(rows, conn=None):
+    """Resolve bench-share CSV rows (reconstruct the regime-tagged `model` key and the sizer's
+    learned-batch key/bucket from model+compile+tile) and import them into the cache with local
+    precedence. Returns (imported, skipped). Fail-safe per row (a bad row is skipped)."""
+    if conn is None:
+        conn = db.get_conn()
+    resolved = []
+    for r in rows:
+        base = (r.get("model") or "").strip()
+        gpu = (r.get("gpu_id") or "").strip()
+        if not base or not gpu:
+            continue
+        try:
+            out_w = int(float(r["out_w"])); out_h = int(float(r["out_h"]))
+            max_batch = int(float(r["max_batch"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        compile_on = (r.get("compile") or "").strip().upper() == "ON"
+        tile = (r.get("tile") or "off").strip() or "off"
+        model_key = _compose_bench_model(base, compile_on, tile)
+        suffix = model_key[len(base):]                 # the |t.../|c tags, shared with the learn key
+        mp = out_w * out_h / 1_000_000.0
+        resolved.append({
+            "gpu_id": gpu, "model": model_key, "out_w": out_w, "out_h": out_h,
+            "max_batch": max_batch, "used_batch": _int_or(r.get("used_batch"), max_batch),
+            "spf": _float_or(r.get("spf")), "peak_vram": _float_or(r.get("peak_vram")),
+            "free_vram": _float_or(r.get("free_vram")), "date": (r.get("date") or ""),
+            "learn_key": f"{gpu}|{sizer.model_tag(base)}{suffix}",
+            "mp_key": sizer.mp_bucket(mp),
+        })
+    return db.import_bench_rows(conn, resolved)
+
+
+def import_share_csv(path, conn=None):
+    """Read a bench-share CSV from disk and import it. Returns (imported, skipped)."""
+    import bench_share
+    return import_rows(bench_share.read_csv(path), conn)
+
+
+def import_community(url=None, dest=None, conn=None):
+    """Download the curated community master (fail-safe) and import it. Returns (imported,
+    skipped); (0, 0) when the download yielded nothing."""
+    import bench_share
+    return import_rows(bench_share.fetch_community(url=url, dest=dest), conn)
+
+
 def _probe_seconds_estimate(cell, gpu_id, conn, default_spf=4.0):
     """Rough seconds for ONE probe of a cell: frames x (measured s/MP x cell MP), or a
     conservative default s/frame when the card is unmeasured (the whole reason to benchmark)."""
@@ -1158,7 +1231,23 @@ def main(argv=None):
                    help="export this card's benchmark summary to a bench-share CSV and exit "
                         "(no sweep). Local card by default; --remote uses IMGTBX_GPU_OVERRIDE "
                         "(feature #8).")
+    p.add_argument("--import-csv", metavar="PATH", default=None,
+                   help="import a bench-share CSV into the cache and exit (no sweep). Local "
+                        "results always take precedence; imported rows are advisory. Pass "
+                        "'community' to download the curated master from GitHub instead "
+                        "(feature #8).")
     args = p.parse_args(argv)
+
+    if args.import_csv:
+        if args.import_csv.strip().lower() == "community":
+            imp, skp = import_community()
+            src = "community master"
+        else:
+            imp, skp = import_share_csv(args.import_csv)
+            src = args.import_csv
+        print(f"Imported {imp} benchmark cell(s) from {src}"
+              + (f" ({skp} skipped: local results already present)." if skp else "."))
+        return 0
 
     if args.export_csv:
         if args.remote:

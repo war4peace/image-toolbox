@@ -405,19 +405,6 @@ class BenchmarkWindow(tk.Toplevel):
         self.start_btn.grid(row=0, column=0)
         self.stop_btn = ttk.Button(bf, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(6, 0))
-        # Share this card's results (feature #8): Export writes a bench-share CSV; Contribute
-        # opens a pre-filled GitHub issue with it (crowdsourced corpus). Enabled once the card
-        # is detected; each is a no-op-with-a-note when nothing is measured yet.
-        self.export_btn = ttk.Button(bf, text="Export…", command=self._export,
-                                     state="disabled")
-        self.export_btn.grid(row=0, column=2, padx=(16, 0))
-        self.contribute_btn = ttk.Button(bf, text="Contribute my results…",
-                                        command=self._contribute, state="disabled")
-        self.contribute_btn.grid(row=0, column=3, padx=(6, 0))
-        Tooltip(self.contribute_btn,
-                "Share this card's benchmark with other users: opens a pre-filled GitHub "
-                "issue (uses your browser's GitHub login, no setup). Local results always "
-                "win over anything you later download.")
         # "Report an issue" link (mirrors the main window's bottom-bar link), but it
         # points reporters at logs/video_benchmark.log -- the benchmark's own diagnostics,
         # far more useful here than the newest crash log the main-window link suggests.
@@ -430,6 +417,34 @@ class BenchmarkWindow(tk.Toplevel):
         issue.bind("<Leave>", lambda _e: issue.configure(fg="#3a86ff"))
         self.close_btn = ttk.Button(bf, text="Close", command=self._close)
         self.close_btn.grid(row=0, column=5)
+
+        # Benchmark sharing (feature #8), second row. GET the crowdsourced corpus (Download the
+        # curated master from GitHub, or Import a file), and GIVE this card's results (Export a
+        # CSV / Contribute via a pre-filled GitHub issue). Local results ALWAYS win over anything
+        # downloaded. Download/Import need no detected GPU (they populate the cache for any card),
+        # so they start enabled; Export/Contribute wait for the card. All are gated during a run.
+        share = ttk.Frame(bf)
+        share.grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        self.download_btn = ttk.Button(share, text="Download community…",
+                                       command=self._download)
+        self.download_btn.grid(row=0, column=0)
+        Tooltip(self.download_btn,
+                "Download the community benchmark corpus from GitHub and merge it in. Your own "
+                "measured results are never overwritten; downloaded rows are advisory.")
+        self.import_btn = ttk.Button(share, text="Import file…", command=self._import_file)
+        self.import_btn.grid(row=0, column=1, padx=(6, 0))
+        Tooltip(self.import_btn, "Import benchmark results from a CSV file on disk.")
+        ttk.Separator(share, orient="vertical").grid(row=0, column=2, sticky="ns", padx=12)
+        self.export_btn = ttk.Button(share, text="Export…", command=self._export,
+                                     state="disabled")
+        self.export_btn.grid(row=0, column=3)
+        self.contribute_btn = ttk.Button(share, text="Contribute my results…",
+                                        command=self._contribute, state="disabled")
+        self.contribute_btn.grid(row=0, column=4, padx=(6, 0))
+        Tooltip(self.contribute_btn,
+                "Share this card's benchmark with other users: opens a pre-filled GitHub "
+                "issue (uses your browser's GitHub login, no setup). Local results always "
+                "win over anything you later download.")
 
     def _track_geometry(self, _e=None):
         if self.app is not None and self.state() == "normal":
@@ -826,6 +841,8 @@ class BenchmarkWindow(tk.Toplevel):
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.close_btn.configure(state="disabled")
+        self.download_btn.configure(state="disabled")  # no cache mutation mid-sweep
+        self.import_btn.configure(state="disabled")
         for w in self._toggles:                        # the plan is fixed for the run
             w.configure(state="disabled")
         # The "X GB already in use" warning is a pre-start hint; once a sweep is running that
@@ -1048,6 +1065,81 @@ class BenchmarkWindow(tk.Toplevel):
                 f"{path}\n\nYou can attach that file to a GitHub issue manually.",
                 parent=self)
 
+    # ── import side (feature #8): download the community corpus / import a file ──
+
+    def _download(self):
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "Download the community benchmark corpus from GitHub and merge it into your "
+                "results?\n\nYour own measured results are never overwritten. Downloaded rows "
+                "are advisory (the batch sizer's OOM back-off corrects any that don't fit).",
+                parent=self):
+            return
+        self.download_btn.configure(state="disabled")
+        self.import_btn.configure(state="disabled")
+        self.status_var.set("Downloading community benchmarks …")
+
+        def work():
+            try:
+                imp, skp = vb.import_community(conn=self.conn)
+                err = None
+            except Exception as exc:                    # noqa: BLE001 (fail-safe)
+                imp = skp = 0
+                err = exc
+            self.after(0, lambda: self._download_done(imp, skp, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _download_done(self, imp, skp, err):
+        self.download_btn.configure(state="normal")
+        self.import_btn.configure(state="normal")
+        if err is not None:
+            messagebox.showerror(
+                APP_TITLE, f"Could not download the community benchmarks:\n{err}", parent=self)
+            self.status_var.set("Download failed.")
+            return
+        self._after_import(
+            imp, skp, source="the community corpus",
+            empty_note="No community benchmarks were available (or the download failed). "
+                       "Nothing was changed.")
+
+    def _import_file(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Import benchmark results",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            imp, skp = vb.import_share_csv(path, self.conn)
+        except Exception as exc:                        # noqa: BLE001 (fail-safe)
+            messagebox.showerror(APP_TITLE, f"Could not import the CSV:\n{exc}", parent=self)
+            return
+        self._after_import(
+            imp, skp, source=os.path.basename(path),
+            empty_note="No usable benchmark rows were found in that file. Nothing was changed.")
+
+    def _after_import(self, imp, skp, *, source, empty_note):
+        """Report an import's counts and refresh the results view for the current card."""
+        if imp == 0 and skp == 0:
+            messagebox.showinfo(APP_TITLE, empty_note, parent=self)
+            self.status_var.set("Nothing imported.")
+            return
+        # New rows may cover the currently-shown card: rebuild its table + filters + estimate.
+        if getattr(self, "gpu_id", None):
+            try:
+                self._load_prior()
+                self._populate_bench_filters()
+                self._apply_feasibility()
+                self._refresh_estimate()
+            except Exception:                           # noqa: BLE001 (a refresh miss is cosmetic)
+                pass
+        skip_note = (f"\n\n{skp} cell(s) were left unchanged because you already have local "
+                     "measurements for them (local always wins).") if skp else ""
+        self.status_var.set(f"Imported {imp} benchmark cell(s) from {source}."
+                            + (f" {skp} kept local." if skp else ""))
+        messagebox.showinfo(
+            APP_TITLE, f"Imported {imp} benchmark cell(s) from {source}.{skip_note}", parent=self)
+
     # ── subprocess pump (compact @@TBX@@ parser, mirrors tab_video) ───────────
 
     def _pump(self):
@@ -1183,6 +1275,8 @@ class BenchmarkWindow(tk.Toplevel):
         self.stop_btn.configure(state="disabled")
         self.close_btn.configure(state="normal")
         self.start_btn.configure(state="normal")
+        self.download_btn.configure(state="normal")
+        self.import_btn.configure(state="normal")
         for w in self._toggles:
             w.configure(state="normal")
         # The pod is torn down when a remote sweep ends: hide its telemetry row and zero the

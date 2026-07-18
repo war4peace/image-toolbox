@@ -303,3 +303,103 @@ def test_merge_master_is_sorted_deterministically(tmp_path):
     out = bs.read_csv(master)
     ordered = [(r["gpu_id"], int(r["out_w"])) for r in out]
     assert ordered == sorted(ordered)               # gpu_id then out_w ascending
+
+
+# ── download side: fetch_community (mocked network) ──────────────────────────
+
+def test_fetch_community_parses_and_caches(tmp_path, monkeypatch):
+    import io
+    import urllib.request
+    csv_text = bs.to_text([_row()])
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(csv_text.encode("utf-8")))
+    dest = str(tmp_path / "cached.csv")
+    rows = bs.fetch_community(dest=dest)
+    assert len(rows) == 1 and rows[0]["gpu_id"] == "RTX 3090"
+    assert bs.read_csv(dest)                          # the raw text was cached to disk
+
+
+def test_fetch_community_failsafe_on_error(monkeypatch):
+    import urllib.request
+
+    def boom(*a, **k):
+        raise OSError("network down")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert bs.fetch_community() == []                 # never raises, empty on failure
+
+
+# ── download side: import into the cache (video_bench + learned + precedence) ─
+
+def _import_row(**over):
+    base = {"gpu_id": "RTX 3090", "run_on": "local", "model": "7b", "compile": "OFF",
+            "tile": "off", "target": "1080p", "out_w": 1920, "out_h": 1080,
+            "max_batch": "13", "used_batch": "9", "overlap": "6", "spf": "1.2",
+            "peak_vram": "18.7", "free_vram": "22", "price_usd_hr": "", "source": "local",
+            "date": "2026-07-18"}
+    base.update(over)
+    return base
+
+
+@pytest.mark.parametrize("base,compile_on,tile,expect", [
+    ("7b", False, "off", "7b"),
+    ("7b", True, "off", "7b|c"),
+    ("7b", True, "d1024", "7b|td1024|c"),
+    ("3b_fp16", False, "e1024_d512", "3b_fp16|te1024_d512"),
+])
+def test_compose_bench_model(base, compile_on, tile, expect):
+    assert vb._compose_bench_model(base, compile_on, tile) == expect
+
+
+def test_compose_decompose_roundtrip():
+    for key in ("7b", "7b|c", "7b|td1024|c", "3b", "3b_fp16|te1024_d512"):
+        b, con, tile = vb._decompose_bench_model(key)
+        assert vb._compose_bench_model(b, con, tile) == key   # compose uses '|c' (never '|cd')
+
+
+def test_import_rows_writes_bench_and_learned(db_conn):
+    import video_vram_sizer as sizer
+    imp, skp = vb.import_rows([_import_row()], db_conn)
+    assert (imp, skp) == (1, 0)
+    batches = {r["batch"]: r for r in db.get_bench_probes(db_conn, "RTX 3090", "7b")}
+    assert set(batches) == {9, 13}                    # used + ceiling probes
+    assert batches[9]["seconds"] and batches[9]["frames"] == 9   # timing on the used probe
+    assert batches[13]["seconds"] is None                        # ceiling has no timing
+    assert db_conn.execute("SELECT DISTINCT source FROM video_bench").fetchone()[0] == "imported"
+    got = db.get_learned_batch_ge(db_conn, "RTX 3090|7b", sizer.mp_bucket(1920 * 1080 / 1e6))
+    assert got == 9                                   # learned batch seeded at the used batch
+
+
+def test_import_compiled_row_key_has_compile_tag(db_conn):
+    vb.import_rows([_import_row(compile="ON")], db_conn)
+    assert db.bench_models(db_conn, "RTX 3090") == ["7b|c"]
+
+
+def test_import_local_precedence_skips_measured_cell(db_conn):
+    db.record_bench_probe(db_conn, "RTX 3090", "7b", 1920, 1080, 9, "ok",
+                          frames=9, seconds=30.0, peak_alloc=20.0)     # user's own measurement
+    imp, skp = vb.import_rows([_import_row(max_batch="13", used_batch="13")], db_conn)
+    assert (imp, skp) == (0, 1)
+    rows = db.get_bench_probes(db_conn, "RTX 3090", "7b")
+    assert [r["batch"] for r in rows] == [9]         # untouched
+    assert db_conn.execute("SELECT source FROM video_bench").fetchone()[0] == "local"
+
+
+def test_reimport_replaces_stale_imported_probes(db_conn):
+    vb.import_rows([_import_row(used_batch="9", max_batch="13")], db_conn)
+    imp, skp = vb.import_rows([_import_row(used_batch="11", max_batch="17")], db_conn)
+    assert (imp, skp) == (1, 0)
+    assert {r["batch"] for r in db.get_bench_probes(db_conn, "RTX 3090", "7b")} == {11, 17}
+
+
+def test_import_share_csv_from_disk(tmp_path, db_conn):
+    p = str(tmp_path / "share.csv")
+    bs.write_csv(p, [_import_row(), _import_row(target="4K", out_w=3840, out_h=2160,
+                                               max_batch="5", used_batch="5")])
+    imp, skp = vb.import_share_csv(p, db_conn)
+    assert (imp, skp) == (2, 0)
+    assert len(db.bench_gpu_ids(db_conn)) == 1

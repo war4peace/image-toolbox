@@ -430,6 +430,12 @@ def _ensure_video_columns(conn):
         for _c in ("peak_alloc_steady", "peak_reserved_steady"):
             if cols and _c not in cols:
                 conn.execute(f"ALTER TABLE video_bench ADD COLUMN {_c} REAL")
+        # #8 benchmark sharing: data provenance drives import local-precedence. Existing rows
+        # were all measured on THIS machine, so 'local' is the correct default (an import can
+        # never clobber them); a downloaded row is tagged 'imported' by import_bench_rows.
+        if cols and "source" not in cols:
+            conn.execute("ALTER TABLE video_bench "
+                         "ADD COLUMN source TEXT NOT NULL DEFAULT 'local'")
     except Exception as exc:
         debug_log("db._ensure_video_columns(video_bench)", exc=exc)
 
@@ -561,12 +567,14 @@ def get_learned_batch_ge(conn, gpu_id, mp_key, max_age_days=90):
 
 
 @_locked
-def put_learned_batch(conn, gpu_id, mp_key, batch):
+def put_learned_batch(conn, gpu_id, mp_key, batch, updated_at=None):
     """Record the converged safe batch for (gpu_id, output-MP key). Overwrites any prior value
-    (the newest measurement wins, so a driver/code change self-corrects). Commits."""
+    (the newest measurement wins, so a driver/code change self-corrects). `updated_at` lets an
+    IMPORT stamp the shared benchmark's own date (so staleness stays honest) instead of now.
+    Commits."""
     if not gpu_id or mp_key is None or not batch or batch <= 0:
         return
-    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    now = updated_at or datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     conn.execute(
         "INSERT INTO video_batch_learn (gpu_id, mp_key, batch, updated_at) "
         "VALUES (?, ?, ?, ?) ON CONFLICT(gpu_id, mp_key) DO UPDATE SET "
@@ -601,16 +609,17 @@ def record_bench_probe(conn, gpu_id, model, out_w, out_h, batch, outcome,
     conn.execute(
         "INSERT INTO video_bench (gpu_id, model, out_w, out_h, batch, outcome, frames, "
         "seconds, peak_alloc, peak_reserved, free_vram, peak_alloc_steady, "
-        "peak_reserved_steady, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "peak_reserved_steady, updated_at, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(gpu_id, model, out_w, out_h, batch) DO UPDATE SET "
         "outcome=excluded.outcome, frames=excluded.frames, seconds=excluded.seconds, "
         "peak_alloc=excluded.peak_alloc, peak_reserved=excluded.peak_reserved, "
         "free_vram=excluded.free_vram, peak_alloc_steady=excluded.peak_alloc_steady, "
-        "peak_reserved_steady=excluded.peak_reserved_steady, updated_at=excluded.updated_at",
+        "peak_reserved_steady=excluded.peak_reserved_steady, updated_at=excluded.updated_at, "
+        "source=excluded.source",
         (gpu_id, model, int(out_w), int(out_h), int(batch), str(outcome),
          (int(frames) if frames is not None else None),
          _f(seconds), _f(peak_alloc), _f(peak_reserved), _f(free_vram),
-         _f(peak_alloc_steady), _f(peak_reserved_steady), now))
+         _f(peak_alloc_steady), _f(peak_reserved_steady), now, "local"))
     conn.commit()
 
 
@@ -649,6 +658,103 @@ def bench_models(conn, gpu_id):
         return []
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT model FROM video_bench WHERE gpu_id=?", (gpu_id,))]
+
+
+def _to_float(x):
+    try:
+        return float(x) if x not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _mp_bucket(mp):
+    """int output-MP key, matching video_vram_sizer.mp_bucket (MP_KEY_UNIT grid)."""
+    return int(round(max(0.0, float(mp or 0)) / MP_KEY_UNIT))
+
+
+def _import_probe(conn, gpu, model, ow, oh, batch, *, frames, seconds, peak_alloc, free_vram, ts):
+    """Write ONE synthetic 'ok' probe (source='imported') for the importer. No commit / no lock:
+    the caller (import_bench_rows) holds both. The cell is guaranteed free of a local row."""
+    conn.execute(
+        "INSERT INTO video_bench (gpu_id, model, out_w, out_h, batch, outcome, frames, "
+        "seconds, peak_alloc, free_vram, updated_at, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(gpu_id, model, out_w, out_h, batch) DO UPDATE SET "
+        "outcome=excluded.outcome, frames=excluded.frames, seconds=excluded.seconds, "
+        "peak_alloc=excluded.peak_alloc, free_vram=excluded.free_vram, "
+        "updated_at=excluded.updated_at, source=excluded.source",
+        (gpu, model, int(ow), int(oh), int(batch), "ok",
+         (int(frames) if frames else None), _to_float(seconds),
+         _to_float(peak_alloc), _to_float(free_vram), ts, "imported"))
+
+
+def _local_bucket_taken(conn, gpu, model, mp_key):
+    """True if this card+regime has a source='local' probe in the SAME MP bucket as `mp_key`.
+    The learned-batch key is coarser (per MP bucket) than a video_bench cell, so this guards a
+    locally-learned value from being overwritten by an imported cell that maps to its bucket."""
+    for w, h in conn.execute(
+            "SELECT out_w, out_h FROM video_bench "
+            "WHERE gpu_id=? AND model=? AND source='local'", (gpu, model)):
+        if _mp_bucket((w * h) / 1_000_000.0) == mp_key:
+            return True
+    return False
+
+
+@_locked
+def import_bench_rows(conn, rows):
+    """Import curated community benchmark SUMMARY rows (#8, bench_share) into video_bench +
+    video_batch_learn, with LOCAL PRECEDENCE: a cell (gpu_id, model, out_w, out_h) the user has
+    already measured locally (source='local') is left completely untouched, so a download can
+    never clobber measured ground truth. Imported rows are tagged source='imported' and stay
+    ADVISORY (the sizer's OOM back-off self-corrects a slightly-wrong ceiling on the first run).
+
+    Each `row` is a RESOLVED dict (the caller reconstructs the regime-tagged `model`, the
+    sizer's `learn_key` and `mp_key` from the CSV's model+compile+tile): gpu_id, model, out_w,
+    out_h, max_batch, used_batch, spf, peak_vram, free_vram, date, learn_key, mp_key. Two
+    synthetic 'ok' probes are seeded per cell (the used batch, carrying the timing so the
+    report + throughput-optimal reproduce the shared numbers, and the ceiling), plus the sizer's
+    learned batch unless a local probe already owns that MP bucket. gpu_perf (the estimate rate)
+    is deliberately NOT seeded: it is an accumulating store and the estimator already falls back
+    to the author rate table for an unmeasured card. Returns (imported, skipped). Best-effort
+    per row; commits once."""
+    imported = skipped = 0
+    for r in rows:
+        try:
+            gpu = (r.get("gpu_id") or "").strip()
+            model = (r.get("model") or "").strip()
+            ow = int(r["out_w"]); oh = int(r["out_h"])
+            ceiling = int(r["max_batch"])
+            used = int(r.get("used_batch") or ceiling)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not gpu or not model or ow <= 0 or oh <= 0 or ceiling <= 0 or used <= 0:
+            continue
+        if conn.execute(
+                "SELECT 1 FROM video_bench WHERE gpu_id=? AND model=? AND out_w=? AND out_h=? "
+                "AND source='local' LIMIT 1", (gpu, model, ow, oh)).fetchone():
+            skipped += 1                                  # local ground truth: never clobber
+            continue
+        # No local row owns this cell, so any existing rows here are imported: clear them so a
+        # refreshed download that changed the numbers doesn't leave stale probes behind.
+        conn.execute("DELETE FROM video_bench WHERE gpu_id=? AND model=? AND out_w=? AND out_h=? "
+                     "AND source='imported'", (gpu, model, ow, oh))
+        date = (r.get("date") or "")[:10]
+        ts = (date + "T00:00:00") if date else \
+            datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        spf = _to_float(r.get("spf"))
+        peak = _to_float(r.get("peak_vram"))
+        free = _to_float(r.get("free_vram"))
+        _import_probe(conn, gpu, model, ow, oh, used, frames=used,
+                      seconds=(spf * used if (spf and used) else None),
+                      peak_alloc=peak, free_vram=free, ts=ts)
+        if ceiling != used:
+            _import_probe(conn, gpu, model, ow, oh, ceiling, frames=None, seconds=None,
+                          peak_alloc=peak, free_vram=free, ts=ts)
+        lk, mpk = r.get("learn_key"), r.get("mp_key")
+        if lk and mpk is not None and not _local_bucket_taken(conn, gpu, model, int(mpk)):
+            put_learned_batch(conn, lk, int(mpk), used, updated_at=ts)
+        imported += 1
+    conn.commit()
+    return imported, skipped
 
 
 @_locked

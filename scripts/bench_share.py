@@ -104,6 +104,41 @@ def read_csv(path):
         return []
 
 
+# The curated community master lives IN the repo and is served raw + anonymously (no auth, no
+# API), the same GitHub host updater.py already fetches from. `main` is the default branch.
+COMMUNITY_URL = ("https://raw.githubusercontent.com/war4peace/image-toolbox/"
+                 "main/docs/video-benchmarks.csv")
+
+
+def fetch_community(url=None, dest=None, timeout=20):
+    """Download the curated community benchmark CSV (anonymous GET over the certifi trust
+    context, the path updater.py uses) and return its parsed rows. When `dest` is given the
+    raw text is also cached there, so a fresh install keeps the corpus offline. The download
+    is UNTRUSTED: `_parse` already skips malformed rows, and this returns [] on ANY error
+    (network down, 404, decode failure), never raising into the GUI."""
+    import io
+    import urllib.request
+    try:
+        from net_ssl import ssl_context
+        ctx = ssl_context()
+    except Exception:                                    # noqa: BLE001 (fail-safe: default TLS)
+        ctx = None
+    try:
+        req = urllib.request.Request(url or COMMUNITY_URL,
+                                     headers={"User-Agent": "ImageToolbox-BenchShare"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            text = resp.read().decode("utf-8-sig", "replace")
+    except Exception:                                    # noqa: BLE001 (fail-safe)
+        return []
+    if dest:
+        try:
+            with open(dest, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+    return _parse(io.StringIO(text))
+
+
 def _parse(fh):
     # Drop the sentinel + any leading comment lines before the header, so csv.DictReader
     # sees the real header first.
