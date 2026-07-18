@@ -72,11 +72,14 @@ class BenchmarkWindow(tk.Toplevel):
         geo = self.app.settings.get("benchmark_geometry") if self.app is not None else None
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "900x560")
         self.minsize(900, 480)                             # match the main window's min width
-        # NOT transient(master): while the benchmark is up we MINIMIZE the main window (see
+        # NOT transient(master): while the benchmark is up we fully HIDE the main window (see
         # _hide_master / _restore_master) so a non-technical user can't reach the tabs behind
         # it and start a conflicting GPU job. A transient child is auto-hidden when its master
-        # is iconified, which would hide the benchmark itself, so it must be independent.
+        # is hidden, which would hide the benchmark itself, so it must be independent. The window
+        # keeps its OWN taskbar button (it is non-transient + never iconified at open), so the app
+        # still shows in the taskbar while the main window is withdrawn.
         self._master_win = master
+        self._closing = False               # set once the master is deliberately restored
 
         self.proc = None
         self.console = ConsoleBuffer()
@@ -99,32 +102,53 @@ class BenchmarkWindow(tk.Toplevel):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Configure>", self._track_geometry, add="+")
+        # Safety net: restore the main window no matter HOW this one goes away (a normal close
+        # runs _close first; this catches any other teardown so the app can't be left running
+        # with its only window hidden). Guarded to this widget (Destroy bubbles from children).
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.deiconify()                    # reveal now that it's fully built (no flash)
         # No modal grab_set(): an application grab makes Windows swallow the title-bar MINIMIZE
         # and MAXIMIZE system commands (SC_MINIMIZE/SC_MAXIMIZE), so a long remote sweep (hours)
         # could not be minimized out of the way -- only edge-drag resizing still worked. The grab
         # was only a belt-and-suspenders guard against a second benchmark window (already blocked
         # by the tab's _benchmark_win reuse guard) and a conflicting local GPU job (already
-        # blocked by _hide_master iconifying the main window + the Benchmark button's
+        # blocked by _hide_master hiding the main window + the Benchmark button's
         # local_gpu_job_running() backstop), so dropping it costs no real protection.
         self.after(80, self._detect_gpu)
         self._hide_master()
 
     def _hide_master(self):
-        """Minimize the main app window for the benchmark's lifetime (restored in _close)."""
+        """Fully hide (withdraw) the main app window for the benchmark's lifetime, restored in
+        _restore_master. This window is not a real modal (grab was dropped in 0.5.0 so a long
+        sweep can be minimized, see __init__); its 'modal' guarantee is that the main window is
+        out of reach so no conflicting GPU job can be started behind it. Withdraw, not iconify:
+        a merely-minimized root gets RESTORED by Windows to service a mid-session dialog (a
+        messagebox, a filedialog, the card picker's grab) and then sits there reachable once the
+        dialog closes; a withdrawn window is not remapped for a dialog parented elsewhere, so the
+        whole problem goes away."""
         try:
             if self._master_win is not None and self._master_win.winfo_exists():
-                self._master_win.iconify()
+                self._master_win.withdraw()
         except Exception:                              # noqa: BLE001
             pass
 
     def _restore_master(self):
+        if self._closing:
+            return                                     # idempotent: _close + <Destroy> both call
+        self._closing = True
         try:
             if self._master_win is not None and self._master_win.winfo_exists():
                 self._master_win.deiconify()
                 self._master_win.lift()
         except Exception:                              # noqa: BLE001
             pass
+
+    def _on_destroy(self, event):
+        # Any teardown path (not just the normal _close) must bring the main window back, or the
+        # app is left running with no visible window. Guard to THIS widget: <Destroy> bubbles up
+        # from every child widget as they are torn down.
+        if event.widget is self:
+            self._restore_master()
 
     # ── layout ───────────────────────────────────────────────────────────────
 
