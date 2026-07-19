@@ -54,21 +54,28 @@ proven (real submissions sent + curated). Shipped:
   numbers match the UI), `export_share_csv`, `infer_run_on`, and the
   `--export-csv` headless flag; the remote-compile-OFF exclusion.
 - The Benchmark GPU window's **Export…** and **Contribute my results…** buttons,
-  the card picker over `db.bench_gpu_ids` (hides cards with zero contributable
-  rows, shows each card's row count), and `gui.common.contribute_benchmark` (the
-  browser-delegated pre-filled GitHub issue, inline-CSV or attach fallback).
+  a **MULTI-select** card picker over `db.bench_gpu_ids` (hides cards with zero
+  contributable rows, shows each card's row count, pre-selects ALL so several GPUs
+  go into ONE submission), and `gui.common.contribute_benchmark` (the
+  browser-delegated pre-filled GitHub issue, inline-CSV or attach fallback). One
+  submission can carry many cards (the CSV keys each row by `gpu_id`), removing the
+  one-issue-per-GPU friction.
 - The **maintainer merge tool** `bench_share.py --merge` (dedupe + sanity gate +
   curated-master export). See "Maintainer merge tool" at the end of this section.
-- **Download half:** the `source` column migration on `video_bench`
-  (`_ensure_video_columns`, existing rows default `'local'`; `record_bench_probe`
-  now stamps `'local'`), `db.import_bench_rows` (local-precedence, writes synthetic
-  `ok` probes + the sizer's learned batch, tagged `'imported'`),
+- **Download half (now fully automatic):** the `source` column migration on
+  `video_bench` (`_ensure_video_columns`, existing rows default `'local'`;
+  `record_bench_probe` now stamps `'local'`), `db.import_bench_rows` (local-precedence,
+  writes synthetic `ok` probes + the sizer's learned batch, tagged `'imported'`),
   `bench_share.fetch_community` (anonymous GitHub GET via `net_ssl`),
   `video_benchmark.import_rows` / `import_share_csv` / `import_community` (reconstruct
-  the regime-tagged `model` + learned key from the CSV's model+compile+tile), the
-  `--import-csv PATH|community` headless flag, the Benchmark window's **Download
-  community…** and **Import file…** buttons, the seeded `docs/video-benchmarks.csv`
-  + its installer `[Files]` line.
+  the regime-tagged `model` + learned key from the CSV's model+compile+tile), and the
+  `--import-csv PATH|community` headless flag. Refresh is **automatic**:
+  `video_benchmark.auto_update` (community pull, shipped-CSV fallback when offline) runs
+  in the background at every launch (`App._startup_bench_sync`), silently and fail-safe,
+  so the local set is always current with no button and no prompt. There are therefore
+  **no Download/Import buttons** (an early design had them; auto-refresh made them
+  redundant). The seeded `docs/video-benchmarks.csv` + its installer `[Files]` line
+  provide the offline seed.
 
 **Import scope (deliberate):** import seeds `video_bench` (so the window shows the
 card as characterised and `max_feasible_output_mp` benefits) AND `video_batch_learn`
@@ -98,26 +105,50 @@ infrastructure this avoids. Reading public data needs no account; writing always
 needs auth as *some* account, so the write path is delegated to the browser where
 the user is already signed in, instead of teaching the app to authenticate.)
 
-- **What it is (four entry points on `gui/video_benchmark.py`):**
-  - **Download community benchmarks** — anonymous GET of a curated
-    `docs/video-benchmarks.csv` from `raw.githubusercontent.com/<repo>/main/...`
-    (via `net_ssl.ssl_context()`), parsed and imported. The file also ships in the
-    installer to `{app}/docs` (a `[Files]` line next to the existing
-    `Benchmarks.csv` one), so a fresh install has the corpus offline and the
-    download just refreshes it.
-  - **Contribute my results… / Export…** — a **card picker** (`db.bench_gpu_ids`)
-    lists EVERY card with benchmark data on disk, not just the one the window opened
-    on, so an out-of-stock remote card's past results are still contributable (the
-    window can only *open* on an in-stock pick; the data is keyed by card in
-    `video_bench` regardless). The picker is skipped when only one card exists, and
-    defaults to the window's card; it shows each card's contributable row count.
-    Contribute exports the chosen card's rows to a CSV on disk, then opens the
+- **What it is (entry points on `gui/video_benchmark.py`):**
+  - **Automatic community refresh (no button):** at every launch,
+    `App._startup_bench_sync` runs `video_benchmark.auto_update` on a background
+    thread: an anonymous GET of the curated `docs/video-benchmarks.csv` from
+    `raw.githubusercontent.com/<repo>/main/...` (via `net_ssl.ssl_context()`), parsed
+    and imported, with a fall-back to the shipped `{app}/docs/video-benchmarks.csv`
+    when offline (a `[Files]` line ships it next to `Benchmarks.csv`, so a fresh
+    install has the corpus offline). Silent (no "data updated" prompt) and fail-safe;
+    local measurements always take precedence. This replaced the original
+    **Download community…** / **Import file…** buttons: since the refresh is automatic
+    a user never has to think about it, so the buttons were removed. The
+    `--import-csv PATH|community` headless flag remains for manual/scripted import.
+  - **Contribute my results… / Export…**: a **MULTI-select card picker**
+    (`db.bench_gpu_ids`) lists EVERY card with benchmark data on disk, not just the one
+    the window opened on, so an out-of-stock remote card's past results are still
+    contributable (the window can only *open* on an in-stock pick; the data is keyed by
+    card in `video_bench` regardless). It is skipped when only one card has
+    contributable rows; otherwise it pre-selects ALL cards (with Select all / Clear
+    helpers) so submitting several GPUs is one click, and shows each card's row count.
+    Contribute writes the selected cards' combined rows to a CSV on disk, then opens the
     browser at a **pre-filled GitHub new-issue** form
     (`.../issues/new?labels=benchmark&title=...&body=...`). The user reviews and
     submits with their own account. If the CSV is small enough for the URL cap
     (~8 KB), it is inlined in the issue body as a fenced block (near one click);
     otherwise the body says "benchmark written to `<path>`, drag it into this issue"
-    (a URL cannot pre-attach a file).
+    (a URL cannot pre-attach a file). ONE issue can carry MANY cards (each row is
+    keyed by `gpu_id`), removing the old one-issue-per-GPU friction.
+  - **Contribute submits only YOUR data, and only what's NEW.** Two filters keep a
+    user from re-posting the same rows day after day (submission happens in the browser,
+    so the app can't confirm an issue was actually created):
+    - *Only measured cells.* `build_share_rows` filters probes to `source='local'` (a
+      local GPU run OR the user's own rented-pod sweep both record `'local'`), so the
+      community data pulled in by the startup auto-refresh (`source='imported'`) is never
+      contributed back as if it were the user's. A card with only imported cells offers
+      nothing and is hidden from the picker.
+    - *Only rows not already published.* Contribute fetches the live community master
+      and drops every candidate row whose measurement identity is already there
+      (`bench_share.new_rows`, keyed on the measurement columns, ignoring the volatile
+      date / price / free_vram). So partially benchmarking a card, submitting, then
+      benchmarking the rest and submitting again sends only the second batch's rows. A
+      re-measured cell with a DIFFERENT ceiling/spf counts as new and is kept. If nothing
+      is new the user is told so and no issue opens. A residual duplicate window remains
+      (manual curation lags between submit and merge), which the maintainer `--merge`
+      dedups; the fetch is fail-safe (offline -> submit everything, merge still dedups).
   - **Remote is compile-ON only.** `build_share_rows` DROPS compile-OFF regimes for a
     `run_on=remote` card: a rented pod always runs `torch.compile` on, so its OFF
     rows are not representative (and old remote `7b` rows are mislabelled compile
@@ -135,8 +166,10 @@ the user is already signed in, instead of teaching the app to authenticate.)
     committed, so a submission's added rows are reviewable as a git text diff. This
     sanity-check step is the **moderation gate** that keeps one over-optimistic
     ceiling from poisoning every user's estimator.
-  - **Export… / Import file…** — the local-file path as a secondary offline option
-    (save a CSV, load a CSV), reusing the same serializer/importer.
+  - **Export…** — the local-file path as a secondary offline option (save a CSV to
+    disk), reusing the same serializer. (An **Import file…** button existed briefly;
+    with the automatic startup refresh it was redundant, so the manual import path is
+    now the `--import-csv` headless flag only.)
 - **Why:** a per-card sweep is slow and, on a pod, costs money; a shared corpus
   means a card someone has already characterised is not re-measured on every
   machine. It also seeds the estimator (`video_estimate.recommend_gpus`) for cards
@@ -211,12 +244,13 @@ the user is already signed in, instead of teaching the app to authenticate.)
   `read_csv` / `fetch_community`, plus the maintainer-side `--merge` that dedupes +
   sanity-checks submissions into the curated master CSV).
 - **Work needed:** DONE (feature complete, experimental): the serializer,
-  `build_share_rows` + `--export-csv`, the Export/Contribute buttons + card picker,
+  `build_share_rows` + `--export-csv`, the Export button + MULTI-select card picker,
   `contribute_benchmark`, the maintainer `--merge`, and the whole download half
-  (`fetch_community`, `import_bench_rows` + the `source` migration, the
-  Download/Import buttons, `--import-csv`, the seeded master + its installer line).
-  Possible follow-on: seed `gpu_perf` from imports so shared TIME estimates apply
-  to unmeasured cards (see "Import scope" above).
+  (`fetch_community`, `import_bench_rows` + the `source` migration, `--import-csv`,
+  the seeded master + its installer line) wired to run **automatically at startup**
+  (`auto_update` / `App._startup_bench_sync`) rather than behind buttons. Possible
+  follow-on: seed `gpu_perf` from imports so shared TIME estimates apply to unmeasured
+  cards (see "Import scope" above).
 - **Risks:** low. Fail-safe on a malformed CSV or a failed download (skip bad
   rows, return None, never raise into the GUI); local precedence protects measured
   data; it only writes cache rows the user can re-measure.

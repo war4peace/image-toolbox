@@ -403,3 +403,72 @@ def test_import_share_csv_from_disk(tmp_path, db_conn):
     imp, skp = vb.import_share_csv(p, db_conn)
     assert (imp, skp) == (2, 0)
     assert len(db.bench_gpu_ids(db_conn)) == 1
+
+
+# ── startup auto-update (community first, shipped-CSV fallback offline) ───────
+
+def test_auto_update_prefers_community(db_conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(bs, "fetch_community", lambda **k: [_import_row()])   # network up
+    local = str(tmp_path / "local.csv")
+    bs.write_csv(local, [_import_row(target="4K", out_w=3840, out_h=2160)])   # a DIFFERENT cell
+    imp, skp, src = vb.auto_update(conn=db_conn, local_csv=local)
+    assert src == "community" and imp == 1
+    # Only the community cell (1080p) landed; the local file was not consulted.
+    assert {r["out_w"] for r in db.get_bench_probes(db_conn, "RTX 3090", "7b")} == {1920}
+
+
+def test_auto_update_falls_back_to_local_when_offline(db_conn, monkeypatch, tmp_path):
+    monkeypatch.setattr(bs, "fetch_community", lambda **k: [])                # offline / failed
+    local = str(tmp_path / "local.csv")
+    bs.write_csv(local, [_import_row()])
+    imp, skp, src = vb.auto_update(conn=db_conn, local_csv=local)
+    assert src == "local" and imp == 1
+
+
+def test_auto_update_none_when_nothing_available(db_conn, monkeypatch):
+    monkeypatch.setattr(bs, "fetch_community", lambda **k: [])
+    assert vb.auto_update(conn=db_conn, local_csv=None) == (0, 0, "none")
+
+
+# ── contribution dedup against the published corpus (new_rows) ────────────────
+
+def test_new_rows_drops_identical_keeps_new():
+    existing = [_row(target="1080p")]
+    same = _row(target="1080p")
+    fresh = _row(target="4K", out_w=3840, out_h=2160, max_batch=5, used_batch=5)
+    assert bs.new_rows([same, fresh], existing) == [fresh]
+
+
+def test_new_rows_ignores_volatile_fields():
+    # Same measurement, different date / price / free_vram: recognised as already present.
+    existing = [_row(price_usd_hr=1.39, date="2026-07-18", free_vram=80.0)]
+    cand = [_row(price_usd_hr=2.50, date="2026-07-19", free_vram=60.0)]
+    assert bs.new_rows(cand, existing) == []
+
+
+def test_new_rows_keeps_changed_measurement():
+    # A re-measured cell with a different ceiling is genuinely new data, so it is kept.
+    assert bs.new_rows([_row(max_batch=17)], [_row(max_batch=13)]) == [_row(max_batch=17)]
+
+
+def test_new_rows_empty_existing_keeps_all():
+    cand = [_row(), _row(target="4K", out_w=3840, out_h=2160)]
+    assert bs.new_rows(cand, []) == cand
+
+
+# ── build_share_rows contributes only locally-measured cells ─────────────────
+
+def test_build_share_rows_excludes_imported_cells(db_conn):
+    gpu = "RTX 3090"
+    db.record_bench_probe(db_conn, gpu, "7b", 1920, 1080, 9, "ok",
+                          frames=9, seconds=30.0, peak_alloc=20.0)          # LOCAL measurement
+    vb.import_rows([_import_row(gpu_id=gpu, target="4K", out_w=3840, out_h=2160,
+                               max_batch="5", used_batch="5")], db_conn)    # IMPORTED community cell
+    rows = vb.build_share_rows(db_conn, gpu, run_on="local")
+    assert {(int(r["out_w"]), int(r["out_h"])) for r in rows} == {(1920, 1080)}
+
+
+def test_build_share_rows_empty_for_import_only_card(db_conn):
+    vb.import_rows([_import_row(gpu_id="NVIDIA A100 80GB PCIe", run_on="remote",
+                               compile="ON")], db_conn)
+    assert vb.build_share_rows(db_conn, "NVIDIA A100 80GB PCIe", run_on="remote") == []

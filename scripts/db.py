@@ -631,7 +631,8 @@ def get_bench_probes(conn, gpu_id, model, out_w=None, out_h=None):
     if not gpu_id or not model:
         return []
     sql = ("SELECT out_w, out_h, batch, outcome, frames, seconds, peak_alloc, "
-           "peak_reserved, free_vram, updated_at FROM video_bench WHERE gpu_id=? AND model=?")
+           "peak_reserved, free_vram, updated_at, source "
+           "FROM video_bench WHERE gpu_id=? AND model=?")
     params = [gpu_id, model]
     if out_w and out_h:
         sql += " AND out_w=? AND out_h=?"

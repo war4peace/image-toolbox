@@ -139,6 +139,33 @@ def fetch_community(url=None, dest=None, timeout=20):
     return _parse(io.StringIO(text))
 
 
+# Columns that identify one MEASUREMENT, for de-duping a contribution against the published
+# corpus. Excludes the volatile / advisory fields (date, price_usd_hr, free_vram, source) and
+# the derived `target` label, so a row already in the community set is recognised even though
+# those differ run-to-run (a remote price is re-stamped daily; the target label is just a name
+# for out_w x out_h). A re-measured cell with a DIFFERENT ceiling/used/spf/peak IS new here and
+# is kept, so genuine updates still get submitted.
+_IDENTITY = ("gpu_id", "run_on", "model", "compile", "tile", "out_w", "out_h",
+             "max_batch", "used_batch", "overlap", "spf", "peak_vram")
+
+
+def _identity(row):
+    """Canonical identity tuple for a row, comparing the SAME text the CSV would carry (so an
+    int/float from build_share_rows matches the string from a parsed corpus row)."""
+    return tuple(_fmt(row.get(c)) for c in _IDENTITY)
+
+
+def new_rows(candidate, existing):
+    """The subset of `candidate` rows whose measurement identity is NOT already present in
+    `existing` (the curated community corpus). Lets a user who benchmarks a bit more each day
+    contribute only the genuinely new/changed rows instead of re-submitting the whole set every
+    time. Submitting outside the app can't be confirmed, and manual curation lags, so a small
+    duplicate window remains (the maintainer `--merge` dedups anyway); this just removes the
+    obvious noise. Order-preserving."""
+    have = {_identity(r) for r in existing}
+    return [r for r in candidate if _identity(r) not in have]
+
+
 def _parse(fh):
     # Drop the sentinel + any leading comment lines before the header, so csv.DictReader
     # sees the real header first.

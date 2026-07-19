@@ -175,6 +175,12 @@ class App(tk.Tk):
             self.after(1500, lambda: threading.Thread(
                 target=self._startup_worker, daemon=True).start())
 
+        # Benchmark corpus auto-refresh (#8): silently pull the community video-benchmark
+        # dataset from GitHub in the background so the local set is kept current with no button
+        # and no prompt. Fail-safe; local measurements always take precedence on import.
+        self.after(2000, lambda: threading.Thread(
+            target=self._startup_bench_sync, daemon=True).start())
+
         # First-start Wizard (0.4.6): one-time GPU-aware model setup. Shown just
         # after the window is up (before the 1500 ms update worker even starts, so
         # the two modal dialogs never fight for the grab on a fresh install).
@@ -612,6 +618,16 @@ class App(tk.Tk):
         if (update_auto_check_enabled() and update_available
                 and payload.version != update_skipped_version()):
             self.after(0, lambda: self.show_update_dialog(payload))
+
+    def _startup_bench_sync(self):
+        """Launch-time background task (off the UI thread): refresh the local benchmark cache
+        from the community corpus on GitHub, falling back to the shipped CSV when offline.
+        Silent and fail-safe; never touches the UI. Local results take precedence on import."""
+        try:
+            import video_benchmark as vb
+            vb.auto_update(local_csv=os.path.join(APP_ROOT, "docs", "video-benchmarks.csv"))
+        except Exception as exc:                           # noqa: BLE001 (fail-safe)
+            debug_log("App._startup_bench_sync", exc=exc)
 
     # ── MQTT (Home Assistant) ────────────────────────────────────────────────
 

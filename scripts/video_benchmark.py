@@ -418,7 +418,12 @@ def build_share_rows(conn, gpu_id, *, run_on, price_usd_hr=None):
 
     REMOTE contributions drop compile-OFF regimes: a rented pod runs torch.compile ON only,
     so its OFF rows are no longer representative (and old remote '7b' rows are mislabelled
-    compile state anyway, see sizer.compile_tag). Local keeps both modes."""
+    compile state anyway, see sizer.compile_tag). Local keeps both modes.
+
+    Only cells the user actually MEASURED are contributable: probes are filtered to
+    source='local' (a local GPU run OR the user's own rented-pod sweep both record 'local'),
+    so community data pulled in by auto_update (source='imported') is never contributed back
+    as if it were the user's own. A card with only imported cells yields no rows."""
     dims = {(w, h): name for name, (w, h, _s) in TARGETS.items()}
     rows = []
     for model_key in db.bench_models(conn, gpu_id):
@@ -427,6 +432,8 @@ def build_share_rows(conn, gpu_id, *, run_on, price_usd_hr=None):
             continue
         cells = {}
         for p in db.get_bench_probes(conn, gpu_id, model_key):
+            if p.get("source", "local") != "local":     # skip imported (community) probes
+                continue
             cells.setdefault((p["out_w"], p["out_h"]), []).append(p)
         for (w, h), cp in cells.items():
             oks = [p for p in cp if p.get("outcome") == "ok"]
@@ -536,6 +543,28 @@ def import_community(url=None, dest=None, conn=None):
     skipped); (0, 0) when the download yielded nothing."""
     import bench_share
     return import_rows(bench_share.fetch_community(url=url, dest=dest), conn)
+
+
+def auto_update(conn=None, local_csv=None):
+    """Startup auto-refresh of the benchmark cache from the community corpus (#8). Pull the
+    curated master from GitHub and import it; if the network yields nothing (offline / a failed
+    fetch), fall back to the shipped local CSV so a fresh OFFLINE install still gets the seed.
+    Silent and fail-safe by design (called from a background thread at launch): local
+    measurements always take precedence on import (db.import_bench_rows), so this can never
+    clobber a card the user measured. Returns (imported, skipped, source)."""
+    try:
+        imp, skp = import_community(conn=conn)
+        if imp or skp:
+            return imp, skp, "community"
+    except Exception:                                      # noqa: BLE001 (fail-safe)
+        pass
+    if local_csv and os.path.exists(local_csv):
+        try:
+            imp, skp = import_share_csv(local_csv, conn)
+            return imp, skp, "local"
+        except Exception:                                  # noqa: BLE001
+            pass
+    return 0, 0, "none"
 
 
 def _probe_seconds_estimate(cell, gpu_id, conn, default_spf=4.0):
