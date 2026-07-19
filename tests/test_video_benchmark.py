@@ -16,6 +16,21 @@ import video_estimate as ve
 import benchmark_clip as bclip
 
 
+@pytest.fixture(autouse=True)
+def _pin_compile_gate(monkeypatch):
+    """Make every sweep test's torch.compile mode DETERMINISTIC across machines.
+
+    run_benchmark routes the local path through bv.gate_local_compile, and the video config
+    defaults compile to ON, so on a runner WITHOUT a C compiler (e.g. CI) effective_settings
+    drops the compile-ON mode and nothing sweeps: tests that assert on the swept batches then
+    fail (empty `asked`) or, worse, pass vacuously (an empty `for probe in asked` loop). Pin
+    the gate to "available, not disabled" so compile stays at the config default everywhere;
+    the returned (False, None) does not mutate the settings. Gate-specific tests set their OWN
+    gate mock in the test body, which runs after this fixture and overrides it. Mirrors the
+    cea16e1 "pin Triton present" fix for the pod compile-gate tests."""
+    monkeypatch.setattr(vb.bv, "gate_local_compile", lambda *a, **k: (False, None))
+
+
 @pytest.fixture
 def db_conn(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_DIR", str(tmp_path / "db"))
@@ -404,13 +419,6 @@ def fake_run(db_conn, tmp_path, monkeypatch):
     import local_video_engine as lve
     monkeypatch.setattr(lve, "LocalVideoEngine", lambda *a, **k: engine)
     monkeypatch.setattr(lve, "_query_gpu_name", lambda: "FakeGPU")
-    # Pin the local compile gate so the swept mode does NOT depend on whether the machine
-    # running the tests has a C compiler. Without this, effective_settings drops the config's
-    # (compile-ON) mode on a compiler-less runner (e.g. CI), so nothing sweeps and the asserts
-    # below see an empty run. (False, None) means "compile available, not disabled" and does
-    # not mutate the settings, so compile stays at the config default everywhere. Mirrors the
-    # cea16e1 "pin Triton present" fix for the pod compile-gate tests.
-    monkeypatch.setattr(vb.bv, "gate_local_compile", lambda *a, **k: (False, None))
     # No GPU in the test: force the VRAM read to unknown so the climb starts at the base floor
     # (5) deterministically, independent of whatever card the test machine actually has.
     monkeypatch.setattr(sizer, "free_vram_gb", lambda *a, **k: (None, None))
