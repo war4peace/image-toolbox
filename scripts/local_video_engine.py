@@ -277,6 +277,7 @@ class LocalVideoEngine:
         self._seg_ctx = (None, None, 0)      # (seg_index 0-based, seg_total, frames_total)
         self._chunk_state = {"last": 0}      # last chunk index we announced (per segment)
         self._real_stdout = None             # the runner's stdout, saved before any redirect
+        self._seg_on_progress = None         # runner callback, so per-chunk lines also move the bar
 
     # ── live per-chunk progress ──────────────────────────────────────────────
 
@@ -315,6 +316,19 @@ class LocalVideoEngine:
         where = f"segment {seg_i + 1}/{seg_n}, " if (seg_i is not None and seg_n) else ""
         self._emit_progress(f"    {where}chunk {idx}/{tot}"
                             + (f" of {frames} frames" if frames else "") + " …")
+        # Also STEP THE PROGRESS BAR: the remote engine feeds real frames_processed via
+        # status polls, but a local segment runs synchronously and only reported at start
+        # and 'done', so the bar sat at 0 % then jumped. A newly-started chunk means the
+        # PREVIOUS chunks are finished, so report (idx-1)/tot of the segment as done. The
+        # 'done' event then supplies the exact final count. Fail-safe (never break output).
+        cb = getattr(self, "_seg_on_progress", None)
+        if cb is not None and frames and tot:
+            try:
+                cb({"state": "running",
+                    "frames_processed": int(round((idx - 1) / tot * frames)),
+                    "total_chunks": int(tot)})
+            except Exception:                            # noqa: BLE001
+                pass
 
     # ── window sizing (spike-grade; see module docstring) ────────────────────
 
@@ -370,6 +384,7 @@ class LocalVideoEngine:
         # can bypass the engine-output capture and reach the terminal. Reset the chunk counter.
         self._real_stdout = sys.stdout
         self._chunk_state = {"last": 0}
+        self._seg_on_progress = on_progress          # so per-chunk lines step the progress bar
 
         # Probe frames AND source dims in one pass; derive the OUTPUT size (box-fit to the
         # short-side `resolution`) so the sizer can budget by output megapixels.

@@ -118,6 +118,25 @@ def test_engine_stdout_to_file_and_chunks_to_terminal(fake_engine, capsys):
     assert "Requested output format" not in out
 
 
+def test_each_chunk_steps_the_progress_callback(fake_engine, capsys):
+    # A local segment runs synchronously and used to report on_progress only at start and
+    # 'done', so the GUI bar sat at 0 % then jumped. Each 'Chunk X/N' marker must now feed
+    # a frames_processed estimate ((X-1)/N of the segment) so the bar steps per chunk.
+    progress = []
+    eng = l.LocalVideoEngine("repo", "model", {"dit_model": "m"}, diag_sink=lambda _s: None)
+    eng._seg_ctx = (0, 1, 294)                           # segment 1/1, 294 frames
+    eng._chunk_state = {"last": 0}
+    eng._real_stdout = sys.stdout
+    eng._seg_on_progress = progress.append               # set by process_segment in real runs
+
+    eng._run_attempt("s", "d", 1080, 97, 98, 8, None, "opencv", False, None, None)
+
+    running = [p for p in progress if p.get("state") == "running"]
+    # Chunk 1 -> 0 done, chunk 2 -> ~1/3, chunk 3 -> ~2/3 (monotonic, never past the segment).
+    assert [p["frames_processed"] for p in running] == [0, 98, 196]
+    assert all(p["total_chunks"] == 3 for p in running)
+
+
 def test_no_diag_sink_keeps_live_stdout(fake_engine, capsys):
     # Without a sink (e.g. the benchmark), behaviour is unchanged: the engine prints live to
     # stdout and no per-chunk re-emission happens.
