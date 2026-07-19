@@ -258,7 +258,11 @@ def test_clip_round_trip_passthrough(db_conn, tmp_path):
     engine = bv.PassthroughVideoEngine()
     budget = bv.RunBudget(0, 0.0)
     summary = bv.run_queue(engine, db_conn, root, src_root, vcfg, budget)
-    assert summary == {"done": 1, "failed": 0, "stopped": None, "total": 1}
+    assert {k: summary[k] for k in ("done", "failed", "stopped", "total")} == \
+        {"done": 1, "failed": 0, "stopped": None, "total": 1}
+    # The completion notification's per-file record (name, dims, runtime; no cost locally).
+    assert [f["name"] for f in summary["files"]] == ["birthday.avi"]
+    assert summary["files"][0]["cost"] is None       # local/passthrough: no billed pod
 
     out_path = os.path.join(out_root, "birthday_cake_1080p.mp4")
     assert os.path.exists(out_path)

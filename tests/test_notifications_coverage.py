@@ -146,3 +146,58 @@ def test_notify_summary_startup_refusal_has_no_resume_hint(monkeypatch):
                        "X:\\src")
     assert sent["title"] == "Video upscale did not start"
     assert "re-run to continue" not in sent["desc"]
+
+
+# ── rich per-file completion summary (_summary_desc) ─────────────────────────
+
+def _file(name, sw, sh, ow, oh, wall, cost=None):
+    return {"name": name, "src_w": sw, "src_h": sh, "out_w": ow, "out_h": oh,
+            "wall": wall, "gpu_secs": wall, "cost": cost}
+
+
+def test_summary_desc_local_lists_files_without_cost():
+    # A local run has no cost_per_hr, so each file's cost is None and no "$" appears.
+    summary = {"done": 2, "failed": 0, "stopped": None, "total": 2, "files": [
+        _file("a.mp4", 320, 240, 640, 480, 524),
+        _file("b.mp4", 720, 480, 1440, 960, 130),
+    ]}
+    desc = bv._summary_desc(summary)
+    assert "2 done, 0 failed of 2 job(s)." in desc
+    assert "- a.mp4" in desc
+    assert "320x240 -> 640x480" in desc
+    assert "8m 44s" in desc                              # 524 s
+    assert "$" not in desc                               # no cost on a local run
+    assert "Totals: 2 files, 10m 54s" in desc           # 524 + 130 = 654 s
+
+
+def test_summary_desc_remote_shows_per_file_and_total_cost():
+    summary = {"done": 2, "failed": 0, "stopped": None, "total": 2, "files": [
+        _file("a.mp4", 320, 240, 640, 480, 600, cost=0.03),
+        _file("b.mp4", 720, 480, 1440, 960, 600, cost=0.05),
+    ]}
+    desc = bv._summary_desc(summary)
+    assert "$0.03" in desc and "$0.05" in desc
+    assert "Totals: 2 files, 20m 00s, $0.08" in desc
+
+
+def test_summary_desc_caps_a_long_queue():
+    files = [_file(f"f{i}.mp4", 320, 240, 640, 480, 10) for i in range(bv._NOTIFY_FILE_CAP + 5)]
+    summary = {"done": len(files), "failed": 0, "stopped": None,
+               "total": len(files), "files": files}
+    desc = bv._summary_desc(summary)
+    assert "...and 5 more." in desc
+    # The totals still count EVERY file, not just the listed ones.
+    assert f"Totals: {len(files)} files" in desc
+
+
+def test_summary_desc_missing_dimension_is_not_fatal():
+    summary = {"done": 1, "failed": 0, "stopped": None, "total": 1,
+               "files": [_file("x.mp4", None, None, 640, 480, 5)]}
+    desc = bv._summary_desc(summary)
+    assert "? -> 640x480" in desc                        # unreadable source dims degrade to '?'
+
+
+def test_summary_desc_no_files_is_just_the_counts():
+    # The failure / did-not-start paths carry no files; the body is the bare counts line.
+    desc = bv._summary_desc({"done": 0, "failed": 1, "stopped": None, "total": 1})
+    assert desc == "0 done, 1 failed of 1 job(s)."

@@ -226,6 +226,7 @@ GUI_MARKER      = runner_common.GUI_MARKER
 GUI_MODE        = runner_common.GUI_MODE
 _stdin_is_piped = runner_common.stdin_is_piped
 fmt_hhmmss      = runner_common.fmt_hhmmss
+fmt_duration    = runner_common.fmt_duration
 
 
 _LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
@@ -434,11 +435,12 @@ class PodLost(Exception):
     accurate final summary across redeploys (each pass counts only its own jobs; a resumed
     pass never re-counts a `done` job, so summing is correct)."""
 
-    def __init__(self, reason, done=0, failed=0, done_frames=0):
+    def __init__(self, reason, done=0, failed=0, done_frames=0, files=None):
         super().__init__(reason)
         self.done = done
         self.failed = failed
         self.done_frames = done_frames
+        self.files = files or []       # per-file records completed this pass (for the summary)
 
 
 def _is_pod_failure(exc):
@@ -1372,10 +1374,11 @@ def enqueue_folder(conn, root_id, source_root, output_root, target, vcfg):
 
 def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, total,
                 notify_settings=None, slow_watch=None):
-    """Process one queued (source, target) job. Returns ('done', seconds). Raises
-    StopInstallment when a cap is hit mid-job (the rest stays pending, the job is
-    marked 'partial'). `slow_watch` (a run-wide VideoSlowWatch) gets each completed
-    segment's rate for the notify-only slow-segment signal (item 6)."""
+    """Process one queued (source, target) job. Returns a dict {status, seconds, file}
+    where `file` is the per-file record the completion notification lists (name, src/out
+    dimensions, runtime, cost). Raises StopInstallment when a cap is hit mid-job (the rest
+    stays pending, the job is marked 'partial'). `slow_watch` (a run-wide VideoSlowWatch)
+    gets each completed segment's rate for the notify-only slow-segment signal (item 6)."""
     rel, target = job["rel_path"], job["target"]
     clip_id = job["clip_id"] or 0                  # 0 = whole file; >0 = a virtual clip
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
@@ -1792,7 +1795,20 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     gui_event("VRESULT", {"rel": rel, "target": target, "clip_id": clip_id,
                           "outcome": "ok", "output_path": out_video,
                           "warnings": report.warnings})
-    return "done", total_secs
+    # Per-file record for the completion notification (richer than the bare counts).
+    # Runtime is this run's real elapsed for the file; cost is the billed GPU seconds
+    # x the pod's $/h (remote only — a local run has no cost_per_hr, so cost stays None).
+    cost = None
+    if getattr(budget, "cost_per_hr", None):
+        cost = pod_secs / 3600.0 * float(budget.cost_per_hr)
+    file_record = {
+        "name": os.path.basename(rel), "rel": rel,
+        "src_w": info.width, "src_h": info.height,
+        "out_w": out_info.width, "out_h": out_info.height,
+        "target": target, "clip_id": clip_id,
+        "wall": wall, "gpu_secs": pod_secs, "cost": cost,
+    }
+    return {"status": "done", "seconds": total_secs, "file": file_record}
 
 
 # ─────────────────────────────────────────────
@@ -1874,6 +1890,7 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     done = failed = 0
     done_frames = 0
     stopped = None
+    completed = []                     # per-file records (for the rich completion notification)
     attempted = set()                  # (rel, target, clip_id) tried this run
     # Run-wide slow-segment health signal (item 6): one baseline across every segment of
     # every job this run (the pod is shared), notify-only.
@@ -1899,10 +1916,13 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         idx = done + failed + 1
         total = idx + len(pending) - 1
         try:
-            process_job(engine, conn, root_id, source_root, job, vcfg, budget,
-                        idx, total, notify_settings=notify_settings, slow_watch=slow_watch)
+            result = process_job(engine, conn, root_id, source_root, job, vcfg, budget,
+                                 idx, total, notify_settings=notify_settings,
+                                 slow_watch=slow_watch)
             done += 1
             done_frames += _job_frames(conn, root_id, job)
+            if isinstance(result, dict) and result.get("file"):
+                completed.append(result["file"])
         except StopInstallment as exc:
             stopped = str(exc)
             break
@@ -1937,7 +1957,7 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
             # normal per-job failure path below.
             if auto_resume and _is_pod_failure(exc):
                 raise PodLost(str(exc)[:300], done=done, failed=failed,
-                              done_frames=done_frames) from exc
+                              done_frames=done_frames, files=completed) from exc
             failed += 1
             reason = str(exc)[:300]
             # The traceback, to logs/debug.log. `str(exc)` alone is often the LEAST useful
@@ -1961,7 +1981,7 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         stopped = "stopped by user"
 
     summary = {"done": done, "failed": failed, "stopped": stopped,
-               "total": done + failed}
+               "total": done + failed, "files": completed}
     # The supervisor (#6) sends ONE accumulated summary across all its redeploys, so it
     # passes notify_summary=False here to suppress a per-pod notification.
     if notify_summary:
@@ -2002,6 +2022,54 @@ def _stop_notice(stopped):
     return "Video upscale stopped early", 0xF1C40F, True   # unknown reason: report plainly
 
 
+_NOTIFY_FILE_CAP = 20          # list at most this many files; the rest fold into "and N more"
+
+
+def _fmt_res(w, h):
+    """A 'WxH' resolution string, or '?' when a dimension is missing/unreadable."""
+    try:
+        return f"{int(w)}x{int(h)}" if w and h else "?"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _summary_desc(summary):
+    """Build the completion-notification body: the counts line, one line per finished file
+    (name, then source -> output resolution, runtime, and cost where a pod was billed), and
+    a totals line. Long queues are capped (the rest fold into 'and N more'). Pure, so it is
+    unit-tested; every backend renders this same multi-line description."""
+    lines = [f"{summary['done']} done, {summary['failed']} failed of "
+             f"{summary['total']} job(s)."]
+    files = summary.get("files") or []
+    if files:
+        lines.append("")
+        total_secs = 0.0
+        total_cost = 0.0
+        any_cost = False
+        for f in files[:_NOTIFY_FILE_CAP]:
+            res = f"{_fmt_res(f.get('src_w'), f.get('src_h'))} -> " \
+                  f"{_fmt_res(f.get('out_w'), f.get('out_h'))}"
+            parts = [res, fmt_duration(f.get("wall") or 0)]
+            if f.get("cost") is not None:
+                parts.append(f"${f['cost']:.2f}")
+            lines.append(f"- {f.get('name', '?')}")
+            lines.append(f"    {' · '.join(parts)}")
+        for f in files:                                # totals span EVERY file, not just listed
+            total_secs += float(f.get("wall") or 0)
+            if f.get("cost") is not None:
+                any_cost = True
+                total_cost += float(f["cost"])
+        if len(files) > _NOTIFY_FILE_CAP:
+            lines.append(f"- ...and {len(files) - _NOTIFY_FILE_CAP} more.")
+        totals = [f"{len(files)} file" + ("s" if len(files) != 1 else ""),
+                  fmt_duration(total_secs)]
+        if any_cost:
+            totals.append(f"${total_cost:.2f}")
+        lines.append("")
+        lines.append("Totals: " + ", ".join(totals))
+    return "\n".join(lines)
+
+
 def _notify_summary(notify_settings, summary, src_root):
     if not notify_settings:
         return
@@ -2016,10 +2084,9 @@ def _notify_summary(notify_settings, summary, src_root):
             title, color, resume_hint = _stop_notice(stopped)
         else:
             color, title = 0x2ECC71, "Video upscale complete"
-        desc = (f"{summary['done']} done, {summary['failed']} failed of "
-                f"{summary['total']} job(s).")
+        desc = _summary_desc(summary)
         if stopped:
-            desc += f"\n{stopped}" + (", re-run to continue." if resume_hint else ".")
+            desc += f"\n\n{stopped}" + (", re-run to continue." if resume_hint else ".")
         notifications.notify(notify_settings, title, desc, color,
                              fields=[{"name": "Source", "value": src_root}])
     except Exception:
@@ -2164,8 +2231,9 @@ def _healer_gpu_target(cfg):
     return gpu_id, gpu_id, region
 
 
-def _final_summary(done, failed, stopped):
-    return {"done": done, "failed": failed, "stopped": stopped, "total": done + failed}
+def _final_summary(done, failed, stopped, files=None):
+    return {"done": done, "failed": failed, "stopped": stopped,
+            "total": done + failed, "files": files or []}
 
 
 def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_stopped,
@@ -2188,9 +2256,10 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
       close_session(session, stop_pod)               teardown (stop_pod False keeps the pod)
     """
     acc_done = acc_failed = 0
+    acc_files = []                    # per-file records accumulated across every redeploy
 
     def finish(stopped):
-        summary = _final_summary(acc_done, acc_failed, stopped)
+        summary = _final_summary(acc_done, acc_failed, stopped, acc_files)
         _notify_summary(notify_settings, summary, source_root)
         log(f"Summary: {acc_done} done, {acc_failed} failed of {acc_done + acc_failed}"
             + (f", stopped early ({stopped})" if stopped else "") + ".")
@@ -2215,6 +2284,7 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
         except PodLost as exc:
             acc_done += exc.done
             acc_failed += exc.failed
+            acc_files.extend(exc.files)
             reason = str(exc)
             # Hard stops (never redeploy): the funds guard deliberately stopped the pod, or
             # the user pressed Stop. Both look like a pod death to the engine; distinguishing
@@ -2241,6 +2311,7 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
         else:
             acc_done += summary["done"]
             acc_failed += summary["failed"]
+            acc_files.extend(summary.get("files") or [])
             close_session(session, None)               # default teardown for the run's end
             return finish(summary.get("stopped"))
 
