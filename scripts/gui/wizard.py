@@ -484,9 +484,11 @@ class FirstStartWizard(tk.Toplevel):
 
         # state == "ready": show the explainer, the recommendation, and the two actions.
         adv = wr.recommend_compile(wr.vram_mb_to_gb(self.vram_total_mb))
-        intro = ("torch.compile makes local video runs about 20-40% faster after the "
-                 "first segment: the same speedup the rented-pod runs use. It's optional "
-                 "and speed-only. It needs two pieces:")
+        intro = ("torch.compile can speed up local video runs after the first segment "
+                 "(the same lever the rented-pod runs use), but the gain depends on your "
+                 "card and target: it roughly doubles VRAM, so it only pays off when the "
+                 "card has room to keep a big batch. It's optional and speed-only. It "
+                 "needs two pieces:")
         ttk.Label(parent, wraplength=520, justify="left",
                   text=intro).grid(row=1, column=0, sticky="w", pady=(8, 6))
 

@@ -23,6 +23,13 @@ installer/Output/
 # Internal-only working copy of the benchmark data (the .csv is the tracked source)
 docs/Benchmarks.xlsx
 
+# Maintainer-only working DB for the benchmark-sharing merge tool (bench_share.py --merge).
+# The curated docs/video-benchmarks.csv it exports IS the tracked/distributed artifact; this
+# accumulator DB is private (db ergonomics + outlier review) and never committed.
+benchmarks.db
+# Incoming community benchmark CSVs downloaded from GitHub issues, staged for --merge.
+submissions/
+
 # torch.compile caches (inductor + Triton), redirected here by triton_setup.ensure_cache_env.
 # Kept OUT of %TEMP% on purpose: the default %TEMP%/torchinductor_<username> contains a space
 # for any account whose name has one, and inductor does not quote the source path (see

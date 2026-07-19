@@ -975,6 +975,7 @@ class VideoTab(ttk.Frame):
         self._scan_res = {}              # "WxH" -> count, for the summary breakdown
         self._scan_listing = 0           # files found so far during the tree walk
         self._scan_removed = []          # (rel, target) outputs reconciled off disk
+        self._scan_adopted = []          # (rel, target) outputs found on disk, adopted into the DB
         self._scan_seq += 1
         seq = self._scan_seq
         self._scan_q = queue.Queue()
@@ -1027,6 +1028,12 @@ class VideoTab(ttk.Frame):
                     # has nothing to upscale to) -> not an eligible video, so skip it.
                     self._scan_q.put(("ineligible", rel))
                     continue
+                # Adopt any output another install already wrote to the shared destination but
+                # that THIS install's DB doesn't know about (cross-install consistency), so the
+                # row shows it as done instead of offering to redo it.
+                adopted = bv.reconcile_outputs_from_disk(conn, self._root_id, self._out_root, rel)
+                if adopted:
+                    self._scan_q.put(("adopted", adopted))
                 outs = [(o["target"], o["status"], o["output_path"])
                         for o in bv.db.get_video_outputs_for(conn, self._root_id, rel)]
                 self._scan_q.put(("row", (rel, abs_path, dict(r), elig, outs)))
@@ -1050,6 +1057,10 @@ class VideoTab(ttk.Frame):
                 for rel, tgt in data:
                     self.console.feed(f"  removed (deleted off disk): {rel} → {tgt}\n")
                 self._load_queue()       # the removed jobs leave any queue view
+            elif kind == "adopted":
+                self._scan_adopted.extend(data)
+                for rel, tgt in data:
+                    self.console.feed(f"  found on disk (already upscaled elsewhere): {rel} → {tgt}\n")
             elif kind == "listing":
                 self._scan_listing = data
                 self.status_var.set(f"Listing files … {data} found")
@@ -1165,10 +1176,12 @@ class VideoTab(ttk.Frame):
         ineligible = getattr(self, "_scan_ineligible", [])
         res = getattr(self, "_scan_res", {})
         removed = getattr(self, "_scan_removed", [])
+        adopted = getattr(self, "_scan_adopted", [])
         self.progress.set(100 if self._scan_total else 0)
         tail = f", {len(ineligible)} already ≥ 4K (skipped)" if ineligible else ""
         tail += f", {len(skipped)} unreadable (skipped)" if skipped else ""
         tail += f", {len(removed)} stale removed" if removed else ""
+        tail += f", {len(adopted)} found on disk" if adopted else ""
         self.status_var.set(f"{n} eligible video(s){tail}." if n
                             else f"No eligible videos found{tail}.")
         self._populate_scan_filters()
@@ -1185,6 +1198,10 @@ class VideoTab(ttk.Frame):
         if removed:
             self.console.feed(f"  Upscaled removed (deleted off disk): {len(removed)}\n")
             for rel, tgt in removed:
+                self.console.feed(f"     {rel} → {tgt}\n")
+        if adopted:
+            self.console.feed(f"  Already upscaled elsewhere (found on disk): {len(adopted)}\n")
+            for rel, tgt in adopted:
                 self.console.feed(f"     {rel} → {tgt}\n")
         if res:
             self.console.feed("  By resolution:\n")

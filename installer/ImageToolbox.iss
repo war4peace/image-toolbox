@@ -26,8 +26,11 @@ DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=Output
 OutputBaseFilename=ImageToolboxSetup
-SetupIconFile=toolbox.ico
-UninstallDisplayIcon={app}\toolbox.ico
+; One icon everywhere (app.ico): the setup exe, the uninstall entry, the Start-menu and
+; desktop shortcuts, and the running window all use the SAME icon, so the app looks identical
+; in every place Windows shows it. app.ico lives at the repo root (shipped to {app}).
+SetupIconFile=..\app.ico
+UninstallDisplayIcon={app}\app.ico
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -59,10 +62,12 @@ Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
 ; Author benchmark data — drives the remote-pod "$ / 100 images" cost estimate
 ; (benchmarks.py reads it from {app}\docs).
 Source: "..\docs\Benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
-Source: "toolbox.ico";            DestDir: "{app}"; Flags: ignoreversion
-; Running-app icon: shown on the main window title bar and taskbar button at
-; runtime (gui/app.py loads {app}\app.ico via APP_ROOT). Distinct from
-; toolbox.ico, which is the setup/uninstall/shortcut icon.
+; Curated community VIDEO benchmark corpus (feature #8). Ships so a fresh install has the
+; dataset offline; the app auto-refreshes it from GitHub in the background at each launch.
+Source: "..\docs\video-benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
+; The single application icon (app.ico): the running window (gui/app.py loads {app}\app.ico
+; via APP_ROOT), AND the setup/uninstall/shortcut icons (see [Setup] / [Icons]). One icon in
+; every place. (The old separate toolbox.ico is no longer used.)
 Source: "..\app.ico";             DestDir: "{app}"; Flags: ignoreversion
 ; Never overwrite the user's configuration on upgrades, never delete it on uninstall
 Source: "..\config.json";         DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -80,8 +85,8 @@ Type: files;          Name: "{app}\*.py"
 Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Icons]
-Name: "{autoprograms}\Image Toolbox"; Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"
-Name: "{autodesktop}\Image Toolbox";  Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\toolbox.ico"; Tasks: desktopicon
+Name: "{autoprograms}\Image Toolbox"; Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"
+Name: "{autodesktop}\Image Toolbox";  Filename: "{app}\Image Toolbox.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\app.ico"; Tasks: desktopicon
 
 [Run]
 ; Remote/Both need a RunPod account with credit to rent a GPU. Offer to open the

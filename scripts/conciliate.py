@@ -1,18 +1,19 @@
 """
 conciliate.py
 -------------
-Image tree conciliation — replace original photos with their processed
-(upscaled, optionally tagged & renamed) counterparts.
+Media tree conciliation — replace original photos AND videos with their
+processed (upscaled, optionally tagged & renamed) counterparts.
 
 Runs in two phases, driven over stdin by toolbox_gui.py (or interactively from
 a terminal):
 
-  1. SCAN  — match each original image to its processed counterpart. Matching
-             prefers content-hash lineage (db.lineage), which is independent of
-             paths and so survives moving or renaming either tree; it falls back
-             to mirrored-name matching (using the tag/rename cache) for files
-             with no recorded lineage. Emits a per-folder preview (replaced /
-             skipped / kept). NOTHING on disk is touched in this phase.
+  1. SCAN  — match each original image/video to its processed counterpart.
+             Matching prefers content-hash lineage (db.lineage), which is
+             independent of paths and so survives moving or renaming either tree.
+             IMAGES additionally fall back to mirrored-name matching (via the
+             tag/rename cache) when no lineage exists; VIDEOS are matched by
+             lineage only (see the video note below). Emits a per-folder preview
+             (replaced / no-match / kept). NOTHING on disk is touched here.
   2. RUN   — once the user confirms, perform the chosen operation per matched
              pair:
                archive — move the original into  <original>/__Archive__/<rel>,
@@ -21,9 +22,21 @@ a terminal):
                delete  — delete the original, then move its processed
                          counterpart into the original tree.
 
+Video note (roadmap #5): a video is matched by content-hash lineage ONLY — no
+name fallback. The Video Upscaler records source<->output lineage on completion
+(item 10, on by default), and a video output is named <stem>_<target>.mp4 (a
+suffix, often a different container), NOT a mirror of the source name. A name
+guess would be unsafe: a *clip* extract (`<base>_<label>_<target>.mp4`) records no
+lineage yet shares the source's `<base>_` prefix, so a name match could replace a
+whole source with a short clip. Requiring lineage rules that out — an un-lineaged
+video (a clip, or one upscaled with record_lineage off) has no match and is left
+untouched. A video is only ever acted on when its processed output is actually
+present in the chosen processed tree, so pointing this at an image-only processed
+folder never touches a video (and vice versa).
+
 Safety rules (non-negotiable):
-  * An original image with NO processed counterpart on disk is NEVER touched.
-  * Non-image files in the original tree are NEVER touched (counted as "kept").
+  * An original file with NO processed counterpart on disk is NEVER touched.
+  * Non-media files in the original tree are NEVER touched (counted as "kept").
   * The processed counterpart is moved in only AFTER the original has been
     archived/deleted, so the freed name is available; an unrelated file already
     occupying the destination name aborts that one pair (original left intact).
@@ -65,6 +78,11 @@ SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 # App root = parent of scripts/. Data folders (logs/, db/, …) live there.
 APP_ROOT    = runner_common.APP_ROOT
 IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+# Mirrors batch_video_upscale.VIDEO_EXTS. Defined locally (not imported) to keep
+# conciliate.py torch-free — batch_video_upscale pulls in the heavy engine stack.
+VIDEO_EXTS  = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg",
+               ".flv", ".webm", ".3gp", ".ts", ".mts", ".m2ts", ".vob"}
+MEDIA_EXTS  = IMAGE_EXTS | VIDEO_EXTS
 ARCHIVE_DIRNAME = "__Archive__"
 
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common.
@@ -181,16 +199,23 @@ def find_tr_cache(processed_root):
 
 def build_processed_hash_index(processed_root, conn, abort=None):
     """
-    Map content-hash -> absolute path for every image in the processed tree.
+    Map content-hash -> absolute path for every image/video in the processed tree.
     Hashes are memoised in the DB (db.hash_file_cached), so this is cheap on
     repeat scans of an unchanged tree. The first matching path for a hash wins.
+
+    Videos are hashed the same way as images (not cached-only): a processed video
+    the user moved or renamed since it was produced has a fresh path, so it must be
+    re-hashed to still be matched by content — that path-independence is the whole
+    point of lineage matching. The app's outputs were already hashed at production
+    time (keyed by their then-path), so an unmoved tree is served entirely from the
+    cache; only genuinely new/moved files pay a hash, once, then they too are cached.
     """
     index = {}
     for dirpath, dirnames, filenames in os.walk(processed_root):
         if abort is not None and abort():
             break
         for fn in filenames:
-            if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+            if os.path.splitext(fn)[1].lower() not in MEDIA_EXTS:
                 continue
             p_abs = os.path.join(dirpath, fn)
             h = db.hash_file_cached(conn, p_abs)
@@ -250,22 +275,35 @@ def resolve_by_name(o_rel, processed_root, tr_index):
     return None
 
 
+# NB: videos are matched by content-hash LINEAGE ONLY — there is deliberately no
+# <stem>_<target> name fallback for them (unlike images, which mirror the source
+# name). A whole-video upscale records lineage by default (item 10); a *clip*
+# extract does NOT, and a clip output (`<base>_<label>_<target>.mp4`) shares the
+# source's `<base>_` prefix, so a name fallback could match a full source to a short
+# clip and propose replacing the whole video with it — a loss the counts-only preview
+# would not reveal. Requiring lineage makes that impossible: an un-lineaged video (a
+# clip, or one upscaled with record_lineage off) simply has no match and is left
+# untouched. Custom targets make the name equally unreliable, so lineage it is.
+
+
 def build_plan(original_root, processed_root, tr_index, conn=None,
                abort=None, status_cb=None):
     """
-    Walk the original tree and pair each image with its processed counterpart.
+    Walk the original tree and pair each image/video with its processed
+    counterpart.
 
     Matching prefers content-hash lineage (path-independent — survives moving or
-    renaming either tree); it falls back to mirrored-name matching for files
-    that have no recorded lineage (e.g. older data). The processed-tree hash
-    index is built lazily, only once a lineage match is actually needed.
+    renaming either tree). IMAGES fall back to mirrored-name matching (tag/rename
+    cache) when they have no recorded lineage; VIDEOS are lineage-only (a name
+    guess could mistake a partial clip for a whole-video match). The processed-tree
+    hash index is built lazily, only once a lineage match is actually needed.
 
     Returns (plan, folders, kept_files):
       plan       — list of (original_abs, processed_abs, original_rel) to act on.
       folders    — list of (rel_dir, replaced, skipped, kept) per folder, for the
-                   preview. 'kept' counts non-image files (never touched);
-                   'skipped' counts images with no processed counterpart.
-      kept_files — absolute paths of the non-image files that were kept, so the
+                   preview. 'kept' counts non-media files (never touched);
+                   'skipped' counts media files with no processed counterpart.
+      kept_files — absolute paths of the non-media files that were kept, so the
                    preview can list exactly what was left untouched (e.g. a
                    hidden Thumbs.db that Explorer doesn't show).
     Skips the __Archive__ subfolder and the processed tree if it is nested
@@ -299,7 +337,8 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
         replaced = skipped = kept = 0
         for fn in sorted(filenames):
             abs_f = os.path.join(dirpath, fn)
-            if os.path.splitext(fn)[1].lower() not in IMAGE_EXTS:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in MEDIA_EXTS:
                 kept += 1
                 kept_files.append(abs_f)
                 continue
@@ -307,7 +346,10 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
             p_abs = None
             if has_lineage:
                 p_abs = resolve_by_lineage(abs_f, conn, get_index)
-            if p_abs is None:
+            # Images also get a mirrored-name fallback (survives a missing lineage);
+            # videos are lineage-only on purpose (see the note above resolve_by_name /
+            # build_plan) so a clip can never be mistaken for a whole-video match.
+            if p_abs is None and ext in IMAGE_EXTS:
                 p_abs = resolve_by_name(o_rel, processed_root, tr_index)
             if p_abs is None:
                 skipped += 1
@@ -443,7 +485,7 @@ def _print_preview_table(folders, log):
         parts = [f"{replaced} replaced"]
         if skipped:
             parts.append(f"{skipped} without a match (left untouched)")
-        parts.append(f"{kept} non-image file(s) kept")
+        parts.append(f"{kept} non-media file(s) kept")
         log.tee(f"    {label.ljust(width)}  -  {', '.join(parts)}")
 
 
@@ -517,18 +559,18 @@ def main():
     # exactly what was left untouched and why the "kept" count is non-zero.
     if kept_files:
         log.tee("")
-        log.tee("Non-image files: ")
+        log.tee("Non-media files: ")
         for p in kept_files:
             log.tee(p)
     log.tee("")
-    log.tee(f"  Total: {total_replaced} image(s) to replace, "
+    log.tee(f"  Total: {total_replaced} file(s) to replace, "
             f"{total_skipped} without a match (left untouched), "
-            f"{total_kept} non-image file(s) kept.")
+            f"{total_kept} non-media file(s) kept.")
 
     if total_replaced == 0:
         _gui_event("STATUS", "Nothing to conciliate.")
         log.tee("")
-        log.tee("Nothing to do — no original images have a processed counterpart.")
+        log.tee("Nothing to do — no original files have a processed counterpart.")
         log.close()
         sys.exit(0)
 
@@ -574,7 +616,7 @@ def main():
     _gui_event("DONE", json.dumps(
         {"done": done, "conflicts": conflicts, "errors": errors,
          "removed_dirs": removed_dirs}))
-    _gui_event("STATUS", f"Done — {done} image(s) replaced.")
+    _gui_event("STATUS", f"Done — {done} file(s) replaced.")
 
     # Notify: conciliation used to finish silently (item 9). Colour by outcome,
     # matching the upscaler's palette (green clean, yellow stopped/with-issues).

@@ -23,10 +23,10 @@ CONCILIATE_MODES = [
 
 class ConciliateTab(ToolTab):
     """
-    Replace original photos with their processed (upscaled, optionally tagged &
-    renamed) counterparts. Two phases: Scan/Preview builds a per-folder plan and
-    touches nothing; Run performs the chosen archive/delete operation. Drives
-    conciliate.py as a subprocess, reusing ToolTab's stdin/marker plumbing.
+    Replace original photos and videos with their processed (upscaled, optionally
+    tagged & renamed) counterparts. Two phases: Scan/Preview builds a per-folder
+    plan and touches nothing; Run performs the chosen archive/delete operation.
+    Drives conciliate.py as a subprocess, reusing ToolTab's stdin/marker plumbing.
     """
 
     def __init__(self, notebook, app):
@@ -63,14 +63,14 @@ class ConciliateTab(ToolTab):
     def _build(self):
         self.columnconfigure(1, weight=1)
 
-        ttk.Label(self, text="Original Photos:").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(self, text="Original Files:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.orig_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_orig).grid(row=0, column=2, pady=3)
         self.save_orig_btn = ttk.Button(
             self, text="Save as Default", command=lambda: self._save_default("orig"))
         self.save_orig_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
-        ttk.Label(self, text="Processed Photos:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Label(self, text="Processed Files:").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.proc_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
         ttk.Button(self, text="Browse…", command=self._pick_proc).grid(row=1, column=2, pady=3)
         self.save_proc_btn = ttk.Button(
@@ -127,7 +127,7 @@ class ConciliateTab(ToolTab):
         self.tree.heading("#0", text="Folder")
         self.tree.heading("replaced", text="Replaced")
         self.tree.heading("skipped", text="No match (kept)")
-        self.tree.heading("kept", text="Non-image (kept)")
+        self.tree.heading("kept", text="Non-media (kept)")
         self.tree.column("#0", width=320, anchor="w", stretch=True)
         for c in cols:
             self.tree.column(c, width=120, anchor="center", stretch=False)
@@ -252,12 +252,12 @@ class ConciliateTab(ToolTab):
     # ── actions ────────────────────────────────────────────────────────────────
 
     def _pick_orig(self):
-        folder = filedialog.askdirectory(title="Choose the folder with the ORIGINAL photos")
+        folder = filedialog.askdirectory(title="Choose the folder with the ORIGINAL files")
         if folder:
             self.orig_var.set(os.path.normpath(folder))
 
     def _pick_proc(self):
-        folder = filedialog.askdirectory(title="Choose the folder with the PROCESSED photos")
+        folder = filedialog.askdirectory(title="Choose the folder with the PROCESSED files")
         if folder:
             self.proc_var.set(os.path.normpath(folder))
 
@@ -278,10 +278,10 @@ class ConciliateTab(ToolTab):
         orig = self.orig_var.get().strip()
         proc = self.proc_var.get().strip()
         if not os.path.isdir(orig):
-            messagebox.showwarning(APP_TITLE, "Please choose a valid Original Photos folder.")
+            messagebox.showwarning(APP_TITLE, "Please choose a valid Original Files folder.")
             return
         if not os.path.isdir(proc):
-            messagebox.showwarning(APP_TITLE, "Please choose a valid Processed Photos folder.")
+            messagebox.showwarning(APP_TITLE, "Please choose a valid Processed Files folder.")
             return
         if os.path.normcase(os.path.abspath(orig)) == os.path.normcase(os.path.abspath(proc)):
             messagebox.showwarning(APP_TITLE,
@@ -307,7 +307,7 @@ class ConciliateTab(ToolTab):
         if mode == "delete":
             if not messagebox.askyesno(
                     APP_TITLE,
-                    f"DELETE {n} original photo(s) and replace them with the processed "
+                    f"DELETE {n} original file(s) and replace them with the processed "
                     f"versions?\n\nThe originals will NOT be archived."):
                 return
             if not messagebox.askyesno(
@@ -317,7 +317,7 @@ class ConciliateTab(ToolTab):
         else:
             if not messagebox.askyesno(
                     APP_TITLE,
-                    f"Archive {n} original photo(s) into '__Archive__' and move the "
+                    f"Archive {n} original file(s) into '__Archive__' and move the "
                     f"processed versions into the original folder?"):
                 return
         self.run_btn.configure(state="disabled")

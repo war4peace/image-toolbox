@@ -82,22 +82,30 @@ def recommend_models(vram_total_mb):
 def recommend_compile(vram_gb):
     """Advice on the optional torch.compile speedup for LOCAL video runs, by card size.
 
-    compile makes local runs ~20-40% faster after the first (compiling) segment, but
-    it raises VRAM use, so the largest safe batch shrinks. That trade tips on card
-    size: a clear win on a big card (esp. long videos), marginal at 16 GB, and a
-    likely NET LOSS on a small card where the smaller batch costs more than compile
-    saves (see tab_settings' compile tooltip and gate_local_compile). This only
-    guides the wizard's copy; runtime still gates compile on Triton + a real compiler.
+    compile can speed up local runs after the first (compiling) segment, but it
+    roughly doubles activation VRAM, so the largest safe batch shrinks. That trade
+    tips on card size, and it tips LATER than first assumed: a measured 24 GB sweep
+    (RTX 3090, 7B) showed compile winning only at sub-1080p outputs (+3-5%) and
+    losing at every real 1080p-class target (24% slower up to a hard OOM above
+    1440x1080), because the halved batch outweighs the per-frame gain right where it
+    matters. So it only pays off on a card with enough VRAM headroom to absorb the
+    batch halving at real targets (>=32 GB); at 24 GB it is a wash-to-loss, and a net
+    loss on a smaller card (see tab_settings' compile tooltip and gate_local_compile).
+    This only guides the wizard's copy; runtime still gates compile on Triton + a real
+    compiler.
 
     Takes rounded GB (as vram_mb_to_gb yields); 0 / no GPU -> not recommended.
     """
-    if vram_gb >= 24:
+    if vram_gb >= 32:
         return CompileAdvice("recommended",
-                             "A clear win on your card, especially on long videos.")
+                             "A clear win on your card, especially on long videos: "
+                             "enough VRAM to keep a big batch even with compile on.")
     if vram_gb >= 16:
         return CompileAdvice("optional",
-                             "Marginal on 16 GB: the smaller batch can eat the gain. "
-                             "Benchmark both ways if you care.")
+                             "A wash-to-loss at 24 GB: compile halves the batch at "
+                             "real 1080p+ targets and the smaller batch eats the gain "
+                             "(measured on a 3090). Benchmark both ways before committing "
+                             "to the ~2-3 GB toolchain.")
     return CompileAdvice("not_recommended",
                          "On a smaller card the extra VRAM shrinks the batch, so it "
                          "often ends up slower. Leave it off unless you've measured a win.")

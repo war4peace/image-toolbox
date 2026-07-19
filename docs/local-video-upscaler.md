@@ -486,6 +486,45 @@ table on Windows**; we cannot lean on a smarter allocator to undo fragmentation.
 3. Because "Prefer No Sysmem Fallback" is soft (14.3), the sizer should target **~2 GB below**
    the measured physical ceiling so it does not depend on the tolerated sliver of spill.
 
+### 14.4 `torch.compile` ON vs OFF on 24 GB: a net loss at real targets
+
+Re-benchmarked the 3090 with the 0.5.1 dual-mode sweep (both compile regimes in one run,
+stored under separate `bench_key`s: `7b` = OFF, `7b|c` = ON). Comparing each target's **best
+achievable throughput** (min s/frame over the successful batches) and **max feasible batch**:
+
+| Target (output) | OFF best s/frame | OFF max batch | ON best s/frame | ON max batch | Speed result | Batch ratio |
+|-----------------|------------------|---------------|-----------------|--------------|--------------|-------------|
+| 540x720         | 0.379 (b125)     | 125           | **0.368** (b61) | 61           | ON +3.0%     | 0.49x       |
+| 960x720         | 0.691 (b69)      | 69            | **0.657** (b37) | 37           | ON +4.9%     | 0.54x       |
+| 810x1080        | **0.897** (b53)  | 53            | 1.116 (b29)     | 29           | OFF +24%     | 0.55x       |
+| 1280x960        | **2.189** (b17)  | 17            | 5.474 (b5)      | 5            | OFF +150%    | 0.29x       |
+| 1440x1080       | **7.873** (b5)   | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
+| 1600x1200       | **10.899** (b5)  | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
+| 1920x1080       | **12.244** (b5)  | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
+
+**Finding:** compile wins **only at sub-1080p outputs** (+3-5%), and there it wins *despite*
+running at half the batch, so the per-frame speedup is genuinely covering the throughput lost
+to the smaller batch. At every real **1080p-class target** it loses: 24% slower at 810x1080,
+2.5x slower at 1280x960, and a **hard OOM even at batch 5** above 1440x1080 (it cannot run at
+all while OFF completes). The crossover sits exactly at the boundary of the targets the tool
+is for.
+
+**Mechanism (consistent with the PRO 6000 4K finding):** compile roughly **doubles activation
+VRAM**, which halves the batch ceiling (0.49-0.55x across the low/mid targets, worse above).
+At low output-MP the ceiling is high enough that the per-frame win survives; at high output-MP
+the collapsed batch ceiling dominates and compile is a net loss. The reported s/frame is
+**steady-state** (the schema separates `peak_*_steady` from the cold pass), so it *excludes*
+compile's cold-start and per-geometry recompile cost: the true low-res win is below the 3-5%
+shown.
+
+**Consequence (as built):** `wizard_recommend.recommend_compile` moved the "recommended" line
+from **>=24 GB to >=32 GB**; the 24 GB tier is now **"optional"** with copy stating it's a
+wash-to-loss at real targets. The wizard intro no longer flatly claims "20-40% faster." This is
+copy-only: compile stays a runtime-gated default (`gate_local_compile`), selectable in
+Settings > Video for anyone who wants to benchmark it on their own card. The trade is a
+**VRAM-headroom** story, so it may flip on a card large enough to absorb the batch halving at
+real targets (>=32 GB) even though activations remain the wall at 4K.
+
 ## 15. As built: the predictive VRAM sizer (`scripts/video_vram_sizer.py`)
 
 The batch/overlap picker for the LOCAL path, built to the requirements above. It picks the

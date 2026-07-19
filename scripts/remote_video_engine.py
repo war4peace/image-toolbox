@@ -70,7 +70,8 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
     def process_segment(self, src_path, dest_path, *, resolution, batch_size,
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
-                        poll_interval=5, on_progress=None, should_stop=None):
+                        poll_interval=5, on_progress=None, should_stop=None,
+                        seg_index=None, seg_total=None):
         """Upscale one segment file on the pod and write the result to dest_path
         atomically. Returns the number of frames the worker wrote. Raises
         RemoteVideoError on a worker error, a lost job, or a dropped tunnel.

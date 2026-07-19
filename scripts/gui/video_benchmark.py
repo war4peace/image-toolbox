@@ -10,6 +10,7 @@ batch. The findings feed the sizer (AUTO batch) and the local time estimate auto
 """
 
 import os
+import re
 import json
 import time
 import queue
@@ -17,7 +18,7 @@ import codecs
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import db
 import video_benchmark as vb
@@ -25,7 +26,8 @@ import video_estimate as ve
 import video_vram_sizer as sizer
 from gui.common import (APP_ROOT, APP_TITLE, CFG, GUI_MARKER, PYTHON_EXE, SCRIPT_DIR,
                         CREATE_NO_WINDOW, _geometry_on_screen, save_settings,
-                        fmt_funds, funds_color, config_funds_floor, _FUNDS_GREY)
+                        fmt_funds, funds_color, config_funds_floor, _FUNDS_GREY,
+                        report_issue, contribute_benchmark)
 from gui.widgets import ConsoleBuffer, LogPane, TelemetryRow, Tooltip
 
 
@@ -68,13 +70,18 @@ class BenchmarkWindow(tk.Toplevel):
         except Exception:
             pass
         geo = self.app.settings.get("benchmark_geometry") if self.app is not None else None
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "900x560")
+        # First-ever open uses the SAME default size as the main window (gui/app.py
+        # _restore_geometry "980x720"); after that the remembered geometry wins.
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
         self.minsize(900, 480)                             # match the main window's min width
-        # NOT transient(master): while the benchmark is up we MINIMIZE the main window (see
+        # NOT transient(master): while the benchmark is up we fully HIDE the main window (see
         # _hide_master / _restore_master) so a non-technical user can't reach the tabs behind
         # it and start a conflicting GPU job. A transient child is auto-hidden when its master
-        # is iconified, which would hide the benchmark itself, so it must be independent.
+        # is hidden, which would hide the benchmark itself, so it must be independent. The window
+        # keeps its OWN taskbar button (it is non-transient + never iconified at open), so the app
+        # still shows in the taskbar while the main window is withdrawn.
         self._master_win = master
+        self._closing = False               # set once the master is deliberately restored
 
         self.proc = None
         self.console = ConsoleBuffer()
@@ -82,36 +89,55 @@ class BenchmarkWindow(tk.Toplevel):
         self._hold = ""
         self._marker_buf = None
         self.gpu_id = None
-        # The regime-tagged video_bench key the RUNNER will write under, resolved by the runner's
-        # own helper so the two can never disagree. Read _resolve_bench_key before changing this.
-        self.model_tag = self._resolve_bench_key()
+        # Per-compile-mode video_bench keys + whether compile-ON is benchmarkable on THIS machine.
+        # Resolved via the runner's own helpers so the table reads exactly the keys the runner writes.
+        # Sets self._bench_keys / self._display_modes / self._compile_available / self._compile_why /
+        # self.model_tag. Read _resolve_keys before changing this.
+        self._resolve_keys()
         self.total_vram_gb = 0
         self.target_vars = {}
-        self._rows = {}                     # target -> tree iid
+        self._rows = {}                     # (target, "off"/"on") -> tree iid
+        self._row_meta = {}                 # iid -> (target, mode), for sort/filter keys
+        self._row_order = []                # iids in creation order (filtered reattach base)
+        self._bench_sort = {}              # view-sort direction state for the results headers
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Configure>", self._track_geometry, add="+")
+        # Safety net: restore the main window no matter HOW this one goes away (a normal close
+        # runs _close first; this catches any other teardown so the app can't be left running
+        # with its only window hidden). Guarded to this widget (Destroy bubbles from children).
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.deiconify()                    # reveal now that it's fully built (no flash)
         # No modal grab_set(): an application grab makes Windows swallow the title-bar MINIMIZE
         # and MAXIMIZE system commands (SC_MINIMIZE/SC_MAXIMIZE), so a long remote sweep (hours)
         # could not be minimized out of the way -- only edge-drag resizing still worked. The grab
         # was only a belt-and-suspenders guard against a second benchmark window (already blocked
         # by the tab's _benchmark_win reuse guard) and a conflicting local GPU job (already
-        # blocked by _hide_master iconifying the main window + the Benchmark button's
+        # blocked by _hide_master hiding the main window + the Benchmark button's
         # local_gpu_job_running() backstop), so dropping it costs no real protection.
         self.after(80, self._detect_gpu)
         self._hide_master()
 
     def _hide_master(self):
-        """Minimize the main app window for the benchmark's lifetime (restored in _close)."""
+        """Fully hide (withdraw) the main app window for the benchmark's lifetime, restored in
+        _restore_master. This window is not a real modal (grab was dropped in 0.5.0 so a long
+        sweep can be minimized, see __init__); its 'modal' guarantee is that the main window is
+        out of reach so no conflicting GPU job can be started behind it. Withdraw, not iconify:
+        a merely-minimized root gets RESTORED by Windows to service a mid-session dialog (a
+        messagebox, a filedialog, the card picker's grab) and then sits there reachable once the
+        dialog closes; a withdrawn window is not remapped for a dialog parented elsewhere, so the
+        whole problem goes away."""
         try:
             if self._master_win is not None and self._master_win.winfo_exists():
-                self._master_win.iconify()
+                self._master_win.withdraw()
         except Exception:                              # noqa: BLE001
             pass
 
     def _restore_master(self):
+        if self._closing:
+            return                                     # idempotent: _close + <Destroy> both call
+        self._closing = True
         try:
             if self._master_win is not None and self._master_win.winfo_exists():
                 self._master_win.deiconify()
@@ -119,26 +145,84 @@ class BenchmarkWindow(tk.Toplevel):
         except Exception:                              # noqa: BLE001
             pass
 
+    def _on_destroy(self, event):
+        # Any teardown path (not just the normal _close) must bring the main window back, or the
+        # app is left running with no visible window. Guard to THIS widget: <Destroy> bubbles up
+        # from every child widget as they are torn down.
+        if event.widget is self:
+            self._restore_master()
+
     # ── layout ───────────────────────────────────────────────────────────────
 
-    def _resolve_bench_key(self):
-        """The video_bench key this window must READ, which is whatever the runner will WRITE:
-        the model tag plus a tag per setting that moves the numbers (VAE tiling, torch.compile).
+    def _resolve_keys(self):
+        """Resolve the per-torch.compile-mode video_bench keys the runner will WRITE, plus whether
+        compile-ON can actually run here. Sets:
+          self.model_tag        - base model DISPLAY name (no compile suffix), for the header.
+          self._bench_keys      - {"off": key, "on": key} (LOCAL) or {mode: key} (REMOTE, single).
+          self._display_modes   - the modes that get a table row, in display order.
+          self._compile_available / self._compile_why - drives the "Also use Torch Compile" toggle.
 
-        A bare model tag was wrong whenever either feature was on. With compile enabled the
-        runner wrote "7b|c" while this window read "7b", so the results table showed the STALE
-        UNCOMPILED cell (ceiling 125, 0.54 s/f) for the entire compiled sweep, and the resume
-        estimate counted those rows as work already done.
-
-        Resolved ONCE at open, not per refresh: the local branch runs the compile gate, which
-        verifies the toolchain by actually compiling. That is cached per process but costs a
-        second on first call, and _refresh_estimate fires on every checkbox tick. Fail-safe: any
-        problem falls back to the bare display tag (a wrong table beats no window)."""
+        LOCAL shows the no-compile baseline always, and the compiled mode too when the toolchain
+        verifies (gate_local_compile). REMOTE is single-mode (the config's compile setting): running
+        both compile modes is a local-GPU feature; a pod owns its own compile. Resolved ONCE at open
+        (the local gate verifies by compiling, ~1 s, cached per process). Fail-safe: any problem
+        degrades to a single OFF row keyed by the bare model tag, so the window still opens."""
+        self.model_tag = sizer.model_tag(CFG.get("video", {}).get(
+            "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
+        self._compile_available = False
+        self._compile_why = None
         try:
-            return vb.resolve_bench_key(remote=self.remote, log_fn=lambda *_a, **_k: None)
-        except Exception:
-            return sizer.model_tag(CFG.get("video", {}).get(
-                "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
+            if self.remote:
+                key = vb.resolve_bench_key(remote=True, log_fn=lambda *_a, **_k: None)
+                mode = "on" if (key.endswith("|c") or key.endswith("|cd")) else "off"
+                self._bench_keys = {mode: key}
+                self._display_modes = [mode]
+            else:
+                keys = vb.resolve_bench_keys(remote=False, log_fn=lambda *_a, **_k: None)
+                self._bench_keys = {"off": keys["off"]}
+                self._display_modes = ["off"]
+                self._compile_available = bool(keys.get("compile_available"))
+                self._compile_why = keys.get("compile_why")
+                if self._compile_available and keys.get("on"):
+                    self._bench_keys["on"] = keys["on"]
+                    self._display_modes.append("on")
+        except Exception:                              # noqa: BLE001 (a working window beats a right key)
+            self._bench_keys = {"off": self.model_tag}
+            self._display_modes = ["off"]
+
+    def _bench_key(self, mode):
+        """The video_bench key for a compile mode ("off"/"on"), or None if this window has no
+        such mode (e.g. compile unavailable, or a remote single-mode window)."""
+        return self._bench_keys.get(mode)
+
+    def _run_modes(self):
+        """The compile modes the NEXT run will benchmark. LOCAL: the no-compile baseline always,
+        plus compile-ON when 'Also use Torch Compile' is ticked (and available). REMOTE: the single
+        config-derived mode (the runner reads config; no --compile-modes is passed)."""
+        if self.remote:
+            return list(self._display_modes)
+        modes = ["off"]
+        if self._compile_available and self.also_compile_var.get():
+            modes.append("on")
+        return modes
+
+    def _also_compile_tip_text(self):
+        """Dynamic tooltip for the 'Also use Torch Compile' checkbox: what it does, or why it is
+        disabled (remote, or no compile toolchain on this machine)."""
+        if self.remote:
+            return ("Benchmarking both torch.compile modes at once is a local-GPU feature. A remote "
+                    "pod benchmark uses the compile setting from Settings.")
+        if not self._compile_available:
+            why = self._compile_why or ("the torch.compile toolchain (Triton + a C compiler) is "
+                                        "not set up")
+            return ("Disabled: torch.compile can't run on this machine, so only the no-compile "
+                    f"baseline is benchmarked.\nReason: {why}.\n"
+                    "Set it up from the first-start wizard (or Settings) to benchmark compiled too.")
+        return ("On: benchmark BOTH with and without torch.compile in one run. Each is saved under "
+                "its own key, so AUTO and the time estimate use the right numbers whichever mode you "
+                "later upscale with.\nOff: benchmark the no-compile baseline only.\n"
+                "This is independent of the Torch Compile checkbox in Settings; it only affects "
+                "this benchmark.")
 
     @staticmethod
     def _target_label(t):
@@ -193,11 +277,25 @@ class BenchmarkWindow(tk.Toplevel):
             cb.grid(row=i // cols, column=i % cols, padx=(0, 16), pady=(0, 4), sticky="w")
             self._toggles.append(cb)
             self._target_cb[t] = cb
+        base_row = (len(self.ALL_TARGETS) + cols - 1) // cols
+        # "Also use Torch Compile" (before Restart): benchmark both compile modes at once. Default
+        # ticked when the machine can compile; disabled + unticked otherwise (remote, or no toolchain).
+        self.also_compile_var = tk.BooleanVar(
+            value=bool(self._compile_available and not self.remote))
+        self.also_compile_cb = ttk.Checkbutton(
+            tf, text="Also use Torch Compile (benchmark with AND without compile)",
+            variable=self.also_compile_var, command=self._refresh_estimate)
+        self.also_compile_cb.grid(row=base_row, column=0, columnspan=cols, sticky="w", pady=(6, 0))
+        if not (self._compile_available and not self.remote):
+            self.also_compile_cb.configure(state="disabled")
+        else:
+            self._toggles.append(self.also_compile_cb)      # locked while a run is in flight
+        self.also_compile_tip = Tooltip(self.also_compile_cb, self._also_compile_tip_text())
+
         self.restart_var = tk.BooleanVar(value=False)
         rb = ttk.Checkbutton(tf, text="Restart (discard saved results for the ticked targets)",
                              variable=self.restart_var, command=self._refresh_estimate)
-        rb.grid(row=(len(self.ALL_TARGETS) + cols - 1) // cols, column=0, columnspan=cols,
-                sticky="w", pady=(6, 0))
+        rb.grid(row=base_row + 1, column=0, columnspan=cols, sticky="w", pady=(2, 0))
         self._toggles.append(rb)
         Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
                     "On: clears the saved probes for the TICKED targets only and measures\n"
@@ -207,30 +305,59 @@ class BenchmarkWindow(tk.Toplevel):
         rf = ttk.LabelFrame(self, text=" Results & log ", padding=4)
         rf.grid(row=3, column=0, sticky="nsew", pady=(8, 0), **pad)
         self.rowconfigure(3, weight=1)
-        rf.rowconfigure(1, weight=1)          # the log grows; the 5-row table stays put
+        rf.rowconfigure(2, weight=1)          # the log grows; the filter bar + table stay put
         rf.columnconfigure(0, weight=1)
-        cols = ("ceiling", "saved", "overlap", "spf", "peak", "status", "runtime")
-        self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=5)
-        self.tree.column("#0", width=110, stretch=False)
-        self.tree.heading("#0", text="Target")
+
+        # Filter bar (mirrors the Video Upscaler's lists): narrow the results by compile mode
+        # or target, populated once the rows exist (_populate_bench_filters). Detach/reattach,
+        # so filtering is view-only and never touches the saved probes.
+        filt = ttk.Frame(rf)
+        filt.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(filt, text="Filter:").pack(side="left")
+        self.filter_mode_var = tk.StringVar(value="All")
+        self.filter_target_var = tk.StringVar(value="All")
+        self._filter_combos = {}
+        for label, var, width in (("Torch Compile", self.filter_mode_var, 8),
+                                  ("Target", self.filter_target_var, 12)):
+            ttk.Label(filt, text=f"  {label}:").pack(side="left")
+            cb = ttk.Combobox(filt, textvariable=var, state="readonly",
+                              width=width, values=["All"])
+            cb.pack(side="left", padx=(2, 0))
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_bench_filters())
+            self._filter_combos[label] = cb
+        ttk.Button(filt, text="Reset", command=self._reset_bench_filters).pack(
+            side="left", padx=(10, 0))
+
+        # Column one is "Torch Compile" (ON/OFF): each target gets a row per benchmarked compile
+        # mode. The tree column (#0) carries it; "Target" is the first data column.
+        cols = ("target", "ceiling", "saved", "overlap", "spf", "peak", "status", "runtime")
+        self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=6)
+        self.tree.column("#0", width=100, minwidth=90, stretch=False, anchor="center")
+        # Click any header (incl. Torch Compile/#0) to view-sort by that column (toggles
+        # asc/desc); the values sort by their UNDERLYING number, not the display text.
+        _titles = {"#0": "Torch Compile"}
+        self.tree.heading("#0", text="Torch Compile",
+                          command=lambda: self._sort_tree("#0"))
         # "Max batch" = how far the card pushed (the raw ceiling); "Used" = the batch AUTO
         # actually runs (the fastest window, which can be lower: the ceiling rides VRAM spill).
-        # "Runtime" = the GPU time this target's probes took (summed from the saved probes, so it
+        # "Runtime" = the GPU time this cell's probes took (summed from the saved probes, so it
         # persists and re-accumulates correctly on resume).
-        for c, txt, w in (("ceiling", "Max batch", 84), ("saved", "Used", 60),
-                          ("overlap", "Overlap", 66), ("spf", "s/frame", 74),
-                          ("peak", "Peak VRAM", 104), ("status", "Status", 180),
-                          ("runtime", "Runtime", 78)):
-            self.tree.heading(c, text=txt)
+        for c, txt, w in (("target", "Target", 104), ("ceiling", "Max batch", 84),
+                          ("saved", "Used", 60), ("overlap", "Overlap", 66),
+                          ("spf", "s/frame", 74), ("peak", "Peak VRAM", 104),
+                          ("status", "Status", 170), ("runtime", "Runtime", 78)):
+            _titles[c] = txt
+            self.tree.heading(c, text=txt, command=lambda c=c: self._sort_tree(c))
             self.tree.column(c, width=w, stretch=(c == "status"),
                              anchor=("e" if c == "runtime" else "w"))
-        self.tree.grid(row=0, column=0, sticky="ew")
+        self._bench_sort["_titles"] = _titles
+        self.tree.grid(row=1, column=0, sticky="ew")
         sb = ttk.Scrollbar(rf, orient="vertical", command=self.tree.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        sb.grid(row=1, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
 
         logf = ttk.Frame(rf)
-        logf.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        logf.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         logf.rowconfigure(1, weight=1)
         logf.columnconfigure(0, weight=1)
         ttk.Label(logf, text="Program output (no engine diagnostics)",
@@ -296,16 +423,41 @@ class BenchmarkWindow(tk.Toplevel):
                 self.app.telemetry_rows.append(self.telemetry_row)
                 self.after(200, self.app.sample_telemetry)
 
-        # Buttons.
+        # Buttons: run controls, share actions, the issue link and Close all on ONE row.
+        # Start/Stop drive the sweep; Export/Contribute give your measured results back (the
+        # community corpus is pulled automatically at startup, App._startup_bench_sync, so there
+        # is no Download/Import button); Export/Contribute enable once a card is detected and let
+        # you pick SEVERAL cards for one submission. The issue link's column takes the slack so
+        # Close sits at the far right.
         bf = ttk.Frame(self)
         bf.grid(row=8, column=0, sticky="ew", pady=(8, 10), **pad)
-        bf.columnconfigure(2, weight=1)
+        bf.columnconfigure(4, weight=1)
         self.start_btn = ttk.Button(bf, text="Start", command=self._start, state="disabled")
         self.start_btn.grid(row=0, column=0)
         self.stop_btn = ttk.Button(bf, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(6, 0))
+        self.export_btn = ttk.Button(bf, text="Export…", command=self._export,
+                                     state="disabled")
+        self.export_btn.grid(row=0, column=2, padx=(16, 0))
+        self.contribute_btn = ttk.Button(bf, text="Contribute my results…",
+                                        command=self._contribute, state="disabled")
+        self.contribute_btn.grid(row=0, column=3, padx=(6, 0))
+        Tooltip(self.contribute_btn,
+                "Share your benchmark results with other users: opens a pre-filled GitHub "
+                "issue (uses your browser's GitHub login, no setup). You can select several "
+                "GPUs to submit at once. Local results always win over the community data.")
+        # "Report an issue" link (mirrors the main window's bottom-bar link), but it
+        # points reporters at logs/video_benchmark.log -- the benchmark's own diagnostics,
+        # far more useful here than the newest crash log the main-window link suggests.
+        issue = tk.Label(bf, text="Report an issue", fg="#3a86ff",
+                         cursor="hand2", font=("Segoe UI", 9, "underline"))
+        issue.grid(row=0, column=4, sticky="w", padx=(16, 0))
+        issue.bind("<Button-1>", lambda _e: report_issue(
+            os.path.join(APP_ROOT, "logs", "video_benchmark.log"), "Benchmark log"))
+        issue.bind("<Enter>", lambda _e: issue.configure(fg="#1a5fd0"))
+        issue.bind("<Leave>", lambda _e: issue.configure(fg="#3a86ff"))
         self.close_btn = ttk.Button(bf, text="Close", command=self._close)
-        self.close_btn.grid(row=0, column=3)
+        self.close_btn.grid(row=0, column=5)
 
     def _track_geometry(self, _e=None):
         if self.app is not None and self.state() == "normal":
@@ -357,8 +509,11 @@ class BenchmarkWindow(tk.Toplevel):
         if self.total_vram_gb >= 80:
             self.target_vars["4K"].set(True)
         self._load_prior()
+        self._populate_bench_filters()      # rows now exist: fill the filter combos
         self._apply_feasibility()
         self.start_btn.configure(state="normal")
+        self.export_btn.configure(state="normal")
+        self.contribute_btn.configure(state="normal")
         self._refresh_estimate()
         self._refresh_vram_warning(g)
 
@@ -383,7 +538,9 @@ class BenchmarkWindow(tk.Toplevel):
                                    f"exceeds the ~{max_mp:.1f} MP ceiling of a "
                                    f"{self.total_vram_gb} GB GPU for SeedVR2.")
                         cb._infeasible_tip = True
-                self.tree.set(self._ensure_row(t), "status", "not supported on this card (VRAM)")
+                for m in self._display_modes:
+                    self.tree.set(self._ensure_row(t, m), "status",
+                                  "not supported on this card (VRAM)")
             elif cb is not None:
                 cb.configure(state="normal")
 
@@ -413,32 +570,143 @@ class BenchmarkWindow(tk.Toplevel):
             self.vram_warn_lbl.grid_remove()
 
     def _load_prior(self):
-        """Pre-fill the table from saved probes (a resumable prior run)."""
+        """Pre-fill the table from saved probes (a resumable prior run), one row per (target,
+        compile-mode). Each mode reads its OWN key, so the with- and without-compile results show
+        side by side."""
         for t in self.ALL_TARGETS:
-            self._ensure_row(t)
             box = vb.TARGETS[t]
-            probes = vb.drop_collapsed(db.get_bench_probes(
-                self.conn, self.gpu_id, self.model_tag, box[0], box[1]))
-            if not probes:
-                self.tree.set(self._rows[t], "status", "not benchmarked")
-                self._set_runtime(t)
-                continue
-            ceil = vb.cell_ceiling(probes)
-            saved = vb.throughput_optimal_batch(probes)
-            done = vb.cell_done(probes)
-            self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)", saved=saved)
+            for m in self._display_modes:
+                self._ensure_row(t, m)
+                probes = vb.drop_collapsed(db.get_bench_probes(
+                    self.conn, self.gpu_id, self._bench_key(m), box[0], box[1]))
+                if not probes:
+                    self.tree.set(self._rows[(t, m)], "status", "not benchmarked")
+                    self._set_runtime(t, m)
+                    continue
+                ceil = vb.cell_ceiling(probes)
+                saved = vb.throughput_optimal_batch(probes)
+                done = vb.cell_done(probes)
+                self._set_ceiling(t, m, ceil, "saved" if done else "partial (resumable)",
+                                  saved=saved)
+                self._set_saved_metrics(t, m, probes)   # spf + Peak VRAM (persisted, not live)
 
     @property
     def conn(self):
         return db.get_conn()
 
-    def _ensure_row(self, target):
-        if target not in self._rows:
-            self._rows[target] = self.tree.insert("", "end", text=target)
-        return self._rows[target]
+    def _ensure_row(self, target, mode):
+        key = (target, mode)
+        if key not in self._rows:
+            iid = self.tree.insert(
+                "", "end", text=mode.upper(),          # "OFF" / "ON" in the Torch Compile column
+                values=(target, "", "", "", "", "", "", ""))
+            self._rows[key] = iid
+            self._row_meta[iid] = (target, mode)
+            self._row_order.append(iid)
+        return self._rows[key]
 
-    def _set_ceiling(self, target, ceil, status, saved=None):
-        iid = self._ensure_row(target)
+    # ── results filtering + column sorting (mirrors the Video Upscaler lists) ──
+
+    def _populate_bench_filters(self):
+        """Fill the Torch Compile / Target filter combos with the DISTINCT values now present
+        in the table (plus 'All'), in row-creation order. Called once the rows exist."""
+        modes, targets = [], []
+        for iid in self._row_order:
+            t, m = self._row_meta[iid]
+            if m.upper() not in modes:
+                modes.append(m.upper())
+            if t not in targets:
+                targets.append(t)
+        self._filter_combos["Torch Compile"].configure(values=["All"] + modes)
+        self._filter_combos["Target"].configure(values=["All"] + targets)
+
+    def _reset_bench_filters(self):
+        self.filter_mode_var.set("All")
+        self.filter_target_var.set("All")
+        self._apply_bench_filters()
+
+    def _apply_bench_filters(self):
+        """Show only rows matching every active filter, by detaching the rest and reattaching
+        matches in creation order. View-only: the saved probes are untouched. Setting cell
+        values on a detached row is fine, so a running sweep still updates hidden rows."""
+        mf = self.filter_mode_var.get()
+        tf = self.filter_target_var.get()
+        idx = 0
+        for iid in self._row_order:
+            t, m = self._row_meta.get(iid, (None, None))
+            if t is None:
+                continue
+            ok = ((mf in ("", "All") or m.upper() == mf) and
+                  (tf in ("", "All") or t == tf))
+            if ok:
+                self.tree.reattach(iid, "", idx)
+                idx += 1
+            else:
+                self.tree.detach(iid)
+
+    @staticmethod
+    def _num(s):
+        """Leading number in a display cell (e.g. '5', '0.39', '23.1/23.1 GB'), or -1.0 when
+        there is none ('—', ''), so blank/absent cells sort to the bottom of an ascending sort."""
+        mm = re.search(r"[-+]?\d*\.?\d+", s or "")
+        return float(mm.group()) if mm else -1.0
+
+    @staticmethod
+    def _hms_to_s(s):
+        """Seconds from a 'H:MM:SS' / 'M:SS' runtime cell, or -1.0 for '—'/blank."""
+        s = (s or "").strip()
+        if not s or s == "—":
+            return -1.0
+        try:
+            sec = 0
+            for part in s.split(":"):
+                sec = sec * 60 + int(part)
+            return float(sec)
+        except ValueError:
+            return -1.0
+
+    def _bench_sort_key(self, col):
+        """Sort key for a results row, by the UNDERLYING value (not the display text): the
+        compile mode orders OFF<ON, Target by its output pixels, the numeric columns by their
+        parsed number, runtime by seconds, and Status alphabetically."""
+        def key(iid):
+            t, m = self._row_meta.get(iid, ("", "off"))
+            if col == "#0":
+                return 0 if m == "off" else 1
+            if col == "target":
+                w, h = vb.TARGETS[t][:2]
+                return w * h
+            if col in ("ceiling", "saved", "overlap", "spf", "peak"):
+                return self._num(self.tree.set(iid, col))
+            if col == "runtime":
+                return self._hms_to_s(self.tree.set(iid, "runtime"))
+            return (self.tree.set(iid, col) or "").lower()      # status
+        return key
+
+    def _sort_tree(self, col):
+        """View-sort the results table by `col` (toggling asc/desc), only over the currently
+        VISIBLE (unfiltered) rows. Header-only: it reorders the display, not the saved probes."""
+        state = self._bench_sort
+        reverse = not state.get(col, True)          # first click = ascending
+        keyfunc = self._bench_sort_key(col)
+        rows = [(keyfunc(iid), iid) for iid in self.tree.get_children("")]
+        try:
+            rows.sort(key=lambda t: t[0], reverse=reverse)
+        except TypeError:                                # mixed types -> compare as str
+            rows.sort(key=lambda t: str(t[0]), reverse=reverse)
+        for i, (_k, iid) in enumerate(rows):
+            self.tree.move(iid, "", i)
+        titles = state.get("_titles", {})
+        for k in list(state.keys()):                     # reset directions, keep titles
+            if k != "_titles":
+                del state[k]
+        state[col] = reverse
+        for c, base in titles.items():
+            arrow = (" ▲" if not reverse else " ▼") if c == col else ""
+            self.tree.heading(c, text=base + arrow)
+
+    def _set_ceiling(self, target, mode, ceil, status, saved=None):
+        iid = self._ensure_row(target, mode)
         self.tree.set(iid, "ceiling", str(ceil) if ceil else "—")
         self.tree.set(iid, "saved", str(saved) if saved else "—")
         # Overlap reflects the batch AUTO will actually run: the saved (fastest) one, else the
@@ -446,21 +714,41 @@ class BenchmarkWindow(tk.Toplevel):
         ov_b = saved or ceil
         self.tree.set(iid, "overlap", str(sizer.auto_overlap(ov_b)) if ov_b else "—")
         self.tree.set(iid, "status", status)
-        self._set_runtime(target)
+        self._set_runtime(target, mode)
 
-    def _cell_runtime_s(self, target):
-        """Total GPU time this target's probes took = the sum of the saved probes' seconds. Read
-        from the DB (the runner records each probe before signalling the GUI, and upserts a
-        re-probe), so it is correct live, persists, and re-accumulates on resume."""
+    def _set_saved_metrics(self, target, mode, probes):
+        """Fill the s/frame + Peak VRAM columns from the SAVED (throughput-optimal) probe.
+
+        Those two columns are otherwise written ONLY by live BPROBE events, so a REOPENED
+        window (and the reflected final state after a run) showed them blank even though the
+        per-probe timing and VRAM peaks are persisted in db.video_bench — the values were
+        saved, just never read back. Shows the batch AUTO will actually use (matching the
+        runner's recorded rate and summary table), so a resumed/closed sweep reads the same
+        s/frame a live probe did. Fail-safe: a cell with no timed 'ok' probe leaves the two
+        columns untouched."""
+        m = vb.saved_metrics(probes)
+        if not m:
+            return
+        iid = self._ensure_row(target, mode)
+        self.tree.set(iid, "spf", f"{m['spf']:.2f}")
+        pa, pr = m["peak_alloc"], m["peak_reserved"]
+        if pa or pr:                                   # mirror the live BPROBE formatting
+            self.tree.set(iid, "peak", f"{pa or '?'}/{pr or '?'} GB")
+
+    def _cell_runtime_s(self, target, mode):
+        """Total GPU time this (target, mode) cell's probes took = the sum of the saved probes'
+        seconds under that mode's key. Read from the DB (the runner records each probe before
+        signalling the GUI, and upserts a re-probe), so it is correct live, persists, and
+        re-accumulates on resume."""
         if not self.gpu_id:
             return 0.0
         w, h = vb.TARGETS[target][:2]
-        probes = db.get_bench_probes(self.conn, self.gpu_id, self.model_tag, w, h)
+        probes = db.get_bench_probes(self.conn, self.gpu_id, self._bench_key(mode), w, h)
         return sum((p["seconds"] or 0) for p in probes)
 
-    def _set_runtime(self, target):
-        s = self._cell_runtime_s(target)
-        self.tree.set(self._ensure_row(target), "runtime", _fmt_hms(s) if s else "—")
+    def _set_runtime(self, target, mode):
+        s = self._cell_runtime_s(target, mode)
+        self.tree.set(self._ensure_row(target, mode), "runtime", _fmt_hms(s) if s else "—")
 
     def _selected_targets(self):
         return [t for t in self.ALL_TARGETS if self.target_vars[t].get()]
@@ -475,16 +763,24 @@ class BenchmarkWindow(tk.Toplevel):
             return
         self.start_btn.configure(state="normal" if self.proc is None else "disabled")
         plan = vb.build_plan(targets)
+        run_modes = self._run_modes()
+        # Estimate + done count sum over every compile mode the run will sweep (each is a full pass).
+        est = 0.0
         done = 0
-        if not self.restart_var.get():
-            for c in plan:
-                done += len(db.get_bench_probes(self.conn, self.gpu_id, self.model_tag,
-                                                c["out_w"], c["out_h"]))
-        est = vb.estimate_runtime(plan, self.gpu_id, self.conn, done=done)
+        for m in run_modes:
+            key = self._bench_key(m)
+            dm = 0
+            if not self.restart_var.get():
+                dm = sum(len(db.get_bench_probes(self.conn, self.gpu_id, key,
+                                                 c["out_w"], c["out_h"])) for c in plan)
+            done += dm
+            est += vb.estimate_runtime(plan, self.gpu_id, self.conn, done=dm)
         verb = "Restart" if self.restart_var.get() else ("Resume" if done else "Run")
         self.start_btn.configure(text=verb if self.proc is None else verb)
-        self.estimate_var.set(f"{verb}: {len(targets)} target(s) · estimated ~{_fmt_hms(est)} "
-                              f"(rough; the card's real speed is unknown until measured).")
+        modes_note = " · with + without compile" if len(run_modes) > 1 else ""
+        self.estimate_var.set(f"{verb}: {len(targets)} target(s){modes_note} · estimated "
+                              f"~{_fmt_hms(est)} (rough; the card's real speed is unknown until "
+                              f"measured).")
 
     # ── run / stop ───────────────────────────────────────────────────────────
 
@@ -520,14 +816,18 @@ class BenchmarkWindow(tk.Toplevel):
                     "Any other target measured on this card keeps its results.",
                     parent=self):
                 return
+        run_modes = self._run_modes()
         cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "video_benchmark.py"),
                "--targets", ",".join(targets)]
         if self.remote:
-            cmd.append("--remote")
+            cmd.append("--remote")                     # remote uses the config compile setting
+        else:
+            cmd += ["--compile-modes", ",".join(run_modes)]
         if self.restart_var.get():
             cmd.append("--restart")
             for t in targets:                          # clear the table rows we're redoing
-                self._set_ceiling(t, None, "queued")
+                for m in run_modes:
+                    self._set_ceiling(t, m, None, "queued")
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
@@ -623,6 +923,210 @@ class BenchmarkWindow(tk.Toplevel):
             except Exception:                          # noqa: BLE001
                 pass
         self.stop_btn.configure(state="disabled")
+
+    # ── benchmark sharing (feature #8) ───────────────────────────────────────
+
+    def _local_name(self):
+        """The machine's detected card name, queried once and cached (used to infer
+        local/remote for a contributed card that isn't the window's)."""
+        if not hasattr(self, "_local_gpu_cache"):
+            try:
+                from local_video_engine import _query_gpu_name
+                self._local_gpu_cache = _query_gpu_name()
+            except Exception:                              # noqa: BLE001
+                self._local_gpu_cache = None
+        return self._local_gpu_cache
+
+    def _run_on_for(self, gpu_id):
+        # The window's own card: its mode is authoritative. Any other card on disk: infer.
+        if gpu_id == self.gpu_id:
+            return "remote" if self.remote else "local"
+        return vb.infer_run_on(gpu_id, local_name=self._local_name())
+
+    def _rows_for(self, gpu_id):
+        """Contributable summary rows for a card. Price only applies to the window's own
+        remote card (a historical card carries no live price). Fail-safe: [] on any error."""
+        price = self.remote_gpu.get("price") if (self.remote and gpu_id == self.gpu_id) else None
+        try:
+            return vb.build_share_rows(self.conn, gpu_id,
+                                       run_on=self._run_on_for(gpu_id), price_usd_hr=price)
+        except Exception:                                  # noqa: BLE001 (never break the window)
+            return []
+
+    def _gpu_picker(self, cards, counts):
+        """Modal MULTI-select card chooser: every card with contributable rows on disk (out-of-
+        stock remote cards included, so their past results can still be shared), each showing its
+        contributable row count. Pre-selects ALL so submitting several GPUs at once is one click;
+        narrow the selection with click / Ctrl+click / Shift+click. Returns the chosen list of
+        gpu_ids (empty if cancelled)."""
+        win = tk.Toplevel(self)
+        win.title("Choose cards to share")
+        win.transient(self)
+        win.grab_set()
+        try:
+            win.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+        except Exception:
+            pass
+        ttk.Label(win, text="Contribute benchmark results for (select one or more):").pack(
+            anchor="w", padx=12, pady=(12, 4))
+        lb = tk.Listbox(win, selectmode="extended", width=54,
+                        height=min(12, len(cards)), activestyle="none", exportselection=False)
+        lb.pack(fill="both", expand=True, padx=12)
+        for c in cards:
+            n = counts[c]
+            lb.insert("end", f"{c}   ({n} row{'' if n == 1 else 's'})")
+        lb.selection_set(0, "end")                     # default: all cards, so multi-submit is 1 click
+        lb.see(0)
+        chosen = {"gpus": []}
+
+        def ok(_e=None):
+            chosen["gpus"] = [cards[i] for i in lb.curselection()]
+            win.destroy()
+
+        lb.bind("<Double-Button-1>", ok)
+        lb.bind("<Return>", ok)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=12, pady=12)
+        ttk.Button(bf, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(bf, text="OK", command=ok).pack(side="right", padx=(0, 6))
+        ttk.Button(bf, text="Select all",
+                   command=lambda: lb.selection_set(0, "end")).pack(side="left")
+        ttk.Button(bf, text="Clear",
+                   command=lambda: lb.selection_clear(0, "end")).pack(side="left", padx=(6, 0))
+        win.update_idletasks()
+        self.wait_window(win)
+        return chosen["gpus"]
+
+    def _pick_and_rows(self):
+        """Choose which card(s) to share and build their COMBINED rows. The multi-select picker
+        is shown when >1 card has contributable rows (a single card skips it); cards with zero
+        contributable rows are hidden. Returns (gpu_ids, rows) or None (cancelled / nothing)."""
+        if not db.bench_gpu_ids(self.conn):
+            messagebox.showinfo(
+                APP_TITLE, "No benchmark results to share yet. Run a benchmark first, then "
+                "Export or Contribute.", parent=self)
+            return None
+        # Build each card's rows once; keep only cards that actually have something to share
+        # (a remote card with only Torch Compile OFF results contributes nothing, so it is
+        # hidden rather than offered as an empty pick).
+        by_card = {c: self._rows_for(c) for c in db.bench_gpu_ids(self.conn)}
+        cards = [c for c, r in by_card.items() if r]
+        if not cards:
+            messagebox.showinfo(
+                APP_TITLE, "No contributable results yet.\n\nRemote pods run with Torch "
+                "Compile ON, so Torch Compile OFF results from a rented pod are not shared.",
+                parent=self)
+            return None
+        if len(cards) == 1:
+            chosen = [cards[0]]
+        else:
+            counts = {c: len(by_card[c]) for c in cards}
+            chosen = self._gpu_picker(cards, counts)
+            if not chosen:
+                return None
+        rows = [r for c in chosen for r in by_card[c]]
+        return chosen, rows
+
+    def _default_csv_name(self, gpu_ids):
+        """CSV filename for one or several cards: the card name for a single GPU, else a generic
+        multi-GPU name (the CSV itself carries each card's gpu_id)."""
+        if isinstance(gpu_ids, str):
+            gpu_ids = [gpu_ids]
+        if len(gpu_ids) == 1:
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", gpu_ids[0] or "gpu").strip("_") or "gpu"
+            return f"benchmark_{safe}.csv"
+        return f"benchmark_{len(gpu_ids)}-gpus.csv"
+
+    @staticmethod
+    def _share_label(gpu_ids):
+        """Human label for a set of shared cards (issue title / status line)."""
+        return gpu_ids[0] if len(gpu_ids) == 1 else f"{len(gpu_ids)} GPUs"
+
+    def _export(self):
+        picked = self._pick_and_rows()
+        if picked is None:
+            return
+        gpu_ids, rows = picked
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Export benchmark results", defaultextension=".csv",
+            initialfile=self._default_csv_name(gpu_ids), filetypes=[("CSV files", "*.csv")])
+        if not path:
+            return
+        import bench_share
+        try:
+            n = bench_share.write_csv(path, rows)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Could not write the CSV:\n{exc}", parent=self)
+            return
+        self.status_var.set(f"Exported {n} row(s) for {self._share_label(gpu_ids)} to {path}")
+        messagebox.showinfo(
+            APP_TITLE, f"Exported {n} benchmark row(s) for {self._share_label(gpu_ids)} to:\n{path}",
+            parent=self)
+
+    def _contribute(self):
+        picked = self._pick_and_rows()
+        if picked is None:
+            return
+        gpu_ids, rows = picked
+        # Diff against the LIVE community corpus so a user who benchmarks a bit more each day
+        # only submits genuinely new/changed rows, instead of re-posting the whole set every
+        # time (submission happens in the browser and can't be confirmed by the app). Fetch off
+        # the UI thread; on any failure we fall back to submitting everything (the maintainer
+        # merge dedups anyway, so a missed diff is noise, never lost data).
+        self.contribute_btn.configure(state="disabled")
+        self.status_var.set("Checking the community data set for new results …")
+
+        def work():
+            import bench_share
+            try:
+                existing = bench_share.fetch_community()
+                to_send = bench_share.new_rows(rows, existing) if existing else list(rows)
+                checked = bool(existing)
+                err = None
+            except Exception as exc:                    # noqa: BLE001 (fail-safe -> send all)
+                to_send, checked, err = list(rows), False, exc
+            self.after(0, lambda: self._contribute_ready(gpu_ids, to_send, len(rows), checked, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _contribute_ready(self, gpu_ids, to_send, total, checked, err):
+        self.contribute_btn.configure(state="normal")
+        label = self._share_label(gpu_ids)
+        dropped = total - len(to_send)
+        if not to_send:
+            self.status_var.set("Nothing new to contribute.")
+            messagebox.showinfo(
+                APP_TITLE, f"All of {label}'s results are already in the community data set. "
+                "Nothing new to submit.", parent=self)
+            return
+        import bench_share
+        path = os.path.join(APP_ROOT, "logs", self._default_csv_name(gpu_ids))
+        try:
+            bench_share.write_csv(path, to_send)        # copy on disk for the attach fallback
+            csv_text = bench_share.to_text(to_send)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Could not write the CSV:\n{exc}", parent=self)
+            return
+        # How the dedup went, appended to every outcome message.
+        note = (f" ({dropped} already in the community set were skipped)" if dropped else "")
+        if not checked and err is not None:
+            note = " (could not check the community set, so all rows are included)"
+        mode = contribute_benchmark(label, csv_text, path)
+        if mode == "inline":
+            self.status_var.set(f"Opened a pre-filled issue for {label} "
+                                f"({len(to_send)} new row(s)){note}. Review and Submit in your browser.")
+        elif mode == "attach":
+            self.status_var.set(f"Results saved to {path}.")
+            messagebox.showinfo(
+                APP_TITLE, "Your results are too large to embed in the issue directly.\n\n"
+                f"They were saved to:\n{path}\n\nDrag that file into the GitHub issue that "
+                "just opened, then Submit.", parent=self)
+        else:
+            messagebox.showwarning(
+                APP_TITLE, "Could not open your browser. Your results were saved to:\n"
+                f"{path}\n\nYou can attach that file to a GitHub issue manually.",
+                parent=self)
 
     # ── subprocess pump (compact @@TBX@@ parser, mirrors tab_video) ───────────
 
@@ -720,15 +1224,19 @@ class BenchmarkWindow(tk.Toplevel):
         if kind == "BSTART" and data:
             n = len(data.get("plan") or [])
             where = "a pod" if data.get("remote") else data.get("gpu")
-            self.status_var.set(f"Benchmarking {n} target(s) on {where} …")
+            modes = data.get("modes") or []
+            mnote = " (with + without compile)" if len(modes) > 1 else ""
+            self.status_var.set(f"Benchmarking {n} target(s){mnote} on {where} …")
         elif kind == "BCELL" and data:
-            self._set_ceiling(data["name"], None, "benchmarking …")
+            self._set_ceiling(data["name"], data.get("compile", "off"), None, "benchmarking …")
         elif kind == "BPROBE" and data:
             t = data.get("name")
+            mode = data.get("compile", "off")
             if data.get("state") == "running":
-                self.tree.set(self._ensure_row(t), "status", f"probing batch {data.get('batch')} …")
+                self.tree.set(self._ensure_row(t, mode),
+                              "status", f"probing batch {data.get('batch')} …")
             elif data.get("state") == "done":
-                iid = self._ensure_row(t)
+                iid = self._ensure_row(t, mode)
                 oc = data.get("outcome")
                 if oc == "ok":
                     self.tree.set(iid, "ceiling", str(data.get("batch")))
@@ -741,13 +1249,13 @@ class BenchmarkWindow(tk.Toplevel):
                     self.tree.set(iid, "status", f"batch {data.get('batch')} ok")
                 else:
                     self.tree.set(iid, "status", f"batch {data.get('batch')} {oc}")
-                self._set_runtime(t)                   # probe recorded -> refresh the target's total
+                self._set_runtime(t, mode)             # probe recorded -> refresh the cell's total
         elif kind == "BCEILING" and data:
             ceil = data.get("ceiling")
             saved = data.get("saved")
             status = (f"done — uses {saved} (max fit {ceil})" if saved and ceil and saved != ceil
                       else f"done — batch {saved}" if saved else "can't do this target")
-            self._set_ceiling(data["name"], ceil, status, saved=saved)
+            self._set_ceiling(data["name"], data.get("compile", "off"), ceil, status, saved=saved)
         elif kind == "BDONE" and data:
             self.status_var.set("Benchmark stopped." if data.get("stopped") else "Benchmark complete.")
 
@@ -766,18 +1274,23 @@ class BenchmarkWindow(tk.Toplevel):
             except Exception:                          # noqa: BLE001
                 pass
         self._apply_feasibility()                      # keep infeasible targets gated
-        for t in self.ALL_TARGETS:                     # reflect the persisted final state
+        for t in self.ALL_TARGETS:                     # reflect the persisted final state per mode
             box = vb.TARGETS[t]
-            probes = vb.drop_collapsed(db.get_bench_probes(
-                self.conn, self.gpu_id, self.model_tag, box[0], box[1]))
-            if probes:
+            for m in self._display_modes:
+                probes = vb.drop_collapsed(db.get_bench_probes(
+                    self.conn, self.gpu_id, self._bench_key(m), box[0], box[1]))
+                if not probes:
+                    continue
                 ceil = vb.cell_ceiling(probes)
                 saved = vb.throughput_optimal_batch(probes)
                 done = vb.cell_done(probes)
-                cur = self.tree.set(self._rows.get(t, self._ensure_row(t)), "status")
+                cur = self.tree.set(self._ensure_row(t, m), "status")
                 if not cur.startswith("done") and not cur.startswith("can't"):
-                    self._set_ceiling(t, ceil, "saved" if done else "partial (resumable)",
+                    self._set_ceiling(t, m, ceil, "saved" if done else "partial (resumable)",
                                       saved=saved)
+                # Reflect the SAVED batch's s/frame + Peak VRAM (persisted). Live BPROBE left
+                # whatever the last probe showed, which mid-refine isn't the optimal one.
+                self._set_saved_metrics(t, m, probes)
         self.restart_var.set(False)
         self._refresh_estimate()
         # Nudge the tab to re-read the (now calibrated) estimate on its next view.
