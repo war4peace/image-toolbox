@@ -330,6 +330,7 @@ class UpscaleTab(ToolTab):
         self.app.set_tag_tab_enabled(not running)
         self.app.refresh_conciliate_lock()
         self.app.refresh_benchmark_lock()
+        self.app.refresh_tab_exclusivity()
 
     def on_exit(self, code):
         self._set_running(False)

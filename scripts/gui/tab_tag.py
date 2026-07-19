@@ -351,6 +351,7 @@ class TagTab(ToolTab):
             state="normal" if (not running and has_dir) else "disabled")
         self.app.refresh_conciliate_lock()
         self.app.refresh_benchmark_lock()
+        self.app.refresh_tab_exclusivity()
 
     def on_exit(self, code):
         self._set_running(False)

@@ -2281,6 +2281,9 @@ class VideoTab(ttk.Frame):
             return
         self._hold = ""
         self._marker_buf = None
+        # Exclusivity: lock the other tabs now that proc is live (a local run owns the
+        # GPU; _begin_run ran before proc existed, so it can't do this itself).
+        self.app.refresh_tab_exclusivity()
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
 
@@ -2595,6 +2598,7 @@ class VideoTab(ttk.Frame):
         # Auto-resume is pod-only: keep it greyed in Local mode, re-enable it in Remote.
         self._apply_mode_ui()
         self.app.refresh_benchmark_lock()             # run over: re-enable the benchmark (if idle)
+        self.app.refresh_tab_exclusivity()            # run over: re-enable the other tabs
         # The run is over: its pod (if any) is no longer protected from terminate.
         # Cleared GUI-side (not via a runner event) so a hard-killed runner still
         # releases the protection. Mirrors ToolTab.on_exit.

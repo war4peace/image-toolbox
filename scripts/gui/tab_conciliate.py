@@ -338,6 +338,7 @@ class ConciliateTab(ToolTab):
         if not running:
             self.run_btn.configure(state="disabled")
         self._refresh_buttons()
+        self.app.refresh_tab_exclusivity()
 
     def on_exit(self, code):
         self._set_running(False)

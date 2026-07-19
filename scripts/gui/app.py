@@ -571,6 +571,21 @@ class App(tk.Tk):
         if fn is not None:
             fn()
 
+    def refresh_tab_exclusivity(self):
+        """Exclusivity: while ANY tool run is active, disable every OTHER notebook tab so a
+        second run can't be started. Two concurrent runs would fight over the local GPU and
+        the shared SQLite cache (the case that motivated this: a local Video Upscale left the
+        Batch Upscaler's Start reachable). The running tab stays enabled so its progress and
+        Stop button remain in reach; Settings/RunPod are locked too, since a mid-run config
+        change is unsafe. Called from every tool's run start/stop transition, where `.running`
+        is already accurate. Supersedes the older per-pair locks (which stay as a subset)."""
+        tool_tabs = (self.upscale_tab, self.tag_tab, self.conciliate_tab, self.video_tab)
+        active = next((t for t in tool_tabs if getattr(t, "running", False)), None)
+        for tab_id in self.nb.tabs():
+            widget = self.nb.nametowidget(tab_id)
+            keep = active is None or widget is active
+            self.nb.tab(tab_id, state="normal" if keep else "disabled")
+
     # ── Shared log window ────────────────────────────────────────────────────
 
     def show_log(self, console, title):
