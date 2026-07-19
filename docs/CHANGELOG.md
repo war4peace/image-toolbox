@@ -6,7 +6,7 @@ working draft those notes are distilled from, and it records **experimental**,
 in-development versions before they are tagged. For released versions, see the GitHub
 Releases page.
 
-## 0.5.1-experimental (in development)
+## 0.5.1
 
 ### Benchmark sharing (feature #8, NEW)
 Turns the per-card video benchmark into a **crowdsourced dataset**, so a GPU someone
