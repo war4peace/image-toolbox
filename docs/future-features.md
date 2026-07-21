@@ -100,6 +100,16 @@ The user installs and runs the application on their Unraid server.
 
 ## Decided against / constraints
 
+- **Pause for the Video Upscaler — decided against 2026-07-21.** Pause exists so the
+  user can reclaim the GPU without losing the queue, and it can only act at a safe
+  boundary. For stills that boundary is the gap between images (seconds); for video it
+  is the gap between segments (minutes to hours), so the button would not act when
+  pressed, and acting mid-segment means discarding partial work or building
+  frame-level checkpointing. Even a two-second clip is ~50 frames. Stop already covers
+  the need: a stopped run resumes at the first unfinished **segment** (`db.py`
+  `video_*` tables), which is the same machinery the per-run minute/cost cap uses.
+  Consequence: "a pause frees every resident model" (0.5.2) applies to the Batch
+  Upscaler and Tag & Rename; the Video Upscaler has no pause at all.
 - **Region pre-seed at first-run bootstrap — dropped.** The idea was to ask the
   user's region during install and pre-seed `data_center_ids`. After repeatedly
   checking the live list, there are so few regions/data centers that auto-detecting

@@ -17,7 +17,8 @@ import runpod_client
 import ssh_setup
 import taskbar_progress
 from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode
-from gui.widgets import ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip
+from gui.widgets import (ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip,
+                         use_window_button_style)
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
 from gui.tooltab import ToolTab
 
@@ -424,6 +425,7 @@ class VideoTab(ttk.Frame):
         # Remote-only install can't run locally (no torch/SeedVR2) and a Local-only
         # install has no remote path, so the unavailable radio is disabled. On a "both"
         # install the last choice is remembered.
+        W = Tooltip.WRAP_NARROW
         top = ttk.Frame(self)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         top.columnconfigure(3, weight=1)
@@ -445,15 +447,27 @@ class VideoTab(ttk.Frame):
             top, text="Local GPU", value="local",
             variable=self.mode_var, command=self._on_mode_change)
         self.mode_local_rb.grid(row=0, column=2, padx=(6, 0))
+        # One Tooltip per radio, retargeted (not a second one added) when an install
+        # mode disables a choice: two Tooltips on one widget would both pop up.
+        self.mode_remote_tip = Tooltip(
+            self.mode_remote_rb,
+            "Do the GPU work on a rented RunPod machine, streaming one segment at "
+            "a time. Costs money per hour and needs a RunPod API key, but leaves "
+            "this PC's graphics card free.", wraplength=W)
+        self.mode_local_tip = Tooltip(
+            self.mode_local_rb,
+            "Do the GPU work on this PC's graphics card. Free, but the card is "
+            "fully busy for the whole run, which can take hours per video.",
+            wraplength=W)
         if imode == "remote":
             self.mode_local_rb.configure(state="disabled")
-            Tooltip(self.mode_local_rb,
-                    "This is a Remote-only install (no local SeedVR2 / torch).\n"
-                    "Re-run setup as Local or Both to upscale on this machine.")
+            self.mode_local_tip.set_text(
+                "This is a Remote-only install (no local SeedVR2 / torch). "
+                "Re-run setup as Local or Both to upscale on this machine.")
         elif imode == "local":
             self.mode_remote_rb.configure(state="disabled")
-            Tooltip(self.mode_remote_rb,
-                    "This is a Local-only install (no RunPod remote stack).")
+            self.mode_remote_tip.set_text(
+                "This is a Local-only install (no RunPod remote stack).")
         self.ready_var = tk.StringVar(value="Checking readiness …")
         self.ready_lbl = tk.Label(top, textvariable=self.ready_var, anchor="w",
                                   fg="#7f8a99", font=("Segoe UI", 9))
@@ -466,19 +480,37 @@ class VideoTab(ttk.Frame):
         ttk.Label(ff, text="Video folder:").grid(row=0, column=0, sticky="w")
         self.src_var = tk.StringVar()
         ttk.Entry(ff, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6)
-        ttk.Button(ff, text="Browse…", command=self._browse_source).grid(row=0, column=2)
+        browse_src = ttk.Button(ff, text="Browse…", command=self._browse_source)
+        browse_src.grid(row=0, column=2)
         self.scan_btn = ttk.Button(ff, text="Scan", command=self._scan)
         self.scan_btn.grid(row=0, column=3, padx=(6, 0))
+        Tooltip(browse_src,
+                "Pick the folder of videos to upscale. Sub-folders are included; "
+                "your source files are never modified.", wraplength=W)
+        Tooltip(self.scan_btn,
+                "Look through the folder and list every video that could be "
+                "upscaled, reading each one's resolution, length and frame rate. "
+                "Videos already upscaled into the output folder are recognised as "
+                "done. Nothing is upscaled by scanning.", wraplength=W)
         ttk.Label(ff, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.out_var = tk.StringVar()
         ttk.Entry(ff, textvariable=self.out_var).grid(row=1, column=1, sticky="ew",
                                                       padx=6, pady=(4, 0))
-        ttk.Button(ff, text="Browse…", command=self._browse_output).grid(
-            row=1, column=2, pady=(4, 0))
+        browse_out = ttk.Button(ff, text="Browse…", command=self._browse_output)
+        browse_out.grid(row=1, column=2, pady=(4, 0))
         # Segments manager (extracted scenes = virtual clip jobs, section 16.5),
         # directly below Scan.
         self.segments_btn = ttk.Button(ff, text="Segments…", command=self._open_segments)
         self.segments_btn.grid(row=1, column=3, padx=(6, 0), pady=(4, 0))
+        Tooltip(browse_out,
+                "Pick where the upscaled videos are written. The source folder's "
+                "structure is mirrored there.", wraplength=W)
+        use_window_button_style(self.segments_btn)     # opens its own window
+        Tooltip(self.segments_btn,
+                "Manage extracted scenes: short pieces cut out of a long video and "
+                "upscaled on their own, instead of the whole file. Useful to try a "
+                "target quickly, or to keep only the part worth the GPU time.",
+                wraplength=W)
 
         # 3) Scan list.
         sf = ttk.LabelFrame(self, text=" Eligible videos ", padding=4)
@@ -512,9 +544,17 @@ class VideoTab(ttk.Frame):
                               width=width, values=["All"])
             cb.pack(side="left")
             cb.bind("<<ComboboxSelected>>", lambda _e: self._on_scan_filter_change())
+            Tooltip(cb, f"Show only videos whose {label.lower()} matches. The four "
+                        f"filters combine, and each one offers only values that "
+                        f"still exist under the others, so no combination can come "
+                        f"back empty. This only changes what you see: nothing is "
+                        f"removed from the list.", wraplength=W)
             self._filter_combos[label] = cb
-        ttk.Button(filt, text="Reset", width=6,
-                   command=self._reset_scan_filters).pack(side="left", padx=(10, 0))
+        reset_scan = ttk.Button(filt, text="Reset", width=6,
+                                command=self._reset_scan_filters)
+        reset_scan.pack(side="left", padx=(10, 0))
+        Tooltip(reset_scan, "Clear all four filters and show every video found.",
+                wraplength=W)
 
         cols = ("res", "dur", "codec", "fps", "up", "upres", "status")
         self.scan_tree = ttk.Treeview(sf, columns=cols, show="tree headings", height=7)
@@ -543,6 +583,13 @@ class VideoTab(ttk.Frame):
         self.scan_tree.bind("<<TreeviewSelect>>", self._on_scan_select)
         self.scan_tree.bind("<Double-1>", self._on_scan_double)
         self.scan_tree.bind("<Button-3>", self._on_scan_right)
+        Tooltip(self.scan_tree,
+                "Every video the scan found. Green means an upscaled version "
+                "already exists; red means an earlier attempt failed.\n"
+                "Click one to choose a target for it, double-click to open the "
+                "video (double-click the Upscaled cell to compare before/after), "
+                "right-click for more actions. Click a column heading to sort.",
+                wraplength=W)
 
         # 4) Source file + target + Prepare.
         pf = ttk.Frame(self)
@@ -552,7 +599,8 @@ class VideoTab(ttk.Frame):
         self.srcfile_var = tk.StringVar()
         ttk.Entry(pf, textvariable=self.srcfile_var, state="readonly").grid(
             row=0, column=1, sticky="ew", padx=6)
-        ttk.Label(pf, text="Target:").grid(row=0, column=2)
+        target_lbl = ttk.Label(pf, text="Target:")
+        target_lbl.grid(row=0, column=2)
         self.target_var = tk.StringVar()
         self.target_combo = ttk.Combobox(pf, textvariable=self.target_var,
                                          state="readonly", width=15, values=[])
@@ -561,6 +609,16 @@ class VideoTab(ttk.Frame):
         self.prepare_btn = ttk.Button(pf, text="Prepare ▾ add to queue",
                                      command=self._prepare, state="disabled")
         self.prepare_btn.grid(row=0, column=4, padx=(6, 0))
+        target_tip = ("How large the upscaled video should be. The video is fitted "
+                      "inside the chosen size, keeping its shape, so the first edge "
+                      "to reach the limit decides the result. Bigger targets look "
+                      "better but cost much more GPU time.")
+        Tooltip(target_lbl, target_tip, wraplength=W)
+        Tooltip(self.target_combo, target_tip, wraplength=W)
+        Tooltip(self.prepare_btn,
+                "Add the selected video, at the chosen target, to the queue below. "
+                "This works out how the video will be split into segments; no GPU "
+                "work happens until you press Start Upscaling.", wraplength=W)
 
         # 5) Queue list.
         qf = ttk.LabelFrame(self, text=" Upscale queue ", padding=4)
@@ -585,9 +643,16 @@ class VideoTab(ttk.Frame):
                               width=width, values=["All"])
             cb.pack(side="left")
             cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_queue_filters())
+            Tooltip(cb, f"Show only queued jobs with this {label.lower()}. Handy "
+                        f"for hiding finished jobs on a long queue. This only "
+                        f"changes what you see: the queue itself is unchanged.",
+                    wraplength=W)
             self._qfilter_combos[label] = cb
-        ttk.Button(qfilt, text="Reset", width=6,
-                   command=self._reset_queue_filters).pack(side="left", padx=(10, 0))
+        reset_queue = ttk.Button(qfilt, text="Reset", width=6,
+                                 command=self._reset_queue_filters)
+        reset_queue.pack(side="left", padx=(10, 0))
+        Tooltip(reset_queue, "Clear both filters and show the whole queue.",
+                wraplength=W)
 
         # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
         # (a view-only sort) never hides where a job actually sits in the queue.
@@ -618,26 +683,55 @@ class VideoTab(ttk.Frame):
         self.queue_tree.configure(yscrollcommand=qsb.set)
         self.queue_tree.bind("<Double-1>", self._on_queue_double)
         self.queue_tree.bind("<Button-3>", self._on_queue_right)
-        ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1)).grid(row=1, column=2, padx=(4, 0))
-        ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1)).grid(row=2, column=2, padx=(4, 0))
-        ttk.Button(qf, text="Remove", command=self._queue_remove).grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
+        up_btn = ttk.Button(qf, text="↑", width=3, command=lambda: self._queue_move(-1))
+        up_btn.grid(row=1, column=2, padx=(4, 0))
+        down_btn = ttk.Button(qf, text="↓", width=3, command=lambda: self._queue_move(1))
+        down_btn.grid(row=2, column=2, padx=(4, 0))
+        remove_btn = ttk.Button(qf, text="Remove", command=self._queue_remove)
+        remove_btn.grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
+        Tooltip(self.queue_tree,
+                "The videos waiting to be upscaled, in run order (the # column, "
+                "1 = next). Double-click to open a video, right-click for more "
+                "actions. Sorting by a heading changes the view only, never the "
+                "order they actually run in.", wraplength=W)
+        Tooltip(up_btn, "Move the selected job one place earlier in the run order.",
+                wraplength=W)
+        Tooltip(down_btn, "Move the selected job one place later in the run order.",
+                wraplength=W)
+        Tooltip(remove_btn,
+                "Take the selected job off the queue and delete the part-finished "
+                "segment files it was holding (often several GB). The source video "
+                "and any finished output are untouched.", wraplength=W)
 
         # 6) GPU picker + estimate.
         gf = ttk.Frame(self)
         gf.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         gf.columnconfigure(5, weight=1)
-        ttk.Label(gf, text="GPU:").grid(row=0, column=0, sticky="w")
+        gpu_lbl = ttk.Label(gf, text="GPU:")
+        gpu_lbl.grid(row=0, column=0, sticky="w")
         self.gpu_var = tk.StringVar()
         self.gpu_combo = ttk.Combobox(gf, textvariable=self.gpu_var, state="readonly",
                                      width=40, values=[])
         self.gpu_combo.grid(row=0, column=1, padx=4)
         self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_gpu_change())
-        ttk.Button(gf, text="↻", width=3, command=self._refresh_gpus).grid(row=0, column=2)
+        refresh_gpu = ttk.Button(gf, text="↻", width=3, command=self._refresh_gpus)
+        refresh_gpu.grid(row=0, column=2)
+        gpu_tip = ("Which graphics card runs the queue. For a rented pod this lists "
+                   "the cards actually available right now with their hourly price, "
+                   "cheapest first; the card you pick is the card you get, never a "
+                   "substitute. The estimate on the right follows your choice.")
+        Tooltip(gpu_lbl, gpu_tip, wraplength=W)
+        Tooltip(self.gpu_combo, gpu_tip, wraplength=W)
+        Tooltip(refresh_gpu,
+                "Re-check which cards are in stock and at what price. Worth "
+                "pressing if a run refused to start because the card sold out.",
+                wraplength=W)
         # Local-only: benchmark THIS card to find its real per-target batch ceiling +
         # speed (feature #7). Created here, shown/hidden by _apply_mode_ui (pod runs
         # have no local benchmark). Column 3 so it sits right of the refresh button.
         self.benchmark_btn = ttk.Button(gf, text="Benchmark GPU…", command=self._open_benchmark)
         self.benchmark_btn.grid(row=0, column=3, padx=(8, 0))
+        use_window_button_style(self.benchmark_btn)    # opens its own window
         Tooltip(self.benchmark_btn,
                 "Measure the largest safe batch (and the real speed) for each target on "
                 "this GPU. Runs a short test-till-it-breaks sweep; results calibrate local "
@@ -665,6 +759,16 @@ class VideoTab(ttk.Frame):
         self.start_btn.grid(row=0, column=0)
         self.stop_btn = ttk.Button(af, text="Stop", command=self._stop, state="disabled")
         self.stop_btn.grid(row=0, column=1, padx=(6, 0))
+        Tooltip(self.start_btn,
+                "Work through the queue: each video is split into segments, "
+                "upscaled a segment at a time, then put back together with its "
+                "sound. On a rented pod this creates a billed machine and shuts it "
+                "down when the queue ends.", wraplength=W)
+        Tooltip(self.stop_btn,
+                "End the run. The segment in progress is abandoned (its work is "
+                "lost), but every finished segment is kept, so starting again "
+                "carries on from there rather than from the beginning.",
+                wraplength=W)
         # Self-healing (#6): opt-in, per-run, visible at the point of action (not a hidden
         # Setting), default OFF. When on, a lost pod reconnects or waits for the SAME GPU to
         # return and the run continues from the first unfinished segment. Passed to the
@@ -682,7 +786,11 @@ class VideoTab(ttk.Frame):
                 "queue, or Stop still end the run.")
         self.progress = ProgressBar(af, width=200)
         self.progress.grid(row=0, column=3, sticky="ew", padx=12)
-        ttk.Button(af, text="View log", command=self._view_log).grid(row=0, column=4)
+        video_log_btn = ttk.Button(af, text="View log", command=self._view_log)
+        video_log_btn.grid(row=0, column=4)
+        Tooltip(video_log_btn,
+                "Open the log window with the full output of the run: per-segment "
+                "progress, timings and any errors.", wraplength=W)
         self.status_var = tk.StringVar(value="Ready.")
         tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
                  font=("Consolas", 9)).grid(row=7, column=0, sticky="ew", pady=(4, 0))

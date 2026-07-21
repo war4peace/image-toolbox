@@ -62,32 +62,56 @@ class ConciliateTab(ToolTab):
 
     def _build(self):
         self.columnconfigure(1, weight=1)
+        W = Tooltip.WRAP_NARROW
 
         ttk.Label(self, text="Original Files:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.orig_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(self, text="Browse…", command=self._pick_orig).grid(row=0, column=2, pady=3)
+        browse_orig = ttk.Button(self, text="Browse…", command=self._pick_orig)
+        browse_orig.grid(row=0, column=2, pady=3)
         self.save_orig_btn = ttk.Button(
             self, text="Save as Default", command=lambda: self._save_default("orig"))
         self.save_orig_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
+        Tooltip(browse_orig,
+                "Pick the folder holding your ORIGINAL photos and videos: the "
+                "files that will be archived or deleted once a processed version "
+                "is found for them.", wraplength=W)
+        Tooltip(self.save_orig_btn,
+                "Remember this folder as the default Original Files folder, "
+                "pre-filled every time the app starts.", wraplength=W)
 
         ttk.Label(self, text="Processed Files:").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.proc_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(self, text="Browse…", command=self._pick_proc).grid(row=1, column=2, pady=3)
+        browse_proc = ttk.Button(self, text="Browse…", command=self._pick_proc)
+        browse_proc.grid(row=1, column=2, pady=3)
         self.save_proc_btn = ttk.Button(
             self, text="Save as Default", command=lambda: self._save_default("proc"))
         self.save_proc_btn.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
+        Tooltip(browse_proc,
+                "Pick the folder holding the PROCESSED versions (upscaled, and "
+                "optionally tagged & renamed). These move into the original tree, "
+                "taking the originals' place.", wraplength=W)
+        Tooltip(self.save_proc_btn,
+                "Remember this folder as the default Processed Files folder, "
+                "pre-filled every time the app starts.", wraplength=W)
 
         # Operation picklist
         opf = ttk.Frame(self)
         opf.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
-        ttk.Label(opf, text="When I run this:").pack(side="left", padx=(0, 6))
+        mode_lbl = ttk.Label(opf, text="When I run this:")
+        mode_lbl.pack(side="left", padx=(0, 6))
         self.mode_cmb = ttk.Combobox(opf, textvariable=self.mode_var, state="readonly",
                                      values=[m[0] for m in CONCILIATE_MODES], width=20)
         self.mode_cmb.pack(side="left")
-        Tooltip(self.mode_cmb,
-                "Archive: move each matched original into __Archive__, then move its\n"
-                "processed version into the original folder.\n"
-                "Delete: permanently remove each matched original instead of archiving.")
+        # One line break separates the two definitions (that structure is
+        # meaningful); the wrap width breaks the lines within each.
+        mode_tip = ("What happens to an original once its processed version is "
+                    "found.\n"
+                    "Archive: the original moves into an __Archive__ subfolder, "
+                    "so it stays recoverable.\n"
+                    "Delete: the original is removed for good, which cannot be "
+                    "undone from the app.")
+        Tooltip(mode_lbl, mode_tip, wraplength=W)
+        Tooltip(self.mode_cmb, mode_tip, wraplength=W)
         self.mode_hint = ttk.Label(opf, text="", foreground="#666")
         self.mode_hint.pack(side="left", padx=(12, 0))
         self.mode_var.trace_add("write", lambda *_: self._update_mode_hint())
@@ -103,6 +127,24 @@ class ConciliateTab(ToolTab):
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
         for b in (self.scan_btn, self.run_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
+        Tooltip(self.scan_btn,
+                "Work out what would happen and show it in the table below. "
+                "Nothing is moved, archived or deleted by this step: it is only a "
+                "preview, and it is safe to run at any time.", wraplength=W)
+        Tooltip(self.run_btn,
+                "Carry out the plan shown in the table: archive (or delete) each "
+                "matched original and move its processed version into place. "
+                "Available only after a scan found something to replace.",
+                wraplength=W)
+        Tooltip(self.stop_btn,
+                "End the operation after the file currently being handled. Files "
+                "already replaced stay replaced; the rest are left untouched.",
+                wraplength=W)
+        Tooltip(self.open_btn,
+                "Open the Original Files folder in Windows Explorer.", wraplength=W)
+        Tooltip(self.viewlog_btn,
+                "Open the log window with the full output of this scan or run. "
+                "Available once one has started.", wraplength=W)
 
         # Status + progress
         sf = ttk.Frame(self)
@@ -132,6 +174,16 @@ class ConciliateTab(ToolTab):
         for c in cols:
             self.tree.column(c, width=120, anchor="center", stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
+        # The three counts are the least self-evident thing on the tab, and they
+        # are what the user checks before allowing a delete, so spell them out.
+        Tooltip(self.tree,
+                "One row per folder, counting what the scan found.\n"
+                "Replaced: an original that has a processed version and will be "
+                "archived or deleted.\n"
+                "No match (kept): no processed version was found, so the original "
+                "is left alone.\n"
+                "Non-media (kept): anything that is not a photo or video, never "
+                "touched.", wraplength=W)
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         vsb.grid(row=0, column=1, sticky="ns")

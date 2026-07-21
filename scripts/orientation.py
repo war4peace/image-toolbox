@@ -89,6 +89,38 @@ def _get_model():
     return _MODEL
 
 
+def unload():
+    """
+    Drop the cached CNN and hand its VRAM back. The next detect_rotation()
+    reloads it lazily, so this is safe to call at any time between images.
+
+    Called when a run pauses: the rule is that a pause frees EVERY model the app
+    holds, with no size-based exceptions. This one is small next to a vision or
+    upscale model, but an exception is a thing to remember, and the next person
+    to add a model would have to rediscover the rule.
+
+    Returns True if a loaded model was actually released.
+
+    Never imports torch just to unload: on a Remote-only install torch isn't
+    there at all, and if it was never imported then nothing is loaded anyway.
+    """
+    global _MODEL
+    if _MODEL is None:
+        return False
+    _MODEL = None
+    try:
+        import sys
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    except Exception:
+        pass          # fail safe: worst case the memory stays held
+    return True
+
+
 def _preprocess_pil(pil_img):
     """Resize longest side to 224, pad to 224x224 (black), ImageNet-normalize.
 

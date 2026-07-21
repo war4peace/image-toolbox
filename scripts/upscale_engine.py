@@ -455,13 +455,52 @@ class UpscaleEngine:
         finally:
             self._drain_capture(buf)
 
-    def close(self):
-        """Release cached models and free VRAM/RAM."""
+    def release(self):
+        """
+        Unload DiT + VAE and hand their VRAM back to the driver, so another app
+        can use the card. The next upscale() transparently reloads them (a cold
+        model load, tens of seconds), because an empty runner cache makes
+        _process_frames_core rebuild the context and runner from scratch.
+
+        Clearing self._runner_cache alone frees NOTHING. seedvr2 keeps a SECOND,
+        module-level cache (src/core/model_cache.GlobalModelCache) keyed by the
+        ids we pass as dit_id/vae_id ("cli_dit"/"cli_vae"), and prepare_runner
+        looks there first. Our dict is only a handle on models that cache owns;
+        dropping it leaves the real references alive, so empty_cache() finds
+        nothing to return and nvidia-smi keeps showing ~14 GB in use. The unload
+        has to go through the global cache's remove_dit/remove_vae, which release
+        each model's memory before dropping it.
+
+        Fail-safe: any error leaves the engine usable (worst case the VRAM simply
+        stays held, which is today's behaviour).
+        """
+        try:
+            from src.core.model_cache import get_global_cache
+            cache = get_global_cache()
+            cache.remove_dit({"node_id": "cli_dit"}, self._cli.debug)
+            cache.remove_vae({"node_id": "cli_vae"}, self._cli.debug)
+        except Exception as exc:                       # noqa: BLE001 (upstream moved it)
+            debug_log("upscale_engine.release: global cache unload failed", exc=exc)
         self._runner_cache.clear()
         try:
             import torch
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+        except Exception as exc:                       # noqa: BLE001
+            debug_log("upscale_engine.release: empty_cache failed", exc=exc)
+
+    def vram_used_gb(self):
+        """VRAM this process currently holds (reserved by the allocator), in GB.
+        Used to report what a pause actually gave back. None if unavailable."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+            return torch.cuda.memory_reserved(0) / (1024 ** 3)
         except Exception:
-            pass
+            return None
+
+    def close(self):
+        """Release cached models and free VRAM/RAM."""
+        self.release()

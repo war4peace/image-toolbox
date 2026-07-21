@@ -178,7 +178,21 @@ class RemoteControl:
     child of toolbox_gui.py (stdin is a pipe, not a console):
 
         "q"            → stop gracefully after the current image
+        "p"            → the GUI's dual-purpose button (see below)
         any other line → resume after an outage pause
+
+    The dual button: the tab shows ONE button that is "Pause" during normal
+    work and "Resume" while an outage holds the run open. Those two states are
+    mutually exclusive in this loop — it is either tagging an image or blocked
+    in wait_resume(), never both — so one button can serve both.
+
+    Crucially "p" does not carry the meaning; THIS class decides it, from the
+    state only it knows for sure. The GUI's label is a replica that lags the
+    run by one pipe hop, so a click can land in the window where the run just
+    entered an outage but the button still reads "Pause". Letting the button
+    dictate ("pause now") would make that click do the wrong thing; letting the
+    runner interpret it ("the user pressed the button") cannot, because
+    _waiting_resume is true exactly when the meaning is "resume".
 
     Inactive (no thread, no stdin reads) when stdin is an interactive
     console, so normal terminal usage is unchanged.
@@ -188,6 +202,9 @@ class RemoteControl:
         self.active  = False
         self._stop   = threading.Event()
         self._resume = threading.Event()
+        self._lock   = threading.Lock()
+        self._paused = False      # user pause, between images
+        self._waiting_resume = False   # True while wait_resume() is blocked
         try:
             if sys.stdin is not None and not sys.stdin.isatty():
                 self.active = True
@@ -207,6 +224,8 @@ class RemoteControl:
                 elif cmd == "qkeep":          # quit but leave the remote pod running
                     _set_remote_teardown("keep")
                     self._stop.set()
+                elif cmd in ("p", "pause"):
+                    self._dual_button()
                 else:
                     self._resume.set()
         except Exception:
@@ -215,17 +234,74 @@ class RemoteControl:
         self._stop.set()
         self._resume.set()
 
+    def _dual_button(self):
+        """Apply a press of the GUI's dual Pause / Resume button. An outage wait
+        wins: there, the only sensible meaning is 'continue'."""
+        with self._lock:
+            if self._waiting_resume:
+                self._resume.set()
+                return
+            self._paused = not self._paused
+
     @property
     def stop_requested(self):
         return self._stop.is_set()
 
+    @property
+    def paused(self):
+        with self._lock:
+            return self._paused
+
     def wait_resume(self):
         """Block until a resume line arrives. Returns False if stop instead."""
         self._resume.clear()
-        while not self._resume.wait(0.5):
-            if self._stop.is_set():
-                return False
-        return not self._stop.is_set()
+        with self._lock:
+            self._waiting_resume = True
+            # An outage supersedes a user pause: the run is already held open,
+            # and the same button now means 'continue'. Clearing this here stops
+            # a pause taken just before the outage from re-blocking the loop the
+            # moment the user resolves the outage.
+            self._paused = False
+        try:
+            while not self._resume.wait(0.5):
+                if self._stop.is_set():
+                    return False
+            return not self._stop.is_set()
+        finally:
+            with self._lock:
+                self._waiting_resume = False
+
+    def wait_while_paused(self, on_pause=None, on_resume=None):
+        """
+        Call between images. Blocks while the user has paused the run, firing
+        on_pause once it goes to sleep and on_resume when it wakes (that is where
+        the vision model is unloaded, so a pause actually frees the GPU).
+
+        Returns True to continue, False if a stop was requested meanwhile.
+        Hooks run on the CALLING thread, where no tagging request is in flight.
+        """
+        if not self.paused:
+            return True
+        _fire(on_pause)
+        try:
+            while self.paused:
+                if self._stop.is_set():
+                    return False
+                time.sleep(0.25)
+            return not self._stop.is_set()
+        finally:
+            if not self._stop.is_set():
+                _fire(on_resume)
+
+
+def _fire(hook):
+    """Run a pause hook, never letting it break the run."""
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as exc:                       # noqa: BLE001
+        debug_log("tag_and_rename pause hook failed", exc=exc)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1832,8 +1908,52 @@ def main():
     folder_start      = None
     stop_reason       = None      # "user" or "ollama" when the run ends early
 
+    # ── Pause frees the GPU ──────────────────────────────────
+    # Same bargain as the upscaler's Pause: the user wants the card back for
+    # something else without losing the queue. Ollama holds the vision model
+    # resident (its own keep_alive would only drop it minutes later), so a pause
+    # that did not unload would not actually free anything.
+    #
+    # Local runs only: on a remote run the model sits on the pod, where
+    # unloading frees nothing on this PC and costs a reload on a billed machine.
+    def _pause_release():
+        _gui_event("PSTATE", "paused")
+        # Free EVERY model this run holds, not just the big one: the vision model
+        # (in the Ollama server) and the auto-straighten CNN (in this process).
+        # No size-based exceptions — an exception is one more thing to remember.
+        freed = []
+        if not REMOTE:
+            if unload_model():
+                freed.append("vision model")
+            # Remote runs detect orientation on the pod (REMOTE_ORIENT), so
+            # locally there is nothing loaded to release.
+            try:
+                import orientation          # lazy, as everywhere else in here
+                if orientation.unload():
+                    freed.append("straighten model")
+            except Exception as exc:                   # noqa: BLE001
+                debug_log("tag_and_rename: orientation unload failed", exc=exc)
+        if freed:
+            print(f"\n  ⏸  PAUSED — {' and '.join(freed)} unloaded, the GPU is "
+                  f"free for other apps. Press Resume to continue.")
+        else:
+            print("\n  ⏸  PAUSED — press Resume to continue.")
+
+    def _pause_reload():
+        _gui_event("PSTATE", "running")
+        # Ollama reloads the model on the next request by itself, so there is
+        # nothing to do here beyond warning that the next image is slower.
+        print("  ▶  RESUMED — the vision model reloads on the next image.\n")
+
+    _gui_event("PSTATE", "running")
+
     for idx, path in enumerate(work_items, 1):
         if control.stop_requested:
+            print("\n  Stop requested — stopping before the next image.")
+            stop_reason = "user"
+            break
+
+        if not control.wait_while_paused(_pause_release, _pause_reload):
             print("\n  Stop requested — stopping before the next image.")
             stop_reason = "user"
             break
@@ -2027,10 +2147,15 @@ def main():
                     ],
                 )
                 if unload_model():
-                    print("  (Vision model unloaded while paused - VRAM released.)")
+                    print("  (Vision model unloaded while the run is held - VRAM released.)")
                 if control.active:
                     print("  Restart Ollama if needed, then press Resume in the app.")
-                    if not control.wait_resume():
+                    # Relabel the dual button: while the outage holds the run, it
+                    # means Resume, not Pause.
+                    _gui_event("PSTATE", "outage")
+                    resumed = control.wait_resume()
+                    _gui_event("PSTATE", "running")
+                    if not resumed:
                         print("  Stop requested — exiting.")
                         stop_reason = "user"
                         break

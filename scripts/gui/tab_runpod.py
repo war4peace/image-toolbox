@@ -19,7 +19,7 @@ import runpod_client
 import ssh_setup
 import runpod_provision
 from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, CFG, save_config, PYTHON_EXE
-from gui.widgets import Tooltip, LogPane, _ScrollFrame
+from gui.widgets import Tooltip, LogPane, _ScrollFrame, use_window_button_style
 
 
 class RunPodTab(ttk.Frame):
@@ -82,7 +82,12 @@ class RunPodTab(ttk.Frame):
         key_entry.pack(side="left", padx=(4, 0))
         Tooltip(key_entry, "RunPod API key (rest.runpod.io). Stored locally in "
                            "config.json; never committed.")
+        W = Tooltip.WRAP_NARROW
         self.runpod_test_btn = ttk.Button(keyrow, text="Test", command=self._test_runpod)
+        Tooltip(self.runpod_test_btn,
+                "Check that this key works by contacting RunPod. Nothing is rented "
+                "and nothing is charged; it only confirms the key is valid.",
+                wraplength=W)
         self.runpod_test_btn.pack(side="left", padx=(6, 0))
         # Zero-config SSH: the app owns a dedicated key and hands its public half to
         # every pod via PUBLIC_KEY, so the user never runs ssh-keygen or pastes a key
@@ -126,8 +131,11 @@ class RunPodTab(ttk.Frame):
                 "Only data centers that support network volumes are listed. The "
                 "GPU lists and model volume below apply to this data center. Refresh "
                 "to pull the live list (data centers, GPUs and volumes) from RunPod.")
-        ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters).grid(
-            row=0, column=4, sticky="w", padx=(8, 0))
+        dc_refresh = ttk.Button(dcsel, text="Refresh", command=self._refresh_datacenters)
+        Tooltip(dc_refresh,
+                "Ask RunPod for the current list of regions and data centers, and "
+                "reload the GPUs and volumes that go with them.", wraplength=W)
+        dc_refresh.grid(row=0, column=4, sticky="w", padx=(8, 0))
         # The account balance is shown in the shared bottom-bar "Funds" readout
         # (always visible on this tab), so it isn't duplicated here; Refresh still
         # updates it (see _refresh_datacenters).
@@ -199,8 +207,17 @@ class RunPodTab(ttk.Frame):
         # The four volume action buttons on their own row, aligned under the combo.
         volbtns = ttk.Frame(gv)
         volbtns.grid(row=3, column=1, sticky="w", pady=(4, 0))
-        ttk.Button(volbtns, text="Refresh", command=self._refresh_volumes).pack(side="left")
-        ttk.Button(volbtns, text="Create…", command=self._create_volume).pack(side="left", padx=(6, 0))
+        vol_refresh = ttk.Button(volbtns, text="Refresh", command=self._refresh_volumes)
+        vol_refresh.pack(side="left")
+        create_btn = ttk.Button(volbtns, text="Create…", command=self._create_volume)
+        create_btn.pack(side="left", padx=(6, 0))
+        Tooltip(vol_refresh,
+                "List the model volumes on your RunPod account again, in case one "
+                "was added or removed elsewhere.", wraplength=W)
+        Tooltip(create_btn,
+                "Make a new model volume in the data center shown below. A volume "
+                "is storage you keep, so it adds a small monthly charge even when "
+                "nothing is running; you are asked to confirm first.", wraplength=W)
         del_btn = tk.Button(volbtns, text="Delete…", fg="#b3261e", activeforeground="#b3261e",
                             cursor="hand2", command=self._delete_volume)
         del_btn.pack(side="left", padx=(6, 0))
@@ -208,6 +225,7 @@ class RunPodTab(ttk.Frame):
                          "models stored on it. Asks for confirmation first.")
         prov_btn = ttk.Button(volbtns, text="Provision…", command=self._provision_models)
         prov_btn.pack(side="left", padx=(6, 0))
+        use_window_button_style(prov_btn)             # opens its own progress window
         Tooltip(prov_btn, "One-time: fill the selected volume with the models "
                           "(SeedVR2 + Ollama) by briefly renting a pod. ~10-20 min; "
                           "the pod is terminated automatically when finished.")
@@ -318,7 +336,12 @@ class RunPodTab(ttk.Frame):
         hdr = ttk.Frame(pods)
         hdr.pack(fill="x")
         ttk.Label(hdr, text="Your pods", font=("Segoe UI", 9, "bold")).pack(side="left")
-        ttk.Button(hdr, text="Refresh", command=self._refresh_pods).pack(side="left", padx=(10, 0))
+        pods_refresh = ttk.Button(hdr, text="Refresh", command=self._refresh_pods)
+        pods_refresh.pack(side="left", padx=(10, 0))
+        Tooltip(pods_refresh,
+                "List every pod on your account, running or stopped, with what it "
+                "costs per hour. Worth a look if you want to be sure nothing is "
+                "still billing.", wraplength=W)
         self.runpod_pods_term_btn = tk.Button(
             hdr, text="Terminate selected…", fg="#b3261e", activeforeground="#b3261e",
             cursor="hand2", state="disabled", command=self._terminate_pod)
@@ -349,7 +372,12 @@ class RunPodTab(ttk.Frame):
         # ── Save bar ────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
-        ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
+        rp_save = ttk.Button(bar, text="Save settings", command=self._save)
+        rp_save.pack(side="left")
+        Tooltip(rp_save,
+                "Write the RunPod settings on this page to disk. Runs read the "
+                "saved values, so an unsaved key or volume is not used yet.",
+                wraplength=W)
         self.save_status = ttk.Label(bar, text="", foreground="#666")
         self.save_status.pack(side="left", padx=12)
 

@@ -14,7 +14,7 @@ import mqtt_publisher
 import notifications
 import updater
 from gui.common import APP_TITLE, APP_VERSION, CFG, save_config, update_auto_check_enabled, ollama_installed, ollama_list_models, test_discord_webhook
-from gui.widgets import Tooltip, _ScrollFrame
+from gui.widgets import Tooltip, _ScrollFrame, use_window_button_style
 
 
 RESOLUTION_PRESETS = [
@@ -51,6 +51,36 @@ _SEEDVR_LABELS = {
     "encode_tile_size": "Encode tile size",
     "decode_tile_size": "Decode tile size",
     "outage_threshold": "Outage threshold",
+}
+
+# Hover help for the SeedVR controls, keyed the same way as the labels, so a
+# control built by _make_seedvr_control gets its tooltip automatically (including
+# the generic one-per-row fallback for an unrecognised key). A key with no entry
+# here simply gets no tooltip rather than a wrong one.
+_SEEDVR_TIPS = {
+    "attention_mode": (
+        "Which maths kernel does the heavy work. Leave on 'auto': the engine then "
+        "picks the fastest one your card actually supports. Only change this if a "
+        "specific backend misbehaves."),
+    "outage_threshold": (
+        "How many images may fail in a row before the run pauses and asks for "
+        "help. Guards against grinding through a whole folder while something is "
+        "broken.   Recommended: 3"),
+    "encode_tiled": (
+        "Process the image in tiles when READING it into the model. Cuts memory "
+        "use so a big picture fits on a smaller card, at some cost in speed."),
+    "decode_tiled": (
+        "Process the image in tiles when WRITING the result out. This is the step "
+        "that usually runs out of memory at high resolutions, so it is the one "
+        "worth turning on first."),
+    "encode_tile_size": (
+        "How big each tile is when reading the image in. Smaller tiles use less "
+        "memory and run slower. Only used when VAE Tiled Encode is ticked.   "
+        "Recommended: 1024"),
+    "decode_tile_size": (
+        "How big each tile is when writing the result out. Smaller tiles use less "
+        "memory and run slower. Only used when VAE Tiled Decode is ticked.   "
+        "Recommended: 1024"),
 }
 
 # Suggested values for the free-text enum fields (editable — type anything).
@@ -98,6 +128,7 @@ class SettingsTab(ttk.Frame):
     # ── construction ─────────────────────────────────────────────────────────
 
     def _build(self):
+        W = Tooltip.WRAP_NARROW
         sf = _ScrollFrame(self)
         sf.pack(fill="both", expand=True)
         body = sf.body
@@ -127,8 +158,13 @@ class SettingsTab(ttk.Frame):
                 ("Video Upscaler — Output folder:",  self.default_vout_var))):
             ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
             ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
-            ttk.Button(sec, text="Browse…",
-                       command=lambda v=var: self._pick_folder(v)).grid(row=r, column=2, pady=3)
+            b = ttk.Button(sec, text="Browse…",
+                           command=lambda v=var: self._pick_folder(v))
+            b.grid(row=r, column=2, pady=3)
+            # Same wording for all seven, naming the field it fills, so the row is
+            # unambiguous when several Browse buttons sit above one another.
+            Tooltip(b, f"Choose the folder that {text.rstrip(':')} starts with "
+                       f"every time the app opens.", wraplength=W)
 
         # ── Ollama ────────────────────────────────────────────────────────────
         sec = self._section(body, "Ollama")
@@ -149,8 +185,12 @@ class SettingsTab(ttk.Frame):
         Tooltip(self.ollama_model_cmb,
                 "Vision model used for tagging. Pick from the models installed on "
                 "the Ollama server; press Check to (re)load the list.")
-        ttk.Button(sec, text="Check", command=self._check_ollama).grid(
-            row=0, column=4, padx=(8, 0), pady=3)
+        check_btn = ttk.Button(sec, text="Check", command=self._check_ollama)
+        check_btn.grid(row=0, column=4, padx=(8, 0), pady=3)
+        Tooltip(check_btn,
+                "Contact the Ollama server at the address on the left and load the "
+                "list of models it has installed. Use it after starting Ollama or "
+                "pulling a new model.", wraplength=W)
 
         self.ollama_status = ttk.Label(sec, text="", foreground="#666")
         self.ollama_status.grid(row=1, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 0))
@@ -175,7 +215,8 @@ class SettingsTab(ttk.Frame):
         spin = ttk.Spinbox(strip, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
                            textvariable=self.straighten_conf_var)
         spin.pack(side="left")
-        Tooltip(spin, "0.50–1.00   (higher = fewer, safer rotations)")
+        Tooltip(spin, "0.50–1.00   (higher = fewer, safer rotations)   "
+                      "Recommended: 0.90")
 
         ttk.Label(strip, text="Max image size sent to model:").pack(side="left", padx=(18, 4))
         self.tag_maxpx_var = tk.IntVar(value=int(tag.get("max_image_px", 1280)))
@@ -214,7 +255,8 @@ class SettingsTab(ttk.Frame):
         cut_spin = ttk.Spinbox(skip, from_=0, to=99, width=4, textvariable=self.cutoff_var)
         cut_spin.pack(side="left")
         ttk.Label(skip, text="% of target resolution").pack(side="left", padx=(4, 0))
-        Tooltip(cut_spin, "Percentage of the target resolution.   (0 = upscale everything eligible)")
+        Tooltip(cut_spin, "Percentage of the target resolution.   (0 = upscale "
+                          "everything eligible)   Recommended: 66")
 
         self.up_straighten_var = tk.BooleanVar(value=bool(ups.get("auto_straighten", True)))
         up_chk = ttk.Checkbutton(sec, text="Auto-straighten photos",
@@ -232,7 +274,8 @@ class SettingsTab(ttk.Frame):
         up_spin = ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
                               textvariable=self.up_straighten_conf_var)
         up_spin.pack(side="left")
-        Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)")
+        Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)   "
+                         "Recommended: 0.90")
 
         self.watchdog_var = tk.BooleanVar(value=bool(ups.get("watchdog_enabled", True)))
         wd_chk = ttk.Checkbutton(
@@ -252,13 +295,14 @@ class SettingsTab(ttk.Frame):
                               textvariable=self.watchdog_factor_var)
         wf_spin.pack(side="left")
         Tooltip(wf_spin, "How many times slower than the run's healthy rate (per megapixel) "
-                         "counts as 'slow' (e.g. 3×).")
+                         "counts as 'slow'.   Recommended: 3.0")
         ttk.Label(wd, text="for").pack(side="left", padx=(12, 4))
         self.watchdog_consec_var = tk.IntVar(value=int(ups.get("watchdog_consecutive", 2)))
         wc_spin = ttk.Spinbox(wd, from_=1, to=10, width=4, textvariable=self.watchdog_consec_var)
         wc_spin.pack(side="left")
         ttk.Label(wd, text="images in a row").pack(side="left", padx=(4, 0))
-        Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a single odd image).")
+        Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a "
+                         "single odd image).   Recommended: 2")
 
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
         sec = self._section(body, "SeedVR Settings")
@@ -331,13 +375,19 @@ class SettingsTab(ttk.Frame):
         sec.columnconfigure(1, weight=1)
         ttk.Label(sec, text="Default target:").grid(row=0, column=0, sticky="w", pady=3)
         self.video_target_var = tk.StringVar(value=vid.get("target", "1080p"))
-        ttk.Combobox(sec, textvariable=self.video_target_var, state="readonly",
-                     width=10, values=["1080p", "1440p", "4K"]).grid(
-            row=0, column=1, sticky="w", padx=6, pady=3)
+        vt_cb = ttk.Combobox(sec, textvariable=self.video_target_var, state="readonly",
+                             width=10, values=["1080p", "1440p", "4K"])
+        vt_cb.grid(row=0, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(vt_cb,
+                "The size pre-selected on the Video Upscaler tab. You can still "
+                "pick a different one per video before queueing it.", wraplength=W)
         ttk.Label(sec, text="Output subfolder:").grid(row=1, column=0, sticky="w", pady=3)
         self.video_outsub_var = tk.StringVar(value=vid.get("output_subdir", "__upscaled__"))
-        ttk.Entry(sec, textvariable=self.video_outsub_var, width=20).grid(
-            row=1, column=1, sticky="w", padx=6, pady=3)
+        vo_ent = ttk.Entry(sec, textvariable=self.video_outsub_var, width=20)
+        vo_ent.grid(row=1, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(vo_ent,
+                "Name of the folder created for upscaled videos when you have not "
+                "chosen an output folder yourself.", wraplength=W)
         ttk.Label(sec, text="Work folder (staging):").grid(row=11, column=0, sticky="w", pady=3)
         self.video_workroot_var = tk.StringVar(value=vid.get("work_root", ""))
         wr = ttk.Frame(sec)
@@ -345,8 +395,12 @@ class SettingsTab(ttk.Frame):
         wr.columnconfigure(0, weight=1)
         wr_entry = ttk.Entry(wr, textvariable=self.video_workroot_var)
         wr_entry.grid(row=0, column=0, sticky="ew")
-        ttk.Button(wr, text="Browse", width=8,
-                   command=self._pick_video_workroot).grid(row=0, column=1, padx=(6, 0))
+        wr_btn = ttk.Button(wr, text="Browse", width=8,
+                            command=self._pick_video_workroot)
+        wr_btn.grid(row=0, column=1, padx=(6, 0))
+        Tooltip(wr_btn,
+                "Choose the staging folder. Leave the box empty for the "
+                "recommended default on the app drive.", wraplength=W)
         Tooltip(wr_entry,
                 "Where segments are staged during a run. Leave EMPTY to use a fast "
                 "local folder on the app drive (recommended). Staging locally means a "
@@ -356,9 +410,13 @@ class SettingsTab(ttk.Frame):
                 "folder or the scanner may re-read its own segments.")
         ttk.Label(sec, text="Output quality:").grid(row=2, column=0, sticky="w", pady=3)
         self.video_codec_var = tk.StringVar(value=self._video_codec_label(vid))
-        ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
-                     width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS]).grid(
-            row=2, column=1, sticky="w", padx=6, pady=3)
+        vc_cb = ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
+                             width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS])
+        vc_cb.grid(row=2, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(vc_cb,
+                "How the finished video is compressed. Higher quality means a "
+                "bigger file for the same picture; it does not change how long the "
+                "upscaling itself takes.", wraplength=W)
         ttk.Label(sec, text="Model:").grid(row=3, column=0, sticky="w", pady=3)
         self.video_model_var = tk.StringVar(value=self._video_model_label(vid))
         model_cb = ttk.Combobox(sec, textvariable=self.video_model_var, state="readonly",
@@ -441,11 +499,15 @@ class SettingsTab(ttk.Frame):
         # row 12, NOT 11: row 11 already holds the work-folder row above. Two widgets in one
         # grid cell do not push each other aside, they DRAW ON TOP of each other, so this
         # checkbox silently covered the "Work folder (staging)" label and its entry.
-        ttk.Checkbutton(sec, text="Confirm (show the cost estimate) before renting a pod",
-                        variable=self.video_confirm_var).grid(
-            row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        Tooltip(sec, "The Video Upscaler runs only on a rented RunPod GPU. The "
-                     "output subfolder mirrors the source tree (like Batch Upscaler).")
+        confirm_chk = ttk.Checkbutton(
+            sec, text="Confirm (show the cost estimate) before renting a pod",
+            variable=self.video_confirm_var)
+        confirm_chk.grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        Tooltip(confirm_chk,
+                "Ask first, showing what the queue is expected to cost and how "
+                "long it should take, before any billed machine is created. "
+                "Leave this on unless the prompt is getting in your way.",
+                wraplength=W)
 
         # ── Notifications ───────────────────────────────────────────────────────
         # Settings live in the "notifications" config section; resolve_settings()
@@ -461,7 +523,10 @@ class SettingsTab(ttk.Frame):
         webhook_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=3)
         Tooltip(webhook_entry,
                 "Optional. Notifies when a queue finishes or on errors. Leave empty to disable.")
-        ttk.Button(sec, text="Test", command=self._test_webhook).grid(row=0, column=2, pady=3)
+        wh_test = ttk.Button(sec, text="Test", command=self._test_webhook)
+        wh_test.grid(row=0, column=2, pady=3)
+        Tooltip(wh_test, "Send a sample alert to this webhook now, so you can see "
+                         "whether it arrives in Discord.", wraplength=W)
         self.webhook_status = ttk.Label(sec, text="", foreground="#666")
         self.webhook_status.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
 
@@ -472,7 +537,10 @@ class SettingsTab(ttk.Frame):
         Tooltip(tg_token_entry,
                 "Optional. In Telegram, create a bot with @BotFather and paste the "
                 "token it gives you here. Leave empty to disable Telegram alerts.")
-        ttk.Button(sec, text="Test", command=self._test_telegram).grid(row=2, column=2, pady=3)
+        tg_test = ttk.Button(sec, text="Test", command=self._test_telegram)
+        tg_test.grid(row=2, column=2, pady=3)
+        Tooltip(tg_test, "Send a sample alert to the chat ID below, so you can see "
+                         "whether it arrives in Telegram.", wraplength=W)
 
         ttk.Label(sec, text="Telegram chat ID:").grid(row=3, column=0, sticky="w", pady=3)
         self.tg_chat_var = tk.StringVar(value=notif.get("telegram_chat_id", ""))
@@ -481,7 +549,12 @@ class SettingsTab(ttk.Frame):
         Tooltip(tg_chat_entry,
                 "Where to send alerts. Open your bot in Telegram and press Start "
                 "(or send it any message), then click Detect to fill this in.")
-        ttk.Button(sec, text="Detect", command=self._detect_telegram).grid(row=3, column=2, pady=3)
+        tg_detect = ttk.Button(sec, text="Detect", command=self._detect_telegram)
+        tg_detect.grid(row=3, column=2, pady=3)
+        Tooltip(tg_detect,
+                "Fill in the chat ID automatically by asking your bot who has "
+                "written to it. Press Start in the Telegram chat first, otherwise "
+                "there is nothing for it to find.", wraplength=W)
         self.tg_status = ttk.Label(sec, text="", foreground="#666")
         self.tg_status.grid(row=4, column=1, columnspan=2, sticky="w", padx=6)
 
@@ -501,7 +574,10 @@ class SettingsTab(ttk.Frame):
                 "A topic name you make up, then subscribe to in the ntfy app. On the "
                 "public server anyone who knows the topic can read it, so pick an "
                 "unguessable name. Leave empty to disable ntfy alerts.")
-        ttk.Button(sec, text="Test", command=self._test_ntfy).grid(row=6, column=2, pady=3)
+        ntfy_test = ttk.Button(sec, text="Test", command=self._test_ntfy)
+        ntfy_test.grid(row=6, column=2, pady=3)
+        Tooltip(ntfy_test, "Publish a sample alert to this server and topic, so you "
+                           "can see whether it reaches the ntfy app.", wraplength=W)
         self.ntfy_status = ttk.Label(sec, text="", foreground="#666")
         self.ntfy_status.grid(row=7, column=1, columnspan=2, sticky="w", padx=6)
 
@@ -532,8 +608,13 @@ class SettingsTab(ttk.Frame):
         ttk.Label(hostrow, text="mqtt://").pack(side="left")
         ttk.Entry(hostrow, textvariable=self.mqtt_host_var).pack(side="left", fill="x", expand=True)
         ttk.Label(sec, text="Port:").grid(row=1, column=2, sticky="e", pady=3)
-        ttk.Spinbox(sec, from_=1, to=65535, width=7,
-                    textvariable=self.mqtt_port_var).grid(row=1, column=3, sticky="w", padx=6, pady=3)
+        port_spin = ttk.Spinbox(sec, from_=1, to=65535, width=7,
+                                textvariable=self.mqtt_port_var)
+        port_spin.grid(row=1, column=3, sticky="w", padx=6, pady=3)
+        Tooltip(port_spin,
+                "The broker's port. 1883 is the standard, and is almost always "
+                "right; change it only if your broker was set up differently.",
+                wraplength=W)
 
         # Username, Password, Test and Publish now share one row. Client ID has no
         # control (mqtt_cid_var still carries it through to config.json) — it's an
@@ -546,7 +627,15 @@ class SettingsTab(ttk.Frame):
         ttk.Entry(urow, textvariable=self.mqtt_pass_var, show="•", width=16).pack(side="left", padx=(4, 0))
         self.mqtt_test_btn = ttk.Button(urow, text="Test", command=self._test_mqtt)
         self.mqtt_test_btn.pack(side="left", padx=(12, 0))
-        ttk.Button(urow, text="Publish now", command=self._publish_mqtt).pack(side="left", padx=(6, 0))
+        pub_btn = ttk.Button(urow, text="Publish now", command=self._publish_mqtt)
+        pub_btn.pack(side="left", padx=(6, 0))
+        Tooltip(self.mqtt_test_btn,
+                "Try connecting to the broker with these details and report "
+                "whether it worked. Nothing is saved by testing.", wraplength=W)
+        Tooltip(pub_btn,
+                "Send the current state (version, last run, idle/busy) to the "
+                "broker straight away, so Home Assistant shows it without waiting "
+                "for the next change.", wraplength=W)
 
         self.mqtt_status = ttk.Label(sec, text="", foreground="#666")
         self.mqtt_status.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
@@ -555,8 +644,15 @@ class SettingsTab(ttk.Frame):
         sec = self._section(body, "Setup")
         row = ttk.Frame(sec)
         row.grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Button(row, text="Re-run first-start wizard",
-                   command=self._rerun_wizard).pack(side="left")
+        # Bold: the wizard is modal (grab_set) and a multi-step task, not a glance.
+        wizard_btn = ttk.Button(row, text="Re-run first-start wizard",
+                                command=self._rerun_wizard)
+        wizard_btn.pack(side="left")
+        use_window_button_style(wizard_btn)
+        Tooltip(wizard_btn,
+                "Open the setup guide again: it looks at your graphics card and "
+                "suggests which models suit it, then offers to download the "
+                "tagging model. Nothing changes until you finish it.", wraplength=W)
         ttk.Label(row, foreground="#666",
                   text="Re-detect your GPU and recommend upscaling / tagging models.").pack(
             side="left", padx=(12, 0))
@@ -567,18 +663,31 @@ class SettingsTab(ttk.Frame):
         row.grid(row=0, column=0, sticky="w", pady=3)
         ttk.Label(row, text=f"Current version: {APP_VERSION}").pack(side="left")
         self.auto_update_var = tk.BooleanVar(value=update_auto_check_enabled())
-        ttk.Checkbutton(row, text="Check for updates on startup",
-                        variable=self.auto_update_var).pack(side="left", padx=(18, 0))
+        auto_upd_chk = ttk.Checkbutton(row, text="Check for updates on startup",
+                                       variable=self.auto_update_var)
+        auto_upd_chk.pack(side="left", padx=(18, 0))
         self.check_update_btn = ttk.Button(
             row, text="Check for updates now", command=self._check_updates)
         self.check_update_btn.pack(side="left", padx=(18, 0))
+        Tooltip(auto_upd_chk,
+                "Look for a newer version each time the app starts, and say so if "
+                "one exists. Nothing is downloaded without asking you.",
+                wraplength=W)
+        Tooltip(self.check_update_btn,
+                "Look for a newer version now and show what changed in it. A "
+                "version you chose to skip is offered again.", wraplength=W)
         self.update_status = ttk.Label(sec, text="", foreground="#666")
         self.update_status.grid(row=1, column=0, sticky="w", padx=6, pady=(4, 0))
 
         # ── Save bar ────────────────────────────────────────────────────────────
         bar = ttk.Frame(body, padding=(8, 12))
         bar.pack(fill="x")
-        ttk.Button(bar, text="Save settings", command=self._save).pack(side="left")
+        save_btn = ttk.Button(bar, text="Save settings", command=self._save)
+        save_btn.pack(side="left")
+        Tooltip(save_btn,
+                "Write every setting on this page to disk. Changes only take "
+                "effect once saved: leaving the tab with unsaved edits asks what "
+                "to do with them.", wraplength=W)
         self.save_status = ttk.Label(bar, text="", foreground="#666")
         self.save_status.pack(side="left", padx=12)
 
@@ -625,6 +734,9 @@ class SettingsTab(ttk.Frame):
                 widget = ttk.Entry(parent, textvariable=var,
                                   width=width if width is not None else 22)
             self._seedvr_vars[key] = (var, str)
+        tip = _SEEDVR_TIPS.get(key)
+        if tip:
+            Tooltip(widget, tip, wraplength=Tooltip.WRAP_NARROW)
         return widget
 
     def _section(self, parent, title):

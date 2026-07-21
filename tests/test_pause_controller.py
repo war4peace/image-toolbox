@@ -66,6 +66,63 @@ def test_quit_requested_and_check_reflect_quit(monkeypatch):
     assert pc.check() is False              # a requested quit stops the loop
 
 
+def test_pause_hooks_release_and_reload_around_the_wait(monkeypatch):
+    """Pause exists to hand the GPU back, so .check() must unload on the way into
+    the wait and reload on the way out, both on the calling (main) thread."""
+    pc = _quiet_controller(monkeypatch)
+    calls = []
+    pc.on_pause  = lambda: calls.append("release")
+    pc.on_resume = lambda: calls.append("reload")
+
+    assert pc.check() is True
+    assert calls == []                      # not paused -> no unload/reload churn
+
+    pc.force_pause()
+    t = threading.Thread(target=pc.check)
+    t.start()
+    t.join(0.3)
+    assert calls == ["release"], "the GPU must be freed while the run sleeps"
+
+    pc._handle_key("p")
+    t.join(1.0)
+    assert calls == ["release", "reload"]
+
+
+def test_pause_hooks_skip_the_reload_on_quit(monkeypatch):
+    """Stopping from a pause ends the run, so paying a cold model load there
+    would only delay the shutdown."""
+    pc = _quiet_controller(monkeypatch)
+    calls = []
+    pc.on_pause  = lambda: calls.append("release")
+    pc.on_resume = lambda: calls.append("reload")
+
+    pc.force_pause()
+    t = threading.Thread(target=pc.check)
+    t.start()
+    t.join(0.3)
+    pc._handle_key("q")
+    t.join(1.0)
+    assert calls == ["release"]
+
+
+def test_pause_hook_failure_never_breaks_the_run(monkeypatch):
+    """A failed unload must leave the run working (worst case: VRAM stays held)."""
+    pc = _quiet_controller(monkeypatch)
+
+    def boom():
+        raise RuntimeError("driver said no")
+
+    pc.on_pause = pc.on_resume = boom
+    pc.force_pause()
+    result = {}
+    t = threading.Thread(target=lambda: result.setdefault("r", pc.check()))
+    t.start()
+    t.join(0.3)
+    pc._handle_key("p")
+    t.join(1.0)
+    assert result.get("r") is True
+
+
 def test_force_pause_then_quit_unblocks_check(monkeypatch):
     # Stop (not Resume) while paused must also release .check(), returning False.
     pc = _quiet_controller(monkeypatch)

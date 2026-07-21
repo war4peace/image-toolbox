@@ -12,6 +12,7 @@ import ssh_setup
 import taskbar_progress
 from gui.common import APP_TITLE, CFG, get_default_folder, set_default_folder, get_install_mode
 from gui.tooltab import ToolTab
+from gui.widgets import Tooltip
 
 
 class UpscaleTab(ToolTab):
@@ -64,14 +65,16 @@ class UpscaleTab(ToolTab):
     def _build(self):
         ttk.Label(self, text="Photo folder:").grid(row=0, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.src_var).grid(row=0, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(self, text="Browse…", command=self._pick_src).grid(row=0, column=2, pady=3)
+        self.browse_src_btn = ttk.Button(self, text="Browse…", command=self._pick_src)
+        self.browse_src_btn.grid(row=0, column=2, pady=3)
         self.save_src_btn = ttk.Button(
             self, text="Save as Default", command=lambda: self._save_default("src"))
         self.save_src_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
 
         ttk.Label(self, text="Save upscaled to:").grid(row=1, column=0, sticky="w", pady=3)
         ttk.Entry(self, textvariable=self.out_var).grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Button(self, text="Browse…", command=self._pick_out).grid(row=1, column=2, pady=3)
+        self.browse_out_btn = ttk.Button(self, text="Browse…", command=self._pick_out)
+        self.browse_out_btn.grid(row=1, column=2, pady=3)
         self.save_out_btn = ttk.Button(
             self, text="Save as Default", command=lambda: self._save_default("out"))
         self.save_out_btn.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
@@ -85,9 +88,62 @@ class UpscaleTab(ToolTab):
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
         for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
+        self._add_tooltips()
 
         self._build_remote_row(row=3)
         self._build_output_area(row=4)
+
+    # ── Button hints ─────────────────────────────────────────────────────────
+
+    # The middle button changes label with the run phase, so its hint follows
+    # (see _sync_pause_tip). Keyed by the label the button is currently showing.
+    PAUSE_TIPS = {
+        "Cancel": ("Cancel the run before the per-image work starts. The current "
+                   "step (scanning, cache check) is finished cleanly and what was "
+                   "scanned so far is kept."),
+        "Pause":  ("Pause after the current image and unload the AI models, "
+                   "giving the graphics card back to you for other work. The "
+                   "queue is kept, so Resume continues without re-scanning."),
+        "Resume": ("Continue the paused run. The AI models reload first, so the "
+                   "next image takes longer than the rest."),
+    }
+
+    def _add_tooltips(self):
+        W = Tooltip.WRAP_NARROW
+        Tooltip(self.browse_src_btn,
+                "Pick the folder of photos to upscale. Sub-folders are included.",
+                wraplength=W)
+        Tooltip(self.browse_out_btn,
+                "Pick where the upscaled copies go. The source folder's structure "
+                "is mirrored there; your originals are never modified.",
+                wraplength=W)
+        Tooltip(self.save_src_btn,
+                "Remember this photo folder as the default source, pre-filled "
+                "every time the app starts.", wraplength=W)
+        Tooltip(self.save_out_btn,
+                "Remember this folder as the default destination for upscaled "
+                "photos, pre-filled every time the app starts.", wraplength=W)
+        Tooltip(self.start_btn,
+                "Scan the photo folder and upscale every image that is below the "
+                "Resolution Target. Your originals are never modified: the "
+                "results are written to the output folder.", wraplength=W)
+        self.pause_tip = Tooltip(self.pause_btn, self.PAUSE_TIPS["Pause"],
+                                 wraplength=W)
+        Tooltip(self.stop_btn,
+                "End the run once the current image is finished. Whatever is "
+                "left stays queued: starting again picks up where you stopped.",
+                wraplength=W)
+        Tooltip(self.open_btn,
+                "Open the folder holding the upscaled copies in Windows Explorer.",
+                wraplength=W)
+        Tooltip(self.viewlog_btn,
+                "Open the log window with this run's full output. Available once "
+                "a run has started.", wraplength=W)
+
+    def _sync_pause_tip(self):
+        tip = self.PAUSE_TIPS.get(self.pause_btn.cget("text"))
+        if tip:
+            self.pause_tip.set_text(tip)
 
     # ── GUI events specific to the upscaler ─────────────────────────────────
 
@@ -105,6 +161,7 @@ class UpscaleTab(ToolTab):
                 if self.running and not self._cancelled:
                     self.pause_btn.configure(
                         text="Pause" if processing else "Cancel")
+                    self._sync_pause_tip()
         elif kind == "PROG":
             cur, _, tot = payload.partition("|")
             try:
@@ -280,6 +337,7 @@ class UpscaleTab(ToolTab):
             self._set_running(True)
             # Until per-image processing starts, this button cancels the run
             self.pause_btn.configure(text="Cancel")
+            self._sync_pause_tip()
 
     def _pause_or_cancel(self):
         """
@@ -297,8 +355,14 @@ class UpscaleTab(ToolTab):
         self.send("p")
         self._paused = not self._paused
         self.pause_btn.configure(text="Resume" if self._paused else "Pause")
+        self._sync_pause_tip()
         if self._paused:
-            self.status_var.set("Pausing — finishes the current image first …")
+            # A local run releases the GPU once the current image is done; a
+            # remote one has nothing local to release (the models are on the pod).
+            self.status_var.set(
+                "Pausing — finishes the current image, then releases the GPU …"
+                if not getattr(self, "_remote_run", False)
+                else "Pausing — finishes the current image first …")
 
     def _stop(self):
         if getattr(self, "_remote_run", False):
@@ -336,6 +400,7 @@ class UpscaleTab(ToolTab):
         self._set_running(False)
         self._paused = False
         self.pause_btn.configure(text="Pause")
+        self._sync_pause_tip()
         self.eta_var.set("—")
         # The remote-pod telemetry row only makes sense during a remote run; hide it and
         # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.

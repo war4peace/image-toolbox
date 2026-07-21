@@ -140,11 +140,24 @@ class ToolTab(ttk.Frame):
             row=0, column=0, sticky="w")
         zb = ttk.Frame(header)
         zb.grid(row=0, column=1, sticky="e")
-        ttk.Label(zb, text="Thumbnail size:").pack(side="left", padx=(0, 4))
-        ttk.Button(zb, text="–", width=3,
-                   command=lambda: self.strip.zoom_out()).pack(side="left")
-        ttk.Button(zb, text="+", width=3,
-                   command=lambda: self.strip.zoom_in()).pack(side="left", padx=(2, 0))
+        size_lbl = ttk.Label(zb, text="Thumbnail size:")
+        size_lbl.pack(side="left", padx=(0, 4))
+        smaller_btn = ttk.Button(zb, text="–", width=3,
+                                 command=lambda: self.strip.zoom_out())
+        smaller_btn.pack(side="left")
+        larger_btn = ttk.Button(zb, text="+", width=3,
+                                command=lambda: self.strip.zoom_in())
+        larger_btn.pack(side="left", padx=(2, 0))
+        Tooltip(size_lbl,
+                "How big each picture is drawn in the preview strip below. The "
+                "size you pick is remembered between runs.",
+                wraplength=Tooltip.WRAP_NARROW)
+        Tooltip(smaller_btn,
+                "Smaller thumbnails, so more of the run's images fit on screen "
+                "at once.", wraplength=Tooltip.WRAP_NARROW)
+        Tooltip(larger_btn,
+                "Larger thumbnails, so more detail is visible in each image.",
+                wraplength=Tooltip.WRAP_NARROW)
 
         cell = int(self.app.settings.get("thumb_cell", CELL_DEFAULT))
         self.strip = FilmStrip(body, cell=cell, on_zoom=self._save_cell)
@@ -219,10 +232,16 @@ class ToolTab(ttk.Frame):
             rr, text="Run on remote pod (RunPod)", variable=self.remote_var,
             command=self._on_remote_toggle)
         self.remote_chk.pack(side="left")
-        Tooltip(self.remote_chk,
-                "Run on a rented RunPod GPU instead of this PC (roadmap #1, "
-                "experimental). Creates a billed pod and terminates it when done. "
-                "Needs a RunPod API key + model volume in Settings.")
+        # Kept as an attribute so a tab with a different story (Tag & Rename runs
+        # locally and only tunnels the model calls) can RETARGET it via set_text.
+        # Adding a second Tooltip would not override this one: Tooltip binds with
+        # add="+", so both would pop up, stacked.
+        self.remote_tip = Tooltip(
+            self.remote_chk,
+            "Run on a rented RunPod GPU instead of this PC (roadmap #1, "
+            "experimental). Creates a billed pod and terminates it when done. "
+            "Needs a RunPod API key + model volume in Settings.",
+            wraplength=Tooltip.WRAP_NARROW)
         ttk.Label(rr, text="GPU:").pack(side="left", padx=(16, 4))
         self.gpu_pick_var = tk.StringVar(value="")
         self.gpu_combo = ttk.Combobox(

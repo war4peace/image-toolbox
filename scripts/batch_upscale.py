@@ -706,6 +706,15 @@ class PauseController:
         self._available      = False
         self._pause_start    = None   # wall time when current pause began
         self._paused_total   = 0.0   # accumulated seconds spent paused
+        # Optional hooks, run by .check() on the MAIN thread around the blocking
+        # wait: on_pause when the run goes to sleep, on_resume when it wakes.
+        # main() uses them to unload the models so a paused run frees the GPU.
+        # They must NOT be called from the watcher thread — it fires while the
+        # main thread is mid-upscale, and touching the engine there would race
+        # a live CUDA workload. At .check() time the engine is idle by
+        # construction (it is called between images).
+        self.on_pause        = None
+        self.on_resume       = None
         # Real terminal stream, captured before the engine redirects
         # sys.stdout during upscales — keypress feedback must reach the
         # terminal even while the redirect is active in the main thread.
@@ -805,14 +814,33 @@ class PauseController:
             if not self._paused:
                 return True
         # Script is paused — the pause message was already printed by _watch.
-        # Just sleep until resumed or quit, no further output.
-        while True:
-            with self._lock:
-                if self._quit:
-                    return False
-                if not self._paused:
-                    return True
-            time.sleep(0.5)
+        # Hand the GPU back before sleeping (the point of Pause), then just sleep
+        # until resumed or quit, no further output.
+        self._fire(self.on_pause)
+        try:
+            while True:
+                with self._lock:
+                    if self._quit:
+                        return False
+                    if not self._paused:
+                        return True
+                time.sleep(0.5)
+        finally:
+            # Reload only when the run actually continues. On quit the loop is
+            # about to break and the engine is never used again, so paying a
+            # cold model load there would just delay the shutdown.
+            if not self._quit:
+                self._fire(self.on_resume)
+
+    @staticmethod
+    def _fire(hook):
+        """Run a pause hook, never letting it break the run."""
+        if hook is None:
+            return
+        try:
+            hook()
+        except Exception as exc:                       # noqa: BLE001
+            debug_log("PauseController hook failed", exc=exc)
 
     def force_pause(self):
         """Programmatically enter the paused state (as if the user pressed Pause),
@@ -1530,6 +1558,50 @@ def main():
     # SeedVR2 pipeline output (phase banners, progress bars) goes to the log
     # file only — the terminal shows just the per-image status lines.
     ENGINE.log_sink = logger._fh
+
+    # ── Pause frees the GPU ──────────────────────────────────────────────────
+    # Pausing exists so the user can go do something else that needs the card
+    # (a game, another AI tool) and come back to the queue where it stood.
+    # Merely stopping the loop would not achieve that: the models stay loaded
+    # and their VRAM stays held, so the pause only frees the GPU if we actually
+    # unload. Resuming reloads them and continues at the next image, so the
+    # scan / eligibility work done so far is never repeated.
+    #
+    # Local runs only. On a remote run the models sit on the rented pod, so
+    # unloading frees nothing on this PC and would just pay a reload on a
+    # billed-by-the-hour machine.
+    if not REMOTE:
+        def _pause_release():
+            before = ENGINE.vram_used_gb()
+            _gui_event("STATUS", "Paused — releasing the GPU …")
+            ENGINE.release()
+            # Free EVERY model, not just the big one. Auto-straighten's CNN is
+            # tiny beside SeedVR2, but a pause that leaves something resident is
+            # an exception someone has to remember; there are none.
+            try:
+                import orientation
+                if orientation.unload():
+                    logger.tee("  Straighten model unloaded.")
+            except Exception as exc:                   # noqa: BLE001
+                debug_log("batch_upscale: orientation unload failed", exc=exc)
+            after = ENGINE.vram_used_gb()
+            if before is not None and after is not None:
+                logger.tee(f"  GPU released: {before:.1f} GB → {after:.1f} GB "
+                           f"VRAM held. The card is free for other apps.")
+            else:
+                logger.tee("  Models unloaded — the card is free for other apps.")
+            _gui_event("STATUS", "Paused — GPU released. Press Resume to continue.")
+
+        def _pause_reload():
+            # The models reload lazily on the next image; say so, because that
+            # first image after a resume takes noticeably longer than the rest.
+            logger.tee("  Resuming — the AI engine reloads on the next image "
+                       "(this one takes longer).")
+            _gui_event("STATUS", "Resuming — reloading the AI engine …")
+
+        pause.on_pause  = _pause_release
+        pause.on_resume = _pause_reload
+
     _gui_event("LOG", logger.path)
     # Print log path to terminal only — it's already written to the session header
     log_link = _osc8_link(logger.path)

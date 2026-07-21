@@ -24,6 +24,51 @@ COLLAPSE_PROCESSING_RE = re.compile(r"Processing:\s+\d+/\d+\s+frames")
 
 
 # ─────────────────────────────────────────────
+#  "OPENS A WINDOW" BUTTON STYLE
+# ─────────────────────────────────────────────
+
+# Bold label for a button that hands the user over to another window.
+#
+# The rule, so it does not have to be re-derived per button. Bold when the window
+# is BOTH:
+#   (a) exclusive, modal, or persistent — it hides the main window, blocks it, or
+#       is a place the user stays in and works; AND
+#   (b) demanding of prolonged focus — a task, not a glance.
+# Everything else stays plain: a folder picker or a confirmation is transient, and
+# an optional detail view (the log window) can be opened and closed at will
+# without affecting how the app works, so it is "nice to have", not a destination.
+#
+# Bold today: Segments… and Benchmark GPU… (Video), Provision… (RunPod, a long
+# one-time job the user watches), Re-run first-start wizard (Settings, modal via
+# grab_set). Deliberately plain: View log, Browse…, Undo this folder…, and the
+# install/progress dialogs the user only waits on.
+WINDOW_BUTTON_STYLE = "Window.TButton"
+_window_button_font = None
+
+
+def use_window_button_style(*buttons):
+    """Mark buttons that open a window the user settles into (see the rule above).
+    Idempotent; cosmetic only, so any styling failure leaves the button working
+    and merely unbolded.
+
+    The font is DERIVED from TkDefaultFont rather than hard-coded, so it follows
+    the user's Windows font and size instead of pinning Segoe UI 9 (which would
+    look wrong at a non-default display scale)."""
+    global _window_button_font
+    try:
+        import tkinter.font as tkfont
+        if _window_button_font is None:
+            f = tkfont.nametofont("TkDefaultFont").copy()
+            f.configure(weight="bold")
+            _window_button_font = f
+            ttk.Style().configure(WINDOW_BUTTON_STYLE, font=f)
+        for b in buttons:
+            b.configure(style=WINDOW_BUTTON_STYLE)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────
 #  TOOLTIP
 # ─────────────────────────────────────────────
 
@@ -34,6 +79,9 @@ class Tooltip:
     # A pixel width (Tk's wraplength) reads better than hand-inserted breaks and
     # applies to every tooltip in the app at once.
     WRAP_PX = 360
+    # Narrower wrap for short button hints, so a two-sentence tooltip comes out
+    # as a compact block instead of one wide strip.
+    WRAP_NARROW = 250
 
     def __init__(self, widget, text, delay=500, wraplength=WRAP_PX):
         self.widget = widget
@@ -45,6 +93,16 @@ class Tooltip:
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def set_text(self, text):
+        """Retarget the hint at runtime (a button whose label changes with the
+        run state wants a hint that changes with it). A visible tip is redrawn."""
+        if text == self.text:
+            return
+        self.text = text
+        if self._tip is not None:
+            self._hide()
+            self._show()
 
     def _schedule(self, _event=None):
         self._cancel()
