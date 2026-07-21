@@ -6,6 +6,52 @@ working draft those notes are distilled from, and it records **experimental**,
 in-development versions before they are tagged. For released versions, see the GitHub
 Releases page.
 
+## 0.5.2
+
+### Pause now frees your graphics card
+Pause used to stop the queue but keep the AI models loaded, so the card stayed
+occupied and you could not go and use it for anything else. It now unloads
+everything and hands the memory back, then reloads when you press Resume. The
+queue is kept, so nothing is re-scanned and no work is repeated.
+
+- **Batch Upscaler:** pausing releases the upscaling models (measured: 16.6 GB
+  returned on an RTX 3090). The first image after Resume takes a little longer
+  while they reload.
+- **Tag & Rename now has a Pause at all**, which it never did. It shares one
+  button with the old "Resume after error": it reads **Pause** while tagging,
+  **Resume** while paused, and **Resume after error** when a run is held because
+  the vision model kept failing. Pausing unloads the vision model.
+- A pause frees **every** loaded model, including the small auto-straighten one.
+  No exceptions to remember.
+- Remote runs are unchanged: those models live on the rented pod, so unloading
+  them would free nothing on your PC.
+
+### Hover help on every control
+Every button, checkbox, picklist and list on all six tabs now explains itself on
+hover. The wording avoids jargon, and anything that costs money or changes files
+says so plainly: Conciliation's Delete cannot be undone, a RunPod volume keeps
+billing monthly even when idle, the Video Upscaler's Stop abandons the segment in
+progress. Settings' numeric boxes also state their recommended value.
+
+Buttons that open a window you settle into and work in (Segments…, Benchmark
+GPU…, Provision…, the setup wizard) are drawn in bold, to set them apart from
+buttons that act where you are.
+
+### Fixes
+- The Tag & Rename remote checkbox showed two tooltips stacked on top of each
+  other.
+- Settings claimed the Video Upscaler runs only on a rented pod. That stopped
+  being true in 0.5.0, when local video upscaling arrived, and the claim sat
+  directly above the Local/Remote switch.
+- Video Upscaler: the progress bar now advances within a long segment on a local
+  run, instead of appearing stuck until the segment finished.
+
+### Also in this release
+- **Run exclusivity:** while any run is active, the other tabs are locked, so two
+  runs can no longer fight over the same GPU or the same folders.
+- **Video notifications** carry a per-file summary of what finished, rather than
+  a bare "done".
+
 ## 0.5.1
 
 ### Benchmark sharing (feature #8, NEW)
