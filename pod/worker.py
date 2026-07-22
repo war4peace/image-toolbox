@@ -242,28 +242,57 @@ def _sample_ram():
         return None
 
 
-def _sample_gpu():
-    """(vram_used_mb, vram_total_mb, temp_c) from nvidia-smi."""
+# Keep this column list + parse IDENTICAL to system_telemetry._GPU_QUERY_FIELDS
+# on the app side: the GUI plots local and pod telemetry through one code path, so
+# both must emit the same sample keys. Per-field parse -> a card that reports
+# "[N/A]" for a field (power.limit / clocks on some cards) yields None for just
+# that field, not a dropped sample.
+_GPU_FIELDS = [
+    ("gpu_used_mb",       "memory.used"),
+    ("gpu_total_mb",      "memory.total"),
+    ("gpu_temp_c",        "temperature.gpu"),
+    ("gpu_util_pct",      "utilization.gpu"),
+    ("gpu_power_w",       "power.draw"),
+    ("gpu_power_limit_w", "power.limit"),
+    ("gpu_clock_mhz",     "clocks.gr"),
+]
+
+
+def _parse_gpu_field(raw):
+    raw = (raw or "").strip()
+    if not raw or raw.startswith("[") or raw.lower() in ("n/a", "na"):
+        return None
     try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def _sample_gpu():
+    """Dict of GPU fields (VRAM used/total, temp, util, power draw+limit, clock)
+    from nvidia-smi; each value an int or None. None outright only on failure."""
+    try:
+        query = "--query-gpu=" + ",".join(f for _, f in _GPU_FIELDS)
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.used,memory.total,temperature.gpu",
-             "--format=csv,noheader,nounits"], text=True, timeout=8)
-        used, total, temp = [p.strip() for p in out.strip().splitlines()[0].split(",")]
-        return int(float(used)), int(float(total)), int(float(temp))
+            ["nvidia-smi", query, "--format=csv,noheader,nounits"],
+            text=True, timeout=8)
+        parts = [p.strip() for p in out.strip().splitlines()[0].split(",")]
+        return {k: (_parse_gpu_field(parts[i]) if i < len(parts) else None)
+                for i, (k, _f) in enumerate(_GPU_FIELDS)}
     except Exception:
         return None
 
 
 def _sample_telemetry():
-    ram, gpu = _sample_ram(), _sample_gpu()
-    return {
+    ram, gpu = _sample_ram(), (_sample_gpu() or {})
+    sample = {
         "cpu":          _sample_cpu(),
         "ram_used_mb":  ram[0] if ram else None,
         "ram_total_mb": ram[1] if ram else None,
-        "gpu_used_mb":  gpu[0] if gpu else None,
-        "gpu_total_mb": gpu[1] if gpu else None,
-        "gpu_temp_c":   gpu[2] if gpu else None,
     }
+    for k, _f in _GPU_FIELDS:
+        sample[k] = gpu.get(k)
+    return sample
 
 
 # ── video jobs (Video Upscaler #2, phase 3) ─────────────────────────────────

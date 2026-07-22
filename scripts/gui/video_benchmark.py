@@ -467,11 +467,12 @@ class BenchmarkWindow(tk.Toplevel):
 
     def _detect_gpu(self):
         # Remote: the card is whatever the user picked in the GPU list, not a local probe.
-        # Shape it like sample_gpu's (used_mb, total_mb, temp) so _fill_gpu is unchanged;
-        # there is no live "used VRAM" for a pod that isn't deployed yet, so used=0.
+        # Shape it like sample_gpu's dict so _fill_gpu is unchanged; there is no live
+        # "used VRAM" for a pod that isn't deployed yet, so used=0.
         if self.remote:
             vram_gb = self.remote_gpu.get("memory_gb") or 0
-            g = (0, int(vram_gb) * 1024, None)
+            g = {"gpu_used_mb": 0, "gpu_total_mb": int(vram_gb) * 1024,
+                 "gpu_temp_c": None}
             name = self.remote_gpu.get("id") or self.remote_gpu.get("name") or "remote GPU"
             self.after(0, lambda: self._fill_gpu(g, name))
             return
@@ -492,7 +493,7 @@ class BenchmarkWindow(tk.Toplevel):
             self.estimate_var.set("Local upscaling needs a CUDA GPU.")
             return
         self.gpu_id = name or "local"
-        self.total_vram_gb = round((g[1] or 0) / 1024.0)
+        self.total_vram_gb = round((g.get("gpu_total_mb") or 0) / 1024.0)
         self.header_var.set(f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
         # Default-check the targets this card can plausibly reach (all stay toggleable). Pre-check
         # every feasible LANDSCAPE 4:3 ladder cell (the common old-camera case); PORTRAIT cells
@@ -548,9 +549,9 @@ class BenchmarkWindow(tk.Toplevel):
         """(used_gb, total_gb) for GPU 0 via nvidia-smi, or (None, None). Best-effort."""
         try:
             import system_telemetry as st
-            g = st.sample_gpu()                        # (used_mb, total_mb, temp) or None
-            if g:
-                return g[0] / 1024.0, g[1] / 1024.0
+            g = st.sample_gpu()                        # dict of GPU fields, or None
+            if g and g.get("gpu_used_mb") is not None and g.get("gpu_total_mb"):
+                return g["gpu_used_mb"] / 1024.0, g["gpu_total_mb"] / 1024.0
         except Exception:                              # noqa: BLE001
             pass
         return None, None
@@ -558,7 +559,9 @@ class BenchmarkWindow(tk.Toplevel):
     def _refresh_vram_warning(self, g=None):
         """Show the contention warning iff other apps are already holding VRAM (> the
         threshold). Purely advisory: benchmarking with busy VRAM under-reports the ceiling."""
-        used = (g[0] / 1024.0) if g else self._sample_used_vram()[0]
+        used = ((g["gpu_used_mb"] / 1024.0)
+                if (g and g.get("gpu_used_mb") is not None)
+                else self._sample_used_vram()[0])
         if used is not None and used > self.VRAM_BUSY_WARN_GB:
             self.vram_warn_var.set(
                 f"⚠ {used:.1f} GB of VRAM is already in use. Close all non-essential "

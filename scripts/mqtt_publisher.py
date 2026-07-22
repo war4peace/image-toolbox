@@ -40,6 +40,10 @@ SYS_RAM_TOTAL_TOPIC  = f"{BASE_TOPIC}/system/ram_total"       # RAM total, MB
 SYS_GPU_VRAM_TOPIC   = f"{BASE_TOPIC}/system/gpu_vram"         # VRAM used, MB
 SYS_GPU_VRAM_TOTAL_TOPIC = f"{BASE_TOPIC}/system/gpu_vram_total"  # VRAM total, MB
 SYS_GPU_TEMP_TOPIC   = f"{BASE_TOPIC}/system/gpu_temp"         # GPU temp, °C
+SYS_GPU_UTIL_TOPIC   = f"{BASE_TOPIC}/system/gpu_util"          # GPU core load, %
+SYS_GPU_POWER_TOPIC  = f"{BASE_TOPIC}/system/gpu_power"         # GPU power draw, W
+SYS_GPU_POWER_LIMIT_TOPIC = f"{BASE_TOPIC}/system/gpu_power_limit"  # GPU power cap, W
+SYS_GPU_CLOCK_TOPIC  = f"{BASE_TOPIC}/system/gpu_clock"         # GPU core clock, MHz
 
 # Remote-pod system telemetry (remote upscaling #1, Feature #4) — published only
 # while a remote-pod run is active; otherwise these topics are absent/stale.
@@ -49,6 +53,10 @@ SYS_REMOTE_RAM_TOTAL_TOPIC  = f"{BASE_TOPIC}/system/remote/ram_total"     # RAM 
 SYS_REMOTE_GPU_VRAM_TOPIC   = f"{BASE_TOPIC}/system/remote/gpu_vram"      # VRAM used, MB
 SYS_REMOTE_GPU_VRAM_TOTAL_TOPIC = f"{BASE_TOPIC}/system/remote/gpu_vram_total"  # VRAM total, MB
 SYS_REMOTE_GPU_TEMP_TOPIC   = f"{BASE_TOPIC}/system/remote/gpu_temp"      # GPU temp, °C
+SYS_REMOTE_GPU_UTIL_TOPIC   = f"{BASE_TOPIC}/system/remote/gpu_util"      # GPU core load, %
+SYS_REMOTE_GPU_POWER_TOPIC  = f"{BASE_TOPIC}/system/remote/gpu_power"     # GPU power draw, W
+SYS_REMOTE_GPU_POWER_LIMIT_TOPIC = f"{BASE_TOPIC}/system/remote/gpu_power_limit"  # GPU power cap, W
+SYS_REMOTE_GPU_CLOCK_TOPIC  = f"{BASE_TOPIC}/system/remote/gpu_clock"     # GPU core clock, MHz
 
 # Live task state (published by the persistent client during a run)
 TASK_NAME_TOPIC     = f"{BASE_TOPIC}/task/name"        # idle / upscaling / tagging / conciliating

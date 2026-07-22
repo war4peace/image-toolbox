@@ -293,13 +293,17 @@ class TelemetryRow(ttk.Frame):
             segs.append((fld(f"RAM {text}", 24), self._band(pct)))
 
         vu, vt = sample.get("gpu_used_mb"), sample.get("gpu_total_mb")
+        util   = sample.get("gpu_util_pct")
         temp   = sample.get("gpu_temp_c")
         if vu is not None and vt:
             text, pct = self._gb(vu, vt)
             segs.append((fld(f"VRAM {text}", 24), self._band(pct)))
+        if util is not None:
+            u = round(util)
+            segs.append((fld(f"GPU {u}%", 8), self._band(u)))
         if temp is not None:
             segs.append((f"GPU {temp}°C", self.GREY))
-        if vu is None and temp is None:
+        if vu is None and util is None and temp is None:
             segs.append(("GPU: n/a", self.GREY))
 
         self._set(segs)

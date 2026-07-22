@@ -795,11 +795,17 @@ class App(tk.Tk):
             sample.update(ram_used_mb=ram[0], ram_total_mb=ram[1])
         else:
             sample.update(ram_used_mb=None, ram_total_mb=None)
+        # sample_gpu returns a dict of the widened GPU fields (any value may be
+        # None where the card doesn't report it); keep every key present so the
+        # sample shape is stable whether or not a GPU is found.
+        gpu_keys = ("gpu_used_mb", "gpu_total_mb", "gpu_temp_c", "gpu_util_pct",
+                    "gpu_power_w", "gpu_power_limit_w", "gpu_clock_mhz")
         if gpu is not None:
-            used, total, temp = gpu
-            sample.update(gpu_used_mb=used, gpu_total_mb=total, gpu_temp_c=temp)
+            for k in gpu_keys:
+                sample[k] = gpu.get(k)
         else:
-            sample.update(gpu_used_mb=None, gpu_total_mb=None, gpu_temp_c=None)
+            for k in gpu_keys:
+                sample[k] = None
         try:
             self.after(0, lambda: self._apply_telemetry(sample))
         except Exception:
@@ -824,6 +830,14 @@ class App(tk.Tk):
             values[mqtt_publisher.SYS_GPU_VRAM_TOTAL_TOPIC] = str(sample["gpu_total_mb"])
         if sample.get("gpu_temp_c") is not None:
             values[mqtt_publisher.SYS_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
+        if sample.get("gpu_util_pct") is not None:
+            values[mqtt_publisher.SYS_GPU_UTIL_TOPIC] = str(sample["gpu_util_pct"])
+        if sample.get("gpu_power_w") is not None:
+            values[mqtt_publisher.SYS_GPU_POWER_TOPIC] = str(sample["gpu_power_w"])
+        if sample.get("gpu_power_limit_w") is not None:
+            values[mqtt_publisher.SYS_GPU_POWER_LIMIT_TOPIC] = str(sample["gpu_power_limit_w"])
+        if sample.get("gpu_clock_mhz") is not None:
+            values[mqtt_publisher.SYS_GPU_CLOCK_TOPIC] = str(sample["gpu_clock_mhz"])
         if values:
             self.mqtt_publish(values)
 
@@ -850,6 +864,14 @@ class App(tk.Tk):
             values[mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOTAL_TOPIC] = str(sample["gpu_total_mb"])
         if sample.get("gpu_temp_c") is not None:
             values[mqtt_publisher.SYS_REMOTE_GPU_TEMP_TOPIC] = str(sample["gpu_temp_c"])
+        if sample.get("gpu_util_pct") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_UTIL_TOPIC] = str(sample["gpu_util_pct"])
+        if sample.get("gpu_power_w") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_POWER_TOPIC] = str(sample["gpu_power_w"])
+        if sample.get("gpu_power_limit_w") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_POWER_LIMIT_TOPIC] = str(sample["gpu_power_limit_w"])
+        if sample.get("gpu_clock_mhz") is not None:
+            values[mqtt_publisher.SYS_REMOTE_GPU_CLOCK_TOPIC] = str(sample["gpu_clock_mhz"])
         if values:
             self.mqtt_publish(values)
 
@@ -871,6 +893,10 @@ class App(tk.Tk):
             mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOPIC:       "0",
             mqtt_publisher.SYS_REMOTE_GPU_VRAM_TOTAL_TOPIC: "0",
             mqtt_publisher.SYS_REMOTE_GPU_TEMP_TOPIC:       "0",
+            mqtt_publisher.SYS_REMOTE_GPU_UTIL_TOPIC:        "0",
+            mqtt_publisher.SYS_REMOTE_GPU_POWER_TOPIC:       "0",
+            mqtt_publisher.SYS_REMOTE_GPU_POWER_LIMIT_TOPIC: "0",
+            mqtt_publisher.SYS_REMOTE_GPU_CLOCK_TOPIC:       "0",
         })
 
     def show_update_dialog(self, info):

@@ -169,9 +169,10 @@ class RemoteUpscaleEngine:
     def telemetry(self):
         """Fetch the pod's live system telemetry (remote #1, Feature #4) through
         the tunnel. Returns the same sample dict the GUI's TelemetryRow renders
-        (cpu, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, gpu_temp_c),
-        or None on any error. The worker answers this lock-free, so it works even
-        while an upscale is in flight."""
+        (cpu, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, gpu_temp_c,
+        gpu_util_pct, gpu_power_w, gpu_power_limit_w, gpu_clock_mhz; any field may
+        be None), or None on any error. The worker answers this lock-free, so it
+        works even while an upscale is in flight."""
         url = f"http://127.0.0.1:{self.local_port}/telemetry"
         try:
             with urllib.request.urlopen(url, timeout=15) as resp:

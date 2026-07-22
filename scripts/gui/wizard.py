@@ -242,7 +242,7 @@ class FirstStartWizard(tk.Toplevel):
     def _detect_gpu(self):
         name = system_telemetry.gpu_name()
         gpu = system_telemetry.sample_gpu()
-        vram = gpu[1] if gpu else None
+        vram = gpu.get("gpu_total_mb") if gpu else None
         self.after(0, lambda: self._on_gpu_detected(name, vram))
 
     def _on_gpu_detected(self, name, vram_total_mb):

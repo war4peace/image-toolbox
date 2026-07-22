@@ -990,14 +990,14 @@ class VideoTab(ttk.Frame):
                         "put ffmpeg.exe + ffprobe.exe in ffmpeg\\bin (or on the PATH).", False)
             try:
                 import system_telemetry as st
-                g = st.sample_gpu()                    # (used_mb, total_mb, temp_c) or None
+                g = st.sample_gpu()                    # dict of GPU fields, or None
                 name = st.gpu_name()
             except Exception:
                 g, name = None, None
             if not g:
                 return ("Not ready: no NVIDIA GPU detected (nvidia-smi). Local upscaling "
                         "needs a CUDA GPU; use Remote instead.", False)
-            vram = f"{g[1] / 1024:.0f} GB" if g[1] else "?"
+            vram = f"{g['gpu_total_mb'] / 1024:.0f} GB" if g.get("gpu_total_mb") else "?"
             return (f"Local ready — {name or 'GPU'}, {vram} VRAM. The first segment "
                     f"calibrates the batch size for your card.", True)
         # Local ffmpeg first (a purely local check): every video job needs the
@@ -2143,7 +2143,7 @@ class VideoTab(ttk.Frame):
             self.gpu_var.set("no NVIDIA GPU detected")
             self._update_estimate()
             return
-        vram_gb = round((g[1] or 0) / 1024.0)
+        vram_gb = round((g.get("gpu_total_mb") or 0) / 1024.0)
         # A synthetic choice shaped like a remote GPU dict (id/name/memory_gb/price/stock)
         # so _selected_gpu / _start read it the same way; price=None marks it free/local.
         # id = the nvidia-smi card name so it matches the perf key the LOCAL runner records

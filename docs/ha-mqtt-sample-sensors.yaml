@@ -31,6 +31,14 @@
     unique_id: image_toolbox_task_runtime
     unit_of_measurement: "s"
 
+  - name: "Image Toolbox Task Progress"
+    state_topic: image-toolbox/task/progress
+    unique_id: image_toolbox_task_progress
+
+  - name: "Image Toolbox Task ETA"
+    state_topic: image-toolbox/task/eta
+    unique_id: image_toolbox_task_eta
+
   - name: "Image Toolbox Average Processing Time"
     state_topic: image-toolbox/task/average_processing_time
     unique_id: image_toolbox_average_processing_time
@@ -41,9 +49,16 @@
     unique_id: image_toolbox_last_processing_time
     unit_of_measurement: "s"
 
+  # last_run is a JSON OBJECT (runner summary + tool + finished_at), not a scalar.
+  # Bound as a plain state_topic it would exceed HA's 255-char state limit and show
+  # truncated, so the state is a short template and the full object is exposed as
+  # attributes (read individual fields with {{ state_attr('sensor.image_toolbox_last_run_summary','<key>') }}).
   - name: "Image Toolbox Last Run Summary"
     state_topic: image-toolbox/last_run
     unique_id: image_toolbox_last_run_summary
+    value_template: >-
+      {{ value_json.tool | default('unknown') }} @ {{ value_json.finished_at | default('') }}
+    json_attributes_topic: image-toolbox/last_run
 
   - name: "Image Toolbox Last Exit Timestamp"
     state_topic: image-toolbox/last_used
@@ -79,6 +94,26 @@
     unique_id: image_toolbox_gpu_temperature
     unit_of_measurement: "°C"
 
+  - name: "Image Toolbox GPU Utilization"
+    state_topic: image-toolbox/system/gpu_util
+    unique_id: image_toolbox_gpu_utilization
+    unit_of_measurement: "%"
+
+  - name: "Image Toolbox GPU Power Draw"
+    state_topic: image-toolbox/system/gpu_power
+    unique_id: image_toolbox_gpu_power_draw
+    unit_of_measurement: "W"
+
+  - name: "Image Toolbox GPU Power Limit"
+    state_topic: image-toolbox/system/gpu_power_limit
+    unique_id: image_toolbox_gpu_power_limit
+    unit_of_measurement: "W"
+
+  - name: "Image Toolbox GPU Clock"
+    state_topic: image-toolbox/system/gpu_clock
+    unique_id: image_toolbox_gpu_clock
+    unit_of_measurement: "MHz"
+
 # === Image Toolbox REMOTE Pod sensors ===
 
   - name: "Image Toolbox Remote CPU Usage"
@@ -110,3 +145,23 @@
     state_topic: image-toolbox/system/remote/gpu_temp
     unique_id: image_toolbox_remote_gpu_temperature
     unit_of_measurement: "°C"
+
+  - name: "Image Toolbox Remote GPU Utilization"
+    state_topic: image-toolbox/system/remote/gpu_util
+    unique_id: image_toolbox_remote_gpu_utilization
+    unit_of_measurement: "%"
+
+  - name: "Image Toolbox Remote GPU Power Draw"
+    state_topic: image-toolbox/system/remote/gpu_power
+    unique_id: image_toolbox_remote_gpu_power_draw
+    unit_of_measurement: "W"
+
+  - name: "Image Toolbox Remote GPU Power Limit"
+    state_topic: image-toolbox/system/remote/gpu_power_limit
+    unique_id: image_toolbox_remote_gpu_power_limit
+    unit_of_measurement: "W"
+
+  - name: "Image Toolbox Remote GPU Clock"
+    state_topic: image-toolbox/system/remote/gpu_clock
+    unique_id: image_toolbox_remote_gpu_clock
+    unit_of_measurement: "MHz"

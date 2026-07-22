@@ -130,18 +130,47 @@ def sample_ram():
 
 # ── GPU (nvidia-smi) ─────────────────────────────────────────────────────────
 
+# Columns queried from nvidia-smi, in order. Keep this list and pod/worker.py's
+# copy (_sample_gpu) IDENTICAL — the app plots local and pod telemetry with one
+# code path, so both sides must produce the same sample keys. Adding a column is
+# a one-line change here: the parse is per-field, so a card that reports "[N/A]"
+# for a field (common for power.limit / clocks / on laptops) yields None for just
+# that field instead of poisoning the whole sample.
+_GPU_QUERY_FIELDS = [
+    ("gpu_used_mb",       "memory.used"),
+    ("gpu_total_mb",      "memory.total"),
+    ("gpu_temp_c",        "temperature.gpu"),
+    ("gpu_util_pct",      "utilization.gpu"),
+    ("gpu_power_w",       "power.draw"),
+    ("gpu_power_limit_w", "power.limit"),
+    ("gpu_clock_mhz",     "clocks.gr"),
+]
+
+
+def _parse_gpu_field(raw):
+    """One nvidia-smi cell -> int, or None for '[N/A]' / blank / unparseable."""
+    raw = (raw or "").strip()
+    if not raw or raw.startswith("[") or raw.lower() in ("n/a", "na"):
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
 def sample_gpu(timeout=5):
     """
     Query the first NVIDIA GPU via ``nvidia-smi``.
 
-    Returns ``(vram_used_mb, vram_total_mb, temp_c)`` as ints, or ``None`` if
-    ``nvidia-smi`` is missing / fails / reports nothing parseable.
+    Returns a dict with the keys in ``_GPU_QUERY_FIELDS`` (VRAM used/total MB, GPU
+    temperature C, core utilisation %, power draw + limit W, core clock MHz), each
+    an int or ``None`` where the card doesn't report it. Returns ``None`` outright
+    only if ``nvidia-smi`` is missing / fails / prints nothing parseable.
     """
+    query = "--query-gpu=" + ",".join(f for _, f in _GPU_QUERY_FIELDS)
     try:
         proc = subprocess.run(
-            ["nvidia-smi",
-             "--query-gpu=memory.used,memory.total,temperature.gpu",
-             "--format=csv,noheader,nounits"],
+            ["nvidia-smi", query, "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=timeout,
             creationflags=CREATE_NO_WINDOW,
         )
@@ -149,14 +178,13 @@ def sample_gpu(timeout=5):
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
         return None
-    line = proc.stdout.strip().splitlines()[0]
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 3:
+    parts = [p.strip() for p in proc.stdout.strip().splitlines()[0].split(",")]
+    if len(parts) < 2:            # need at least VRAM used/total to be worth it
         return None
-    try:
-        return int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
-    except ValueError:
-        return None
+    result = {}
+    for i, (key, _field) in enumerate(_GPU_QUERY_FIELDS):
+        result[key] = _parse_gpu_field(parts[i]) if i < len(parts) else None
+    return result
 
 
 def gpu_name(timeout=5):
