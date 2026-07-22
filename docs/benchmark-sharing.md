@@ -9,6 +9,20 @@ duplicating slow (and, on a rented pod, billed) sweeps across machines.
 Scope: `db.video_bench` only (the per-probe video ceilings). The image-task
 `docs/image-benchmarks.csv` stays a separate, author-maintained file.
 
+## Contents
+
+- [Distribution model (zero-infrastructure)](#distribution-model-zero-infrastructure)
+- [The shared shape](#the-shared-shape)
+- [Download (automatic, no button)](#download-automatic-no-button)
+  - [Import target and local precedence](#import-target-and-local-precedence)
+- [Contribute](#contribute)
+- [CSV format](#csv-format)
+- [Maintainer merge tool (`bench_share.py --merge`)](#maintainer-merge-tool-bench_sharepy---merge)
+- [Why](#why)
+- [Code map](#code-map)
+
+---
+
 ## Distribution model (zero-infrastructure)
 
 One curated CSV (`docs/video-benchmarks.csv`) lives in the GitHub repo. The app pulls it
@@ -23,6 +37,8 @@ public data needs no account; writing always needs auth as *some* account, so th
 path is delegated to the browser where the user is already signed in, instead of teaching
 the app to authenticate.
 
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
+
 ## The shared shape
 
 The exported rows are the **summary table the Benchmark GPU window already shows**: one
@@ -31,6 +47,8 @@ That is what a human reads and curates, and it carries everything the machine co
 need (the ceiling batch, the chosen batch, s/frame and peak VRAM). `build_share_rows`
 reuses the same `throughput_optimal_batch` / `saved_metrics` the window renders, so shared
 numbers match the UI.
+
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
 
 ## Download (automatic, no button)
 
@@ -76,6 +94,8 @@ accumulating store, so injecting an imported rate risks polluting the user's own
 average, and the estimator already falls back to the author `RATES` table for an unmeasured
 card. Seeding it from imports (with its own precedence) is a possible follow-on.
 
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
+
 ## Contribute
 
 **Contribute my results…** (Benchmark GPU window) opens a **pre-filled GitHub new-issue**
@@ -117,6 +137,8 @@ representative (and old remote `7b` rows are mislabelled compile state anyway, s
 window's own (picked from the chooser), `run_on` is inferred: it matches the machine's
 detected card name means `local`, else `remote` (`video_benchmark.infer_run_on`).
 
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
+
 ## CSV format
 
 A `# imgtbx-bench v1` sentinel is the first line (it guards against a future column add
@@ -157,6 +179,8 @@ The reader (`bench_share.read_csv`) is tolerant: it skips the sentinel and any `
 lines, ignores unknown columns, defaults missing ones blank, and skips a row missing a
 required field (`gpu_id, model, out_w, out_h, max_batch`). It never raises: a bad download
 or attachment returns `[]`.
+
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
 
 ## Maintainer merge tool (`bench_share.py --merge`)
 
@@ -212,6 +236,8 @@ deliberately lenient (it only catches the clearly impossible) because you still 
 git diff. Note: structurally broken rows are dropped by `read_csv` before the gate, so
 "parsed" in the report can be lower than the file's line count.
 
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
+
 ## Why
 
 A per-card sweep is slow and, on a pod, costs money; a shared corpus means a card someone
@@ -219,6 +245,8 @@ has already characterised is not re-measured on every machine. It also seeds the
 (`video_estimate.recommend_gpus`) for cards the user has never run, and (with `spf` +
 `price_usd_hr` per card) is the data a future **fastest-OR-cheapest GPU recommender** would
 rank on: throughput from the corpus, cost from the LIVE price at decision time.
+
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
 
 ## Code map
 
@@ -232,6 +260,8 @@ rank on: throughput from the corpus, cost from the LIVE price at decision time.
 - `scripts/db.py`: the `source` column migration, `import_bench_rows` (local precedence),
   `bench_gpu_ids` / `bench_models`, and `get_bench_probes` returning `source`.
 - `scripts/gui/common.py`: `contribute_benchmark` (browser-delegated issue).
+
+<div align="right"><a href="#benchmark-sharing-feature-8">↑ Back to top</a></div>
 - `scripts/gui/video_benchmark.py`: the Export / Contribute buttons and multi-select picker.
 - `scripts/gui/app.py`: `_startup_bench_sync` (background auto-refresh at launch).
 - `docs/video-benchmarks.csv`: the curated master (committed; shipped to `{app}/docs`).

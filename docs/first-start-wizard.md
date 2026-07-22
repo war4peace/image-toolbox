@@ -13,6 +13,20 @@ it recommends and helps install the two halves `torch.compile` needs (Triton +
 MSVC), being explicit about download size and the speed/VRAM trade (step 5 in the
 flow below).
 
+## Contents
+
+- [Decisions (agreed)](#decisions-agreed)
+- [What already exists (reuse, do not rebuild)](#what-already-exists-reuse-do-not-rebuild)
+- [Trigger and the first-run flag](#trigger-and-the-first-run-flag)
+- [Recommendation tiers (calibrated)](#recommendation-tiers-calibrated)
+- [Wizard flow](#wizard-flow)
+- [Files touched (as built)](#files-touched-as-built)
+- [Follow-up: stopped the GPU-blind model pre-download (DONE)](#follow-up-stopped-the-gpu-blind-model-pre-download-done)
+  - [Safety net: pull-on-Start in Tag & Rename (DONE)](#safety-net-pull-on-start-in-tag--rename-done)
+- [Resolved decisions (were open questions)](#resolved-decisions-were-open-questions)
+
+---
+
 ## Decisions (agreed)
 
 1. **Ollama model: recommend + offer to pull.** SeedVR2 weights auto-download
@@ -30,6 +44,8 @@ flow below).
    sweet-spot model for the detected VRAM but shows every option with a note, so
    the user can knowingly pick a heavier/lighter model.
 
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
+
 ## What already exists (reuse, do not rebuild)
 
 - **GPU detection:** `system_telemetry.sample_gpu()` returns
@@ -46,6 +62,8 @@ flow below).
 - **Config write path:** `config_store.save(cfg, APP_ROOT)` (keeps secrets in the
   untracked overlay). The wizard must go through this, not hand-write `config.json`.
 
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
+
 ## Trigger and the first-run flag
 
 There is currently **no** first-run flag anywhere (`gui_settings.json` holds only
@@ -59,6 +77,8 @@ GUI-only state, not tracked config).
   for anyone who wants it again.
 - Fail safe: any error building/detecting inside the wizard just sets the flag and
   closes, so a broken wizard can never block the app from launching.
+
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
 
 ## Recommendation tiers (calibrated)
 
@@ -85,6 +105,8 @@ Notes:
   the whole card is free during tagging, not just what SeedVR leaves.
 - SeedVR "sharp" and GGUF quantized options stay visible as secondary picks (the
   full picklist is always shown, per decision 3); only the pre-selection is tiered.
+
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
 
 ## Wizard flow
 
@@ -131,6 +153,8 @@ Notes:
 The wizard does NOT touch the Resolution Target: it stays at the 4K default (the
 tiers already size for 4K, so no separate choice is needed here).
 
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
+
 ## Files touched (as built)
 
 - `scripts/gui/wizard_recommend.py` (new): the pure, tkinter-free tier logic
@@ -152,6 +176,8 @@ tiers already size for 4K, so no separate choice is needed here).
   GPU / server / tkinter). `tests/test_wizard_compile.py` (0.5.0): the compile step's
   off-thread state routing (unsupported / degrade-on-raise / ready +/- a compiler).
 - Docs: this file + a feature-list entry in `CLAUDE.md` / `README.md` at release.
+
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
 
 ## Follow-up: stopped the GPU-blind model pre-download (DONE)
 
@@ -176,6 +202,8 @@ offers a modal `OllamaPullDialog` (in `gui/dialogs.py`, reusing `common.ollama_p
 before launching. It is fail-open when the server can't be reached (the runner
 reports Ollama problems itself) and covered by `tests/test_tag_ensure_ollama.py`.
 
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>
+
 ## Resolved decisions (were open questions)
 
 1. VRAM tier boundaries: calibrated (see the tier table above).
@@ -187,3 +215,5 @@ reports Ollama problems itself) and covered by `tests/test_tag_ensure_ollama.py`
    speedup most image-only users never need. The Triton half (~50 MB) IS installed
    in-app (a verified, hash-pinned wheel). The step writes no config: runtime
    `gate_local_compile` remains the single source of truth for whether compile runs.
+
+<div align="right"><a href="#first-start-wizard-046">↑ Back to top</a></div>

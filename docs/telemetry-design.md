@@ -31,6 +31,27 @@
 
 ---
 
+## Contents
+
+- [1. Why this comes before the graphs](#1-why-this-comes-before-the-graphs)
+- [2. The telemetry data model (widened)](#2-the-telemetry-data-model-widened)
+  - [2.1 The one `nvidia-smi` call](#21-the-one-nvidia-smi-call)
+  - [2.2 What we deliberately did NOT add](#22-what-we-deliberately-did-not-add)
+- [3. MQTT surface (additions)](#3-mqtt-surface-additions)
+  - [3.1 Sample-sensor file fixes (part of the foundation)](#31-sample-sensor-file-fixes-part-of-the-foundation)
+- [4. In-app telemetry graphs (#9)](#4-in-app-telemetry-graphs-9)
+  - [4.0 A graph is per-run, not app-lifetime](#40-a-graph-is-per-run-not-app-lifetime)
+  - [4.1 `TelemetryHistory` (new, pure, unit-testable)](#41-telemetryhistory-new-pure-unit-testable)
+  - [4.2 Axis ceilings are pinned to hardware capacity](#42-axis-ceilings-are-pinned-to-hardware-capacity)
+  - [4.3 `TelemetryGraphWindow` (new `gui/` module)](#43-telemetrygraphwindow-new-gui-module)
+  - [4.4 Range control: dynamic, toggle, global](#44-range-control-dynamic-toggle-global)
+  - [4.5 Opening the window](#45-opening-the-window)
+  - [4.6 Readout row (`TelemetryRow.show`)](#46-readout-row-telemetryrowshow)
+- [5. Work breakdown](#5-work-breakdown)
+- [6. Risk](#6-risk)
+
+---
+
 ## 1. Why this comes before the graphs
 
 The graph window (#9) and the HA dashboards (#10) both read *the same* telemetry.
@@ -41,6 +62,8 @@ The single most important gap: **GPU core utilization is not sampled at all**
 today. The app tracks VRAM and temperature but not whether the GPU is actually
 *working*, which is the headline series any "usage graph" exists to show. It is
 free to add: `nvidia-smi` already returns it in the one call the app makes.
+
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>
 
 ## 2. The telemetry data model (widened)
 
@@ -96,6 +119,8 @@ comment on each pointing at the other). `sample_gpu` returns a **dict** now, not
   event-driven `task/*` topics (they are per-item events, not a time series). The
   graph is a *system-load* view; mixing in throughput would muddy both.
 
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>
+
 ## 3. MQTT surface (additions)
 
 Additive only: every existing topic keeps its name and meaning. New retained
@@ -138,6 +163,8 @@ entities, no paste) is explicitly **out of scope for this pass**: it is a real
 app-side feature (unique_ids, availability wiring, config lifecycle) and the
 dependency-light samples approach covers the need now. Logged as a separate future
 item, not scheduled.
+
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>
 
 ## 4. In-app telemetry graphs (#9)
 
@@ -283,6 +310,8 @@ Power/clock stay graph- and MQTT-only to keep the single line compact (especiall
 the Upscale tab's paired local+remote rows). Final segment order is a small UI
 call during dev; util-in-row is the requirement.
 
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>
+
 ## 5. Work breakdown
 
 **Phase A: widen the telemetry model (the foundation, ships on its own).**
@@ -325,6 +354,8 @@ folder (core + custom Lovelace YAML, README, screenshots) as scoped in
 `future-features.md` #10. It consumes Phase A's widened topics and the fixed
 sensor file; no further app code.
 
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>
+
 ## 6. Risk
 
 Low throughout. Phase A is additive and fail-safe (a missing metric is `None`
@@ -333,3 +364,5 @@ B is read-only and in-memory; its one new element is the **matplotlib** GUI
 dependency, contained by lazy + fail-safe import (absent matplotlib disables only
 the graph window) and already present on Local/Both, so the only real delta is the
 Remote-only bootstrap download. Phase C touches no pipeline code.
+
+<div align="right"><a href="#telemetry-design-in-app-graphs-9--home-assistant-foundation">↑ Back to top</a></div>

@@ -18,27 +18,27 @@ lives in `CLAUDE.md`, `docs/runpod-notes.md`, `docs/video-upscaler.md`,
 only because code and other docs cite the roadmap by them (`remote #1`, `Video
 Upscaler #2`, `local #7`):
 
-- **#1 — Remote upscaling (RunPod).** Shipped 0.3.1–0.4.2. See `CLAUDE.md` +
+- **#1: Remote upscaling (RunPod).** Shipped 0.3.1–0.4.2. See `CLAUDE.md` +
   `docs/runpod-notes.md`.
-- **#2 — Video upscaling (RunPod-only, experimental).** Shipped. See
+- **#2: Video upscaling (RunPod-only, experimental).** Shipped. See
   `docs/video-upscaler.md`.
-- **#5 — Video conciliation.** Shipped 0.5.1-experimental: Conciliation now
+- **#5: Video conciliation.** Shipped 0.5.1-experimental: Conciliation now
   matches and replaces VIDEO originals with their upscaled outputs, alongside
   images, in one scan. Videos match by the content-hash `lineage` the Video
-  Upscaler records on completion (item 10) ONLY — no name fallback, so a partial
+  Upscaler records on completion (item 10) ONLY: no name fallback, so a partial
   clip (which records no lineage) can never be mistaken for a whole-video match;
   a video is acted on only when its output is present in the chosen processed
   tree. See `CLAUDE.md` (Conciliation) and `conciliate.py`.
-- **#6 — Self-healing remote runs (auto-recover a lost pod).** Shipped 0.5.0
+- **#6: Self-healing remote runs (auto-recover a lost pod).** Shipped 0.5.0
   (video only): an opt-in "Auto-resume" supervisor reconnects a blipped pod, or
   waits unbounded for the identical card and redeploys it, continuing from the
   first unfinished segment. Funds guard / user Stop / completed queue are the only
   non-redeploy stops. See `docs/video-upscaler.md` section 17.
-- **#7 — Local video upscaling (free-and-slow alternative to remote).** Shipped
+- **#7: Local video upscaling (free-and-slow alternative to remote).** Shipped
   0.5.0: the same SeedVR2 video work runs in-process on the user's own GPU via
   `LocalVideoEngine`, with a predictive VRAM sizer, a one-click per-card benchmark,
   and optional `torch.compile`. See `docs/local-video-upscaler.md`.
-- **#8 — Benchmark sharing (community download / contribute).** Shipped 0.5.1: the
+- **#8: Benchmark sharing (community download / contribute).** Shipped 0.5.1: the
   per-card video benchmark becomes a crowdsourced corpus, auto-downloaded from GitHub
   at launch and contributed back via a browser-delegated GitHub issue (multi-GPU,
   deduped against the published set); a maintainer `--merge` tool curates submissions.
@@ -46,7 +46,18 @@ Upscaler #2`, `local #7`):
 
 ---
 
-## 9. Telemetry usage graphs — Easy-Medium (QoL)
+## Contents
+
+- [9. Telemetry usage graphs](#9-telemetry-usage-graphs-easy-medium-qol)
+- [10. Home Assistant dashboard samples](#10-home-assistant-dashboard-samples-easy-medium-qol-docssamples)
+- [3. HTTP interface](#3-http-interface-hard-low-priority)
+- [4. Unraid Community Apps integration](#4-unraid-community-apps-integration-hardest-low-priority)
+- [Sequencing & dependencies](#sequencing--dependencies)
+- [Decided against / constraints](#decided-against--constraints)
+
+---
+
+## 9. Telemetry usage graphs: Easy-Medium (QoL)
 > **Status: implemented on 0.5.3-experimental** (folds into the shipped legend at
 > release). Design + as-built: `docs/telemetry-design.md`. The plan below is kept
 > as the record.
@@ -96,7 +107,9 @@ dependency, no runner changes. Open: persist local history across restarts?
 Recommend NO for v1 (keep it in-memory and honest). One combined dual-axis chart
 vs two stacked? Recommend two stacked (no dual-axis confusion).
 
-## 10. Home Assistant dashboard samples — Easy-Medium (QoL, docs/samples)
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
+
+## 10. Home Assistant dashboard samples: Easy-Medium (QoL, docs/samples)
 > **Status: implemented on 0.5.3-experimental** (folds into the shipped legend at
 > release). Delivered as `samples/home-assistant/` (README + `mqtt-sensors.yaml`
 > + `template-sensors.yaml` + `dashboard-core.yaml` + `dashboard-custom.yaml`;
@@ -111,7 +124,7 @@ for nicer graphs and status tiles. All HA material lives in a new
 
 - **This is a docs/samples deliverable, not a code feature.** The MQTT surface is
   already complete and stable (`mqtt_publisher.py`): every topic a dashboard needs
-  is published retained under `image-toolbox/` — `version`, `update`,
+  is published retained under `image-toolbox/`: `version`, `update`,
   `latest_version`, `availability` (LWT online/offline), `last_run` (JSON),
   `last_used`, the `task/*` live group (`name`, `details`, `runtime`, `progress`
   = "X/Y", `eta`, `average_processing_time`, `last_processing_time`), and the
@@ -162,16 +175,18 @@ for nicer graphs and status tiles. All HA material lives in a new
 is the two sensor fixes). **Risk:** low; nothing in the app changes, no new
 dependency. Only risk is HACS card churn (pin versions / note "as of <date>").
 
-## 3. HTTP interface — Hard (low priority)
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
+
+## 3. HTTP interface: Hard (low priority)
 Spin up a small HTTP server with a UI that mirrors the application UI.
 
 - **What "mirror" implies:** rebuilding the thumbnail wall, two-row live status,
-  progress/ETA, pause/resume/stop, and Settings as a web app — plus a backend
+  progress/ETA, pause/resume/stop, and Settings as a web app, plus a backend
   and live updates (WebSocket/SSE).
 - **Reuse:** the subprocess + stdin/stdout protocol is a clean backend seam; a
   server can drive the same scripts the GUI does.
-- **Work needed:** an HTTP server (stdlib `http.server` is too thin for this —
-  realistically a small framework), a streaming channel for live
+- **Work needed:** an HTTP server (stdlib `http.server` is too thin for this,
+  so realistically a small framework), a streaming channel for live
   progress/thumbnails, and a full second UI to maintain alongside the tkinter
   one.
 - **Risks:** large, ongoing surface area (two UIs to keep in sync); auth/binding
@@ -179,14 +194,16 @@ Spin up a small HTTP server with a UI that mirrors the application UI.
 - **Scope note:** a minimal "status + start/stop" web panel is far cheaper than
   a true mirror and worth considering first.
 
-## 4. Unraid Community Apps integration — Hardest (low priority)
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
+
+## 4. Unraid Community Apps integration: Hardest (low priority)
 The user installs and runs the application on their Unraid server.
 
-> **Status: deferred.** The app stays Windows-only for now — there is no Linux
+> **Status: deferred.** The app stays Windows-only for now: there is no Linux
 > GPU server to target. Revisit only if that changes.
 
 - **Why it's the hardest:** this is a distribution/packaging effort on top of a
-  Linux port — not a discrete code feature. The app is Windows-bound (tkinter
+  Linux port, not a discrete code feature. The app is Windows-bound (tkinter
   GUI, PowerShell `bootstrap.ps1`, `%USERPROFILE%`/`.venv\Scripts` paths,
   `CREATE_NO_WINDOW`). Unraid runs headless Docker on Linux.
 - **Requires:** the HTTP interface (#3) for any UI; a Linux build of the
@@ -194,6 +211,8 @@ The user installs and runs the application on their Unraid server.
   replacing `bootstrap.ps1`; and a Community Apps template XML.
 - **What helps:** the heavy lifting (PyTorch/CUDA, SeedVR2, Ollama-over-URL) is
   already cross-platform; only the shell/GUI/packaging layers are Windows-only.
+
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -208,13 +227,13 @@ The user installs and runs the application on their Unraid server.
   dependency and no runner changes; #10 (HA dashboard samples) is a docs/samples
   deliverable that touches no pipeline code (only the two sensor fixes), so it can
   ship any time.
-- **#3 and #4 are much lower priority** — large, mostly independent milestones.
+- **#3 and #4 are much lower priority**: large, mostly independent milestones.
   With Home Assistant already done over MQTT, the old telemetry coupling no longer
   drives sequencing.
 - **#4 depends on #3** (headless Unraid needs a web UI).
 - **Follow-ons from the shipped #6/#7 (not yet scheduled):** generalise the
   Auto-resume supervisor from video to the image runners (batch upscale / tag); and
-  #7's deferred Phase 2 — a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class:
+  #7's deferred Phase 2, a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class:
   fast, low-VRAM, deterministic) dropping into the same engine seam.
 - **Follow-on from the shipped #8 (not yet scheduled): extend benchmark sharing
   to the IMAGE tasks.** Today the crowdsourced corpus covers `db.video_bench`
@@ -230,6 +249,8 @@ The user installs and runs the application on their Unraid server.
   and #4 each push toward extra packages, a long-running server, and
   cross-platform support, so adopt those deliberately.
 
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
+
 ---
 
 ## Decided against / constraints
@@ -238,3 +259,5 @@ Moved to **`docs/dropped-ideas.md`**: the Video Upscaler pause, the region
 pre-seed, coarse idea #2 (deferred local-engine install), coarse idea #3
 (parallel jobs), coarse idea #4's automatic-telemetry half, and the standing
 constraints (AMD/ROCm, vast.ai as a second provider).
+
+<div align="right"><a href="#future-features">↑ Back to top</a></div>

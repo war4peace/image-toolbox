@@ -13,7 +13,18 @@ Sources: `docs/future-features.md` (open roadmap) and
 
 ---
 
-## Deferred local-engine install (coarse idea #2) — 2026-07-21
+## Contents
+
+- [Deferred local-engine install (coarse idea #2)](#deferred-local-engine-install-coarse-idea-2-2026-07-21)
+- [Parallel jobs: an image tool + the Video Upscaler (coarse idea #3)](#parallel-jobs-an-image-tool--the-video-upscaler-coarse-idea-3-2026-07-21)
+- [Pause for the Video Upscaler](#pause-for-the-video-upscaler-2026-07-21)
+- [Region pre-seed at first-run bootstrap](#region-pre-seed-at-first-run-bootstrap)
+- [Automatic run-telemetry reporting](#automatic-run-telemetry-reporting-coarse-idea-4-phase-2)
+- [Standing constraints](#standing-constraints)
+
+---
+
+## Deferred local-engine install (coarse idea #2, 2026-07-21)
 
 **The idea.** Stop shipping the ~5 GB GPU stack up front: install torch CUDA +
 seedvr2 on demand, the first time the user starts a LOCAL run, so a "Both"
@@ -41,7 +52,9 @@ install-mode page and the first-start wizard should state the consequence
 plainly ("Local processing adds a ~5 GB AI engine download; Remote keeps the
 install under ~300 MB").
 
-## Parallel jobs: an image tool + the Video Upscaler (coarse idea #3) — 2026-07-21
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Parallel jobs: an image tool + the Video Upscaler (coarse idea #3, 2026-07-21)
 
 **The idea.** Let one image-side tool and the Video Upscaler run at the same
 time, behind a GUI-enforced compatibility matrix.
@@ -70,7 +83,9 @@ floor preflights do not know about each other.
 
 Revisit only if run exclusivity itself proves to be the wrong call.
 
-## Pause for the Video Upscaler — 2026-07-21
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Pause for the Video Upscaler (2026-07-21)
 
 Pause exists so the user can reclaim the GPU without losing the queue, and it can
 only act at a safe boundary. For stills that boundary is the gap between images
@@ -84,6 +99,8 @@ the per-run minute/cost cap uses.
 Consequence: "a pause frees every resident model" (0.5.2) applies to the Batch
 Upscaler and Tag & Rename; the Video Upscaler has no pause at all.
 
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
 ## Region pre-seed at first-run bootstrap
 
 The idea was to ask the user's region during install and pre-seed
@@ -91,6 +108,8 @@ The idea was to ask the user's region during install and pre-seed
 regions/data centers that auto-detecting one adds little: the Settings Region/DC
 picker already lets the user pick directly, which is clearer than guessing for
 them.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
 ## Automatic run-telemetry reporting (coarse idea #4, phase 2)
 
@@ -118,18 +137,20 @@ Dropped from the original plan:
 The curated CSV plus the curation script suffice for the foreseeable future. See
 `docs/benchmark-sharing.md`.
 
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
 ---
 
 ## Standing constraints
 
-- **AMD GPUs (ROCm) — not supported, filtered out.** The pipeline is CUDA-only
+- **AMD GPUs (ROCm): not supported, filtered out.** The pipeline is CUDA-only
   (PyTorch CUDA build, SeedVR2, the orientation CNN, `nvidia-smi` telemetry), so an
   AMD card can't run any task. RunPod occasionally lists AMD Instinct cards (e.g.
   the MI300X in EU-RO-1, sometimes *cheaper* than comparable NVIDIA), so
   `available_gpus` drops them at the source via `is_amd_gpu` (0.4.0) rather than
   letting a user pick one that fails at run time. A ROCm port would be a separate,
   large effort and is not planned.
-- **vast.ai as a second provider — investigated 2026-06-23, not pursued.** The
+- **vast.ai as a second provider: investigated 2026-06-23, not pursued.** The
   goal was provider choice (price/availability/region) behind a thin interface.
   Two billing dimensions RunPod doesn't charge make vast.ai a poor fit for this
   app's stream-one-image-at-a-time, disposable-pod design: **storage** is
@@ -143,3 +164,5 @@ The curated CSV plus the curation script suffice for the foreseeable future. See
   largest lift. Vet any future provider against this checklist before writing
   code: (a) free/cheap ingress+egress, (b) cheap region-wide persistent storage
   that mounts on disposable instances, (c) reliable SSH with key injection.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>

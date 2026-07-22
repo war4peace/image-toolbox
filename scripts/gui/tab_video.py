@@ -401,6 +401,7 @@ class VideoTab(ttk.Frame):
         self._rate = None           # observed s/frame, refined from done segments
         self._remote_rate = None    # pod's real billed $/h (RCOST); live cost readout
         self._run_tick_job = None
+        self._local_telem_job = None   # local-run telemetry sampler (#7, graphs #9)
         self._build()
         self.after(200, self._check_readiness)
         self.after(300, self._initial_load)
@@ -795,11 +796,20 @@ class VideoTab(ttk.Frame):
         tk.Label(self, textvariable=self.status_var, anchor="w", fg="#7f8a99",
                  font=("Consolas", 9)).grid(row=7, column=0, sticky="ew", pady=(4, 0))
 
-        # 8) Remote-pod telemetry (CPU/RAM/GPU). Created hidden; App.apply_remote_
+        # 8) Local-machine telemetry (CPU/RAM/GPU), like the other tabs. A LOCAL
+        # run (#7) works this GPU, so its load must be visible here too; the
+        # earlier layout only had the remote row, so a local video run showed no
+        # telemetry at all. Click it to open the usage-graph window (#9). The idle
+        # sampler keeps it fresh between runs; a local run drives its own sampling
+        # (see _start_local_telemetry) because the idle sampler pauses during a run.
+        self.telemetry_row = TelemetryRow(self, prefix="Local Unit")
+        self.telemetry_row.grid(row=8, column=0, sticky="ew", pady=(4, 0))
+
+        # 9) Remote-pod telemetry (CPU/RAM/GPU). Created hidden; App.apply_remote_
         # telemetry reveals it on the first RTELEM sample of a run and _end_run
         # hides it again, so it only shows while a pod is actually streaming.
         self.remote_telemetry_row = TelemetryRow(self, prefix="Remote pod")
-        self.remote_telemetry_row.grid(row=8, column=0, sticky="ew", pady=(2, 0))
+        self.remote_telemetry_row.grid(row=9, column=0, sticky="ew", pady=(2, 0))
         self.remote_telemetry_row.grid_remove()
 
         # Greys the pod-only Auto-resume control if we're starting in Local mode.
@@ -2340,6 +2350,8 @@ class VideoTab(ttk.Frame):
                         starting_msg="Starting local upscale …")
         self._launch("batch_video_upscale.py",
                      [self._src_root, self._out_root, "--local"], env)
+        if self.proc is not None:            # launch succeeded (else _end_run already ran)
+            self._start_local_telemetry()
 
     def _begin_run(self, total_frames, starting_msg="Starting pod …"):
         self._run_total = total_frames
@@ -2681,6 +2693,38 @@ class VideoTab(ttk.Frame):
         # segment with no on-disk trace. See that runner code.
         self._run_tick_job = self.after(1000, self._run_tick)
 
+    # ── local-run telemetry (#7 local GPU; usage graphs #9) ──────────────────
+    LOCAL_TELEM_MS = 5000     # sampling cadence while a LOCAL run works the GPU
+
+    def _start_local_telemetry(self):
+        """Sample this machine while a LOCAL run works the GPU, so the Local Unit
+        row stays live and the run feeds a per-run usage graph (#9). A remote run
+        uses the pod's own remote row/history instead, and the app's 60 s idle
+        sampler pauses while any run is active, so a local run must drive its own
+        (denser) sampling here."""
+        self.app.telemetry_history_start("local",
+                                         title=f"Local system - {self.tool_name}")
+        self._local_telem_tick()
+
+    def _local_telem_tick(self):
+        if self.proc is None:                 # run ended: stop sampling
+            self._local_telem_job = None
+            return
+        self.app.sample_telemetry()
+        self._local_telem_job = self.after(self.LOCAL_TELEM_MS,
+                                           self._local_telem_tick)
+
+    def _stop_local_telemetry(self):
+        """Cancel the local sampler and seal the run's history (a safe no-op after
+        a remote run, which never started a 'local' history)."""
+        if self._local_telem_job is not None:
+            try:
+                self.after_cancel(self._local_telem_job)
+            except Exception:
+                pass
+            self._local_telem_job = None
+        self.app.telemetry_history_seal("local")
+
     def on_exit(self, code):
         self._end_run()
         self.app.taskbar_clear()
@@ -2717,6 +2761,9 @@ class VideoTab(ttk.Frame):
         if self._run_tick_job is not None:
             self.after_cancel(self._run_tick_job)
             self._run_tick_job = None
+        # Stop the local-run telemetry sampler and freeze its usage graph (#9). Safe
+        # for a remote run too (it never started a 'local' history).
+        self._stop_local_telemetry()
         # The remote-pod telemetry row only makes sense during a remote run; hide it and
         # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.
         self.app.clear_remote_telemetry(self)

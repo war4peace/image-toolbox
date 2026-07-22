@@ -68,8 +68,10 @@ class TelemetryGraphWindow(tk.Toplevel):
 
         self.title(title)
         geo = app.settings.get("telemetry_geometry") if app is not None else None
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1040x820")
-        self.minsize(720, 520)
+        # Default AND minimum size match the main window's default (980x720); the
+        # remembered geometry wins after the first open.
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
+        self.minsize(980, 720)
 
         # ── top: title line + range bar + readout ────────────────────────────
         self._head_var = tk.StringVar(value=title)
@@ -81,15 +83,20 @@ class TelemetryGraphWindow(tk.Toplevel):
         bar = ttk.Frame(self, padding=(10, 0, 10, 4))
         bar.pack(fill="x")
         ttk.Label(bar, text="Range:").pack(side="left")
+        # A pressed range button is marked by BOLDING its label (an active
+        # zoom-to-recent filter), so no separate "Showing: …" caption is needed.
+        import tkinter.font as tkfont
+        _base = tkfont.nametofont("TkDefaultFont")
+        self._btn_bold_font = tkfont.Font(family=_base.cget("family"),
+                                          size=_base.cget("size"), weight="bold")
+        ttk.Style(self).configure("TelSpanActive.TButton",
+                                  font=self._btn_bold_font)
         self._span_btns = {}
         for label, span in st.HISTORY_SPANS:
             b = ttk.Button(bar, text=label, width=4, state="disabled",
                            command=lambda s=span: self._toggle(s))
             b.pack(side="left", padx=2)
             self._span_btns[span] = b
-        self._view_var = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self._view_var,
-                  foreground=_MUTED).pack(side="left", padx=(10, 0))
         # fixed-width readout so hover text never re-lays-out the bar
         self._read = tk.Label(bar, font=("Consolas", 9), width=84, anchor="e")
         self._read.pack(side="right")
@@ -260,15 +267,14 @@ class TelemetryGraphWindow(tk.Toplevel):
     # ── range bar (dynamic enable + global toggle) ───────────────────────────
     def _update_range_bar(self, h):
         enabled = {s for _lbl, s in h.enabled_spans()}
-        for span, btn in self._span_btns.items():
-            btn.configure(state=("normal" if span in enabled else "disabled"))
         if self._active_span is not None and self._active_span not in enabled:
             self._active_span = None    # run got reset shorter than the zoom
-        if self._active_span is None:
-            self._view_var.set("Showing: whole run")
-        else:
-            lbl = next(l for l, s in st.HISTORY_SPANS if s == self._active_span)
-            self._view_var.set(f"Showing: last {lbl} (press again to reset)")
+        for span, btn in self._span_btns.items():
+            # Bold the active span's button so the current zoom is visible without
+            # a separate caption; the rest render in the default (plain) style.
+            active = span == self._active_span
+            btn.configure(state=("normal" if span in enabled else "disabled"),
+                          style="TelSpanActive.TButton" if active else "TButton")
 
     def _toggle(self, span):
         self._active_span = None if self._active_span == span else span
@@ -334,12 +340,24 @@ class TelemetryGraphWindow(tk.Toplevel):
         self._read.config(text="")
 
     # ── geometry + lifecycle ─────────────────────────────────────────────────
-    def _track_geometry(self, _evt):
-        try:
-            if self.state() == "normal":
-                self._last_normal_geo = self.geometry()
-        except Exception:
-            pass
+    def _track_geometry(self, event):
+        if event.widget is self:
+            try:
+                if self.state() == "normal":
+                    self._last_normal_geo = self.geometry()
+            except Exception:
+                pass
+
+    def save_geometry(self):
+        """Persist size/position without destroying (used on app close, so the
+        window is remembered even when the app quits with it open)."""
+        if self._app is not None and self.winfo_exists():
+            try:
+                self._app.settings["telemetry_geometry"] = \
+                    self._last_normal_geo or self.geometry()
+                save_settings(self._app.settings)
+            except Exception:
+                pass
 
     def _close(self):
         if self._job is not None:
@@ -348,13 +366,7 @@ class TelemetryGraphWindow(tk.Toplevel):
             except Exception:
                 pass
             self._job = None
-        try:
-            if self._app is not None:
-                self._app.settings["telemetry_geometry"] = \
-                    self._last_normal_geo or self.geometry()
-                save_settings(self._app.settings)
-        except Exception:
-            pass
+        self.save_geometry()
         if self._app is not None:
             self._app.forget_telemetry_graph(self._source)
         self.destroy()

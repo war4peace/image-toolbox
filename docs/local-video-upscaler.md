@@ -11,6 +11,33 @@ Upscaler** tab, mirroring the image tabs' "Run on remote pod" checkbox.
 
 ---
 
+## Contents
+
+- [1. Why this reverses a documented decision](#1-why-this-reverses-a-documented-decision)
+- [2. Scope](#2-scope)
+- [3. The two objections, as guards not gates](#3-the-two-objections-as-guards-not-gates)
+- [4. Reuse: the engine seam already exists](#4-reuse-the-engine-seam-already-exists)
+- [5. `LocalVideoEngine`](#5-localvideoengine)
+- [6. Custom targets: BOTH explicit resolution AND ratio](#6-custom-targets-both-explicit-resolution-and-ratio)
+- [7. No VRAM gate on local: the floor becomes advisory](#7-no-vram-gate-on-local-the-floor-becomes-advisory)
+- [8. Local benchmark harness (test till it breaks)](#8-local-benchmark-harness-test-till-it-breaks)
+- [9. Local time estimate (no cost)](#9-local-time-estimate-no-cost)
+- [10. Install-mode gate and the tab toggle](#10-install-mode-gate-and-the-tab-toggle)
+- [11. Phase 2 (planned, not now): non-SeedVR fixed-ratio engine](#11-phase-2-planned-not-now-non-seedvr-fixed-ratio-engine)
+- [12. Build order](#12-build-order)
+- [13. Open questions](#13-open-questions)
+- [14. Benchmark log (as-measured, local)](#14-benchmark-log-as-measured-local)
+- [15. As built: the predictive VRAM sizer](#15-as-built-the-predictive-vram-sizer-scriptsvideo_vram_sizerpy)
+- [16. Planned: per-card VRAM benchmark suite (user-runnable)](#16-planned-per-card-vram-benchmark-suite-user-runnable)
+- [17. As built: the mid-segment thrash watchdog](#17-as-built-the-mid-segment-thrash-watchdog-local_video_workerpy--localvideoengine)
+- [18. As built: the runner wiring + the Local/Remote tab toggle](#18-as-built-the-runner-wiring--the-localremote-tab-toggle)
+- [19. As built: the local time estimate (history-driven, honest)](#19-as-built-the-local-time-estimate-history-driven-honest)
+- [20. As built: the per-card VRAM benchmark suite](#20-as-built-the-per-card-vram-benchmark-suite)
+- [21. As built: dynamic ratio targets + the per-GPU feasibility guard](#21-as-built-dynamic-ratio-targets--the-per-gpu-feasibility-guard)
+- [22. Planned: extending the benchmark to remote pods](#22-planned-extending-the-benchmark-to-remote-pods-050-experimental)
+
+---
+
 ## 1. Why this reverses a documented decision
 
 `docs/video-upscaler.md` (section 1) states the Video Upscaler is **"RunPod-only
@@ -37,6 +64,8 @@ injected-engine seam, the watchdog, two-granularity resume, and real benchmark
 tooling. The "never local" language in `docs/video-upscaler.md` is superseded by
 this document.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 2. Scope
 
 - **In:** local SeedVR2 video upscaling, in-process, on a Local/Both install, as an
@@ -48,6 +77,8 @@ this document.
   separate later phase); any change to the remote path's behaviour.
 - **Never touch the source.** Unchanged from the remote path: all work happens on
   temp copies and a separate output tree.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 3. The two objections, as guards not gates
 
@@ -70,6 +101,8 @@ same silicon. The mitigation is **transparency up front**, not exclusion: show a
 honest local time estimate before Start (section 9), and let the user decide.
 Short-clip benchmarking (section 8) makes the estimate real per card.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 4. Reuse: the engine seam already exists
 
 Local video is **not** a from-scratch feature. `batch_video_upscale.py` already
@@ -82,20 +115,22 @@ watchdog, notifications, taskbar.
 
 So local video reduces to:
 
-1. A new **`LocalVideoEngine`** (section 5) — the one genuinely new piece.
-2. **Custom targets** (section 6) — new UI + a small amount of plumbing on top of
+1. A new **`LocalVideoEngine`** (section 5): the one genuinely new piece.
+2. **Custom targets** (section 6): new UI + a small amount of plumbing on top of
    the existing box-fit math.
-3. **Local benchmark harness** (section 8) — `pod/bench_video.py` run locally,
+3. **Local benchmark harness** (section 8): `pod/bench_video.py` run locally,
    driven from the GUI.
-4. **Local time estimate** — a cost-free variant of `video_estimate.py`.
-5. **Un-gate the tab** (section 10) — a local/remote toggle; remove the hard
+4. **Local time estimate:** a cost-free variant of `video_estimate.py`.
+5. **Un-gate the tab** (section 10): a local/remote toggle; remove the hard
    "remote-only" block for Local/Both installs.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 5. `LocalVideoEngine`
 
 A drop-in for the injected engine interface (`process_segment(...)`,
 `last_segment_seconds`, `last_phase`, `telemetry()`, `device_name`, `close()`),
-wrapping the **in-process SeedVR2 streaming path** (`chunk_size>0`) — the same path
+wrapping the **in-process SeedVR2 streaming path** (`chunk_size>0`), the same path
 the pod worker uses (`pod/worker.py --mode video`), **not** the still image path.
 
 - Loads DiT/VAE **once** and caches them, reusing `upscale_engine.py`'s load-once
@@ -108,9 +143,14 @@ the pod worker uses (`pod/worker.py --mode video`), **not** the still image path
   engine runs at batch=1 with heavier offload; on a big card it uses a larger
   temporal window/batch. The local benchmark (section 8) finds the safe batch per
   (card, output-MP), feeding the existing `video_batch_learn` adaptive-batch table.
-- `telemetry()` reads local `system_telemetry.sample_gpu` (VRAM/temp) so the tab's
-  telemetry row works without a pod.
+- `telemetry()` returns `None` by design: unlike the remote engine (which polls the
+  pod and streams `RTELEM`), local GPU telemetry is sampled by the **GUI itself**.
+  During a local run the Video tab drives `App.sample_telemetry` on a short cadence
+  (`_start_local_telemetry`), which feeds the tab's "Local Unit" row and the per-run
+  usage graph (#9), so the engine does not duplicate it.
 - Only available on Local/Both installs (needs torch + SeedVR2 locally, section 10).
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 6. Custom targets: BOTH explicit resolution AND ratio
 
@@ -121,11 +161,11 @@ users with unusual sources want finer control. Local mode adds a **Custom** targ
 with **two interchangeable input modes** (user toggles; ratio reduces to a
 resolution internally):
 
-- **Explicit output resolution** — enter an output short-side in px (or WxH); the
+- **Explicit output resolution:** enter an output short-side in px (or WxH); the
   existing **box-fit** math (`video_estimate.fit_scale` / `output_dims`, which
   already generalizes to any box) fits the source to it, aspect preserved. This is
   the precise mode for sweeping a card to its OOM ceiling.
-- **Upscale ratio** — enter a multiplier (2x / 4x / custom) applied to the source
+- **Upscale ratio:** enter a multiplier (2x / 4x / custom) applied to the source
   dimensions. Matches the ComfyUI mental model and the future fixed-ratio engine
   (section 11). Note the **VRAM ceiling moves per source** in this mode (a 2x of a
   1280x800 clip is far larger than a 2x of a 320x240 clip), so the estimate and the
@@ -138,6 +178,8 @@ is likewise treated as a box.
 **Built (0.5.0): the RATIO half + the feasibility guard shipped; see section 21.**
 The 2x/4x ratio targets and a per-GPU feasibility filter are as-built; the arbitrary
 explicit-resolution entry field is still the remaining part of this section.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 7. No VRAM gate on local: the floor becomes advisory
 
@@ -155,6 +197,8 @@ to offer** a card that cannot serve a target *at a usable batch*. That floor is 
   (section 6) deliberately lets the developer/user push past `VRAM_FLOOR` so the
   ceiling can be **found empirically** (test till it breaks) rather than guessed
   conservatively. The OOM guard (section 3) catches the break cleanly and resumes.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 8. Local benchmark harness (test till it breaks)
 
@@ -180,6 +224,8 @@ The developer's **prototyping stage** uses this harness to build the first real
 local tier table across sources (roughly 320x240 to 1280x800) and destinations,
 before any tier is hard-coded as a default recommendation.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 9. Local time estimate (no cost)
 
 `video_estimate.py` already computes **duration** from `db.gpu_perf` history and a
@@ -190,6 +236,8 @@ a 20-hour local job blind. Seed it from the local benchmark (section 8) and refi
 per card from real runs.
 
 **Built (0.5.0): see section 19 for the as-built history-driven local estimator.**
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 10. Install-mode gate and the tab toggle
 
@@ -205,6 +253,8 @@ per card from real runs.
 
 **Built (0.5.0): see section 18 for the as-built runner wiring + tab toggle.**
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 11. Phase 2 (planned, not now): non-SeedVR fixed-ratio engine
 
 A later, separate phase: a **non-SeedVR, fixed-ratio 2x/4x** upscaler (a
@@ -218,18 +268,22 @@ Real-ESRGAN / RealCUGAN-class model) as a second local engine.
   **same injected-engine seam** (section 4), so it is additive, not a rewrite.
 - **Decision deferred.** Prototype and evaluate quality after local SeedVR2 ships.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 12. Build order
 
 1. **This design doc** + the decision reversal (done: this file; the "never local"
    passages in `docs/video-upscaler.md` are updated to point here; a
    `docs/future-features.md` milestone is added).
-2. **`LocalVideoEngine` spike** — prove the in-process streaming path (`chunk_size>0`)
+2. **`LocalVideoEngine` spike:** prove the in-process streaming path (`chunk_size>0`)
    end-to-end on the local GPU against one short clip. No UI yet. Unblocks everything.
 3. **Local benchmark harness** (section 8) on top of the spike; developer runs the
    prototyping sweep to build the first real tier table.
 4. **Custom targets** (section 6, both modes) + **advisory-only VRAM** (section 7).
 5. **Tab toggle + local time estimate + loud guards** (sections 3, 9, 10).
 6. **Phase 2** (section 11): evaluate the fixed-ratio engine.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 13. Open questions
 
@@ -272,6 +326,8 @@ so it is a research item, not a config knob. If it works it is the path to overl
 1080p on a 24 GB card at full quality. Investigate against the vendored engine's
 `generation_phases` / VAE decode path.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 14. Benchmark log (as-measured, local)
 
 Real measurements from the `LocalVideoEngine` spike (`scripts/spike_local_video.py`),
@@ -305,7 +361,7 @@ Target **1080p** box-fits to **1440x1080** (4.5x, **1.56 MP/frame**). Reproduce:
 | Model | Req b/ov | RAN b/ov | Peak VRAM alloc/reserved | Time (149f) | s/frame · s/MP | Result |
 |-------|----------|----------|--------------------------|-------------|----------------|--------|
 | 7B fp16 | AUTO / 0 | **5 / 0** | 17.1 / 20.8 GB | 375.9 s | 2.52 · 1.62 | PASS (healthy baseline) |
-| 7B fp16 | 33 / 6 | thrash | (spilled >24 GB) | KILLED | — | **THRASH** (sysmem fallback was ON) |
+| 7B fp16 | 33 / 6 | thrash | (spilled >24 GB) | KILLED | n/a | **THRASH** (sysmem fallback was ON) |
 | 7B fp16 | 13 / 6 | **5 / 4** | 22.7 / 26.8 GB* | 1845 s† | 12.39 · 7.96 | bs13,bs9 OOM -> fell to bs5 |
 | 7B FP8-mixed | 17 / 6 | **5 / 4** | 22.7 / 26.7 GB | 1954 s† | 13.12 · 8.43 | bs17,13,9 OOM (all in decode) -> bs5 |
 | 3B fp16 | 9 / 6 | **5 / 4** | 22.6 / 26.7 GB | 1420 s† | 9.53 · 6.13 | bs9 OOM (decode) -> bs5 |
@@ -498,9 +554,9 @@ achievable throughput** (min s/frame over the successful batches) and **max feas
 | 960x720         | 0.691 (b69)      | 69            | **0.657** (b37) | 37           | ON +4.9%     | 0.54x       |
 | 810x1080        | **0.897** (b53)  | 53            | 1.116 (b29)     | 29           | OFF +24%     | 0.55x       |
 | 1280x960        | **2.189** (b17)  | 17            | 5.474 (b5)      | 5            | OFF +150%    | 0.29x       |
-| 1440x1080       | **7.873** (b5)   | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
-| 1600x1200       | **10.899** (b5)  | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
-| 1920x1080       | **12.244** (b5)  | 5             | OOM at b5       | —            | OFF (ON OOMs)| —           |
+| 1440x1080       | **7.873** (b5)   | 5             | OOM at b5       | n/a          | OFF (ON OOMs)| n/a         |
+| 1600x1200       | **10.899** (b5)  | 5             | OOM at b5       | n/a          | OFF (ON OOMs)| n/a         |
+| 1920x1080       | **12.244** (b5)  | 5             | OOM at b5       | n/a          | OFF (ON OOMs)| n/a         |
 
 **Finding:** compile wins **only at sub-1080p outputs** (+3-5%), and there it wins *despite*
 running at half the batch, so the per-frame speedup is genuinely covering the throughput lost
@@ -524,6 +580,8 @@ copy-only: compile stays a runtime-gated default (`gate_local_compile`), selecta
 Settings > Video for anyone who wants to benchmark it on their own card. The trade is a
 **VRAM-headroom** story, so it may flip on a card large enough to absorb the batch halving at
 real targets (>=32 GB) even though activations remain the wall at 4K.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 15. As built: the predictive VRAM sizer (`scripts/video_vram_sizer.py`)
 
@@ -556,6 +614,8 @@ Wired into `LocalVideoEngine.__init__(conn=, gpu_id=)` and `process_segment`: on
 backstop, and whatever batch runs clean is recorded for learning. Unit-tested tkinter/GPU-free
 (seed picks, step-down, learned override, model-key isolation, overlap floor).
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 16. Planned: per-card VRAM benchmark suite (user-runnable)
 
 The sizer's seeds are honest only for 24 GB; every other card starts from a conservative guess
@@ -584,6 +644,8 @@ conservative seed.
   because each probe is an isolated subprocess, so a failed probe can't poison the next.
 - **Status:** BUILT (0.5.0) -- see section 20 for the as-built suite. Tracked in
   `docs/future-features.md` #7.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 17. As built: the mid-segment thrash watchdog (`local_video_worker.py` + `LocalVideoEngine`)
 
@@ -626,6 +688,8 @@ step may need a higher value; the 30 s floor guards against a false trip. Wired 
 `LocalVideoEngine(use_subprocess=, thrash_stall_seconds=)`; the runner (tab-toggle step) passes the
 config value. Watchdog timing tested GPU-free with a fake worker (clean / OOM / stall-kill paths).
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 18. As built: the runner wiring + the Local/Remote tab toggle
 
 This is the step that makes everything above (the engine, the sizer, the watchdog) actually
@@ -655,22 +719,24 @@ resume orchestration runs; only the **injected engine** changes and a **mode sel
 the tab, gated by the install mode: **Remote-only** disables Local (tooltip: re-run setup as
 Local/Both), **Local-only** disables Remote, **Both** remembers the last choice
 (`gui_settings.video_mode`). The mode re-skins the tab without duplicating it:
-  * **Readiness** — Local checks only ffmpeg + a local NVIDIA GPU (nvidia-smi via
+  * **Readiness:** Local checks only ffmpeg + a local NVIDIA GPU (nvidia-smi via
     `system_telemetry.sample_gpu` / `gpu_name`), not the RunPod key/SSH/volume; shows
     "Local ready -- <card>, <VRAM> GB. The first segment calibrates the batch size."
-  * **GPU display** — Local detects THIS machine's card (a cheap nvidia-smi, auto-run on entry,
+  * **GPU display:** Local detects THIS machine's card (a cheap nvidia-smi, auto-run on entry,
     unlike the remote list which hits the API and stays behind `↻`) and shows it as the single
     choice, shaped like a remote GPU dict (`price=None` marks it free) so `_selected_gpu` / the
     estimate / Start read it unchanged.
-  * **Estimate** — history-driven, see section 19. No cost, no funds guard, no GPU-override env.
-  * **Auto-resume** — pod-only, so it is greyed out in Local mode.
-  * **Start** — Local launches `batch_video_upscale.py <src> <out> --local` after a light,
+  * **Estimate:** history-driven, see section 19. No cost, no funds guard, no GPU-override env.
+  * **Auto-resume:** pod-only, so it is greyed out in Local mode.
+  * **Start:** Local launches `batch_video_upscale.py <src> <out> --local` after a light,
     cost-free confirm that warns the run can be slow and may degrade (stops loudly if so).
 
 **Tested** (GPU-free): `resolve_video_cfg` local defaults/overrides, `_local_seedvr2_paths`
 (default + env-expanded config), `_stop_notice("gpu thrash")`, and a `run_queue` thrash scenario
 proving the run stops after the episode, leaves the job `partial` with `fail_count == 0`, and never
 touches the following job (`tests/test_video_local.py`). The full 173-test video suite still passes.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 19. As built: the local time estimate (history-driven, honest)
 
@@ -708,6 +774,8 @@ because per-frame cost depends on source size + batch, not output-MP alone). So:
 history; a measured-history estimate is `calibrated=True` with the exact expected seconds;
 a monkeypatched `LOCAL_RATES` seed is `calibrated=False` ("(rough)"); and a queue is `None`
 if ANY target lacks a rate. The estimate suite (26 tests) and full video suite still pass.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 20. As built: the per-card VRAM benchmark suite
 
@@ -816,6 +884,8 @@ title/colour, per-target fields, no-op without a backend), and the **terminal su
 (max-fit vs saved-batch distinction, saved probe's peak, summed runtime, unbenchmarked row).
 Full suite passes.
 
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
 ## 21. As built: dynamic ratio targets + the per-GPU feasibility guard
 
 Two problems in one: a 24 GB card would happily let you pick 4K (guaranteed OOM), and a
@@ -861,6 +931,8 @@ benchmark-raises-the-cap path, and the runner defer are unit-tested
 **Not yet:** the arbitrary explicit-resolution entry (the other half of section 6), and a
 VRAM-aware remote GPU-list pre-filter for ratio targets (the queue-grey + Start guard cover
 correctness meanwhile).
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 ## 22. Planned: extending the benchmark to remote pods (0.5.0-experimental)
 
@@ -934,12 +1006,7 @@ remote benchmark simply has to WRITE the learned batch under that same key:
   which is correct (resident-remote and offload-local ceilings genuinely differ).
 
 **Known gap (rate, not batch):** `_record_cell_result` also records a rate into `db.gpu_perf`.
-The remote ESTIMATE reads that with a 300-MP trust floor (`seconds_per_mp`), which one short
-benchmark probe won't clear, so the estimate won't immediately pick up remote benchmark timing
-(the local path dropped its floor to 40 MP for exactly this reason). The BATCH -- the actual
-"optimal setting" this feature exists to learn -- is unaffected (the run's tuner has no such
-floor). Lowering the remote rate floor for benchmark-origin data is a documented follow-up, not
-scaffolding.
+The remote ESTIMATE reads that with a 300-MP trust floor (`seconds_per_mp`), which one short benchmark probe won't clear, so the estimate won't immediately pick up remote benchmark timing (the local path dropped its floor to 40 MP for exactly this reason). The BATCH (the actual "optimal setting" this feature exists to learn) is unaffected (the run's tuner has no such floor). Lowering the remote rate floor for benchmark-origin data is a documented follow-up, not scaffolding.
 
 ### 22.4 Pod lifecycle, cost, and the UI flow
 
@@ -980,6 +1047,8 @@ The benchmark needs a deployed pod, wired the same way a run is (`remote_run.Rem
 5. GUI: button visibility + pass the selected GPU + `BenchmarkWindow` remote branch.
 6. Tests (GPU-free): the remote key selection, the engine-agnostic sweep against a fake remote
    engine, `probe_batch` outcome mapping.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
 Public/shared benchmark aggregation (results surfaced in the GPU picker as expected
 performance) stays a later phase; this section is the scaffolding that makes a remote card

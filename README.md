@@ -16,7 +16,29 @@ Batch Upscaler runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upsc
 
 ---
 
-## Install (Windows installer — recommended)
+## Contents
+
+- [Install (Windows installer)](#install-windows-installer-recommended)
+- [Run from source](#run-from-source)
+- [The app](#the-app)
+  - [Common features](#common-features)
+  - [Batch Upscaler](#batch-upscaler)
+  - [Tag & Rename](#tag--rename)
+  - [Conciliation](#conciliation)
+  - [Video Upscaler](#video-upscaler)
+  - [Settings](#settings)
+  - [Notifications](#notifications)
+  - [Home Assistant (MQTT)](#home-assistant-mqtt)
+- [Configuration](#configuration)
+- [Remote GPU cost (RunPod)](#remote-gpu-cost-runpod)
+  - [Remote Upscaling (Batch Upscaler)](#remote-upscaling-batch-upscaler)
+  - [Remote Tag & Rename](#remote-tag--rename)
+- [Samples](#samples)
+- [Notes](#notes)
+
+---
+
+## Install (Windows installer, recommended)
 
 No Git, no Python knowledge required:
 
@@ -28,7 +50,7 @@ The installer offers options to use it locally (taking advantage of your local, 
 
 The first launch opens a setup window that downloads the required components: Python, PyTorch with CUDA, the SeedVR2 engine (about 150 MB for remote-only, or about 3 GB, if you also picked the option to locally upscale images or videos), a GPL ffmpeg build (~160 MB, used by the Video Upscaler), a bundled libVLC (~40 MB, for in-app video playback with sound) and then starts the app. It also offers to install [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works without it, and you can decline). The first upscale process you run additionally downloads the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved to `bootstrap.log` in the application folder (useful for troubleshooting).
 
-> **Windows SmartScreen note:** because the installer is a new, unsigned download, Windows may show *"Windows protected your PC — Unknown publisher"*. Click **More info → Run anyway**. The installer is built automatically from the public source in this repository by GitHub Actions; you can verify the build on the repository's **Actions** tab.
+> **Windows SmartScreen note:** because the installer is a new, unsigned download, Windows may show *"Windows protected your PC: Unknown publisher"*. Click **More info → Run anyway**. The installer is built automatically from the public source in this repository by GitHub Actions; you can verify the build on the repository's **Actions** tab.
 
 **Requirements:**
 
@@ -44,6 +66,8 @@ The first launch opens a setup window that downloads the required components: Py
 * ~3 GB of free disk space (Python infrastructure for application functionality)
 * A runpod.io account (which you can create via a link from the installer, or separately)
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ---
 
 ## Run from source
@@ -53,7 +77,7 @@ If you'd rather run from the repository instead of the installer:
 ```powershell
 # 1. Clone this repo and the SeedVR2 engine into it.
 #    (The engine lives in a repo named "ComfyUI-SeedVR2..." but is used
-#     directly in-process here — the ComfyUI application itself is NOT needed.)
+#     directly in-process here: the ComfyUI application itself is NOT needed.)
 git clone https://github.com/war4peace/image-toolbox
 cd image-toolbox
 git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
@@ -69,7 +93,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\pythonw.exe scripts\toolbox_gui.py
 ```
 
-Or just double-click **`Image Toolbox.cmd`** after cloning — it bootstraps the environment and launches the app for you.
+Or just double-click **`Image Toolbox.cmd`** after cloning: it bootstraps the environment and launches the app for you.
 
 You can also run the tools headless from PowerShell:
 
@@ -85,6 +109,8 @@ You can also run the tools headless from PowerShell:
 The Video Upscaler runs on a rented RunPod GPU by default; add `--local` to upscale on your own GPU instead. `--target` (`1080p` / `1440p` / `4K`) scans the folder and enqueues every eligible video before running; omit it to process a queue you already prepared in the GUI. Like the image tools, it mirrors the source tree into an output subfolder and never touches your originals.
 
 The GUI and the scripts share the same logs and cache database (`db/cache.db`), so you can mix and match freely.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ---
 
@@ -108,17 +134,21 @@ Windows GUI (mostly Python standard-library tkinter) with six tabs.
 
 *The per-run telemetry graph (click a telemetry row to open it): GPU/CPU load, memory against capacity, power and temperature over the run, with a crosshair readout.*
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ### Batch Upscaler
 
 - **High-quality image upscaling** with SeedVR2, prioritising quality over speed. The target is capped at 3840 × 2160 by default (a **Resolution Target** of 4K, 2K or 1080p is selectable in Settings), so results display at native resolution on common screens.
 - **Your originals are never touched.** Upscaled images are written to a separate output folder that mirrors the source folder tree and filenames.
 - **Auto-straighten** (on by default): a small CNN detects sideways photos and rotates them upright *before* upscaling, so the result fits the Resolution Target on the correct axis (a sideways photo upscaled on the wrong axis stops fitting once it's turned upright). It works on a temp copy, so the source is never touched; only confident calls act, and ambiguous ones are left alone. Toggle it and tune the threshold in **Settings → Upscaling**.
-- **Skip-cutoff:** images already close to the target are skipped (default 66% of the target on either axis — i.e. anything that would gain less than ~1.5×). Set it to 0 in Settings to upscale everything eligible.
+- **Skip-cutoff:** images already close to the target are skipped (default 66% of the target on either axis, i.e. anything that would gain less than ~1.5×). Set it to 0 in Settings to upscale everything eligible.
 - **Resilient long runs:** a cache (in the local SQLite database `db/cache.db`) lets a stopped batch resume where it left off; corrupt and missing files are detected, logged and skipped (corrupt files are listed at the end so you can review them); a **second pass** re-scans the source when the batch finishes and processes anything new that appeared while it ran.
 - **Pause / resume / stop** buttons; a stop finishes the current image first so a file is never left half-written. **Pausing hands the graphics card back** (0.5.2): it unloads the AI models and frees the VRAM (measured ~16.6 GB on an RTX 3090) so you can use the card for something else, then reloads on Resume with the queue intact.
 - **Degraded-GPU watchdog:** long GPU sessions can silently slow to a crawl (a known driver/VRAM issue that only a reboot cures, unrelated to this app). The run watches its own throughput and, on a sustained slowdown or an out-of-memory, cleanly stops after the current image and alerts you; the resume cache continues the queue after a reboot.
 - **Log window**: Displays more detailed information in a separate window.
 - **Works with mapped network drives.**
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ### Tag & Rename
 
@@ -128,7 +158,9 @@ Analyses each image with a local or remote Ollama vision model, writes a descrip
 - **One-click Undo** restores file names, EXIF descriptions, or both. Every change is recorded to an undo cache before anything is modified.
 - **Pause / Resume** (0.5.2): pausing a local run unloads the vision model to free VRAM, and Resume reloads it and continues. The same button doubles as *Resume after error* when a run is held because the model kept failing.
 - Already-tagged files are detected and skipped on re-runs (unless forced, optional).
-- **The vision model is your choice** (set it in **Settings**). The default is [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl) — the most accurate of the models tried, reading faint on-screen text and inferring fine detail; it needs ~16 GB VRAM (a 16 GB+ GPU). If you have less VRAM, switch to [`minicpm-v`](https://ollama.com/library/minicpm-v) — fast and light (~7.6 GB VRAM, runs on an 8 GB GPU), which uses terser descriptions. In testing, `llava:34b` was the slowest, heaviest *and* least accurate of the models tried. It's the least recommended option, but still available if preferred.
+- **The vision model is your choice** (set it in **Settings**). The default is [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl): the most accurate of the models tried, reading faint on-screen text and inferring fine detail; it needs ~16 GB VRAM (a 16 GB+ GPU). If you have less VRAM, switch to [`minicpm-v`](https://ollama.com/library/minicpm-v): fast and light (~7.6 GB VRAM, runs on an 8 GB GPU), which uses terser descriptions. In testing, `llava:34b` was the slowest, heaviest *and* least accurate of the models tried. It's the least recommended option, but still available if preferred.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ### Conciliation
 
@@ -140,6 +172,8 @@ Once you're happy with the upscaled (and optionally tagged & renamed) results, *
 - **Videos too:** a video original (e.g. `clip.avi`) is matched to its upscaled output (e.g. `clip_4K.mp4`) by content-hash lineage, so it still matches after folders are moved or renamed. A video is only ever acted on when its output is actually present in the Processed folder you chose, so pointing Conciliation at a photo-only output folder never touches your videos (and vice versa) and the preview always shows exactly what will happen first.
 - **Safety first:** an original with no processed counterpart is never touched, and non-media files are never touched. After a run, emptied processed folders (e.g. a leftover `__upscaled__`) are cleaned up. The tab is locked while the Batch Upscaler or Tag & Rename is running, since they may share the same folders.
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ### Video Upscaler
 
 Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler uses, either on a **rented RunPod GPU** (fast, paid) or on **your own local GPU** (free, slower). Video means a diffusion pass per output frame, so remote could offer access to powerful GPUs which greatly reduce processing time; local is there so anyone with a capable GPU can do it at no cost, except power usage. Your source videos are never modified.
@@ -149,7 +183,7 @@ Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler uses
 - **Extract a scene:** for a long source you don't want to upscale in full, mark an in/out range on a live preview and queue just that clip. The source is never touched (the clip is cut to a temp file, upscaled, then reassembled), and each clip resumes independently like a whole video.
 - **Cost estimate + confirm-before-rent:** the estimated duration and cost for the whole queue is shown *before* any pod is rented, and the estimator improves itself from your own finished runs. ***Note:*** *Estimates start rough and sharpen as you run; benchmarking your GPU (below) makes them accurate.*
 - **Benchmark your GPU (local or remote):** a one-click **Benchmark GPU** window measures, for a specific card, the largest batch size that fits at each target and the card's real per-frame speed, by upscaling a short clip at rising batch sizes until it runs out of memory. Those measurements replace the built-in guesses: the automatic batch sizing, which targets are offered, and the duration/cost estimate are all calibrated to your actual card. It benchmarks **your own GPU** or a **rented pod** (deployed just for the benchmark, billed while it runs, torn down afterwards), and it is resumable: every measured step is saved, so you can stop and continue, and each card is measured only once.
-- **Shared benchmarks (0.5.1):** measured cards are pooled into a community set on GitHub, downloaded automatically at launch so a card someone else already measured is **not** re-swept locally (a sweep is slow, and on a rented pod, billed). You can contribute your own measured cards back with one click — a pre-filled GitHub issue via your existing GitHub login, no tokens or setup.
+- **Shared benchmarks (0.5.1):** measured cards are pooled into a community set on GitHub, downloaded automatically at launch so a card someone else already measured is **not** re-swept locally (a sweep is slow, and on a rented pod, billed). You can contribute your own measured cards back with one click: a pre-filled GitHub issue via your existing GitHub login, no tokens or setup.
 - **Survive losing a pod (opt-in):** tick **Auto-resume** and a long remote run rides out losing its pod mid-run: it reconnects a briefly-dropped pod, or waits (no charge while waiting) for the identical card to come back in stock and redeploys it, continuing from the first unfinished segment. A funds cap, your Stop, or a finished queue are the only things that end it.
 - **Pay in installments:** each video is split into ~1-minute segments and every finished segment is progress saved. Stop any time; the next Start resumes at the first unfinished segment. Optional per-run minute / dollar caps keep a long job on budget.
 - **The original audio is kept** (muxed back into the upscaled result), and a drift check warns if the output timing ever diverges from the source.
@@ -159,6 +193,8 @@ Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler uses
 - **Local runs are guarded, not gated:** on your own GPU the batch is sized predictively from your card's VRAM (so it fits on the first try), targets that would run out of memory aren't offered, a watchdog stops a run that starts thrashing a long GPU session (the Benchmark GPU tool above measures its real safe batch and speed). For best results, close other GPU-heavy apps before a local run.
 
 Video upscaling is compute-heavy: as a rough guide, one hour of footage upscaled to 1080p costs about $28-46 of GPU time on a rented card (the in-app estimator shows the real numbers for your queue before you commit), or nothing but time and power usage on your own GPU. Remote runs require a RunPod account, like the other remote features; local runs need an NVIDIA GPU with a CUDA build of PyTorch.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ### Settings
 
@@ -178,23 +214,29 @@ Changes take effect only on **Save**: a live **"Not saved"** indicator turns red
 
 Remote (RunPod) settings - the API key, region/data center, model volume, GPU preferences and pod management - live on the dedicated **RunPod** tab.
 
-> **Secrets never touch `config.json`.** The API key, MQTT password and notification tokens/webhook URLs are stored in an untracked `config.local.json` overlay; `config.json` keeps only blank placeholders, so it is safe to share or commit without scrubbing. (Personal **Default folders** and non-secret fields like your MQTT host still live in `config.json` — clear those by hand if you want a pristine template to share.)
+> **Secrets never touch `config.json`.** The API key, MQTT password and notification tokens/webhook URLs are stored in an untracked `config.local.json` overlay; `config.json` keeps only blank placeholders, so it is safe to share or commit without scrubbing. (Personal **Default folders** and non-secret fields like your MQTT host still live in `config.json`; clear those by hand if you want a pristine template to share.)
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ### Notifications
 
 Get a message when a queue finishes (for both the Upscaler and Tag & Rename) and on errors (repeated failures, an engine that fails to start, Ollama going unreachable). Three backends, configured in Settings → Notifications, all optional and independent:
 
-- **Discord** — paste a channel **webhook** URL.
-- **Telegram** — create a bot with **@BotFather**, paste its **bot token**, open the bot and press **Start**, then click **Detect** to fill in your chat ID.
-- **ntfy** — make up a **topic** name, subscribe to it in the [ntfy](https://ntfy.sh) app, and enter it here (the **server** defaults to the public `https://ntfy.sh`; point it at your own server if you self-host). On the public server anyone who knows the topic can read it, so pick an unguessable name.
+- **Discord**: paste a channel **webhook** URL.
+- **Telegram**: create a bot with **@BotFather**, paste its **bot token**, open the bot and press **Start**, then click **Detect** to fill in your chat ID.
+- **ntfy**: make up a **topic** name, subscribe to it in the [ntfy](https://ntfy.sh) app, and enter it here (the **server** defaults to the public `https://ntfy.sh`; point it at your own server if you self-host). On the public server anyone who knows the topic can read it, so pick an unguessable name.
 
 Each has a **Test** button. Whatever you configure (any combination, or none) receives the same alerts.
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ### Home Assistant (MQTT)
 
-Optional. Set an MQTT broker **host** in Settings → MQTT and the app publishes its state to your broker: version and update status, availability, live task state (what it's doing, progress, ETA, per-item timings), the last-run summary, and system telemetry — CPU, RAM, VRAM, GPU temperature, and (0.5.3) **GPU utilization, power draw and core clock** — for this machine and, during a remote run, the rented pod. Clear the host to disable it.
+Optional. Set an MQTT broker **host** in Settings → MQTT and the app publishes its state to your broker: version and update status, availability, live task state (what it's doing, progress, ETA, per-item timings), the last-run summary, and system telemetry for this machine and, during a remote run, the rented pod: CPU, RAM, VRAM, GPU temperature, and (0.5.3) **GPU utilization, power draw and core clock**. Clear the host to disable it.
 
 Ready-made Home Assistant content is included under [`samples/home-assistant/`](/samples/home-assistant/): [`mqtt-sensors.yaml`](/samples/home-assistant/mqtt-sensors.yaml) defines every published topic as a Home Assistant MQTT sensor (local and remote-pod), plus two paste-ready dashboards, a **core** one built only from Home Assistant's built-in cards (no HACS) and a richer **custom** one using named HACS cards. See that folder's [README](/samples/home-assistant/README.md) for the install order.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ---
 
@@ -215,9 +257,11 @@ Settings live in `config.json` next to the app, with these sections:
 | `video`    | Video Upscaler deliverable codec/quality and SeedVR tuning knobs.    |
 | `notifications` | Discord webhook, Telegram bot token/chat ID, ntfy server/topic. |
 
-You normally never edit this file by hand — use the **Settings** tab. The installer never overwrites your `config.json` on upgrade, and removes it only on a full uninstall.
+You normally never edit this file by hand; use the **Settings** tab. The installer never overwrites your `config.json` on upgrade, and removes it only on a full uninstall.
 
 **Secrets are kept out of `config.json`.** The RunPod API key, MQTT password and notification tokens/webhook URLs live in an untracked `config.local.json` next to it (created automatically the first time you save settings); `config.json` itself only ever holds blank placeholders for those fields, so it is safe to share.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ---
 
@@ -245,6 +289,8 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 
 **Findings:** The mid-VRAM Ampere cards (A40, A6000 at about $0.19 per 100 images) are the value winners: slower per image than a 5090 but far cheaper per hour, and the resident-VRAM offload is what makes them viable. For raw speed the B200 leads (5.9 sec/img) but at five times the cost, while the **RTX PRO 6000** is the sane fast pick, beating both Hopper cards (H100, H200) at a fraction of their price. The two A100 80GB variants land mid-pack at ~13.8 sec/img (the PCIe a touch cheaper per 100 than the SXM4): capable but unremarkable for upscaling, since the cheaper Ampere cards are far better value and the newer cards are far faster. SeedVR2 upscaling rewards newer architectures: Blackwell over Hopper over Ampere on raw speed.
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ### Remote Tag & Rename
 
 | GPU | $/h | ~sec/img | $/100 images |
@@ -263,15 +309,21 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 
 > **Caveats:** prices are point-in-time and vary by availability and region (the in-app GPU picker shows live prices). The estimates exclude the billed pod boot/teardown (~2 to 3 minutes) and the image upload/download time, so real bills run a little higher, most noticeably on very small runs. Source data: [`docs/image-benchmarks.csv`](/docs/image-benchmarks.csv).
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ---
 
 ## Samples
 
 The [samples](/samples/) folder contains [original images](/samples/original/) and their [upscaled](/samples/upscaled/) versions, so you can compare pairs side-by-side and judge the upscaler's strengths and weaknesses. It also holds the [Home Assistant dashboard samples](/samples/home-assistant/) (see the Home Assistant section above).
 
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
 ---
 
 ## Notes
 
-- **About the code:** these tools were written with the help of Claude (Anthropic) by someone who is not a trained developer — "vibecoding", as some call it. This is a personal project, shared for anyone to use at no cost.
+- **About the code:** these tools were written with the help of Claude (Anthropic) by someone who is not a trained developer ("vibecoding", as some call it). This is a personal project, shared for anyone to use at no cost.
 - **Maintainers:** the installer is built by the `build-installer` GitHub Actions workflow from `installer/ImageToolbox.iss` whenever a `v*` tag is pushed.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>

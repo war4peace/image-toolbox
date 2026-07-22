@@ -133,7 +133,8 @@ class App(tk.Tk):
         self._cpu_sampler   = system_telemetry.CpuSampler()
         self._telemetry_lock = threading.Lock()
         self.telemetry_rows = [t.telemetry_row for t in
-                               (self.upscale_tab, self.tag_tab, self.conciliate_tab)
+                               (self.upscale_tab, self.tag_tab,
+                                self.conciliate_tab, self.video_tab)
                                if t.telemetry_row is not None]
         # Per-run telemetry history + graph windows (usage graphs, #9). Keyed by
         # source: "local" (one machine, fanned out to every tab's local row) and
@@ -1049,6 +1050,12 @@ class App(tk.Tk):
             # surfaces (else the vout thread faults on the destroyed HWND at exit).
             try:
                 self.video_playback_window.teardown_players()
+            except Exception:
+                pass
+        for _tel_win in list(self._tel_windows.values()):
+            try:
+                if _tel_win.winfo_exists():
+                    _tel_win.save_geometry()
             except Exception:
                 pass
         mark("save-geometry")

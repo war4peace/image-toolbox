@@ -6,6 +6,14 @@ working draft those notes are distilled from, and it records **experimental**,
 in-development versions before they are tagged. For released versions, see the GitHub
 Releases page.
 
+## Contents
+
+- [0.5.3](#053)
+- [0.5.2](#052)
+- [0.5.1](#051)
+
+---
+
 ## 0.5.3
 
 ### See what a run is doing to your machine: live telemetry graphs
@@ -38,6 +46,8 @@ If you use Home Assistant, there are now **paste-in dashboards** under
 and a fancier one using popular HACS cards. Each pastes into a single dashboard
 card (no risky whole-dashboard editing). Screenshots and a step-by-step README are
 included.
+
+<div align="right"><a href="#changelog">↑ Back to top</a></div>
 
 ## 0.5.2
 
@@ -84,6 +94,8 @@ buttons that act where you are.
   runs can no longer fight over the same GPU or the same folders.
 - **Video notifications** carry a per-file summary of what finished, rather than
   a bare "done".
+
+<div align="right"><a href="#changelog">↑ Back to top</a></div>
 
 ## 0.5.1
 
@@ -141,3 +153,5 @@ archive-first" guarantees carry over unchanged.
   use the same icon (previously the shortcuts used a different icon).
 - Ships the seeded `docs/video-benchmarks.csv` so a fresh install has the community
   benchmark dataset offline.
+
+<div align="right"><a href="#changelog">↑ Back to top</a></div>

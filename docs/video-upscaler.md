@@ -22,7 +22,28 @@ Upscaler"**.
 > and the user's own `db.gpu_perf` history supersedes the table per card over time.
 > Two SeedVR2 limits are inherent and NOT tunable: temporal jitter of fine detail
 > on slow pans/slow-mo (the 4x causal temporal VAE) and text/plate/logo distortion
-> (generative SR, no OCR) — see the findings noted inline.
+> (generative SR, no OCR); see the findings noted inline.
+
+---
+
+## Contents
+
+- [1. Goal & scope](#1-goal--scope)
+- [2. The engine already does this](#2-the-engine-already-does-this)
+- [3. Terminology (kept distinct on purpose)](#3-terminology-kept-distinct-on-purpose)
+- [4. Architecture: segment = queue item](#4-architecture-segment--queue-item)
+- [5. Cost is the dominant constraint, paid in installments](#5-cost-is-the-dominant-constraint-paid-in-installments)
+- [6. Decisions locked in](#6-decisions-locked-in)
+- [7. SeedVR2 video settings + benchmark prerequisite](#7-seedvr2-video-settings--benchmark-prerequisite)
+- [8. Other gotchas to honour](#8-other-gotchas-to-honour)
+- [9. Shared config (new `video` section)](#9-shared-config-configjson---new-video-section)
+- [10. Shared database (new tables)](#10-shared-database-dbcachedb---new-tables)
+- [11. Build pieces](#11-build-pieces)
+- [13. Operational gotchas & runtime checks](#13-operational-gotchas--runtime-checks)
+- [14. As built: the local container pipeline](#14-as-built-scriptsvideo_pipelinepy-local-container-pipeline)
+- [15. GUI "Video Upscaler" tab (UX spec)](#15-gui-video-upscaler-tab-ux-spec)
+- [16. Segment extraction + real-time playback (0.4.7)](#16-segment-extraction--real-time-playback-047)
+- [17. Self-healing remote runs ("Auto-resume")](#17-self-healing-remote-runs-auto-resume-050-experimental)
 
 ---
 
@@ -51,6 +72,8 @@ Upscaler"**.
   live in a new `video` section of the existing `config.json`; resume/queue state
   lives in new tables in the existing `db/cache.db`. See sections 9 and 10.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 2. The engine already does this
 
 SeedVR2 is a *video* upscaler; the app simply never uses that side.
@@ -69,6 +92,8 @@ bypasses:
 
 So this is an **orchestration + UX + tuning** feature, not an upscaler build.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 3. Terminology (kept distinct on purpose)
 
 | Term | Meaning | Layer |
@@ -78,6 +103,8 @@ So this is an **orchestration + UX + tuning** feature, not an upscaler build.
 
 These are different things at different layers. The doc never uses "chunk" to mean
 a segment.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
 ## 4. Architecture: segment = queue item
 
@@ -122,6 +149,8 @@ source.mp4 ──ffmpeg split──> seg000.mp4 seg001.mp4 ... segNNN.mp4   (tem
   single-streaming-file model cannot do this. Not in v1, but the architecture
   leaves the door open.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 5. Cost is the dominant constraint, paid in installments
 
 SeedVR2 runs **one diffusion pass per output frame**, so cost scales with frame
@@ -165,6 +194,8 @@ segments done so far. To make that deliberate:
   up to N minutes / $X this run, then stop." Makes the installment model one click,
   not manual file-splitting.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 6. Decisions locked in
 
 ### 6.1 Keyframes: round-up is fine; re-encode only the pathological cases
@@ -181,7 +212,7 @@ when keyframes are **extremely sparse** does the re-encode fallback kick in.
   (ASF)** reports **zero** keyframes to `ffprobe -skip_frame nokey` (it can't
   enumerate their `pts_time`), yet decodes and upscales fine. The bug this caused:
   `max_keyframe_gap()` returned `0.0` for `<2` keyframes, and `plan_split` read `0.0`
-  as "tiny gap, safe to `-c copy`" — the OPPOSITE of the truth — so a 3m15s WMV
+  as "tiny gap, safe to `-c copy`", the OPPOSITE of the truth, so a 3m15s WMV
   collapsed to **one** whole-video segment (`1 segment(s) (copy)`), losing
   resume/installment/cost-cap granularity (the upscale itself was still correct).
   **Fix:** `plan_split` now treats `0-or-1` enumerable keyframes as an effective gap
@@ -207,7 +238,7 @@ with nothing in the pipeline noticing.
 **Root cause:** the source is **interlaced 576i** (BFF). The container reports
 `field_order=unknown` (ASF hides it), so only `ffmpeg idet` on the pixels reveals it
 (all frames BFF). The split's forced-keyframe re-encode used `hevc_nvenc`, and **NVENC
-has no interlaced-HEVC encode path** — fed interlaced-flagged frames it emitted black
+has no interlaced-HEVC encode path**: fed interlaced-flagged frames it emitted black
 (and even where it survives, an interlaced intermediate upscales combed and can decode
 to black in the pod's OpenCV). Interlaced fields are also simply wrong input for a model
 trained on progressive frames.
@@ -317,13 +348,15 @@ by **local GPU capability, not video size**.
 - **Two `-c copy` exceptions found in phase 2 (refines the two bullets above):**
   (a) **Audio may not fit mp4.** Old-camera audio codecs (measured: `Pisici.AVI`
   carries `pcm_mulaw`) cannot `-c copy` into an mp4/mov container, so the **audio
-  alone** is re-encoded to AAC (the *video* still `-c copy`s — 6.4's real concern).
+  alone** is re-encoded to AAC (the *video* still `-c copy`s, 6.4's real concern).
   Detected by checking the source audio codec against an mp4-friendly set
   (`aac/mp3/ac3/eac3/alac`). (b) **Re-encode must normalize pixel format.** When the
   split DOES re-encode (VFR/sparse-GOP), NVENC rejects 4:2:2 input (measured:
   `hevc_nvenc` 400s on the source's `yuvj422p` with "YUV422P not supported"), so the
   re-encode forces `-pix_fmt yuv420p` (universal for x264/x265/nvenc; harmless, since
   that intermediate is upscaled downstream by a detail-hallucinating model).
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
 ## 7. SeedVR2 video settings + benchmark prerequisite
 
@@ -584,6 +617,8 @@ so this is "bigger-is-smoother within the VRAM budget", and overlap trades a lit
 throughput (reprocesses `overlap` frames per window) for the join blend. Not yet measured
 perceptually (benchmark ran `temporal_overlap=0` for clean throughput) -> see section 13.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 8. Other gotchas to honour
 
 - **Audio is dropped by the engine.** `FFMPEGVideoWriter` pipes only rawvideo
@@ -648,6 +683,8 @@ perceptually (benchmark ran `temporal_overlap=0` for clean throughput) -> see se
   tiny temporal window (weaker coherence) and/or a big expensive card, compounding
   the cost. 1080p is the sane default for video; gate 4K behind an extra warning.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 9. Shared config (`config.json` -> new `video` section)
 
 No new config file. A new section alongside `upscale`, `tagging`, `runpod`, etc.
@@ -680,6 +717,8 @@ dead-man's-switch limits, SSH) is reused unchanged. Draft keys:
 
 `defaults` gains a Video Upscaler source/output folder pair like the other tools.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 10. Shared database (`db/cache.db` -> new tables)
 
 No new database. New tables in the existing cache, mirroring the upscale
@@ -696,6 +735,8 @@ installment model work across runs:
   per-run cap work: a re-run picks up the first `pending`/`failed` segment.
 
 Logs stay text files in `logs/`, not the DB, consistent with the rest of the app.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
 ## 11. Build pieces
 
@@ -716,13 +757,13 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
   `inference_cli.process_single_file` streaming path the benchmark/RAM harnesses
   validated), reusing the cached DiT/VAE. **Heartbeat:** instead of literal
   per-chunk touches, a `_HeartbeatTee` over the pipeline's tqdm output refreshes
-  the heartbeat on every line of progress — finer-grained than per-chunk AND it
+  the heartbeat on every line of progress, finer-grained than per-chunk AND it
   doubles as hang-detection (a stuck GPU stops emitting progress, so the heartbeat
   goes stale and the dead-man's switch reclaims the pod). Sibling to `full` / `tag`.
   Proven locally with a fake engine (full protocol + 409 + heartbeat + frame-count
   read). The client half (`RemoteVideoEngine`) is built (see below).
 - **`RemoteVideoSession`** (or extend `remote_run.RemoteSession`): **DONE** by
-  extending `RemoteSession` with `mode="video"` (worker `--mode video`) — the same
+  extending `RemoteSession` with `mode="video"` (worker `--mode video`), the same
   create -> push -> start worker -> arm dead-man's switch -> teardown lifecycle,
   handing back a **`RemoteVideoEngine`** (`scripts/remote_video_engine.py`) that
   subclasses `RemoteUpscaleEngine` for the proven tunnel/health/telemetry/close and
@@ -765,6 +806,8 @@ Logs stay text files in `logs/`, not the DB, consistent with the rest of the app
 Reused unchanged from #1: pod lifecycle, network-volume + models, SSH/key
 injection, GraphQL deploy + GPU picker, per-task price ceiling + fallback chain,
 cost tracking, notifications, taskbar progress/flash.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
 ## 13. Operational gotchas & runtime checks
 
@@ -828,6 +871,8 @@ numbering is kept so `section 14`/`section 15` references elsewhere stay valid.)
     not a block (a user may deliberately have a fast NAS scratch); the inside-source case
     is caught for real at run time regardless of how `work_root` was set.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 14. As built: `scripts/video_pipeline.py` (local container pipeline)
 
 This local container pipeline is built and proven on the real motivating
@@ -860,7 +905,7 @@ on a clean copy and **fires** on a real timing change.
 - **CFR normalize legitimately shifts duration**, and the detector correctly warns:
   forcing this source to exactly 30 fps CFR padded 4835 -> 4923 frames (+0.098 s),
   because its real frame count doesn't fill the nominal `fps x duration` grid. Per
-  6.3 the app **warns and keeps the result, never silently fixes** — working as
+  6.3 the app **warns and keeps the result, never silently fixes**, working as
   intended. (Implication for the runner: prefer the `-c copy` path whenever
   possible; the re-encode path can nudge timing on sources whose own metadata is
   internally inconsistent.)
@@ -877,7 +922,7 @@ mid-video (not a failure); a resume run continues at the first pending segment o
 the *reused* split (no re-split, no re-upscale of done segments); recursion +
 output mirroring work; the round trip is frame-perfect (4835->4835) with drift OK;
 "already done" short-circuits. Two bugs the test caught and fixed: (1) a non-ASCII
-log glyph crashed Windows cp1252 stdout and masked the installment path — the
+log glyph crashed Windows cp1252 stdout and masked the installment path: the
 runner now reconfigures stdout to UTF-8 `errors="replace"`; (2) the Discord/Telegram
 `fields` API wants list-of-dicts (`{"name","value"}`), not tuples.
 
@@ -890,7 +935,7 @@ never misfired), pod-reuse + worker version/mode reuse worked on the second
 connect (no reload), and the pod **terminated cleanly** at the end. Output:
 1440x1080, frame-perfect **4835 -> 4835** frames. ~72 min wall, ~$1.20.
 
-**The run found a real bug — and the drift detector caught it.** The output had a
+**The run found a real bug, and the drift detector caught it.** The output had a
 **2.9 s progressive A/V desync**. Cause: `Pisici.AVI` holds 4835 frames over a
 164.1 s container = a REAL **29.46 fps**, but the AVI *tags* 30 fps (r == avg ==
 30/1). SeedVR2's opencv writer trusts the tag and writes 30 fps -> 4835/30 =
@@ -906,13 +951,15 @@ notes the small residual (the CFR-rounding overshoot, output 164.20 s vs source
 30 fps CFR so SeedVR2 reproduces the same 164.2 s. **Possible future refinement:**
 CFR-normalize to the *effective* fps (29.46) for an exact-duration match instead of
 the ~0.1 s overshoot. The two other notes: the opencv backend writes **mpeg4**
-(`mp4v`), not h264 — switch to the ffmpeg backend (x264/x265) for a better
+(`mp4v`), not h264: switch to the ffmpeg backend (x264/x265) for a better
 deliverable once ffmpeg is confirmed on the pod; and the pod's worker re-runs the
 SeedVR2 video path with no code change from #1.
 
 The GUI "Video Upscaler" tab (cost estimator/gate + per-video segment progress,
 consuming the `QUEUE`/`VIDEO`/`SEGMENT`/`VRESULT` GUI events the runner emits, plus
 the `cost_confirm_usd` gate) is built; its full UX spec is section 15.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
 ## 15. GUI "Video Upscaler" tab (UX spec)
 
@@ -1275,18 +1322,18 @@ Goal: a user (and often the dev) shouldn't have to learn SeedVR2's knobs. `batch
 `temporal_overlap`, `chunk_size` and `attention_mode` all default to **Auto** and are
 resolved **on the pod**, the only place that knows the card's real VRAM.
 
-- **batch_size (window)** — `pod/worker._auto_batch(out_w, out_h, vram_gb, resident)`
+- **batch_size (window):** `pod/worker._auto_batch(out_w, out_h, vram_gb, resident)`
   inverts a fitted VRAM model `vram ~= out_megapixels * (A + B*batch)` (A=11.69,
   B=0.2746, from measured anchors: PRO 6000 96 GB 4K-4:3 bs5=81 GB; B200 180 GB 4K-16:9
   bs33=172 GB; the 1440p ~75 GB plateau checks out) to the largest 4n+1 that fits
   `vram * 0.80`, capped at 33 (continuity flattens past there; throughput past ~9) and
   floored at 5. Picks ~5 at 4K on 96 GB, ~17 at 4K on a B200, 33 at 1440p on 96 GB.
-- **temporal_overlap** — `_auto_overlap(batch)` = ~1/6 of the window, floored at 6 (seam
+- **temporal_overlap:** `_auto_overlap(batch)` = ~1/6 of the window, floored at 6 (seam
   quality) and capped at 15 (the seam is a local transition, so a bigger window doesn't need
   a bigger blend; batch/6 ran away to 80 at batch 480), clamped below batch (SeedVR2 silently
   resets overlap >= batch to 0).
-- **chunk_size** — ~90 frames rounded to whole batches (RAM-bound, no quality effect).
-- **attention_mode** — `UpscaleEngine._resolve_attention("auto")` reads SeedVR2's
+- **chunk_size:** ~90 frames rounded to whole batches (RAM-bound, no quality effect).
+- **attention_mode:** `UpscaleEngine._resolve_attention("auto")` reads SeedVR2's
   `compatibility.SAGE_ATTN_*_AVAILABLE` / `FLASH_ATTN_*_AVAILABLE` flags and picks the
   fastest installed kernel (sageattn_3 > sageattn_2 > flash_attn_3 > flash_attn_2 >
   sdpa). Applies to the image upscaler too.
@@ -1317,6 +1364,8 @@ Per-target pod grouping for mixed-target queues (15.1); the h264/h265 deliverabl
 not done in v1 (14). Real-time synchronised playback in the comparison window is **no
 longer deferred**: it is built in section 16 (which also adds the segment extractor).
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 16. Segment extraction + real-time playback (0.4.7)
 
 > Status: **BUILT (experimental).** Two children of the Video Upscaler, specified
@@ -1345,7 +1394,7 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > change faults in it (a C-level segfault Python cannot catch, so it kills the app
 > with no log). Observed on `direct3d11` (crash in `dxgi.dll` on resize) AND on
 > `direct3d9` (crash in the GPU driver on pause-after-resize). `gui.video_player`
-> therefore creates the VLC instance with `--vout=wingdi --avcodec-hw=none` — the GDI
+> therefore creates the VLC instance with `--vout=wingdi --avcodec-hw=none`: the GDI
 > vout has NO swapchain (it blits to the window DC, so a resize is just a new blit
 > rect, nothing to mismanage) and decode stays off the GPU. Software is plenty for
 > the modest clips this window compares; stability wins over GPU efficiency here.
@@ -1354,7 +1403,7 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > now stops -> **detaches the HWND** (`set_hwnd(0)`) -> drops media -> releases, the
 > windows **defer `destroy()`** a tick, and App exit calls `teardown_players()` before
 > the root destroy cascades. (Audio is also re-asserted ~300 ms after `play()`, since
-> libVLC only creates the output once playback starts — otherwise there's no sound
+> libVLC only creates the output once playback starts, otherwise there's no sound
 > until the first pause/play.)
 >
 > **External incompatibility (NOT an app bug): GPU-overlay injectors.** RivaTuner
@@ -1395,7 +1444,7 @@ longer deferred**: it is built in section 16 (which also adds the segment extrac
 > **End-of-media handling + modality (playback window).** libVLC leaves a player in
 > the **Ended** state at the end, from which `play()`/`seek()` silently no-op, so the
 > controls looked dead. On end (`VideoPlayer.on_end`, upscaled = clock) both players
-> are `restart()`ed — a fresh `set_media` re-primes them paused at frame 0 (the only
+> are `restart()`ed: a fresh `set_media` re-primes them paused at frame 0 (the only
 > reliable revive; `play()` alone won't restart ended media in libVLC 3.x). The resync
 > loop also stops nudging the source **once it has ended** (a shorter source was being
 > seeked back to the master's time, replaying its last frames). Both compare windows
@@ -1612,6 +1661,8 @@ come from the source dimensions unchanged.
   sources vs the ffmpeg frame-decode; if libVLC seek is coarse, drive the mark
   readout from an ffmpeg frame index at the settled time so the marks stay exact.
 
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
 ## 17. Self-healing remote runs ("Auto-resume", 0.5.0-experimental)
 
 > Status: **BUILT (experimental), video only.** Design & decisions:
@@ -1631,13 +1682,13 @@ active (like Start).
 
 **Failure taxonomy (the crux).** Everything the pod does surfaces to the client as an
 exception, so the healer must tell apart three look-alikes:
-- **bad source** — the worker ran and rejected the segment (unreadable codec, black-output
+- **bad source:** the worker ran and rejected the segment (unreadable codec, black-output
   guard). Now a distinct `remote_video_engine.RemoteVideoWorkerError`; redeploying an
   identical pod would fail identically, so this is NEVER healed. It counts toward the job's
   `fail_count` (item-4 give-up) as usual.
-- **pod/transport loss** — a dropped tunnel, a lost job, connection refused: plain
+- **pod/transport loss:** a dropped tunnel, a lost job, connection refused: plain
   `RemoteVideoError`. This is what the healer recovers.
-- **deliberate stop** — the funds guard stopped the pod (`session._funds_tripped`) or the
+- **deliberate stop:** the funds guard stopped the pod (`session._funds_tripped`) or the
   user pressed Stop (`_STOP`). Looks like a pod loss to the engine; distinguishing it is
   what keeps the healer from redeploying straight back INTO the funds guard.
 
@@ -1668,7 +1719,7 @@ so each pod-pass stays quiet and the supervisor sends ONE accumulated end-of-run
 
 **Wait-for-stock (`_wait_for_gpu_stock`).** Polls `available_gpus` for the exact picked
 card id (`IMGTBX_GPU_OVERRIDE` first entry, else the configured default; region from the
-model volume). **No time cap** — the guardrail is money, and while waiting **no pod runs so
+model volume). **No time cap:** the guardrail is money, and while waiting **no pod runs so
 nothing is billed**; only a user Stop ends the wait. Backoff 30 s -> 300 s (slows retries,
 never stops them, so a flapping stock doesn't thrash cold-start model reloads). Notifies on
 entering the wait and on recovery, so an unattended check-in shows "waiting for <card>,
@@ -1693,3 +1744,5 @@ funds-trip / user-Stop / redeploy-race / first-start-failure paths.
 
 **Scope.** Video only for now (the long, most-exposed run). Generalising the same supervisor
 to the image runners (batch upscale / tag) is the follow-up if it proves out.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
