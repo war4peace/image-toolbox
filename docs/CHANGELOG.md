@@ -8,11 +8,37 @@ Releases page.
 
 ## Contents
 
+- [0.5.4](#054)
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
 
 ---
+
+## 0.5.4
+
+A small cleanup and fix release.
+
+### Fix: the Video Upscaler now shows telemetry on a local run
+Running the Video Upscaler on your **own GPU** (not a rented pod) showed no
+telemetry at all: no CPU / RAM / VRAM / temperature row under the carousel, and
+nothing to click for the usage graph. The row is now there and updates live while
+a local run works, and clicking it opens the same per-run usage graph (0.5.3) the
+other tools have. A remote-pod run is unchanged: it still shows the pod's own row.
+
+### Telemetry graph window polish
+- The graph window now opens at the **same size as the main window** and won't let
+  you shrink it below that, so the four charts always have room.
+- It **remembers its size and position** between openings and across restarts, like
+  the log and comparison windows.
+- The range bar is cleaner: the active range button is now shown in **bold** instead
+  of a separate "Showing: last Xh" caption.
+
+### Documentation
+- The README and every document under `docs/` gained a **Contents** list at the top
+  and "Back to top" links, so the longer ones are easier to navigate on GitHub.
+
+<div align="right"><a href="#changelog">↑ Back to top</a></div>
 
 ## 0.5.3
 
