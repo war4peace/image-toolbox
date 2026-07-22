@@ -47,6 +47,10 @@ Upscaler #2`, `local #7`):
 ---
 
 ## 9. Telemetry usage graphs — Easy-Medium (QoL)
+> **Status: implemented on 0.5.3-experimental** (folds into the shipped legend at
+> release). Design + as-built: `docs/telemetry-design.md`. The plan below is kept
+> as the record.
+
 A pop-up, non-modal, read-only window with time-based graphs (1h / 3h / 6h / 12h
 / 24h ranges) of the telemetry the app already samples: the local machine's
 always-on row, and a remote pod's row during an active run. Opened by clicking
@@ -93,6 +97,11 @@ Recommend NO for v1 (keep it in-memory and honest). One combined dual-axis chart
 vs two stacked? Recommend two stacked (no dual-axis confusion).
 
 ## 10. Home Assistant dashboard samples — Easy-Medium (QoL, docs/samples)
+> **Status: implemented on 0.5.3-experimental** (folds into the shipped legend at
+> release). Delivered as `samples/home-assistant/` (README + `mqtt-sensors.yaml`
+> + `template-sensors.yaml` + `dashboard-core.yaml` + `dashboard-custom.yaml`;
+> screenshots pending a live capture). The plan below is kept as the record.
+
 Ship ready-made Home Assistant **dashboards** (Lovelace YAML) for users who run
 both HA and Image Toolbox, in two tiers: a **simple** one built only from HA's
 **core** Lovelace cards (no HACS, works on any install), and a **richer /
@@ -107,8 +116,8 @@ for nicer graphs and status tiles. All HA material lives in a new
   `last_used`, the `task/*` live group (`name`, `details`, `runtime`, `progress`
   = "X/Y", `eta`, `average_processing_time`, `last_processing_time`), and the
   `system/*` + `system/remote/*` telemetry groups.
-- **Builds on the existing sensor list** `docs/ha-mqtt-sample-sensors.yaml`
-  (linked from the README), which defines the MQTT `sensor:` entries. This idea is
+- **Builds on the existing sensor list** (now `samples/home-assistant/mqtt-sensors.yaml`,
+  moved there from `docs/`), which defines the MQTT `sensor:` entries. This idea is
   the next layer up: Lovelace views arranging those entities (user pastes sensors
   first, then a dashboard).
 - **Two gaps in that sensor file to fix as part of this work:** (1) it is missing
@@ -128,9 +137,9 @@ for nicer graphs and status tiles. All HA material lives in a new
 
 **Recommended contents of `samples/home-assistant/`:**
 1. **`README.md`** (entry point): prerequisites, install order (sensors YAML
-   first, then a dashboard), a short topic reference. **Copy**
-   `ha-mqtt-sample-sensors.yaml` in (keeping the docs link pointing at the new
-   home) so the folder is self-contained, as the coarse idea asked.
+   first, then a dashboard), a short topic reference. The sensor file was **moved**
+   in as `mqtt-sensors.yaml` (not copied, to avoid a drifting duplicate), and all
+   references repointed, so the folder is self-contained.
 2. **`dashboard-core.yaml`** (tier 1, zero HACS): `entities` card (version /
    update / availability / last-run), a `conditional` card revealing a live-task
    panel only while `task/name` != idle, `gauge` cards (CPU / RAM% / VRAM% / GPU

@@ -4,9 +4,10 @@
 > telemetry half of **#10 (Home Assistant dashboard samples)**. Written 2026-07-22.
 > This is the design of record; it becomes the work-order once green-lit.
 >
-> **Status:** Phase A (widen the telemetry model) and Phase B (the matplotlib
-> graph window + per-run history) are **implemented** on 0.5.3-experimental. Phase
-> C (the `samples/home-assistant/` dashboards, #10) is not started.
+> **Status:** Phases A (widen the telemetry model), B (the matplotlib graph
+> window + per-run history) and C (the `samples/home-assistant/` dashboards, #10)
+> are all **implemented** on 0.5.3-experimental. Only the dashboard screenshots
+> remain (a live Home Assistant capture).
 >
 > **Decisions locked (2026-07-22):** add GPU utilization %, power (draw + limit),
 > and core clock to the sampled set; skip fan speed. Keep RAM/VRAM published as
@@ -118,7 +119,8 @@ leaves no stale non-zero reading in HA), matching the existing six.
 
 ### 3.1 Sample-sensor file fixes (part of the foundation)
 
-`docs/ha-mqtt-sample-sensors.yaml` is the single place a user is sent. As part of
+The sample-sensor file (now `samples/home-assistant/mqtt-sensors.yaml`, moved
+there from `docs/` in Phase C) is the single place a user is sent. As part of
 this work, regardless of the dashboards (#10):
 
 1. **Add the four new GPU sensors** (local + remote), with `unit_of_measurement`.
@@ -292,8 +294,9 @@ call during dev; util-in-row is the requirement.
 4. `App._apply_telemetry` / `apply_remote_telemetry` / `clear_remote_telemetry`:
    publish (and zero, for remote) the new topics.
 5. `TelemetryRow.show`: add the banded GPU-util segment.
-6. `docs/ha-mqtt-sample-sensors.yaml`: add the four GPU sensors + `task/progress`
-   + `task/eta`, and fix the `last_run` JSON binding.
+6. the sample-sensor file (`samples/home-assistant/mqtt-sensors.yaml`): add the
+   four GPU sensors + `task/progress` + `task/eta`, and fix the `last_run` JSON
+   binding.
 7. `remote_upscale_engine.telemetry` docstring: update the field list.
 8. Tests: extend the telemetry parse test with `[N/A]` fields and the new columns;
    assert the new MQTT topics publish when present and are absent when `None`.

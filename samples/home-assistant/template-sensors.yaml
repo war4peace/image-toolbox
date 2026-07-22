@@ -1,0 +1,53 @@
+# =====================================================================
+# Image Toolbox - derived percentage sensors (OPTIONAL)
+# =====================================================================
+# The app publishes RAM and VRAM as raw MB (used + total) on purpose, so
+# the gauge cards in dashboard-core.yaml need a percentage to show. These
+# template sensors derive "used / total * 100" for you. CPU and GPU
+# utilization are already published as a percentage, so they need nothing
+# here.
+#
+# Where this goes: your Home Assistant `configuration.yaml` under a
+# top-level `template:` key (or a file you already `!include` there). This
+# is a different integration from the MQTT `sensor:` block in
+# mqtt-sensors.yaml - keep the two separate.
+#
+#   template: !include template-sensors.yaml   # (then paste just the list below)
+#
+# ...or paste the whole `template:` block straight into configuration.yaml.
+# Reload from Developer Tools > YAML > "Template entities" (or restart HA).
+
+template:
+  - sensor:
+      - name: "Image Toolbox VRAM Percent"
+        unique_id: image_toolbox_vram_percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set used = states('sensor.image_toolbox_gpu_vram_used') | float(0) %}
+          {% set total = states('sensor.image_toolbox_gpu_vram_total') | float(0) %}
+          {{ (100 * used / total) | round(0) if total > 0 else 0 }}
+
+      - name: "Image Toolbox RAM Percent"
+        unique_id: image_toolbox_ram_percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set used = states('sensor.image_toolbox_ram_used') | float(0) %}
+          {% set total = states('sensor.image_toolbox_ram_total') | float(0) %}
+          {{ (100 * used / total) | round(0) if total > 0 else 0 }}
+
+      # --- Remote pod (only meaningful during a remote-pod run) ---
+      - name: "Image Toolbox Remote VRAM Percent"
+        unique_id: image_toolbox_remote_vram_percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set used = states('sensor.image_toolbox_remote_gpu_vram_used') | float(0) %}
+          {% set total = states('sensor.image_toolbox_remote_gpu_vram_total') | float(0) %}
+          {{ (100 * used / total) | round(0) if total > 0 else 0 }}
+
+      - name: "Image Toolbox Remote RAM Percent"
+        unique_id: image_toolbox_remote_ram_percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set used = states('sensor.image_toolbox_remote_ram_used') | float(0) %}
+          {% set total = states('sensor.image_toolbox_remote_ram_total') | float(0) %}
+          {{ (100 * used / total) | round(0) if total > 0 else 0 }}
