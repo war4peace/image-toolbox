@@ -2,8 +2,9 @@
 
 Candidate features that are **not yet implemented**, sorted by difficulty
 (easiest first), with a feasibility assessment for each. See "Sequencing &
-dependencies" for the threads that drive ordering, and "Decided against /
-constraints" at the bottom for ideas investigated and dropped.
+dependencies" for the threads that drive ordering. Ideas investigated and
+**dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
+`docs/dropped-ideas.md`.
 
 The remaining open milestones are both lower priority: two that each introduce a new
 process model, networking, or packaging (HTTP interface #3, Unraid #4).
@@ -92,6 +93,16 @@ The user installs and runs the application on their Unraid server.
   Auto-resume supervisor from video to the image runners (batch upscale / tag); and
   #7's deferred Phase 2 — a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class:
   fast, low-VRAM, deterministic) dropping into the same engine seam.
+- **Follow-on from the shipped #8 (not yet scheduled): extend benchmark sharing
+  to the IMAGE tasks.** Today the crowdsourced corpus covers `db.video_bench`
+  only; per-card image throughput (`db.gpu_perf` for batch upscale and tag) is
+  still served solely by the author-maintained `docs/Benchmarks.csv`, so a user
+  picking a remote GPU for an image run gets the author's numbers or nothing.
+  The transport, CSV format, local-precedence import and maintainer merge tool
+  are all reusable as-is; the work is deciding the shared row's identity for a
+  task whose unit is an image, not a (target x compile x tile) cell, and keeping
+  it out of the accumulating `gpu_perf` store on import (see
+  `docs/dropped-ideas.md`). See `docs/benchmark-sharing.md`.
 - **Architectural watch-item:** the app is dependency-light and Windows-only. #3
   and #4 each push toward extra packages, a long-running server, and
   cross-platform support, so adopt those deliberately.
@@ -100,39 +111,7 @@ The user installs and runs the application on their Unraid server.
 
 ## Decided against / constraints
 
-- **Pause for the Video Upscaler — decided against 2026-07-21.** Pause exists so the
-  user can reclaim the GPU without losing the queue, and it can only act at a safe
-  boundary. For stills that boundary is the gap between images (seconds); for video it
-  is the gap between segments (minutes to hours), so the button would not act when
-  pressed, and acting mid-segment means discarding partial work or building
-  frame-level checkpointing. Even a two-second clip is ~50 frames. Stop already covers
-  the need: a stopped run resumes at the first unfinished **segment** (`db.py`
-  `video_*` tables), which is the same machinery the per-run minute/cost cap uses.
-  Consequence: "a pause frees every resident model" (0.5.2) applies to the Batch
-  Upscaler and Tag & Rename; the Video Upscaler has no pause at all.
-- **Region pre-seed at first-run bootstrap — dropped.** The idea was to ask the
-  user's region during install and pre-seed `data_center_ids`. After repeatedly
-  checking the live list, there are so few regions/data centers that auto-detecting
-  one adds little: the Settings Region/DC picker already lets the user pick
-  directly, which is clearer than guessing for them.
-- **AMD GPUs (ROCm) — not supported, filtered out.** The pipeline is CUDA-only
-  (PyTorch CUDA build, SeedVR2, the orientation CNN, `nvidia-smi` telemetry), so an
-  AMD card can't run any task. RunPod occasionally lists AMD Instinct cards (e.g.
-  the MI300X in EU-RO-1, sometimes *cheaper* than comparable NVIDIA), so
-  `available_gpus` drops them at the source via `is_amd_gpu` (0.4.0) rather than
-  letting a user pick one that fails at run time. A ROCm port would be a separate,
-  large effort and is not planned.
-- **vast.ai as a second provider — investigated 2026-06-23, not pursued.** The
-  goal was provider choice (price/availability/region) behind a thin interface.
-  Two billing dimensions RunPod doesn't charge make vast.ai a poor fit for this
-  app's stream-one-image-at-a-time, disposable-pod design: **storage** is
-  ~$0.33–0.40/GB/mo (RunPod $0.07), and **bandwidth is metered both ways** at
-  ~$40/TB (RunPod free) — directly taxing the upload-every-image / download-every-
-  result flow. It also has **no region-wide network volume** (host-local only),
-  which defeats the availability gain that motivated the look. Reusable finding:
-  the worker, streaming engine, dead-man's switch, and local queue/watchdog are
-  provider-agnostic; a port would be a provider seam (`RunPodProvider` +
-  `VastProvider`) plus a GUI selector, the GUI being the largest lift. Vet any
-  future provider against this checklist before writing code: (a) free/cheap
-  ingress+egress, (b) cheap region-wide persistent storage that mounts on
-  disposable instances, (c) reliable SSH with key injection.
+Moved to **`docs/dropped-ideas.md`**: the Video Upscaler pause, the region
+pre-seed, coarse idea #2 (deferred local-engine install), coarse idea #3
+(parallel jobs), coarse idea #4's automatic-telemetry half, and the standing
+constraints (AMD/ROCm, vast.ai as a second provider).

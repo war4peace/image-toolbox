@@ -598,8 +598,9 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `future-features.md` (roadmap: open milestones #3/#4 + the "decided
-  against" record; shipped #1/#2/#5/#6/#7/#8 kept only as a numbering legend),
+- `docs/` — `future-features.md` (roadmap: open milestones #3/#4; shipped
+  #1/#2/#5/#6/#7/#8 kept only as a numbering legend), `dropped-ideas.md` (ideas
+  investigated and decided against + the standing constraints: AMD/ROCm, vast.ai),
   `runpod-notes.md` (remote-pod upscaling notes), `video-upscaler.md` /
   `local-video-upscaler.md` (design + as-built notes for the Video Upscaler: remote #2
   and the local GPU path #7), `benchmark-sharing.md` (as-built notes for the
