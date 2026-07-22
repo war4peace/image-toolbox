@@ -22,11 +22,10 @@ Design (docs/telemetry-design.md section 4):
 import tkinter as tk
 from tkinter import ttk
 
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure                       # noqa: E402
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
-import matplotlib.ticker as mticker                        # noqa: E402
+# matplotlib is imported LAZILY, inside __init__ (see below) — NOT at module top.
+# The module must import cleanly without matplotlib so the import-smoke test (and a
+# Remote-only install before its bootstrap adds matplotlib) never fails just to
+# reach the App's lazy, guarded open path. Only actually opening a graph needs it.
 
 from gui.common import _geometry_on_screen, save_settings
 import system_telemetry as st
@@ -46,6 +45,18 @@ def _pct(used, total):
 
 class TelemetryGraphWindow(tk.Toplevel):
     def __init__(self, master, app, source, title):
+        # Import matplotlib HERE, before the Toplevel is created: if it is absent
+        # this raises cleanly (App.open_telemetry_graph catches it and shows a
+        # hint) with no half-built window left behind.
+        import matplotlib
+        matplotlib.use("TkAgg")
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        import matplotlib.ticker as mticker
+        self._Figure = Figure
+        self._FigureCanvasTkAgg = FigureCanvasTkAgg
+        self._mticker = mticker
+
         super().__init__(master)
         self._app = app
         self._source = source
@@ -84,8 +95,8 @@ class TelemetryGraphWindow(tk.Toplevel):
         self._read.pack(side="right")
 
         # ── figure: four stacked subplots ────────────────────────────────────
-        self._fig = Figure(figsize=(9, 7), dpi=100)
-        self._canvas = FigureCanvasTkAgg(self._fig, master=self)
+        self._fig = self._Figure(figsize=(9, 7), dpi=100)
+        self._canvas = self._FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(fill="both", expand=True,
                                           padx=10, pady=(0, 10))
         self._build_axes()
@@ -165,7 +176,7 @@ class TelemetryGraphWindow(tk.Toplevel):
             self._markers.append(series_markers)
             self._vlines.append(vline)
         self._axes[-1].xaxis.set_major_formatter(
-            mticker.FuncFormatter(self._fmt_x))
+            self._mticker.FuncFormatter(self._fmt_x))
         self._fig.subplots_adjust(left=0.07, right=0.985, top=0.99, bottom=0.05,
                                   hspace=0.14)
 

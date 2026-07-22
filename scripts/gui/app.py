@@ -971,8 +971,15 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._tel_windows.pop(source, None)
+        title = self._tel_titles.get(source,
+                                     "System telemetry — local"
+                                     if source == "local" else "Remote pod")
+        # Import AND construct inside the guard: telemetry_graph imports cleanly
+        # without matplotlib, but the window needs it (imported in __init__), so a
+        # missing-matplotlib install fails here, not at module import.
         try:
             from gui.telemetry_graph import TelemetryGraphWindow
+            win = TelemetryGraphWindow(self, self, source, title)
         except Exception as exc:
             from tkinter import messagebox
             messagebox.showinfo(
@@ -981,10 +988,6 @@ class App(tk.Tk):
                 "app's environment.\n\nThe live readout row and Home Assistant "
                 "topics work without it.\n\n(" + str(exc) + ")")
             return
-        title = self._tel_titles.get(source,
-                                     "System telemetry — local"
-                                     if source == "local" else "Remote pod")
-        win = TelemetryGraphWindow(self, self, source, title)
         self._tel_windows[source] = win
 
     def forget_telemetry_graph(self, source):
