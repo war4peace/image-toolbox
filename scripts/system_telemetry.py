@@ -259,19 +259,32 @@ class TelemetryHistory:
         """The most recent sample dict, or None if nothing recorded yet."""
         return self._samples[-1][1] if self._samples else None
 
+    def anchor_ts(self):
+        """The timeline origin for the graph: the FIRST recorded sample, not the
+        moment the run was started. A batch's start includes a long
+        eligibility/scan phase that does no GPU work and emits no samples, so
+        anchoring to run-start would leave the graph blank for minutes; anchoring
+        to the first sample makes the plot begin when the first image/video is
+        actually processed. Falls back to start_ts before any sample exists."""
+        if self._samples:
+            return self._samples[0][0]
+        return self._start_ts
+
     def runtime(self):
-        """Elapsed run time in seconds (first sample to last), 0 if <1 sample."""
-        if not self._samples or self._start_ts is None:
+        """Elapsed run time in seconds (first sample to last), 0 if <2 samples.
+        Measured from the first SAMPLE (see anchor_ts), so the range buttons
+        enable on how much data exists, not on time spent pre-scanning."""
+        if len(self._samples) < 2:
             return 0.0
-        return max(0.0, self._samples[-1][0] - self._start_ts)
+        return max(0.0, self._samples[-1][0] - self._samples[0][0])
 
     def bounds(self):
-        """(t0, t1) wall-clock span of the run for the whole-run view."""
+        """(t0, t1) wall-clock span for the whole-run view: first sample to last
+        (no leading dead space from the pre-scan phase)."""
         if not self._samples:
             base = self._start_ts or 0.0
             return base, base
-        t0 = self._start_ts if self._start_ts is not None else self._samples[0][0]
-        return t0, self._samples[-1][0]
+        return self._samples[0][0], self._samples[-1][0]
 
     def enabled_spans(self):
         """Which range buttons are live now (runtime >= span), as (label, secs)."""

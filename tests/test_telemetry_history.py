@@ -58,6 +58,21 @@ def test_runtime_and_enabled_spans():
     assert all(lbl in dict(HISTORY_SPANS) for lbl, _ in h.enabled_spans())
 
 
+def test_anchor_skips_prescan_dead_time():
+    # A batch's start includes minutes of eligibility scanning that emit no
+    # samples; the graph timeline must begin at the FIRST sample, not run start,
+    # so there is no leading blank stretch.
+    h = TelemetryHistory()
+    h.start(1000)                       # Start pressed at t=1000
+    assert h.anchor_ts() == 1000        # no samples yet -> falls back to start
+    h.append(1500, _sample())           # first image processed 500 s later
+    h.append(1500 + 3600, _sample())    # then an hour of data
+    assert h.anchor_ts() == 1500
+    assert h.bounds() == (1500, 5100)   # no dead space from 1000..1500
+    assert h.runtime() == 3600          # measured from first sample, not t=1000
+    assert dict(h.enabled_spans()).keys() == {"1h"}   # exactly 1h of DATA
+
+
 def test_series_plain_field_and_bounds():
     h = TelemetryHistory()
     h.start(0)

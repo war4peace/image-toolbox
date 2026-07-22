@@ -162,6 +162,12 @@ remote, which the earlier draft split.
 - **Destroyed on app close:** it is in-memory only, so nothing survives a restart.
 - Because history is bounded by run length, the old "24 h only fills after 24 h of
   uptime" caveat is gone: the graph's span is exactly the run's elapsed time.
+- **Timeline anchors to the first sample, not run-start** (`TelemetryHistory.
+  anchor_ts`). A batch's start includes a long eligibility/scan phase that does no
+  GPU work and emits no telemetry; anchoring to run-start would leave the graph
+  blank for those minutes. So `bounds()` (the whole-run x-axis), `runtime()` (which
+  drives the range-button enablement) and the "started HH:MM" header all begin at
+  the first recorded sample, i.e. when the first image/video is actually processed.
 
 ### 4.1 `TelemetryHistory` (new, pure, unit-testable)
 

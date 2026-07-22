@@ -175,7 +175,7 @@ class TelemetryGraphWindow(tk.Toplevel):
 
     def _fmt_x(self, x, _pos):
         h = self._history()
-        base = (h.start_ts if h and h.start_ts is not None else 0)
+        base = (h.anchor_ts() if h and h.anchor_ts() is not None else 0)
         return f"{(x - base) / 60:.0f}m"
 
     def _refresh(self):
@@ -229,7 +229,7 @@ class TelemetryGraphWindow(tk.Toplevel):
 
         self._update_range_bar(h)
         state = "live" if h.is_live else "sealed"
-        started = self._fmt_clock(h.start_ts)
+        started = self._fmt_clock(h.anchor_ts())    # when the first sample landed
         self._head_var.set(f"{self.title()}  ·  {state}  ·  started {started}")
         self._canvas.draw()
 
@@ -305,7 +305,7 @@ class TelemetryGraphWindow(tk.Toplevel):
         return raw[i][1], raw[i][0]
 
     def _readout(self, s, tt, h):
-        base = h.start_ts if h.start_ts is not None else tt
+        base = h.anchor_ts() if h.anchor_ts() is not None else tt
         def g(k):
             v = s.get(k)
             return "—" if v is None else v
