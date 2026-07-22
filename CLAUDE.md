@@ -374,18 +374,43 @@ a "Publish now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`);
 the import is lazy so older venvs still launch. See `mqtt_publisher.py`.
 
 **System telemetry** (Feature #3a) — a compact, read-only status row below the
-image carousel on each tool tab showing **CPU usage, RAM, GPU VRAM and GPU
-temperature**, also published to MQTT as retained `image-toolbox/system/*`
-topics (`cpu`, `ram`, `ram_total`, `gpu_vram`, `gpu_vram_total`, `gpu_temp`). The
-percentage readouts are colour-banded by load (blue ≤25 % · green ≤65 % · dark
-yellow ≤85 % · red >85 %). Dependency-light: CPU via Windows `GetSystemTimes` and
-RAM via `GlobalMemoryStatusEx` (both `ctypes`, no psutil), GPU from `nvidia-smi`
-(no pynvml). Cadence: during upscaling, 5 s after each image starts
-(past the load/ramp, avoiding the dip between images); every 30 s during Tag &
-Rename and Conciliation; and every 60 s while **idle** (so the user can watch
-VRAM free up before starting a run). The idle sampler steps aside whenever a task
-is running. Samples run off the UI thread (a lock prevents overlapping
-`nvidia-smi` calls). See `system_telemetry.py`.
+image carousel on each tool tab showing **CPU usage, RAM, GPU VRAM, GPU
+temperature**, and (0.5.3) **GPU core utilization**, also published to MQTT as
+retained `image-toolbox/system/*` topics (`cpu`, `ram`, `ram_total`, `gpu_vram`,
+`gpu_vram_total`, `gpu_temp`, plus 0.5.3's `gpu_util`, `gpu_power`,
+`gpu_power_limit`, `gpu_clock` — power draw + limit and core clock ride the same
+one `nvidia-smi` call, per-field parsed so a card that reports `[N/A]` for a field
+drops only that field). The percentage readouts are colour-banded by load (blue
+≤25 % · green ≤65 % · dark yellow ≤85 % · red >85 %). Dependency-light: CPU via
+Windows `GetSystemTimes` and RAM via `GlobalMemoryStatusEx` (both `ctypes`, no
+psutil), GPU from `nvidia-smi` (no pynvml). Cadence: during upscaling, 5 s after
+each image starts (past the load/ramp, avoiding the dip between images); every
+30 s during Tag & Rename and Conciliation; and every 60 s while **idle** (so the
+user can watch VRAM free up before starting a run). The idle sampler steps aside
+whenever a task is running. Samples run off the UI thread (a lock prevents
+overlapping `nvidia-smi` calls). See `system_telemetry.py`.
+
+**Telemetry usage graphs** (0.5.3, feature #9) — clicking a telemetry row opens a
+floating, per-run **usage-graph window** (`gui/telemetry_graph.py`, one shared
+instance per source: the local machine, or a tab's remote pod). Four vertically
+stacked **matplotlib** charts (embedded via `FigureCanvasTkAgg`) plot the run's
+GPU/CPU load, memory (% of capacity), power and temperature over time, with a
+blitted crosshair readout that stays smooth on hover. The axes are **pinned to
+hardware capacity** (RAM/VRAM total, power limit; temp 0-100 °C), never autoscaled,
+so a run at the wall reads as *at the top of the chart*. The graph is **per-run**:
+its buffer (`system_telemetry.TelemetryHistory`) records only between a run's start
+and end (the continuous idle sampler feeds only the row, never a graph), the
+timeline anchors to the **first processed image/video** (not the pre-scan phase, so
+there is no leading dead space), and on run end it **freezes but stays browsable**
+(resets on the next run, dies with the app). A per-window-**global** range bar
+(1h/3h/6h/12h/24h) enables each button only once the run's runtime passes it, and
+toggles the whole window between the last-N view and the whole run. matplotlib is a
+deliberate, **lazy + fail-safe** GUI dependency (already present on Local/Both via
+seedvr2; added to the Remote-only bootstrap): absent, only the graph is
+unavailable, never the row or MQTT. Ready-made **Home Assistant dashboards** (#10)
+that render the same MQTT telemetry live in `samples/home-assistant/` (a no-HACS
+core dashboard + a Mushroom/ApexCharts one, plus the MQTT + derived-% sensor YAML).
+See `docs/telemetry-design.md`.
 
 **Updates** (0.2.3) — in-app update check against the GitHub Releases API.
 Checks on startup (opt-out) and on demand from Settings; when a newer release

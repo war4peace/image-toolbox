@@ -6,6 +6,39 @@ working draft those notes are distilled from, and it records **experimental**,
 in-development versions before they are tagged. For released versions, see the GitHub
 Releases page.
 
+## 0.5.3
+
+### See what a run is doing to your machine: live telemetry graphs
+The little telemetry row under the image carousel (CPU / RAM / VRAM / GPU) has
+grown up. **Click any telemetry row** and a graph window opens, plotting the whole
+run over time.
+
+- **Four graphs:** GPU and CPU load, memory (VRAM and RAM against how much your
+  card/PC actually has), GPU power, and GPU temperature. Move the mouse across them
+  for an exact readout at that moment.
+- **Honest scale:** the memory and power graphs are pinned to your hardware's real
+  limits, so a run that fills the card sits right at the top of the chart, not
+  rescaled to look half-empty.
+- **Starts when work starts:** the graph begins at the first image or video
+  actually processed, so the long "scanning your folders" phase at the start does
+  not show as empty space.
+- **Range buttons** (1h / 3h / 6h / …) let you zoom into the most recent stretch of
+  a long run; they light up as the run gets long enough. When a run ends the graph
+  freezes so you can still review it.
+- Works for both a **local** run and a **remote pod** run (click the matching row).
+
+### More detail in the telemetry
+The row and the graphs now also show **GPU utilization** (how hard the card is
+actually working, not just how full its memory is), plus **power draw** and **core
+clock**. These also go out over MQTT for Home Assistant.
+
+### Ready-made Home Assistant dashboards
+If you use Home Assistant, there are now **paste-in dashboards** under
+`samples/home-assistant/`: a simple one that works on any install with no add-ons,
+and a fancier one using popular HACS cards. Each pastes into a single dashboard
+card (no risky whole-dashboard editing). Screenshots and a step-by-step README are
+included.
+
 ## 0.5.2
 
 ### Pause now frees your graphics card
