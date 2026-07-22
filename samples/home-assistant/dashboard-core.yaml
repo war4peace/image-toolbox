@@ -1,16 +1,18 @@
 # =====================================================================
-# Image Toolbox - CORE dashboard (no HACS, works on any Home Assistant)
+# Image Toolbox - CORE dashboard card (no HACS, works on any Home Assistant)
 # =====================================================================
 # Built only from Home Assistant's built-in Lovelace cards, so it works on
 # a stock install with nothing extra to download.
 #
-# HOW TO USE
-#   1. First add the entities: paste mqtt-sensors.yaml (MQTT sensors) and
+# This is ONE card (a vertical stack of sub-cards), meant to be pasted into
+# a single card's code editor - NOT the whole-dashboard raw editor (which is
+# risky). Steps:
+#   1. Add the entities first: paste mqtt-sensors.yaml (MQTT sensors) and
 #      template-sensors.yaml (the RAM%/VRAM% used by the gauges) into your
-#      configuration, and reload/restart HA.
-#   2. Open any dashboard, top-right menu > Edit dashboard > (three dots)
-#      Raw configuration editor, and paste the `views:` block below. Or copy
-#      individual cards into an existing view.
+#      configuration, then reload/restart Home Assistant.
+#   2. Edit your dashboard > "+ ADD SECTION" > add any card (e.g. a Heading).
+#   3. On that card, click "Show code editor", select all, and paste
+#      EVERYTHING below (from `type: vertical-stack` to the end).
 #
 # The live-task panel and the remote-pod panel reveal themselves only while
 # a run (local, or remote-pod) is active, using core `conditional` cards.
@@ -18,163 +20,160 @@
 # sample); remote/* exists only during a remote-pod run and goes stale after
 # it, so gaps in the history graphs are normal.
 
-views:
-  - title: Image Toolbox
-    path: image-toolbox
-    icon: mdi:image-multiple
+type: vertical-stack
+cards:
+  # ---- app status -------------------------------------------------
+  - type: entities
+    title: Image Toolbox
+    show_header_toggle: false
+    entities:
+      - entity: sensor.image_toolbox_availability
+        name: App
+      - entity: sensor.image_toolbox_version
+        name: Version
+      - entity: sensor.image_toolbox_update_available
+        name: Update available
+      - entity: sensor.image_toolbox_latest_version
+        name: Latest version
+      - entity: sensor.image_toolbox_last_run_summary
+        name: Last run
+      - entity: sensor.image_toolbox_last_exit_timestamp
+        name: Last used
+
+  # ---- live task (only while a task is running) -------------------
+  - type: conditional
+    conditions:
+      - entity: sensor.image_toolbox_task_name
+        state_not: idle
+      - entity: sensor.image_toolbox_task_name
+        state_not: unavailable
+    card:
+      type: entities
+      title: Current task
+      show_header_toggle: false
+      entities:
+        - entity: sensor.image_toolbox_task_name
+          name: Task
+        - entity: sensor.image_toolbox_task_details
+          name: Phase
+        - entity: sensor.image_toolbox_task_progress
+          name: Progress
+        - entity: sensor.image_toolbox_task_eta
+          name: ETA
+        - entity: sensor.image_toolbox_task_runtime
+          name: Runtime
+        - entity: sensor.image_toolbox_average_processing_time
+          name: Avg per item
+        - entity: sensor.image_toolbox_last_processing_time
+          name: Last item
+
+  # ---- local machine gauges --------------------------------------
+  - type: grid
+    columns: 3
+    square: false
     cards:
-      # ---- app status -------------------------------------------------
-      - type: entities
-        title: Image Toolbox
-        show_header_toggle: false
-        entities:
-          - entity: sensor.image_toolbox_availability
-            name: App
-          - entity: sensor.image_toolbox_version
-            name: Version
-          - entity: sensor.image_toolbox_update_available
-            name: Update available
-          - entity: sensor.image_toolbox_latest_version
-            name: Latest version
-          - entity: sensor.image_toolbox_last_run_summary
-            name: Last run
-          - entity: sensor.image_toolbox_last_exit_timestamp
-            name: Last used
+      - type: gauge
+        name: CPU
+        entity: sensor.image_toolbox_cpu_usage
+        min: 0
+        max: 100
+        needle: true
+        severity: {green: 0, yellow: 70, red: 85}
+      - type: gauge
+        name: GPU util
+        entity: sensor.image_toolbox_gpu_utilization
+        min: 0
+        max: 100
+        needle: true
+        severity: {green: 0, yellow: 70, red: 85}
+      - type: gauge
+        name: GPU temp
+        entity: sensor.image_toolbox_gpu_temperature
+        min: 0
+        max: 100
+        needle: true
+        severity: {green: 0, yellow: 70, red: 85}
+      - type: gauge
+        name: VRAM
+        entity: sensor.image_toolbox_vram_percent
+        min: 0
+        max: 100
+        needle: true
+        severity: {green: 0, yellow: 75, red: 90}
+      - type: gauge
+        name: RAM
+        entity: sensor.image_toolbox_ram_percent
+        min: 0
+        max: 100
+        needle: true
+        severity: {green: 0, yellow: 75, red: 90}
+      - type: gauge
+        name: GPU power
+        entity: sensor.image_toolbox_gpu_power_draw
+        min: 0
+        max: 450
+        needle: true
 
-      # ---- live task (only while a task is running) -------------------
-      - type: conditional
-        conditions:
-          - entity: sensor.image_toolbox_task_name
-            state_not: idle
-          - entity: sensor.image_toolbox_task_name
-            state_not: unavailable
-        card:
-          type: entities
-          title: Current task
-          show_header_toggle: false
-          entities:
-            - entity: sensor.image_toolbox_task_name
-              name: Task
-            - entity: sensor.image_toolbox_task_details
-              name: Phase
-            - entity: sensor.image_toolbox_task_progress
-              name: Progress
-            - entity: sensor.image_toolbox_task_eta
-              name: ETA
-            - entity: sensor.image_toolbox_task_runtime
-              name: Runtime
-            - entity: sensor.image_toolbox_average_processing_time
-              name: Avg per item
-            - entity: sensor.image_toolbox_last_processing_time
-              name: Last item
+  # ---- local telemetry trend -------------------------------------
+  - type: history-graph
+    title: Local telemetry (last hour)
+    hours_to_show: 1
+    refresh_interval: 10
+    entities:
+      - entity: sensor.image_toolbox_gpu_utilization
+        name: GPU util
+      - entity: sensor.image_toolbox_cpu_usage
+        name: CPU
+      - entity: sensor.image_toolbox_vram_percent
+        name: VRAM
+      - entity: sensor.image_toolbox_gpu_temperature
+        name: GPU temp
 
-      # ---- local machine gauges --------------------------------------
-      - type: grid
-        columns: 3
-        square: false
-        cards:
-          - type: gauge
-            name: CPU
-            entity: sensor.image_toolbox_cpu_usage
-            min: 0
-            max: 100
-            needle: true
-            severity: {green: 0, yellow: 70, red: 85}
-          - type: gauge
-            name: GPU util
-            entity: sensor.image_toolbox_gpu_utilization
-            min: 0
-            max: 100
-            needle: true
-            severity: {green: 0, yellow: 70, red: 85}
-          - type: gauge
-            name: GPU temp
-            entity: sensor.image_toolbox_gpu_temperature
-            min: 0
-            max: 100
-            needle: true
-            severity: {green: 0, yellow: 70, red: 85}
-          - type: gauge
-            name: VRAM
-            entity: sensor.image_toolbox_vram_percent
-            min: 0
-            max: 100
-            needle: true
-            severity: {green: 0, yellow: 75, red: 90}
-          - type: gauge
-            name: RAM
-            entity: sensor.image_toolbox_ram_percent
-            min: 0
-            max: 100
-            needle: true
-            severity: {green: 0, yellow: 75, red: 90}
-          - type: gauge
-            name: GPU power
-            entity: sensor.image_toolbox_gpu_power_draw
-            min: 0
-            max: 450
-            needle: true
-
-      # ---- local telemetry trend -------------------------------------
-      - type: history-graph
-        title: Local telemetry (last hour)
-        hours_to_show: 1
-        refresh_interval: 10
-        entities:
-          - entity: sensor.image_toolbox_gpu_utilization
-            name: GPU util
-          - entity: sensor.image_toolbox_cpu_usage
-            name: CPU
-          - entity: sensor.image_toolbox_vram_percent
-            name: VRAM
-          - entity: sensor.image_toolbox_gpu_temperature
-            name: GPU temp
-
-      # ---- remote pod (only during a remote-pod run) -----------------
-      - type: conditional
-        conditions:
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: "0"
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: unavailable
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: unknown
-        card:
-          type: vertical-stack
+  # ---- remote pod (only during a remote-pod run) -----------------
+  - type: conditional
+    conditions:
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: "0"
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: unavailable
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: unknown
+    card:
+      type: vertical-stack
+      cards:
+        - type: grid
+          columns: 3
+          square: false
           cards:
-            - type: grid
-              columns: 3
-              square: false
-              cards:
-                - type: gauge
-                  name: Pod GPU util
-                  entity: sensor.image_toolbox_remote_gpu_utilization
-                  min: 0
-                  max: 100
-                  needle: true
-                  severity: {green: 0, yellow: 70, red: 85}
-                - type: gauge
-                  name: Pod GPU temp
-                  entity: sensor.image_toolbox_remote_gpu_temperature
-                  min: 0
-                  max: 100
-                  needle: true
-                  severity: {green: 0, yellow: 70, red: 85}
-                - type: gauge
-                  name: Pod VRAM
-                  entity: sensor.image_toolbox_remote_vram_percent
-                  min: 0
-                  max: 100
-                  needle: true
-                  severity: {green: 0, yellow: 75, red: 90}
-            - type: history-graph
-              title: Remote pod telemetry (last hour)
-              hours_to_show: 1
-              refresh_interval: 10
-              entities:
-                - entity: sensor.image_toolbox_remote_gpu_utilization
-                  name: Pod GPU util
-                - entity: sensor.image_toolbox_remote_vram_percent
-                  name: Pod VRAM
-                - entity: sensor.image_toolbox_remote_gpu_temperature
-                  name: Pod GPU temp
+            - type: gauge
+              name: Pod GPU util
+              entity: sensor.image_toolbox_remote_gpu_utilization
+              min: 0
+              max: 100
+              needle: true
+              severity: {green: 0, yellow: 70, red: 85}
+            - type: gauge
+              name: Pod GPU temp
+              entity: sensor.image_toolbox_remote_gpu_temperature
+              min: 0
+              max: 100
+              needle: true
+              severity: {green: 0, yellow: 70, red: 85}
+            - type: gauge
+              name: Pod VRAM
+              entity: sensor.image_toolbox_remote_vram_percent
+              min: 0
+              max: 100
+              needle: true
+              severity: {green: 0, yellow: 75, red: 90}
+        - type: history-graph
+          title: Remote pod telemetry (last hour)
+          hours_to_show: 1
+          refresh_interval: 10
+          entities:
+            - entity: sensor.image_toolbox_remote_gpu_utilization
+              name: Pod GPU util
+            - entity: sensor.image_toolbox_remote_vram_percent
+              name: Pod VRAM
+            - entity: sensor.image_toolbox_remote_gpu_temperature
+              name: Pod GPU temp

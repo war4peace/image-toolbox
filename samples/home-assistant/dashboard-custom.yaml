@@ -1,5 +1,5 @@
 # =====================================================================
-# Image Toolbox - CUSTOM dashboard (HACS eye-candy tier)
+# Image Toolbox - CUSTOM dashboard card (HACS eye-candy tier)
 # =====================================================================
 # Same information as dashboard-core.yaml, rendered with named HACS custom
 # cards for a nicer status header, band-coloured metric tiles and real
@@ -13,178 +13,181 @@
 # A minimal set is Mushroom + ApexCharts (the tiles + graphs). card-mod and
 # auto-entities are only used by the optional extras noted inline.
 #
-# HOW TO USE: add the entities first (mqtt-sensors.yaml + template-sensors.yaml),
-# then paste the `views:` block below into the Raw configuration editor.
+# This is ONE card (a vertical stack of sub-cards), pasted into a single
+# card's code editor - NOT the whole-dashboard raw editor. Steps:
+#   1. Add the entities first (mqtt-sensors.yaml + template-sensors.yaml) and
+#      install the HACS cards above.
+#   2. Edit your dashboard > "+ ADD SECTION" > add any card (e.g. a Heading).
+#   3. On that card, click "Show code editor", select all, and paste
+#      EVERYTHING below (from `type: vertical-stack` to the end).
+#
 # The metric tiles are coloured to match the app's own bands:
 #   blue <=25  |  green <=65/75  |  orange <=85/90  |  red above.
 
-views:
-  - title: Image Toolbox
-    path: image-toolbox-plus
-    icon: mdi:image-multiple
+type: vertical-stack
+cards:
+  # ---- status chips header ---------------------------------------
+  - type: custom:mushroom-chips-card
+    chips:
+      - type: template
+        entity: sensor.image_toolbox_task_name
+        icon: >-
+          {{ 'mdi:cog' if states('sensor.image_toolbox_task_name') != 'idle'
+             else 'mdi:sleep' }}
+        icon_color: >-
+          {{ 'green' if states('sensor.image_toolbox_task_name') != 'idle'
+             else 'grey' }}
+        content: "{{ states('sensor.image_toolbox_task_name') | title }}"
+      - type: template
+        entity: sensor.image_toolbox_gpu_temperature
+        icon: mdi:thermometer
+        icon_color: >-
+          {% set t = states('sensor.image_toolbox_gpu_temperature') | float(0) %}
+          {{ 'red' if t > 85 else 'orange' if t > 70 else 'green' }}
+        content: "{{ states('sensor.image_toolbox_gpu_temperature') }}°C"
+      - type: template
+        entity: sensor.image_toolbox_update_available
+        icon: mdi:package-up
+        content: "{{ states('sensor.image_toolbox_version') }}"
+      - type: entity
+        entity: sensor.image_toolbox_availability
+
+  # ---- live task (only while a task is running) ------------------
+  - type: conditional
+    conditions:
+      - entity: sensor.image_toolbox_task_name
+        state_not: idle
+      - entity: sensor.image_toolbox_task_name
+        state_not: unavailable
+    card:
+      type: custom:mushroom-template-card
+      primary: "{{ states('sensor.image_toolbox_task_name') | title }}"
+      secondary: >-
+        {{ states('sensor.image_toolbox_task_details') }} -
+        {{ states('sensor.image_toolbox_task_progress') }} -
+        ETA {{ states('sensor.image_toolbox_task_eta') }}
+      icon: mdi:cog-play
+      icon_color: green
+
+  # ---- band-coloured metric tiles --------------------------------
+  - type: grid
+    columns: 3
+    square: false
     cards:
-      # ---- status chips header ---------------------------------------
-      - type: custom:mushroom-chips-card
-        chips:
-          - type: template
-            entity: sensor.image_toolbox_task_name
-            icon: >-
-              {{ 'mdi:cog' if states('sensor.image_toolbox_task_name') != 'idle'
-                 else 'mdi:sleep' }}
-            icon_color: >-
-              {{ 'green' if states('sensor.image_toolbox_task_name') != 'idle'
-                 else 'grey' }}
-            content: "{{ states('sensor.image_toolbox_task_name') | title }}"
-          - type: template
-            entity: sensor.image_toolbox_gpu_temperature
-            icon: mdi:thermometer
-            icon_color: >-
-              {% set t = states('sensor.image_toolbox_gpu_temperature') | float(0) %}
-              {{ 'red' if t > 85 else 'orange' if t > 70 else 'green' }}
-            content: "{{ states('sensor.image_toolbox_gpu_temperature') }}°C"
-          - type: template
-            entity: sensor.image_toolbox_update_available
-            icon: mdi:package-up
-            content: "{{ states('sensor.image_toolbox_version') }}"
-          - type: entity
-            entity: sensor.image_toolbox_availability
+      - type: custom:mushroom-template-card
+        primary: CPU
+        secondary: "{{ states('sensor.image_toolbox_cpu_usage') }}%"
+        icon: mdi:cpu-64-bit
+        icon_color: >-
+          {% set v = states('sensor.image_toolbox_cpu_usage') | float(0) %}
+          {{ 'red' if v > 85 else 'orange' if v > 65 else 'green' if v > 25 else 'blue' }}
+      - type: custom:mushroom-template-card
+        primary: GPU util
+        secondary: "{{ states('sensor.image_toolbox_gpu_utilization') }}%"
+        icon: mdi:expansion-card
+        icon_color: >-
+          {% set v = states('sensor.image_toolbox_gpu_utilization') | float(0) %}
+          {{ 'red' if v > 85 else 'orange' if v > 65 else 'green' if v > 25 else 'blue' }}
+      - type: custom:mushroom-template-card
+        primary: VRAM
+        secondary: >-
+          {{ states('sensor.image_toolbox_vram_percent') }}%
+          ({{ (states('sensor.image_toolbox_gpu_vram_used') | float(0) / 1024) | round(1) }} GB)
+        icon: mdi:memory
+        icon_color: >-
+          {% set v = states('sensor.image_toolbox_vram_percent') | float(0) %}
+          {{ 'red' if v > 90 else 'orange' if v > 75 else 'green' if v > 25 else 'blue' }}
+      - type: custom:mushroom-template-card
+        primary: RAM
+        secondary: >-
+          {{ states('sensor.image_toolbox_ram_percent') }}%
+          ({{ (states('sensor.image_toolbox_ram_used') | float(0) / 1024) | round(1) }} GB)
+        icon: mdi:memory
+        icon_color: >-
+          {% set v = states('sensor.image_toolbox_ram_percent') | float(0) %}
+          {{ 'red' if v > 90 else 'orange' if v > 75 else 'green' if v > 25 else 'blue' }}
+      - type: custom:mushroom-template-card
+        primary: GPU power
+        secondary: "{{ states('sensor.image_toolbox_gpu_power_draw') }} W"
+        icon: mdi:lightning-bolt
+        icon_color: orange
+      - type: custom:mushroom-template-card
+        primary: GPU clock
+        secondary: "{{ states('sensor.image_toolbox_gpu_clock') }} MHz"
+        icon: mdi:speedometer
+        icon_color: blue
 
-      # ---- live task (only while a task is running) ------------------
-      - type: conditional
-        conditions:
-          - entity: sensor.image_toolbox_task_name
-            state_not: idle
-          - entity: sensor.image_toolbox_task_name
-            state_not: unavailable
-        card:
-          type: custom:mushroom-template-card
-          primary: "{{ states('sensor.image_toolbox_task_name') | title }}"
-          secondary: >-
-            {{ states('sensor.image_toolbox_task_details') }} -
-            {{ states('sensor.image_toolbox_task_progress') }} -
-            ETA {{ states('sensor.image_toolbox_task_eta') }}
-          icon: mdi:cog-play
-          icon_color: green
+  # ---- local telemetry graph (ApexCharts) ------------------------
+  - type: custom:apexcharts-card
+    header:
+      show: true
+      title: Local telemetry
+    graph_span: 1h
+    yaxis:
+      - id: pct
+        min: 0
+        max: 100
+    series:
+      - entity: sensor.image_toolbox_gpu_utilization
+        name: GPU util
+        yaxis_id: pct
+      - entity: sensor.image_toolbox_cpu_usage
+        name: CPU
+        yaxis_id: pct
+      - entity: sensor.image_toolbox_vram_percent
+        name: VRAM
+        yaxis_id: pct
+      - entity: sensor.image_toolbox_gpu_temperature
+        name: Temp
+        yaxis_id: pct
 
-      # ---- band-coloured metric tiles --------------------------------
-      - type: grid
-        columns: 3
-        square: false
-        cards:
-          - type: custom:mushroom-template-card
-            primary: CPU
-            secondary: "{{ states('sensor.image_toolbox_cpu_usage') }}%"
-            icon: mdi:cpu-64-bit
-            icon_color: >-
-              {% set v = states('sensor.image_toolbox_cpu_usage') | float(0) %}
-              {{ 'red' if v > 85 else 'orange' if v > 65 else 'green' if v > 25 else 'blue' }}
-          - type: custom:mushroom-template-card
-            primary: GPU util
-            secondary: "{{ states('sensor.image_toolbox_gpu_utilization') }}%"
-            icon: mdi:expansion-card
-            icon_color: >-
-              {% set v = states('sensor.image_toolbox_gpu_utilization') | float(0) %}
-              {{ 'red' if v > 85 else 'orange' if v > 65 else 'green' if v > 25 else 'blue' }}
-          - type: custom:mushroom-template-card
-            primary: VRAM
-            secondary: >-
-              {{ states('sensor.image_toolbox_vram_percent') }}%
-              ({{ (states('sensor.image_toolbox_gpu_vram_used') | float(0) / 1024) | round(1) }} GB)
-            icon: mdi:memory
-            icon_color: >-
-              {% set v = states('sensor.image_toolbox_vram_percent') | float(0) %}
-              {{ 'red' if v > 90 else 'orange' if v > 75 else 'green' if v > 25 else 'blue' }}
-          - type: custom:mushroom-template-card
-            primary: RAM
-            secondary: >-
-              {{ states('sensor.image_toolbox_ram_percent') }}%
-              ({{ (states('sensor.image_toolbox_ram_used') | float(0) / 1024) | round(1) }} GB)
-            icon: mdi:memory
-            icon_color: >-
-              {% set v = states('sensor.image_toolbox_ram_percent') | float(0) %}
-              {{ 'red' if v > 90 else 'orange' if v > 75 else 'green' if v > 25 else 'blue' }}
-          - type: custom:mushroom-template-card
-            primary: GPU power
-            secondary: "{{ states('sensor.image_toolbox_gpu_power_draw') }} W"
-            icon: mdi:lightning-bolt
-            icon_color: orange
-          - type: custom:mushroom-template-card
-            primary: GPU clock
-            secondary: "{{ states('sensor.image_toolbox_gpu_clock') }} MHz"
-            icon: mdi:speedometer
-            icon_color: blue
+  # ---- GPU power (its own axis, watts) ---------------------------
+  - type: custom:apexcharts-card
+    header:
+      show: true
+      title: GPU power
+    graph_span: 1h
+    series:
+      - entity: sensor.image_toolbox_gpu_power_draw
+        name: Power
+        unit: W
 
-      # ---- local telemetry graph (ApexCharts) ------------------------
-      - type: custom:apexcharts-card
-        header:
-          show: true
-          title: Local telemetry
-        graph_span: 1h
-        yaxis:
-          - id: pct
-            min: 0
-            max: 100
-        series:
-          - entity: sensor.image_toolbox_gpu_utilization
-            name: GPU util
-            yaxis_id: pct
-          - entity: sensor.image_toolbox_cpu_usage
-            name: CPU
-            yaxis_id: pct
-          - entity: sensor.image_toolbox_vram_percent
-            name: VRAM
-            yaxis_id: pct
-          - entity: sensor.image_toolbox_gpu_temperature
-            name: Temp
-            yaxis_id: pct
+  # ---- remote pod (only during a remote-pod run) -----------------
+  - type: conditional
+    conditions:
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: "0"
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: unavailable
+      - entity: sensor.image_toolbox_remote_gpu_vram_total
+        state_not: unknown
+    card:
+      type: custom:apexcharts-card
+      header:
+        show: true
+        title: Remote pod telemetry
+      graph_span: 1h
+      yaxis:
+        - id: pct
+          min: 0
+          max: 100
+      series:
+        - entity: sensor.image_toolbox_remote_gpu_utilization
+          name: Pod GPU util
+          yaxis_id: pct
+        - entity: sensor.image_toolbox_remote_vram_percent
+          name: Pod VRAM
+          yaxis_id: pct
+        - entity: sensor.image_toolbox_remote_gpu_temperature
+          name: Pod temp
+          yaxis_id: pct
 
-      # ---- GPU power (its own axis, watts) ---------------------------
-      - type: custom:apexcharts-card
-        header:
-          show: true
-          title: GPU power
-        graph_span: 1h
-        series:
-          - entity: sensor.image_toolbox_gpu_power_draw
-            name: Power
-            unit: W
-
-      # ---- remote pod (only during a remote-pod run) -----------------
-      - type: conditional
-        conditions:
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: "0"
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: unavailable
-          - entity: sensor.image_toolbox_remote_gpu_vram_total
-            state_not: unknown
-        card:
-          type: custom:apexcharts-card
-          header:
-            show: true
-            title: Remote pod telemetry
-          graph_span: 1h
-          yaxis:
-            - id: pct
-              min: 0
-              max: 100
-          series:
-            - entity: sensor.image_toolbox_remote_gpu_utilization
-              name: Pod GPU util
-              yaxis_id: pct
-            - entity: sensor.image_toolbox_remote_vram_percent
-              name: Pod VRAM
-              yaxis_id: pct
-            - entity: sensor.image_toolbox_remote_gpu_temperature
-              name: Pod temp
-              yaxis_id: pct
-
-      # ---- OPTIONAL: list every Image Toolbox entity (auto-entities) --
-      # Uncomment after installing auto-entities; handy for debugging.
-      # - type: custom:auto-entities
-      #   card:
-      #     type: entities
-      #     title: All Image Toolbox entities
-      #   filter:
-      #     include:
-      #       - entity_id: sensor.image_toolbox_*
+  # ---- OPTIONAL: list every Image Toolbox entity (auto-entities) --
+  # Uncomment after installing auto-entities; handy for debugging.
+  # - type: custom:auto-entities
+  #   card:
+  #     type: entities
+  #     title: All Image Toolbox entities
+  #   filter:
+  #     include:
+  #       - entity_id: sensor.image_toolbox_*

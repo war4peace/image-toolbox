@@ -33,11 +33,19 @@ Add the entities first, then a dashboard.
    sensors compute `used / total * 100` for the gauges. Add under a top-level
    `template:` key and reload template entities (or restart). *Only needed for the
    dashboards' RAM/VRAM gauges; CPU and GPU utilization are already percentages.*
-3. **A dashboard** - open a dashboard, top-right **Edit dashboard >** (three dots)
-   **Raw configuration editor**, and paste the `views:` block from
-   [`dashboard-core.yaml`](dashboard-core.yaml) **or**
-   [`dashboard-custom.yaml`](dashboard-custom.yaml). You can also lift individual
-   cards into an existing view.
+3. **A dashboard card** - each dashboard file is **one card** (a vertical stack),
+   pasted into a single card's code editor. This is deliberate: editing the whole
+   dashboard's raw YAML is risky, so you never touch it.
+   1. Open your dashboard and click **Edit dashboard** (top-right pencil).
+   2. Click **+ ADD SECTION**, then **+ ADD CARD** inside it and pick any card
+      (a **Heading** is fine as a placeholder).
+   3. In that card's editor, click **Show code editor**, select all, and paste
+      the whole contents of [`dashboard-core.yaml`](dashboard-core.yaml) **or**
+      [`dashboard-custom.yaml`](dashboard-custom.yaml) (everything from
+      `type: vertical-stack` down). **Save**.
+
+   To have both tiers, repeat with a second card. You can also lift any single
+   sub-card out of the file into its own card.
 
 ## HACS cards (custom dashboard only)
 
