@@ -21,7 +21,7 @@ bootstrap.log
 installer/Output/
 
 # Internal-only working copy of the benchmark data (the .csv is the tracked source)
-docs/Benchmarks.xlsx
+docs/image-benchmarks.xlsx
 
 # Maintainer-only working DB for the benchmark-sharing merge tool (bench_share.py --merge).
 # The curated docs/video-benchmarks.csv it exports IS the tracked/distributed artifact; this

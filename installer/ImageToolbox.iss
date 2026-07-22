@@ -61,7 +61,7 @@ Source: "..\Image Toolbox.cmd";   DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion
 ; Author benchmark data — drives the remote-pod "$ / 100 images" cost estimate
 ; (benchmarks.py reads it from {app}\docs).
-Source: "..\docs\Benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
+Source: "..\docs\image-benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion
 ; Curated community VIDEO benchmark corpus (feature #8). Ships so a fresh install has the
 ; dataset offline; the app auto-refreshes it from GitHub in the background at each launch.
 Source: "..\docs\video-benchmarks.csv";  DestDir: "{app}\docs"; Flags: ignoreversion

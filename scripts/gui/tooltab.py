@@ -354,7 +354,7 @@ class ToolTab(ttk.Frame):
         return self._gpu_choices[idx]
 
     def _bench_task_for(self, gpu):
-        """The Benchmarks.csv 'Task' that applies to this tab + GPU. Tagging is
+        """The image-benchmarks.csv 'Task' that applies to this tab + GPU. Tagging is
         one task; upscaling splits by VRAM (resident vs pod-RAM offload), the same
         40 GB threshold the engine uses."""
         import benchmarks

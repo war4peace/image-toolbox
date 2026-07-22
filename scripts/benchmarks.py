@@ -2,7 +2,7 @@
 
 Answers one question for the GUI's "$ / 100 images" readout: given a task, a GPU
 and a live hourly price, what did 100 images cost on that card in the author's
-benchmark runs? The data source is ``docs/Benchmarks.csv`` (human-maintained);
+benchmark runs? The data source is ``docs/image-benchmarks.csv`` (human-maintained);
 the installer ships it to ``{app}/docs`` so it is present in installed copies too.
 
 Pure standard library. Fail-safe by design: any missing file, parse error or
@@ -15,7 +15,7 @@ import os
 # APP_ROOT = parent of scripts/, matching the rest of the app (paths anchored off
 # __file__, never the cwd).
 APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CSV_PATH = os.path.join(APP_ROOT, "docs", "Benchmarks.csv")
+CSV_PATH = os.path.join(APP_ROOT, "docs", "image-benchmarks.csv")
 
 # Task tags exactly as written in the CSV's "Task" column.
 TASK_TAG              = "Tag & rename"

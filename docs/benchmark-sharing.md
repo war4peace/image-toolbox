@@ -7,7 +7,7 @@ and lets a user **contribute** their own measured cards back. The goal is to sto
 duplicating slow (and, on a rented pod, billed) sweeps across machines.
 
 Scope: `db.video_bench` only (the per-probe video ceilings). The image-task
-`docs/Benchmarks.csv` stays a separate, author-maintained file.
+`docs/image-benchmarks.csv` stays a separate, author-maintained file.
 
 ## Distribution model (zero-infrastructure)
 
@@ -41,7 +41,7 @@ Refresh is automatic and silent. At every launch, `App._startup_bench_sync` runs
    `raw.githubusercontent.com/<repo>/main/...` (via `net_ssl.ssl_context()`), parsed and
    imported;
 2. if the network yields nothing (offline / a failed fetch), fall back to the shipped
-   `{app}/docs/video-benchmarks.csv` (a `[Files]` line ships it next to `Benchmarks.csv`,
+   `{app}/docs/video-benchmarks.csv` (a `[Files]` line ships it next to `image-benchmarks.csv`,
    so a fresh install has the corpus offline).
 
 It is fail-safe (never raises into the GUI) and shows no "data updated" prompt. Because

@@ -250,7 +250,7 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 
 **Findings.** Tagging is light: the vision model needs only ~6.6 GB, so the big datacenter cards are wildly overprovisioned and barely faster. The fastest card (H100, 2.4 sec/img) is only about 13% quicker than the RTX A4500 yet costs 13 times as much per hour. Pick a cheap card: an **RTX A4500** or **RTX 2000 Ada** tags 10,000 photos for around $2.50. (Tag & Rename also runs on a local GPU at no GPU cost: a local RTX 3090 tagged 100 photos in under six minutes.)
 
-> **Caveats:** prices are point-in-time and vary by availability and region (the in-app GPU picker shows live prices). The estimates exclude the billed pod boot/teardown (~2 to 3 minutes) and the image upload/download time, so real bills run a little higher, most noticeably on very small runs. Source data: [`docs/Benchmarks.csv`](/docs/Benchmarks.csv).
+> **Caveats:** prices are point-in-time and vary by availability and region (the in-app GPU picker shows live prices). The estimates exclude the billed pod boot/teardown (~2 to 3 minutes) and the image upload/download time, so real bills run a little higher, most noticeably on very small runs. Source data: [`docs/image-benchmarks.csv`](/docs/image-benchmarks.csv).
 
 ---
 
