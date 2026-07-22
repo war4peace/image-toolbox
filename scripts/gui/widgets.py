@@ -246,7 +246,25 @@ class TelemetryRow(ttk.Frame):
         super().__init__(master)
         self._prefix = prefix      # optional leading label, e.g. "Remote pod"
         self._labels = []
+        self._on_click = None      # callback set by App to open the graph window
         self._set([(self.IDLE, self.GREY)])
+
+    def set_on_click(self, callback):
+        """Make the whole row clickable (opens its telemetry graph). Idempotent;
+        the binding is (re)applied in _set because the labels are recreated on
+        every update."""
+        self._on_click = callback
+        self._apply_click_binding()
+
+    def _apply_click_binding(self):
+        if self._on_click is None:
+            return
+        cb = lambda _e: self._on_click()
+        self.configure(cursor="hand2")
+        self.bind("<Button-1>", cb)
+        for w in self._labels:
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", cb)
 
     def _set(self, segments):
         """Replace the row with [(text, colour), …], joined by grey separators."""
@@ -261,6 +279,7 @@ class TelemetryRow(ttk.Frame):
             lbl = tk.Label(self, text=text, font=self.FONT, fg=color)
             lbl.pack(side="left")
             self._labels.append(lbl)
+        self._apply_click_binding()     # labels were recreated: re-bind the click
 
     @staticmethod
     def _gb(used_mb, total_mb):

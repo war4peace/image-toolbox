@@ -187,6 +187,129 @@ def sample_gpu(timeout=5):
     return result
 
 
+# ── telemetry history (in-app usage graphs, #9) ──────────────────────────────
+# Per-RUN, in-memory buffers that feed the matplotlib graph window. GUI-free and
+# stdlib-only so this unit-tests without a display (the window lives in
+# gui/telemetry_graph.py). See docs/telemetry-design.md section 4.
+
+# Range-button spans (seconds). A button is enabled only once the run's runtime
+# has reached its span (docs 4.4).
+HISTORY_SPANS = [("1h", 3600), ("3h", 10800), ("6h", 21600),
+                 ("12h", 43200), ("24h", 86400)]
+
+# A gap between adjacent samples wider than this many times the run's median
+# sample interval breaks the plotted line (an honest gap, never an interpolation
+# across a stall / a pod that briefly vanished).
+HISTORY_GAP_FACTOR = 3.0
+
+
+class TelemetryHistory:
+    """One run's telemetry, in memory, for the graph window (#9).
+
+    One instance per source ("local" or a pod). It records **only between
+    ``start()`` and ``seal()``**: ``append`` outside that window is ignored, so
+    the continuous idle sampler (which keeps the readout row live) never leaks
+    into a graph. ``start()`` on an existing instance discards the previous run
+    (reset-on-next-run). A sealed run is frozen but still fully queryable, so the
+    window stays interactive for review. Nothing here persists: it dies with the
+    process.
+    """
+
+    def __init__(self):
+        self._start_ts = None
+        self._sealed = False
+        self._samples = []            # list of (ts, sample_dict)
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    def start(self, ts):
+        """Open a fresh run at wall-clock ``ts`` (discards any previous run)."""
+        self._start_ts = ts
+        self._sealed = False
+        self._samples = []
+
+    def seal(self):
+        """End the run: freeze the data (still queryable), stop accepting appends."""
+        self._sealed = True
+
+    def append(self, ts, sample):
+        """Record one sample. No-op unless the run is live (started, not sealed)."""
+        if self._start_ts is None or self._sealed:
+            return
+        if self._samples and ts < self._samples[-1][0]:
+            ts = self._samples[-1][0]         # clamp the odd out-of-order sample
+        self._samples.append((ts, dict(sample)))
+
+    # ── queries ──────────────────────────────────────────────────────────────
+    @property
+    def is_live(self):
+        return self._start_ts is not None and not self._sealed
+
+    @property
+    def is_sealed(self):
+        return self._sealed
+
+    @property
+    def start_ts(self):
+        return self._start_ts
+
+    def __len__(self):
+        return len(self._samples)
+
+    def latest(self):
+        """The most recent sample dict, or None if nothing recorded yet."""
+        return self._samples[-1][1] if self._samples else None
+
+    def runtime(self):
+        """Elapsed run time in seconds (first sample to last), 0 if <1 sample."""
+        if not self._samples or self._start_ts is None:
+            return 0.0
+        return max(0.0, self._samples[-1][0] - self._start_ts)
+
+    def bounds(self):
+        """(t0, t1) wall-clock span of the run for the whole-run view."""
+        if not self._samples:
+            base = self._start_ts or 0.0
+            return base, base
+        t0 = self._start_ts if self._start_ts is not None else self._samples[0][0]
+        return t0, self._samples[-1][0]
+
+    def enabled_spans(self):
+        """Which range buttons are live now (runtime >= span), as (label, secs)."""
+        rt = self.runtime()
+        return [(label, s) for (label, s) in HISTORY_SPANS if rt >= s]
+
+    def _median_interval(self):
+        if len(self._samples) < 2:
+            return None
+        import statistics
+        deltas = [self._samples[i][0] - self._samples[i - 1][0]
+                  for i in range(1, len(self._samples))]
+        deltas = [d for d in deltas if d > 0]
+        return statistics.median(deltas) if deltas else None
+
+    def series(self, accessor):
+        """(times, values) float lists for plotting.
+
+        ``accessor`` is a sample-field name or a ``callable(sample) -> number |
+        None``. A None value, or a time gap wider than ``HISTORY_GAP_FACTOR`` x
+        the run's median interval, inserts a ``NaN`` so matplotlib breaks the
+        line there instead of drawing across the gap.
+        """
+        fn = accessor if callable(accessor) else (lambda s, k=accessor: s.get(k))
+        med = self._median_interval()
+        times, values = [], []
+        prev_t = None
+        for ts, s in self._samples:
+            if prev_t is not None and med and (ts - prev_t) > HISTORY_GAP_FACTOR * med:
+                times.append((prev_t + ts) / 2.0)   # a break between the two points
+                values.append(float("nan"))
+            v = fn(s)
+            times.append(float(ts))
+            values.append(float("nan") if v is None else float(v))
+            prev_t = ts
+        return times, values
+
+
 def gpu_name(timeout=5):
     """
     The first NVIDIA GPU's model name via ``nvidia-smi`` (e.g. "NVIDIA GeForce

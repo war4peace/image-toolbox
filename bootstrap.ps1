@@ -392,15 +392,18 @@ try {
     # -- 5. Python packages ---------------------------------------------------
     if ($remoteOnly) {
         # No local GPU stack: the GUI needs only Pillow (display/comparison),
-        # piexif, paho-mqtt and python-vlc (playback). torch / SeedVR2 / timm
-        # all live on the pod.
+        # piexif, paho-mqtt, python-vlc (playback) and matplotlib. torch / SeedVR2
+        # / timm all live on the pod.
         Step "Installing the lightweight components (Remote mode - no local GPU stack)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
         # certifi: a Remote-only install has no GPU stack to drag in a CA bundle,
         # and a fresh Windows VM's OS root store often can't verify RunPod's cert
         # (Python's OpenSSL doesn't auto-fetch roots the way SChannel does). We hand
         # urllib certifi's bundle explicitly (net_ssl.py), so it must be present.
-        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi")
+        # matplotlib (+ numpy) draws the telemetry usage graphs (#9); a remote-only
+        # install still watches the rented pod's live graph, so it needs it too
+        # (Local/Both already get it via seedvr2's requirements).
+        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi", "matplotlib")
     } else {
         Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")

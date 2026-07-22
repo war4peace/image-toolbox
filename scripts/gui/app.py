@@ -135,6 +135,14 @@ class App(tk.Tk):
         self.telemetry_rows = [t.telemetry_row for t in
                                (self.upscale_tab, self.tag_tab, self.conciliate_tab)
                                if t.telemetry_row is not None]
+        # Per-run telemetry history + graph windows (usage graphs, #9). Keyed by
+        # source: "local" (one machine, fanned out to every tab's local row) and
+        # "remote:<id(tab)>" (each tab's pod). A history records only between a
+        # run's start and seal; the window is a lazy, one-per-source matplotlib
+        # Toplevel opened by clicking a telemetry row.
+        self._tel_history = {}
+        self._tel_windows = {}
+        self._tel_titles = {}
         # Idle sampler: keep the readout live between runs (e.g. so the user can
         # watch another app's VRAM free up before starting an upscale). Fires on
         # a slow 60 s cadence and only when no task is running — task-driven
@@ -816,9 +824,14 @@ class App(tk.Tk):
         it to the MQTT system topics."""
         for row in self.telemetry_rows:
             try:
+                if getattr(row, "_on_click", None) is None:
+                    row.set_on_click(lambda: self.open_telemetry_graph("local"))
                 row.show(sample)
             except Exception:
                 pass
+        # Feed the local run history (no-op unless a local run is live, so idle
+        # sampling never enters a graph).
+        self.telemetry_history_append("local", sample)
         values = {}
         if sample.get("cpu") is not None:
             values[mqtt_publisher.SYS_CPU_TOPIC] = f"{sample['cpu']:.0f}"
@@ -846,13 +859,22 @@ class App(tk.Tk):
         tab's dedicated remote row — revealing it on the first sample — and
         mirror it to the MQTT system/remote/* topics."""
         row = getattr(tab, "remote_telemetry_row", None)
+        src = f"remote:{id(tab)}"
         if row is not None:
             try:
+                if getattr(row, "_on_click", None) is None:
+                    row.set_on_click(lambda s=src: self.open_telemetry_graph(s))
                 if not row.winfo_manager():     # hidden via grid_remove → reveal
                     row.grid()
                 row.show(sample)
             except Exception:
                 pass
+        # Start this pod's run history on its first sample; append thereafter.
+        h = self._tel_history.get(src)
+        if h is None or h.is_sealed:
+            title = f"Remote pod — {getattr(tab, 'mqtt_task_name', 'run')}"
+            self.telemetry_history_start(src, title=title)
+        self.telemetry_history_append(src, sample)
         values = {}
         if sample.get("cpu") is not None:
             values[mqtt_publisher.SYS_REMOTE_CPU_TOPIC] = f"{sample['cpu']:.0f}"
@@ -886,6 +908,8 @@ class App(tk.Tk):
                     row.grid_remove()
             except Exception:
                 pass
+        # Seal this pod's run history: its graph freezes but stays viewable.
+        self.telemetry_history_seal(f"remote:{id(tab)}")
         self.mqtt_publish({
             mqtt_publisher.SYS_REMOTE_CPU_TOPIC:            "0",
             mqtt_publisher.SYS_REMOTE_RAM_TOPIC:            "0",
@@ -898,6 +922,74 @@ class App(tk.Tk):
             mqtt_publisher.SYS_REMOTE_GPU_POWER_LIMIT_TOPIC: "0",
             mqtt_publisher.SYS_REMOTE_GPU_CLOCK_TOPIC:       "0",
         })
+
+    # ── telemetry history + graph windows (usage graphs, #9) ─────────────────
+
+    def telemetry_history(self, source):
+        """The TelemetryHistory for a source ("local" / "remote:<id>"), or None."""
+        return self._tel_history.get(source)
+
+    def telemetry_history_start(self, source, title=None):
+        """Open a fresh run buffer for a source (resets any previous run). Called
+        at a local run's start (source "local") and on a pod's first sample."""
+        import time
+        h = self._tel_history.get(source)
+        if h is None:
+            h = system_telemetry.TelemetryHistory()
+            self._tel_history[source] = h
+        h.start(time.time())
+        if title:
+            self._tel_titles[source] = title
+
+    def telemetry_history_seal(self, source):
+        """End a source's run: its graph freezes but stays viewable. Safe no-op if
+        the source never started (e.g. sealing 'local' after a remote-only run)."""
+        h = self._tel_history.get(source)
+        if h is not None:
+            h.seal()
+
+    def telemetry_history_append(self, source, sample):
+        """Record a sample into a source's run buffer (no-op unless it is live)."""
+        h = self._tel_history.get(source)
+        if h is not None:
+            import time
+            h.append(time.time(), sample)
+
+    def open_telemetry_graph(self, source):
+        """Open (or focus) the graph window for a source. No-op if the source has
+        no run this session (design 4.5). matplotlib is imported lazily and
+        fail-safe: absent, only the graph is unavailable (the row + MQTT are not)."""
+        h = self._tel_history.get(source)
+        if h is None or len(h) == 0:
+            return
+        win = self._tel_windows.get(source)
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win.lift(); win.focus_set()
+                    return
+            except Exception:
+                pass
+            self._tel_windows.pop(source, None)
+        try:
+            from gui.telemetry_graph import TelemetryGraphWindow
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                APP_TITLE,
+                "Telemetry graphs need matplotlib, which isn't installed in this "
+                "app's environment.\n\nThe live readout row and Home Assistant "
+                "topics work without it.\n\n(" + str(exc) + ")")
+            return
+        title = self._tel_titles.get(source,
+                                     "System telemetry — local"
+                                     if source == "local" else "Remote pod")
+        win = TelemetryGraphWindow(self, self, source, title)
+        self._tel_windows[source] = win
+
+    def forget_telemetry_graph(self, source):
+        """A graph window closed: drop the reference so a reopen makes a new one."""
+        self._tel_windows.pop(source, None)
 
     def show_update_dialog(self, info):
         """Open (or focus) the single update dialog for the given UpdateInfo."""

@@ -857,6 +857,9 @@ class ToolTab(ttk.Frame):
             self.app.notify_active_pods_changed()
         self.app.taskbar_clear()        # remove the taskbar progress/error bar
         self._stop_telemetry()
+        # Seal the local run history: its graph freezes but stays viewable until
+        # the next local run. Safe no-op if this was a remote run (never started).
+        self.app.telemetry_history_seal("local")
         # One immediate idle sample so the row reflects VRAM freeing up right
         # after the run, rather than waiting for the next idle tick. The proc is
         # already cleared by this point, so this counts as an idle reading.
@@ -892,6 +895,13 @@ class ToolTab(ttk.Frame):
         """Begin sampling for this run. Periodic tabs poll on a fixed interval;
         the upscaler is event-driven (per image), so it has no interval set."""
         self._stop_telemetry()
+        # Open a per-run local telemetry history (usage graphs #9) for a LOCAL
+        # run only: a remote run's GPU work is on the pod, whose history starts
+        # from its first remote sample instead. Starting resets any previous run.
+        remote_var = getattr(self, "remote_var", None)
+        if remote_var is None or not remote_var.get():
+            self.app.telemetry_history_start(
+                "local", title=f"Local system — {self.mqtt_task_name}")
         if self.telemetry_interval_ms:
             self._telemetry_tick()
 

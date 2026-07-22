@@ -4,6 +4,10 @@
 > telemetry half of **#10 (Home Assistant dashboard samples)**. Written 2026-07-22.
 > This is the design of record; it becomes the work-order once green-lit.
 >
+> **Status:** Phase A (widen the telemetry model) and Phase B (the matplotlib
+> graph window + per-run history) are **implemented** on 0.5.3-experimental. Phase
+> C (the `samples/home-assistant/` dashboards, #10) is not started.
+>
 > **Decisions locked (2026-07-22):** add GPU utilization %, power (draw + limit),
 > and core clock to the sampled set; skip fan speed. Keep RAM/VRAM published as
 > raw MB only (no derived `%` topics); consumers derive `%` from used/total. Ship
