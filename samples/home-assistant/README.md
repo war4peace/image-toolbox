@@ -97,5 +97,24 @@ All under the base topic `image-toolbox/`:
 
 ## Screenshots
 
-See [`screenshots/`](screenshots/). *(To be captured from a live Home Assistant
-instance; the dashboards work without them.)*
+Captured from a live Home Assistant dashboard (dark theme).
+
+### Core dashboard (no HACS)
+
+App status, the live-task card (shown during an upscale run), and the local /
+remote-pod telemetry panels:
+
+| App status | Current task |
+|---|---|
+| ![App status](screenshots/core-section-general-info.png) | ![Current task](screenshots/core-section-current-task.png) |
+
+| Local telemetry | Remote-pod telemetry |
+|---|---|
+| ![Local telemetry](screenshots/core-section-local-telemetry.png) | ![Remote-pod telemetry](screenshots/core-section-remote-telemetry.png) |
+
+### Custom dashboard (HACS: Mushroom + ApexCharts)
+
+The Mushroom chips header, the live-task card, band-coloured metric tiles, and the
+ApexCharts telemetry graphs, in one section:
+
+![Custom dashboard section](screenshots/custom-section-display.png)
