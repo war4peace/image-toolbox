@@ -96,12 +96,16 @@ Windows GUI (mostly Python standard-library tkinter) with six tabs.
 
 - **First-start wizard:** on the first launch it detects your GPU and recommends the upscaling (SeedVR2) and tagging (Ollama) models that suit your VRAM, and offers to download the vision model in one click. Every model stays selectable (a smaller card can still run a bigger model, just slower). If your card can benefit, it also offers an **optional speed-up for local video** (`torch.compile`): it explains the download size and the trade-offs, installs the small Triton piece for you, and points you to Microsoft's page for the C++ build tools. It's optional and affects speed only, never quality. Re-run the wizard any time from **Settings → Re-run first-start wizard**.
 - **Update checker** makes sure you don't miss updates. Update straight from the app.
-- **Telemetry rows** (for local and/or remote machine): CPU / RAM / VRAM / GPU.
+- **Telemetry rows** (for local and/or remote machine): CPU, RAM, VRAM, GPU temperature, and (0.5.3) **GPU utilization, power draw and core clock**. **Click any row to open a live, per-run usage graph**: four capacity-pinned charts (load, memory, power, temperature) with a movable crosshair readout. The timeline covers exactly the run (it starts when the first image/video is processed, not during the pre-scan), and freezes but stays browsable when the run ends.
 - **Live feedback:** two-row status (current + previous file), a progress bar, and an estimated time remaining that refreshes after each image.
 - **Live preview**: Batches of 100 images are loaded into a "preview" pane, allowing you to open images, perform a live comparison (upscaled images), context menu (right-click images) with common actions.
 - **Resizable thumbnails** in the film strip area.
 - **Notification support**: Currently supports *Discord*, *Telegram* and *ntfy.sh*.
 - **MQTT integration** (e.g. for Home Assistant, see **Home Assistant (MQTT)** section below).
+
+![In-app per-run telemetry graph](screenshots/image-toolbox-telemetry-graph.png)
+
+*The per-run telemetry graph (click a telemetry row to open it): GPU/CPU load, memory against capacity, power and temperature over the run, with a crosshair readout.*
 
 ### Batch Upscaler
 
