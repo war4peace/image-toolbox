@@ -185,7 +185,7 @@ Each has a **Test** button. Whatever you configure (any combination, or none) re
 
 ### Home Assistant (MQTT)
 
-Optional. Set an MQTT broker **host** in Settings → MQTT and the app publishes its state to your broker: version and update status, availability, live task state (what it's doing, progress, ETA, per-item timings), the last-run summary, and system telemetry (CPU / RAM / VRAM / GPU temperature) for this machine and, during a remote run, the rented pod. Clear the host to disable it.
+Optional. Set an MQTT broker **host** in Settings → MQTT and the app publishes its state to your broker: version and update status, availability, live task state (what it's doing, progress, ETA, per-item timings), the last-run summary, and system telemetry — CPU, RAM, VRAM, GPU temperature, and (0.5.3) **GPU utilization, power draw and core clock** — for this machine and, during a remote run, the rented pod. Clear the host to disable it.
 
 Ready-made Home Assistant content is included under [`samples/home-assistant/`](/samples/home-assistant/): [`mqtt-sensors.yaml`](/samples/home-assistant/mqtt-sensors.yaml) defines every published topic as a Home Assistant MQTT sensor (local and remote-pod), plus two paste-ready dashboards, a **core** one built only from Home Assistant's built-in cards (no HACS) and a richer **custom** one using named HACS cards. See that folder's [README](/samples/home-assistant/README.md) for the install order.
 
@@ -260,7 +260,7 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 
 ## Samples
 
-The [samples](/samples/) folder contains [original images](/samples/original/) and their [upscaled](/samples/upscaled/) versions, so you can compare pairs side-by-side and judge the upscaler's strengths and weaknesses.
+The [samples](/samples/) folder contains [original images](/samples/original/) and their [upscaled](/samples/upscaled/) versions, so you can compare pairs side-by-side and judge the upscaler's strengths and weaknesses. It also holds the [Home Assistant dashboard samples](/samples/home-assistant/) (see the Home Assistant section above).
 
 ---
 
