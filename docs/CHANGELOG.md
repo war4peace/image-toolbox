@@ -8,10 +8,58 @@ Releases page.
 
 ## Contents
 
+- [0.5.5](#055)
 - [0.5.4](#054)
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.5.5
+
+Better Tag & Rename descriptions, and much smarter remote provisioning.
+
+### New default vision model: qwen3-vl:8b-instruct
+A 100-image benchmark (RTX 3090) had the **qwen3-vl** family beat the old
+`qwen2.5vl:7b` / `minicpm-v` / `gemma3:4b` picks at every size, with clearer, more
+detailed descriptions. The new defaults, chosen by the first-start wizard to fit
+your card:
+
+- **24 GB+**: `qwen3-vl:8b-instruct` (the clearest; the new overall default)
+- **16 GB**: `qwen3-vl:4b-instruct`
+- **8-12 GB**: `qwen3-vl:2b-instruct`
+
+Every model stays selectable in Settings. See the benchmark table in the README and
+`docs/tag-and-rename.md`.
+
+### Faster tagging via an Ollama context cap
+Newer vision models declare a huge native context (qwen3-vl = 256K), and Ollama
+sizes its VRAM off that, so uncapped they grab almost the whole card and thrash
+(the 8B model ran 9:11 per 100 images at 98% VRAM). Tag & Rename now caps the
+context (`tagging.ollama_num_ctx`, default 8192): the same run drops to **2:37 at
+43% VRAM** with no quality change. Applied automatically, local and remote.
+
+### Smarter remote provisioning
+Provisioning the RunPod model volume is no longer a wasteful all-or-nothing job:
+
+- **Caches the common model set** so you can switch models with no re-provision:
+  all three vision tiers **and** all three SeedVR2 upscale tiers (3B Q8 / 7B
+  FP8-mixed / 7B FP16) now fit the 50 GB volume.
+- **Follows your configured models** (`ollama.model` and `upscale.dit_model`) so the
+  model you actually picked is guaranteed on the volume (previously it silently
+  provisioned a fixed default).
+- **Incremental & self-pruning re-provision:** keeps whatever is already valid and
+  fetches only what changed (the python venv is skipped via a stamp, the cached
+  Ollama runtime is reused, weights skip valid files), and prunes obsolete models to
+  reclaim storage. So a model change or a minor update is a cheap re-provision, not a
+  fresh volume and a full re-download.
+
+### Note on the Remote Tag & Rename cost table
+The README's Remote Tag & Rename cost figures were measured with the old
+`qwen2.5vl:7b` and are now marked obsolete pending fresh remote benchmarks with
+`qwen3-vl:8b-instruct` (the new model ran at essentially the same speed locally, so
+costs should be close).
 
 ---
 

@@ -158,7 +158,22 @@ Analyses each image with a local or remote Ollama vision model, writes a descrip
 - **One-click Undo** restores file names, EXIF descriptions, or both. Every change is recorded to an undo cache before anything is modified.
 - **Pause / Resume** (0.5.2): pausing a local run unloads the vision model to free VRAM, and Resume reloads it and continues. The same button doubles as *Resume after error* when a run is held because the model kept failing.
 - Already-tagged files are detected and skipped on re-runs (unless forced, optional).
-- **The vision model is your choice** (set it in **Settings**). The default is [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl): the most accurate of the models tried, reading faint on-screen text and inferring fine detail; it needs ~16 GB VRAM (a 16 GB+ GPU). If you have less VRAM, switch to [`minicpm-v`](https://ollama.com/library/minicpm-v): fast and light (~7.6 GB VRAM, runs on an 8 GB GPU), which uses terser descriptions. In testing, `llava:34b` was the slowest, heaviest *and* least accurate of the models tried. It's the least recommended option, but still available if preferred.
+- **The vision model is your choice** (set it in **Settings**). The default (0.5.5) is [`qwen3-vl:8b-instruct`](https://ollama.com/library/qwen3-vl): the clearest and most detailed of the models tried, needing ~10 GB VRAM. On a smaller card the first-start wizard suggests a lighter model from the same family: [`qwen3-vl:4b-instruct`](https://ollama.com/library/qwen3-vl) (~8 GB) or [`qwen3-vl:2b-instruct`](https://ollama.com/library/qwen3-vl) (~6 GB). Every model stays selectable, so you can pick a heavier or lighter one knowingly.
+
+**Vision-model benchmark** (RTX 3090, 100 photos, `num_ctx = 8192`; quality is a subjective 1–5 read of the descriptions and filenames):
+
+| Model | Runtime | Peak VRAM (of 24 GB) | Quality (1–5) |
+|---|--------:|---------------------:|:-------------:|
+| **qwen3-vl:8b-instruct** *(default)* | 2:37 | 43% | **5** |
+| qwen3-vl:4b-instruct | 1:42 | 32% | 4 |
+| qwen2.5vl:7b *(previous default)* | 2:37 | 39% | 4 |
+| ministral-3:8b | 2:15 | 44% | 3 |
+| qwen3-vl:2b-instruct | 1:26 | 25% | 3 |
+| gemma3:4b | 2:25 | 24% | 3 |
+
+The qwen3-vl family led at every size. Two others were tested and rejected: `minicpm-v4.6` (quality 2, leaks its reasoning into the description and filename) and `qwen2.5vl:3b` (quality 1, broken output). Full scoring notes and per-model comments are in [`docs/tag-and-rename.md`](/docs/tag-and-rename.md) (raw data: [`docs/tag-rename-benchmarks.csv`](/docs/tag-rename-benchmarks.csv)).
+
+> **Why `num_ctx` matters:** uncapped, qwen3-vl declares a 256K context and Ollama sizes its KV cache off that, grabbing almost the whole card and thrashing (the 8B model ran 9:11 at 98% VRAM). Capped at 8192 the same run is 2:37 at 43% VRAM, with no quality loss. Image Toolbox applies this cap automatically.
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
@@ -292,6 +307,8 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
 ### Remote Tag & Rename
+
+> **⚠️ These figures are obsolete (as of 0.5.5).** They were measured with the previous default vision model, [`qwen2.5vl:7b`](https://ollama.com/library/qwen2.5vl), which has been **superseded by [`qwen3-vl:8b-instruct`](https://ollama.com/library/qwen3-vl)** (see the [Tag & Rename benchmark](#tag--rename) above). They are kept only as a rough guide. The new model ran at essentially the same speed *locally* (~identical seconds per image), so per-run costs should be close, but the table below has **not** been re-measured on remote GPUs yet. Fresh remote benchmarks with `qwen3-vl:8b-instruct` are planned.
 
 | GPU | $/h | ~sec/img | $/100 images |
 |-----|----:|---------:|-------------:|

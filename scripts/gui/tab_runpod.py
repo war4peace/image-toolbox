@@ -878,7 +878,7 @@ class RunPodTab(ttk.Frame):
                 f"Delete this network volume?\n\n  {label}\n\n"
                 "This PERMANENTLY destroys the volume and ALL MODELS stored on it "
                 "(SeedVR2, Ollama). Any disposable pod will have to re-download "
-                "~22 GB the next time you run. This cannot be undone.",
+                "~40 GB the next time you run. This cannot be undone.",
                 icon="warning", default="no"):
             return
         self.runpod_status.configure(text="Deleting network volume…", foreground="#666")
@@ -1115,10 +1115,12 @@ class RunPodTab(ttk.Frame):
         if not messagebox.askyesno(
                 APP_TITLE,
                 "Provision the model volume now?\n\n"
-                "This briefly rents a BILLED pod, downloads ~22 GB of models "
-                "(SeedVR2 + Ollama) onto the selected volume, and terminates the "
-                "pod automatically when done — usually 10-20 minutes. You only "
-                "need to do this once per volume.\n\nProceed?"):
+                "This briefly rents a BILLED pod, downloads ~40 GB of models "
+                "(all three SeedVR2 tiers + all three Ollama vision tiers) onto the "
+                "selected volume, and terminates the pod automatically when done — usually 10-20 "
+                "minutes the first time. Re-running later is safe and incremental: it "
+                "keeps what is already there, prunes obsolete models, and downloads "
+                "only what changed (much faster).\n\nProceed?"):
             return
         self._stream_provision()
 

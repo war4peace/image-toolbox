@@ -28,11 +28,15 @@ SEEDVR_OPTIONS = [
 ]
 
 # Ollama vision options: (label, model tag), heaviest first. These must be pulled
-# (nothing auto-fetches them), which the wizard's pull step handles.
+# (nothing auto-fetches them), which the wizard's pull step handles. The qwen3-vl
+# family swept a 100-image Tag & Rename benchmark on a 3090 (docs/tag-and-rename.md):
+# it beat qwen2.5vl:7b / minicpm-v / gemma3:4b on quality, speed, or both at every
+# tier, and needs the tagging.ollama_num_ctx cap (config.json) to stay fast.
 OLLAMA_OPTIONS = [
-    ("qwen2.5vl:7b (richest captions)",  "qwen2.5vl:7b"),
-    ("minicpm-v (balanced)",             "minicpm-v:latest"),
-    ("gemma3:4b (lightest)",             "gemma3:4b"),
+    ("qwen3-vl:8b-instruct (clearest captions)", "qwen3-vl:8b-instruct"),
+    ("qwen3-vl:4b-instruct (balanced)",          "qwen3-vl:4b-instruct"),
+    ("qwen3-vl:2b-instruct (lightest)",          "qwen3-vl:2b-instruct"),
+    ("qwen2.5vl:7b (previous default)",          "qwen2.5vl:7b"),
 ]
 
 # A recommendation: the tier label (for display), the rounded VRAM in GB used to
@@ -62,21 +66,21 @@ def recommend_models(vram_total_mb):
     a safe default; the wizard handles "no GPU detected" separately (it offers the
     manual path rather than silently trusting this default).
 
-    Calibrated tiers (docs/first-start-wizard.md):
-      * <= ~12 GB : 3B Q8            + gemma3:4b       (8/10/12 GB cards)
-      *    16 GB  : 7B FP8 mixed     + minicpm-v
-      *  >= 24 GB : 7B FP16          + qwen2.5vl:7b    (24 GB and above are equal)
+    Calibrated tiers (docs/first-start-wizard.md; vision models: docs/tag-and-rename.md):
+      * <= ~12 GB : 3B Q8            + qwen3-vl:2b-instruct   (8/10/12 GB cards)
+      *    16 GB  : 7B FP8 mixed     + qwen3-vl:4b-instruct
+      *  >= 24 GB : 7B FP16          + qwen3-vl:8b-instruct   (24 GB and above are equal)
     """
     gb = vram_mb_to_gb(vram_total_mb)
     if gb >= 24:
         return Recommendation("24GB+", gb,
-                              "seedvr2_ema_7b_fp16.safetensors", "qwen2.5vl:7b")
+                              "seedvr2_ema_7b_fp16.safetensors", "qwen3-vl:8b-instruct")
     if gb >= 16:
         return Recommendation("16GB", gb,
                               "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-                              "minicpm-v:latest")
+                              "qwen3-vl:4b-instruct")
     return Recommendation("<=12GB", gb,
-                          "seedvr2_ema_3b-Q8_0.gguf", "gemma3:4b")
+                          "seedvr2_ema_3b-Q8_0.gguf", "qwen3-vl:2b-instruct")
 
 
 def recommend_compile(vram_gb):

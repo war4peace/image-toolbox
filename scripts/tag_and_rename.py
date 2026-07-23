@@ -366,6 +366,16 @@ OUTAGE_THRESHOLD    = _T.get("outage_threshold",    3)
 # The SOURCE FILE IS NEVER TOUCHED — only the in-memory copy sent to the model.
 TAG_MAX_IMAGE_PX    = int(_T.get("max_image_px",    1280))
 
+# Cap the Ollama context window (KV cache) for the tagging call. Newer vision
+# models ship a very large native context (qwen3-vl declares 256K), and Ollama
+# sizes the KV cache off that declared context, so it grabs almost the whole
+# card (measured: a 6.1 GB q4 qwen3-vl:8b pinned a 24 GB 3090 at 98% VRAM, which
+# thrashes into system RAM and slows the run). Our actual need is tiny: the image
+# is downscaled to TAG_MAX_IMAGE_PX and the reply is capped at 120 tokens, so a
+# small context loses nothing for describe-and-title. 0 = don't set num_ctx (let
+# the model/Ollama default stand).
+TAG_NUM_CTX         = int(_T.get("ollama_num_ctx",  8192))
+
 # Auto-straighten: detect sideways photos with a small CNN and rotate them
 # upright before tagging. Only confident 90/270 calls are acted on (see
 # orientation.py); 180 and low-confidence calls are left alone and logged.
@@ -646,12 +656,16 @@ def analyse_image(path, language="English"):
         "Do not include labels like 'LINE 1:' or 'LINE 2:' in your response."
     )
 
+    options = {"temperature": 0.2, "num_predict": 120}
+    if TAG_NUM_CTX and TAG_NUM_CTX > 0:
+        options["num_ctx"] = TAG_NUM_CTX      # cap the KV cache, see TAG_NUM_CTX
+
     payload = json.dumps({
         "model":   OLLAMA_MODEL,
         "prompt":  prompt,
         "images":  [img_b64],
         "stream":  False,
-        "options": {"temperature": 0.2, "num_predict": 120},
+        "options": options,
     }).encode("utf-8")
 
     req = urllib.request.Request(

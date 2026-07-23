@@ -81,6 +81,16 @@ HTTP 400 (every ≤24 GB remote card crashed on the first 2272×1704 image until
 this), and downscaling also speeds up tagging everywhere with no loss for
 describe-and-title use. EXIF orientation is applied to the in-memory copy so the
 model sees the photo upright. See `_encode_image_for_model` in `tag_and_rename.py`.
+The Ollama context is also **capped** (`tagging.ollama_num_ctx`, default 1280-safe
+8192, sent as `options.num_ctx`): newer vision models declare a huge native context
+(qwen3-vl = 256K) and Ollama sizes its KV cache off that, so uncapped it grabs
+almost the whole card and thrashes — a measured `qwen3-vl:8b-instruct` ran 9:11/100
+at 98% VRAM uncapped vs **2:37 at 43%** capped, no quality change. The **shipped
+default vision model is `qwen3-vl:8b-instruct`** (0.5.5): a 100-image benchmark had
+the qwen3-vl family beat qwen2.5vl:7b / minicpm-v / gemma3:4b at every tier (use the
+`instruct` variants, never `thinking` — the tool feeds raw output into EXIF/filenames,
+so a reasoning chain leaks in). See `docs/tag-and-rename.md` +
+`docs/tag-rename-benchmarks.csv`.
 
 **Comparison** (0.2.9) — a floating, resizable **original-vs-upscaled** window
 (like the log window: one shared instance, geometry persisted as
@@ -284,8 +294,10 @@ launch (guarded by `wizard_done` in `gui_settings.json`; re-runnable from Settin
 / `gpu_name`) and **recommends the SeedVR2 upscale model + Ollama vision model that
 fit the card's VRAM**, so a non-technical user gets a fast, sane config without
 knowing what "7B fp16" means. Calibrated tiers (pure `gui/wizard_recommend.py`,
-unit-tested): 8-12 GB → 3B Q8 + `gemma3:4b`; 16 GB → 7B FP8-mixed + `minicpm-v`;
-24 GB+ → 7B FP16 + `qwen2.5vl:7b`. The recommendation is a **suggestion, not a gate**
+unit-tested): 8-12 GB → 3B Q8 + `qwen3-vl:2b-instruct`; 16 GB → 7B FP8-mixed +
+`qwen3-vl:4b-instruct`; 24 GB+ → 7B FP16 + `qwen3-vl:8b-instruct` (the vision tiers
+rechosen 0.5.5 from the Tag & Rename benchmark, `docs/tag-and-rename.md`). The
+recommendation is a **suggestion, not a gate**
 (SeedVR2 offloads, so any card can run any model, just slower): every option stays
 selectable. The chosen Ollama model is **checked and offered for one-click pull**
 (`common.ollama_pull`, streamed `/api/pull` with progress); SeedVR weights download
@@ -470,8 +482,24 @@ runs on the pod. `provision.sh` caches the full **Ollama runtime** on the volume
 `llama-server` + GPU runners — caching only the binary 500s every inference with
 "llama-server binary not found"); `remote_run._start_ollama` trusts the cached
 runtime only when `llama-server` is present, else it falls through to a fresh
-install (so an older binary-only volume self-heals). Tagging uses a **cheap GPU
-tier** (`runpod.tag_gpu_type_id` →
+install (so an older binary-only volume self-heals). **Provisioning is incremental
+& self-pruning** (0.5.5): a re-provision keeps every still-valid artifact and
+(re)fetches only what changed (the venv is skipped via a requirements+torch stamp,
+the cached ollama runtime is reused instead of re-installed, SeedVR2 weights skip
+valid files), AND prunes obsolete models (Ollama models outside the desired set via
+`ollama rm`, stale SeedVR2 DiT weights once the new one is confirmed) so switching a
+model reclaims storage instead of piling up. So a model change is a cheap
+re-provision, not a fresh volume + full ~40 GB re-download. `provision.sh` also
+caches the **common model set** by default so the remote model can be switched with
+no re-provision at all: **all three vision tiers** (`OLLAMA_MODEL_LIST` = qwen3-vl
+2B/4B/8B-instruct) AND **all three SeedVR2 DiT tiers** (`DIT_MODEL_LIST` = 3B Q8 /
+7B FP8-mixed / 7B FP16, ~26 GB, fits the 50 GB volume), each plus the configured
+model (de-duped). The configured DiT is required (its download failing fails the
+provision); the extra tier DiTs are best-effort. Both `OLLAMA_MODEL`/`_ollama_model`
+and `DIT_MODEL`/`_dit_model` follow config (`ollama.model` / `upscale.dit_model`) via
+`runpod_provision._load_config`. Flags: `FORCE_VENV` / `FORCE_ENGINE` /
+`OLLAMA_PRUNE=0` / `SEEDVR2_PRUNE=0`. Tagging uses a **cheap GPU tier**
+(`runpod.tag_gpu_type_id` →
 an ordered fallback chain of 16–20 GB cards in `TAG_GPU_TYPES`; the vision model
 needs only ~6.6 GB), not the upscale GPU. **0.3.3 added a live GPU picker** next
 to each tab's "Run on remote pod" toggle: it queries RunPod's **GraphQL** endpoint
@@ -631,8 +659,11 @@ Engine, packaging & CI:
   `runpod-notes.md` (remote-pod upscaling notes), `video-upscaler.md` /
   `local-video-upscaler.md` (design + as-built notes for the Video Upscaler: remote #2
   and the local GPU path #7), `benchmark-sharing.md` (as-built notes for the
-  crowdsourced benchmark corpus, #8), `CHANGELOG.md` (working draft of per-version
-  release notes), `image-benchmarks.csv` (author benchmark data, read by `benchmarks.py`).
+  crowdsourced benchmark corpus, #8), `tag-and-rename.md` (vision-model design +
+  as-built notes for Tag & Rename: the model tiers + the `ollama_num_ctx` cap, with
+  `tag-rename-benchmarks.csv` the raw 100-image measurements), `CHANGELOG.md` (working
+  draft of per-version release notes), `image-benchmarks.csv` (author benchmark data,
+  read by `benchmarks.py`).
 
 ## Architecture notes for changes
 

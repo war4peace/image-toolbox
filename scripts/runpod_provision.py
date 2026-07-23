@@ -57,6 +57,16 @@ def _load_config():
     rpc = cfg.get("runpod", {})
     if not rpc.get("api_key"):
         sys.exit("No runpod.api_key in config.json (Settings → Remote upscaling).")
+    # The provisioning pull needs the configured vision model, which lives in the
+    # ollama section (not runpod). Stash it so cmd_provision / cmd_setup_volume pull
+    # the model the app is actually set to use — otherwise a re-provision silently
+    # pulls the old hardcoded default. An explicit OLLAMA_MODEL env still overrides.
+    rpc["_ollama_model"] = cfg.get("ollama", {}).get("model", "qwen2.5vl:7b")
+    # Likewise the SeedVR2 DiT lives in the upscale section. Stash it so the volume is
+    # guaranteed to carry the DiT the user actually picked (added to the cached tier
+    # set); otherwise a non-default choice would download at the start of every run.
+    rpc["_dit_model"] = cfg.get("upscale", {}).get("dit_model",
+                                                   "seedvr2_ema_7b_fp16.safetensors")
     return rpc
 
 
@@ -325,11 +335,11 @@ def cmd_provision(rpc, args):
     if not os.path.exists(PROVISION_SH):
         sys.exit(f"Missing {PROVISION_SH}")
     _scp(host, port, key, PROVISION_SH, "/root/provision.sh")
-    dit = rpc.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
+    dit = rpc.get("_dit_model") or "seedvr2_ema_7b_fp16.safetensors"
     # DIT model name actually lives in the upscale section; allow override via env.
     env = (f"DIT_MODEL='{os.environ.get('DIT_MODEL', dit)}' "
-           f"OLLAMA_MODEL='{os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:7b')}'")
-    print("Running provision.sh on the pod (this downloads ~22 GB to the volume)…")
+           f"OLLAMA_MODEL='{os.environ.get('OLLAMA_MODEL', rpc.get('_ollama_model', 'qwen2.5vl:7b'))}'")
+    print("Running provision.sh on the pod (this downloads ~40 GB to the volume)…")
     _ssh(host, port, key, f"{env} bash /root/provision.sh")
 
 
@@ -480,8 +490,8 @@ def cmd_terminate(rpc, args):
 
 def cmd_setup_volume(rpc, args):
     """One-shot model-volume provisioning for the GUI 'Provision models' button:
-    create a fresh pod, run pod/provision.sh to fill the network volume (~22 GB:
-    SeedVR2 + Ollama + venv), then ALWAYS terminate the pod — even on error or
+    create a fresh pod, run pod/provision.sh to fill the network volume (~40 GB:
+    all three SeedVR2 tiers + all three Ollama vision tiers + venv), then ALWAYS terminate the pod — even on error or
     Ctrl-C — so a provisioning pod is never left billing. Streams progress to
     stdout (the GUI shows it live). The on-pod dead-man's switch is not used here
     because this process owns the teardown in a finally."""
@@ -534,7 +544,7 @@ def cmd_setup_volume(rpc, args):
         spec["env"] = {"PUBLIC_KEY": pub}
 
     print(f"Provisioning the model volume {vol_id} in {region}.", flush=True)
-    print(f"  GPU {gpu_chain[0]}, image {image}. This downloads ~22 GB to the volume and", flush=True)
+    print(f"  GPU {gpu_chain[0]}, image {image}. This downloads ~40 GB to the volume and", flush=True)
     print("  can take 10-20 minutes. The pod is terminated automatically when done.", flush=True)
     print("  *** a pod is now BILLING until provisioning finishes ***", flush=True)
 
@@ -575,9 +585,9 @@ def cmd_setup_volume(rpc, args):
               f"(self-terminate after {ceiling} min) …", flush=True)
         _arm_provision_deadman(host, port, kp, key, pod_id, ceiling)
         _scp(host, port, kp, PROVISION_SH, "/root/provision.sh")
-        dit = rpc.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
+        dit = rpc.get("_dit_model") or "seedvr2_ema_7b_fp16.safetensors"
         env = (f"DIT_MODEL='{os.environ.get('DIT_MODEL', dit)}' "
-               f"OLLAMA_MODEL='{os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:7b')}'")
+               f"OLLAMA_MODEL='{os.environ.get('OLLAMA_MODEL', rpc.get('_ollama_model', 'qwen2.5vl:7b'))}'")
         print("Running provision.sh on the pod …", flush=True)
         res = _ssh(host, port, kp, f"{env} bash /root/provision.sh", check=False)
         if res.returncode != 0:

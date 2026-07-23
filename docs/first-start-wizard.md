@@ -92,15 +92,20 @@ Single tier table (both models keyed on the same detected VRAM):
 
 | Detected VRAM | SeedVR2 DiT (`upscale.dit_model` / `video.dit_model`) | Ollama (`ollama.model`) |
 |---|---|---|
-| 8 GB (min supported) | `seedvr2_ema_3b-Q8_0.gguf` | `gemma3:4b` |
-| 10-12 GB | `seedvr2_ema_3b-Q8_0.gguf` | `gemma3:4b` |
-| 16 GB | `seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors` | `minicpm-v:latest` |
-| 24 GB (3090/4090) | `seedvr2_ema_7b_fp16.safetensors` (current default) | `qwen2.5vl:7b` |
-| 32 GB+ | `seedvr2_ema_7b_fp16.safetensors` (or `_sharp_fp16`) | `qwen2.5vl:7b` |
+| 8 GB (min supported) | `seedvr2_ema_3b-Q8_0.gguf` | `qwen3-vl:2b-instruct` |
+| 10-12 GB | `seedvr2_ema_3b-Q8_0.gguf` | `qwen3-vl:2b-instruct` |
+| 16 GB | `seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors` | `qwen3-vl:4b-instruct` |
+| 24 GB (3090/4090) | `seedvr2_ema_7b_fp16.safetensors` (current default) | `qwen3-vl:8b-instruct` |
+| 32 GB+ | `seedvr2_ema_7b_fp16.safetensors` (or `_sharp_fp16`) | `qwen3-vl:8b-instruct` |
 
 Notes:
-- The two lowest tiers share the same models (3B Q8 + gemma3:4b): an 8 GB card and
-  a 12 GB card both want the lightweight pair.
+- The Ollama tiers were rechosen from a measured 100-image Tag & Rename benchmark
+  (see `docs/tag-and-rename.md`): the qwen3-vl family beat the old
+  qwen2.5vl:7b / minicpm-v / gemma3:4b picks at every tier. They depend on the
+  `tagging.ollama_num_ctx` cap (config.json, default 8192) to stay fast: uncapped,
+  qwen3-vl's 256K native context grabs almost the whole card and thrashes.
+- The two lowest tiers share the same models (3B Q8 + qwen3-vl:2b-instruct): an
+  8 GB card and a 12 GB card both want the lightweight pair.
 - Tag & Rename and upscaling never run at the same time, so the Ollama tier assumes
   the whole card is free during tagging, not just what SeedVR leaves.
 - SeedVR "sharp" and GGUF quantized options stay visible as secondary picks (the
@@ -145,8 +150,8 @@ Notes:
    and closes the wizard. For remote-only it is the main path (replacing steps 2-4);
    for a **both** install it is an optional final step. Remote-only installs do NOT
    have their model config rewritten (the GPU/model steps are skipped, so the
-   shipped 7B FP16 + qwen2.5vl:7b defaults are left for the big pod GPU the user
-   picks per-run).
+   shipped 7B FP16 + qwen3-vl:8b-instruct defaults are left for the big pod GPU the
+   user picks per-run).
 7. **Finish:** write config via `config_store.save` (through `gui.common.save_config`),
    set `wizard_done`.
 

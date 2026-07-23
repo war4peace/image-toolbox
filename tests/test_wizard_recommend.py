@@ -29,17 +29,17 @@ def test_vram_none_or_zero_is_zero():
 
 # ── recommend_models: the calibrated tiers ───────────────────────────────────
 
-def test_low_tier_8_to_12gb_is_3b_q8_and_gemma():
+def test_low_tier_8_to_12gb_is_3b_q8_and_qwen3vl_2b():
     for mb in (8192, 10240, 11264, 12288):    # 8, 10, 11, 12 GB cards
         rec = wr.recommend_models(mb)
         assert rec.dit_model == "seedvr2_ema_3b-Q8_0.gguf"
-        assert rec.ollama_model == "gemma3:4b"
+        assert rec.ollama_model == "qwen3-vl:2b-instruct"
 
 
-def test_16gb_tier_is_7b_fp8_mixed_and_minicpm():
+def test_16gb_tier_is_7b_fp8_mixed_and_qwen3vl_4b():
     rec = wr.recommend_models(16376)          # nominal 16 GB
     assert rec.dit_model == "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"
-    assert rec.ollama_model == "minicpm-v:latest"
+    assert rec.ollama_model == "qwen3-vl:4b-instruct"
     assert rec.tier == "16GB"
 
 
@@ -50,26 +50,26 @@ def test_16gb_lower_boundary_is_exactly_16():
     assert wr.recommend_models(16384).tier == "16GB"     # 16 GB -> mid
 
 
-def test_24gb_tier_is_7b_fp16_and_qwen():
+def test_24gb_tier_is_7b_fp16_and_qwen3vl_8b():
     rec = wr.recommend_models(24576)          # 3090 / 4090
     assert rec.dit_model == "seedvr2_ema_7b_fp16.safetensors"
-    assert rec.ollama_model == "qwen2.5vl:7b"
+    assert rec.ollama_model == "qwen3-vl:8b-instruct"
     assert rec.tier == "24GB+"
 
 
 def test_32gb_and_above_matches_24gb_recommendation():
     # 24 GB and 32 GB+ resolve to the same models (only the pre-selection differs
-    # by nothing); both get the full 7B FP16 + qwen2.5vl:7b pair.
+    # by nothing); both get the full 7B FP16 + qwen3-vl:8b-instruct pair.
     for mb in (32607, 49152, 81920):          # 32, 48, 80 GB cards
         rec = wr.recommend_models(mb)
         assert rec.dit_model == "seedvr2_ema_7b_fp16.safetensors"
-        assert rec.ollama_model == "qwen2.5vl:7b"
+        assert rec.ollama_model == "qwen3-vl:8b-instruct"
 
 
 def test_none_vram_falls_back_to_lowest_tier():
     rec = wr.recommend_models(None)
     assert rec.dit_model == "seedvr2_ema_3b-Q8_0.gguf"
-    assert rec.ollama_model == "gemma3:4b"
+    assert rec.ollama_model == "qwen3-vl:2b-instruct"
     assert rec.vram_gb == 0
 
 
