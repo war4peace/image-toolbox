@@ -1756,12 +1756,15 @@ to the image runners (batch upscale / tag) is the follow-up if it proves out.
 
 ---
 
-## 18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (planned, 0.5.6)
+## 18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (0.5.6)
 
-> **Status: DESIGNED, NOT BUILT.** This is the design of record for the next 0.5.6 remote
-> work. The local Real-ESRGAN engine (`docs/local-video-upscaler.md` section 11) shipped on
-> `0.5.6-experimental` (commit `42b971e`); what follows is the REMOTE half plus the general
-> queue change it depends on. Nothing here is in the code yet.
+> **Status: BUILT on `0.5.6-experimental`.** Part A (per-item GPU binding + grouped multi-pod
+> Start + pendulum) is live-validated on a real mixed-GPU SeedVR2 queue. Part B (remote
+> Real-ESRGAN) is built end to end (B1 pod worker mode `1e1cfd5`, B2 no-volume deploy
+> `28a4714`, B3 route + GUI `b823be3`) and the pod path is live-validated on the cheapest card;
+> a full GUI-driven mixed-queue run is the remaining user-side check. See **18.8 (as-built)**
+> for what changed from the design below, especially the CUDA-image constraint. The design that
+> follows (18.1-18.7) is kept as the record of intent.
 
 ### 18.1 Motivation
 
@@ -1918,5 +1921,47 @@ Two pieces wait for a real remote Real-ESRGAN measurement, matching the local en
    tab gating. It drops in as one more (method, GPU) group.
 3. **Deferred:** the remote benchmark + estimator rates + corpus `engine` column, when a real
    measurement lands.
+
+### 18.8 As-built (what shipped, and where it differs from the design)
+
+Part A landed as designed and was live-validated (mixed L4 + PRO 4000 SeedVR2 queue: visible
+cheapest-first reorder, one pod per group in turn, both dynamic mid-run add cases). Part B
+followed in three slices:
+
+- **B1 (`1e1cfd5`) pod worker `--mode esrgan`.** No SeedVR2 load; a `FixedRatioVideoEngine`
+  is built per job (the model key travels in the `/video/submit` query), self-downloading a
+  SHA-verified ~65 MB weight, and mirrors the SeedVR2 job bookkeeping so `/video/status` +
+  `/video/fetch` are identical to the client. `/health` reports the real GPU name (the card
+  identity matters for the wide-GPU benchmarking this mode exists for).
+- **B2 (`28a4714`) no-volume deploy.** `RemoteSession(mode="esrgan")` skips the model volume
+  entirely: own pod name `esrgan-toolbox-remote` (so `_find_existing_pod` never adopts a
+  volume SeedVR2 pod), no `networkVolumeId`/`dataCenterIds` (deploys region-wide), uploads the
+  fixed-ratio engine stack, and stands the worker up on the base image (find the torch python,
+  `pip install spandrel certifi`, fetch a static ffmpeg to `/root/ffmpeg`, launch
+  `--mode esrgan`). Reuse-check + launch-verify + health-wait are factored into helpers shared
+  with the SeedVR2 launch.
+- **B3 (`b823be3`) route + GUI.** A fixed_ratio group routes to `make_session(engine_kind=
+  "fixed_ratio")` -> mode `esrgan`; `process_job` passes the per-job model to
+  `process_segment`; the grouped-path gate fires on ANY fixed_ratio group so an esrgan-only
+  queue reaches the esrgan pod; stock is read globally for a region-wide fixed_ratio group.
+  Real-ESRGAN is offered in the REMOTE Method list, and the remote GPU picker floors by the
+  selected engine (`video_estimate.ESRGAN_VRAM_FLOOR` = 8 GB, region-wide) instead of SeedVR2's
+  32/80/90 target floors.
+
+**Key deviation from the design: the pod IMAGE.** 18.5 assumed the esrgan worker just reuses
+the SeedVR2 image. It cannot: that image is `cu1281` (CUDA 12.8.1) and torch 2.9.1 hard-refuses
+a host driver even one PATCH below it (a real RTX 2000 Ada landed on a 12.8.0 driver:
+"driver too old, found 12080"), and RunPod's `allowedCudaVersions` filter is only minor-granular
+so it can't exclude a 12.8.0 host. A stock `pytorch/pytorch` image is unusable too (no sshd, scp
+fails 255). The fix is a dedicated `remote_run.ESRGAN_IMAGE =
+runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`: a RunPod image (so sshd + the injected
+`PUBLIC_KEY` work) built on CUDA 12.4 (runs on the whole Ampere/Ada fleet, incl. that 12.8.0
+host). Blackwell (sm_120) needs cu128, so a Blackwell esrgan run would need a cu128 image
+override (`runpod.esrgan_image_name`), deferred with the rest of the wide-card benchmarking.
+`runpod_client._cuda_from_image` now parses the `cudaXX.Y` tag form too.
+
+**Live validation (B2, RTX 2000 Ada $0.24):** no-volume region-wide deploy on the first attempt,
+worker ready in 56 s, a 320x180 clip upscaled x4 to 1280x720 (29 frames in 6.2 s), correct HEVC
+output, clean teardown, 64 s total.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
