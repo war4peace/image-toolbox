@@ -1810,9 +1810,23 @@ the earlier "ESRGAN phase then SeedVR2 phase" idea is just the N=2 case of this.
 processed to completion before its pod is torn down (already how `run_queue` behaves within one
 pod; the new part is the queue is partitioned into groups).
 
-**Ordering.** Cheapest groups first is the sensible default (least spent if the user stops
-early, and the cheap Real-ESRGAN work clears first), but the primary gate is **live stock**:
-skip to the next group whose pinned card is in stock rather than block on a sold-out one.
+**Grouping is a VISIBLE, persisted reorder, not a hidden internal sort (user requirement).**
+Pressing Start rewrites `video_outputs.queue_order` so that same-`(engine, gpu)` jobs become
+**contiguous**, preserving each job's existing relative order WITHIN its group (a stable sort
+by group rank), then **refreshes the queue tree** so the user literally sees the run order:
+the `#`/Place column renumbers and the rows visibly regroup before processing begins. The
+GUI already renders the queue in `queue_order`, so reflecting the plan is free once it is
+persisted. This also simplifies the runner: it needs no separate "grouping" concept, it just
+walks the queue in `queue_order` and treats each **maximal contiguous run of same-`(engine,
+gpu)` jobs as one pod session** (`group_queue_order` in `batch_video_upscale` is the pure,
+headless-tested reorder; Start persists its result and reloads the tree). The user's up/down
+reordering still works; grouping is one more reorder they can see, not a black box.
+
+**Group order.** Cheapest pod first is the default rank (least spent if the user stops early,
+and the cheap Real-ESRGAN group clears first), but the primary runtime gate is live **stock**
+(see the pendulum, 18.4): a sold-out group's pod is skipped to the next in-stock group rather
+than blocking. If stock forces a different actual order at run time, the tree is updated to
+match so it never lies about what is running next.
 
 **No GPU substitution, ever (0.4.0 preserved).** Each group runs on exactly the card its rows
 were queued against. A sold-out card is waited for or deferred, never swapped for a different

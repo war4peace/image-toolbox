@@ -1313,6 +1313,34 @@ def _resolve_job_engine(vcfg, engine=None, model=None):
     return eng, mdl
 
 
+def job_group_key(job):
+    """The (engine, gpu) a job runs under (18): the pod-session grouping key. A NULL engine
+    reads as 'seedvr2' and a NULL gpu as '' (the run-level GPU / local), so legacy rows group
+    together exactly as they ran before per-item binding. Kept in one place so the pure
+    reorder, the GUI display and the future multi-pod runner all agree on what a 'group' is."""
+    return ((_row_get(job, "engine") or "seedvr2"), (_row_get(job, "gpu") or ""))
+
+
+def group_queue_order(jobs, group_rank=None):
+    """Reorder a queue (jobs already in queue_order) so jobs sharing an (engine, gpu) become
+    CONTIGUOUS: one pod session each (18). Within a group the jobs keep their existing relative
+    order (a STABLE sort). `group_rank((engine, gpu)) -> sortable` sets the order BETWEEN groups
+    (default: first-appearance order, so a caller with no price/stock info still gets a
+    deterministic, minimal-churn result). The first-appearance index is folded into the sort
+    key as a tiebreaker, so groups stay contiguous even when two groups share a rank.
+
+    Pure + deterministic: does not touch the DB and returns a NEW list; the input is unchanged.
+    Start persists the result into queue_order and reloads the queue tree, so the user SEES the
+    run order (the runner then just walks queue_order, one pod per contiguous same-key run)."""
+    first = {}
+    for j in jobs:
+        k = job_group_key(j)
+        if k not in first:
+            first[k] = len(first)
+    rank = group_rank or (lambda k: first[k])
+    return sorted(jobs, key=lambda j: (rank(job_group_key(j)), first[job_group_key(j)]))
+
+
 def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
                 engine=None, model=None, gpu=None):
     """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
