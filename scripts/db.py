@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS video_outputs (
     clip_frames INTEGER,          -- COUNTED frames of the extracted range (filled at Prepare)
     engine      TEXT,             -- per-job engine (#11): NULL/'seedvr2' | 'fixed_ratio'
     model       TEXT,             -- per-job model: seedvr2 dit filename OR esrgan_models key
+    gpu         TEXT,             -- per-job remote GPU type id (18): NULL = the run-level GPU
     created_at  TEXT,
     updated_at  TEXT,
     PRIMARY KEY (root_id, rel_path, target, clip_id)
@@ -417,7 +418,9 @@ def _ensure_video_columns(conn):
                          "ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
         # #11 per-job engine/model: NULL means the legacy default (seedvr2), so existing
         # rows keep meaning exactly what they did before this landed.
-        for _c in ("engine", "model"):
+        # (18) per-job gpu: the picked remote GPU type id; NULL = the run-level GPU (legacy
+        # single-GPU run), so existing rows and every local/image run are unaffected.
+        for _c in ("engine", "model", "gpu"):
             if cols and _c not in cols:
                 conn.execute(f"ALTER TABLE video_outputs ADD COLUMN {_c} TEXT")
     except Exception as exc:

@@ -1314,7 +1314,7 @@ def _resolve_job_engine(vcfg, engine=None, model=None):
 
 
 def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
-                engine=None, model=None):
+                engine=None, model=None, gpu=None):
     """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
     CLI: do the EXACT pass for this (file, target) (counted frames — the header
     lies), then enqueue a video_outputs job. Returns a dict with nb_frames and an
@@ -1322,7 +1322,10 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
     existing job leaves its queue position and any progress intact.
 
     `engine`/`model` (#11) stamp the per-job method; omit to inherit the vcfg defaults
-    (so the headless `--engine` flag and the Settings default both flow through here)."""
+    (so the headless `--engine` flag and the Settings default both flow through here).
+    `gpu` (18) stamps the per-job remote GPU type id (the card selected when the row was
+    queued); None leaves it NULL = the run-level GPU (a local run, or a legacy single-GPU
+    remote run). Grouped multi-pod Start reads it to route each job to its own pod."""
     abs_path = os.path.join(source_root, rel)
     info = vp.probe(abs_path, count=True)         # exact frames for cost + drift
     # Never enqueue a DOWNSCALE (target box smaller than the source): SeedVR2 is an
@@ -1355,7 +1358,7 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
         db.upsert_video_output(conn, root_id, rel, target, status="queued",
                                output_path=_output_path(output_root, rel, target, engine=eng),
                                queue_order=db.next_queue_order(conn, root_id),
-                               engine=eng, model=mdl)
+                               engine=eng, model=mdl, gpu=(gpu or None))
     seg_secs = vcfg["segment_seconds"]
     approx_segments = max(1, math.ceil((info.duration or 0) / seg_secs)) if seg_secs else 1
     return {"nb_frames": info.nb_frames, "duration": info.duration,
