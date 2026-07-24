@@ -255,18 +255,80 @@ per card from real runs.
 
 <div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
-## 11. Phase 2 (planned, not now): non-SeedVR fixed-ratio engine
+## 11. As built (0.5.6): non-SeedVR fixed-ratio engine (Real-ESRGAN)
 
-A later, separate phase: a **non-SeedVR, fixed-ratio 2x/4x** upscaler (a
-Real-ESRGAN / RealCUGAN-class model) as a second local engine.
+A second local engine: a **non-SeedVR, fixed-ratio 2x/4x** upscaler (Real-ESRGAN-class),
+chosen **per queued video** next to SeedVR2, so one queue can mix methods.
 
-- **Why it may matter more for a broad audience:** it is fast, low-VRAM,
-  deterministic, and runs on any GPU, where local SeedVR2 is slow *everywhere*. For
-  many users "fast, good-enough, runs on my card" beats "slow, generative, best."
-- **Cost:** a new model dependency, a quality tradeoff (deterministic sharpening vs.
-  SeedVR2's generative detail), and a second engine to maintain. It drops into the
-  **same injected-engine seam** (section 4), so it is additive, not a rewrite.
-- **Decision deferred.** Prototype and evaluate quality after local SeedVR2 ships.
+- **Why it matters for a broad audience:** fast, low-VRAM, deterministic, runs on almost
+  any GPU, where local SeedVR2 is slow *everywhere*. For many users "fast, good-enough,
+  runs on my card" beats "slow, generative, best." It also structurally avoids SeedVR2's
+  temporal jitter (no temporal VAE) and greatly reduces text/logo distortion (mild,
+  deterministic prior), at the cost of no temporal-consistency mechanism (possible
+  inter-frame shimmer on noisy sources).
+- **Loader = spandrel** (chaiNNer's MIT model loader), NOT basicsr (the unmaintained
+  install-breaker). Reuses the Local/Both torch stack; added to `bootstrap.ps1` Local/Both.
+- **Measured (RTX 3090, fp16):** the *compact* `realesr-general-x4v3` (SRVGGNetCompact) is
+  the value tier: 1080p x4 at ~5.4 fps in ~1.5 GB, fits an 8 GB card untiled. `RealESRGAN_x4plus`
+  (RRDBNet) is the *quality* option: ~16x slower, ~8 GB for a single 480p frame (tiling
+  mandatory). So the shipped **default is the compact model**; x4plus is opt-in.
+
+### 11.1 As-built shape
+
+- **`scripts/fixed_ratio_engine.py`**: `FixedRatioVideoEngine`, a drop-in for the injected
+  engine seam (section 4). Per segment: ffmpeg raw-rgb24 decode -> batched, tiled per-frame
+  spandrel upscale on the GPU -> ffmpeg yuv420p encode (concat-`-c copy`-compatible). Honors
+  the box-fit `resolution` (model emits src*scale, then a scale filter fits the target box).
+  OOM back-off shrinks the frame-batch then the tile; kills both ffmpeg procs on Stop/error.
+- **`scripts/esrgan_models.py`**: torch-free catalog + lazy, **SHA-256-verified** download
+  (via `net_ssl`) to `models/ESRGAN/`. Weights are grouped into **tiers** (Compact / Quality);
+  the GUI shows ONE Method entry per tier (`catalog()` returns tier representatives). Within a
+  tier the engine **auto-picks the best-scale weight for the target ratio** (`resolve_for_ratio`,
+  resolved at Prepare and stored): a **2x** target uses a native **x2** weight rather than
+  computing 4x and downscaling. Shipped: `realesr-general-x4v3` (compact x4, default),
+  `RealESRGAN_x4plus` (quality x4), `RealESRGAN_x2plus` (quality x2, auto for 2x targets).
+  Measured win: 1080p -> 4K (a 2x target) on a 3090 dropped from **4.82 s/frame** (x4plus,
+  4x-then-downscale) to **1.30 s/frame** (x2plus, native) at identical output. Adding a weight
+  is one verified row (+ a TIERS entry if it is a new tier).
+- **Per-job engine (`db.py`)**: `video_outputs` gained nullable `engine`/`model` columns
+  (NULL = the legacy SeedVR2 default, so pre-#11 rows + output paths are unchanged). The PK
+  is unchanged; the one accepted limitation is that the SAME file at the SAME target can't be
+  queued under two engines at once (a different file or ratio is fine). Non-default engines
+  tag the output filename (`_realesrgan`) so results never collide on disk.
+- **Runner dispatch (`batch_video_upscale.py`)**: `LocalEngineRouter` builds the engine per
+  job from its (engine, model) and keeps ONE resident at a time (closes + reloads on a change
+  to bound VRAM); `run_queue(resolve_engine=...)` picks it per job. Remote / passthrough /
+  auto-resume are unchanged (single injected engine). `prepare_job(engine=, model=)` stamps
+  the job; the headless `--engine` / `--fixed-ratio-model` flags set the default.
+- **Video Upscaler tab**: the add-to-queue row now has a **Method** combobox (engine+model:
+  4 SeedVR2 variants always, +2 Real-ESRGAN in Local mode only) and a **Target** combobox
+  whose options DEPEND on the method (engine-aware feasibility). The queue list shows a
+  **Method** column. So a user builds a mixed queue and presses Start once.
+- **Settings** hold only the **default** method + Real-ESRGAN model (pre-selects the tab's
+  comboboxes); the real choice is per video.
+
+### 11.2 No cap for Real-ESRGAN (limits are benchmark-derived, later)
+
+SeedVR2's output-MP feasibility ceiling (`max_output_mp`, `_job_exceeds_gpu`) is a SeedVR2
+notion (its VRAM scales hard with output size). Real-ESRGAN is fixed-ratio, low-VRAM and
+tiles, so **no VRAM cap is enforced on it**: the tab never greys a fixed_ratio target, the
+Start gate never counts it infeasible, and the runner never defers it. Its real resolution /
+length limits are meant to come from a **real-footage benchmark** later (section 8's harness,
+extended with an `engine` dimension), not an assumed ceiling.
+
+### 11.3 Exact-ratio targets only (no resize of a generated frame)
+
+Because Real-ESRGAN is fixed-ratio, upscaling to a target whose scale is NOT a native model
+scale would need an ffmpeg resize of the *generated* frame: a downscale (e.g. 2x model then
+shrink 4320p -> 1440p) or an upscale (e.g. 4x model then stretch), both of which throw away or
+soften detail the model produced. To avoid that quality loss, the Target combobox offers a
+fixed_ratio target ONLY when its box-fit scale equals a native model scale of the selected tier
+(`esrgan_models.tier_scales`; Quality = {2, 4}, Compact = {4}), within a 1% tolerance for odd
+source dims. So the generated frame is written at its native size, never resized. Consequences:
+1080p -> **4K** is offered (4K IS exactly 2x of 1080p) but 1080p -> **1440p** (1.33x) is NOT
+(that path stays SeedVR2-only); the ratio targets (2X / 4X) always qualify; and the Compact
+tier (x4 only) offers nothing for a 1080p source (its x4 exceeds the 4K cap, and 4K is only
+2x), so a 1080p source uses the Quality tier's native x2.
 
 <div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 
@@ -281,7 +343,8 @@ Real-ESRGAN / RealCUGAN-class model) as a second local engine.
    prototyping sweep to build the first real tier table.
 4. **Custom targets** (section 6, both modes) + **advisory-only VRAM** (section 7).
 5. **Tab toggle + local time estimate + loud guards** (sections 3, 9, 10).
-6. **Phase 2** (section 11): evaluate the fixed-ratio engine.
+6. **Phase 2** (section 11): the non-SeedVR fixed-ratio engine (Real-ESRGAN). **Shipped
+   0.5.6** as a per-video method choice; see section 11 as-built.
 
 <div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 

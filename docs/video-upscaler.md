@@ -22,7 +22,11 @@ Upscaler"**.
 > and the user's own `db.gpu_perf` history supersedes the table per card over time.
 > Two SeedVR2 limits are inherent and NOT tunable: temporal jitter of fine detail
 > on slow pans/slow-mo (the 4x causal temporal VAE) and text/plate/logo distortion
-> (generative SR, no OCR); see the findings noted inline.
+> (generative SR, no OCR); see the findings noted inline. **Both are sidestepped by the
+> alternative local engine (0.5.6):** a **Real-ESRGAN** fixed-ratio 2x/4x upscaler,
+> deterministic and per-frame (no temporal VAE, mild generative prior), selectable **per
+> video** next to SeedVR2 on a Local/Both install. Fast + low-VRAM; see
+> `docs/local-video-upscaler.md` section 11.
 
 ---
 

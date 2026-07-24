@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS video_outputs (
     clip_end    REAL,             -- clip range end (seconds); NULL for a whole-file job
     clip_label  TEXT,             -- optional user label, used in the output filename
     clip_frames INTEGER,          -- COUNTED frames of the extracted range (filled at Prepare)
+    engine      TEXT,             -- per-job engine (#11): NULL/'seedvr2' | 'fixed_ratio'
+    model       TEXT,             -- per-job model: seedvr2 dit filename OR esrgan_models key
     created_at  TEXT,
     updated_at  TEXT,
     PRIMARY KEY (root_id, rel_path, target, clip_id)
@@ -413,6 +415,11 @@ def _ensure_video_columns(conn):
         if cols and "fail_count" not in cols:      # item 4: give up on a job that keeps failing
             conn.execute("ALTER TABLE video_outputs "
                          "ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+        # #11 per-job engine/model: NULL means the legacy default (seedvr2), so existing
+        # rows keep meaning exactly what they did before this landed.
+        for _c in ("engine", "model"):
+            if cols and _c not in cols:
+                conn.execute(f"ALTER TABLE video_outputs ADD COLUMN {_c} TEXT")
     except Exception as exc:
         debug_log("db._ensure_video_columns(video_outputs)", exc=exc)
     try:

@@ -115,6 +115,25 @@ _VIDEO_MODEL_OPTIONS = [
     ("3B FP16 (small, full precision)",       "seedvr2_ema_3b_fp16.safetensors"),
 ]
 
+# LOCAL video engine choice (feature #11). SeedVR2 = the generative default; Real-ESRGAN
+# (fixed_ratio) = a fast, low-VRAM, deterministic per-frame GAN. Only affects LOCAL runs;
+# the remote path is always SeedVR2. (label -> video.engine value.)
+_VIDEO_ENGINE_OPTIONS = [
+    ("SeedVR2: best quality (generative, slower)",       "seedvr2"),
+    ("Real-ESRGAN: fast (fixed 2x/4x, low VRAM)",        "fixed_ratio"),
+]
+
+# Fixed-ratio (Real-ESRGAN) model picklist, built from the shared catalog so Settings and
+# the runner never disagree on what exists. (label -> esrgan_models key.) Guarded: an odd
+# tree without esrgan_models degrades to the compact default only, never a crash.
+try:
+    import esrgan_models as _esrgan_models
+    _ESRGAN_MODEL_OPTIONS = [(m.label, m.key) for m in _esrgan_models.catalog()]
+    _ESRGAN_DEFAULT_KEY = _esrgan_models.DEFAULT_MODEL
+except Exception:                                    # noqa: BLE001
+    _ESRGAN_MODEL_OPTIONS = [("Compact (fast): realesr-general-x4v3", "realesr-general-x4v3")]
+    _ESRGAN_DEFAULT_KEY = "realesr-general-x4v3"
+
 
 class SettingsTab(ttk.Frame):
     """Edit the settings that previously lived only in config.json."""
@@ -508,6 +527,46 @@ class SettingsTab(ttk.Frame):
                 "long it should take, before any billed machine is created. "
                 "Leave this on unless the prompt is getting in your way.",
                 wraplength=W)
+
+        # ── Default method for new queue items ────────────────────────────────────
+        # These are just the DEFAULTS pre-selected on the Video Upscaler tab; the actual
+        # method is chosen PER VIDEO there (a queue can mix methods), so this is not a global
+        # switch (rows 13+ so the existing grid is untouched).
+        ttk.Label(sec, text="Default method for new queue items:", foreground="#888").grid(
+            row=13, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(sec, text="Method:").grid(row=14, column=0, sticky="w", pady=3)
+        self.video_engine_var = tk.StringVar(value=self._video_engine_label(vid))
+        eng_cb = ttk.Combobox(sec, textvariable=self.video_engine_var, state="readonly",
+                              width=40, values=[lbl for lbl, _v in _VIDEO_ENGINE_OPTIONS])
+        eng_cb.grid(row=14, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(eng_cb,
+                "The method PRE-SELECTED for a new video on the Video Upscaler tab. You still "
+                "pick the method per video there, so one queue can mix SeedVR2 and Real-ESRGAN; "
+                "this only sets the starting choice. (Real-ESRGAN is a local-GPU engine; remote "
+                "pod runs are always SeedVR2.)\n\n"
+                "SeedVR2 invents new detail (best quality) but is slow and VRAM-hungry on a "
+                "local card. Real-ESRGAN is a fast, light, fixed 2x/4x upscaler that runs on "
+                "almost any GPU and keeps text/edges cleaner, at some loss of fine invented "
+                "detail. Try Real-ESRGAN if SeedVR2 is too slow on your machine.",
+                wraplength=W)
+        ttk.Label(sec, text="Real-ESRGAN model:").grid(row=15, column=0, sticky="w", pady=3)
+        self.video_esrgan_model_var = tk.StringVar(value=self._video_esrgan_model_label(vid))
+        self._esrgan_model_cb = ttk.Combobox(
+            sec, textvariable=self.video_esrgan_model_var, state="readonly",
+            width=40, values=[lbl for lbl, _k in _ESRGAN_MODEL_OPTIONS])
+        self._esrgan_model_cb.grid(row=15, column=1, sticky="w", padx=6, pady=3)
+        Tooltip(self._esrgan_model_cb,
+                "The Real-ESRGAN model pre-selected when the default method above is "
+                "Real-ESRGAN. You still choose the exact method and model per video on the "
+                "Video Upscaler tab.\n\n"
+                "Compact is fast and low-VRAM (the recommended default). Quality gives sharper "
+                "fine detail but is much slower and needs more VRAM. The chosen model is "
+                "downloaded (and checked) on first use.",
+                wraplength=W)
+        # Grey the model picklist out unless Real-ESRGAN is selected (it does nothing for
+        # SeedVR2). Bound live so the state follows the engine combobox.
+        eng_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_esrgan_model_state())
+        self._sync_esrgan_model_state()
 
         # ── Notifications ───────────────────────────────────────────────────────
         # Settings live in the "notifications" config section; resolve_settings()
@@ -966,6 +1025,32 @@ class SettingsTab(ttk.Frame):
                 return lbl
         return _VIDEO_MODEL_OPTIONS[0][0]
 
+    def _video_engine_label(self, vid):
+        """The local-engine combobox label matching the saved video.engine value."""
+        engine = vid.get("engine", "seedvr2")
+        for lbl, val in _VIDEO_ENGINE_OPTIONS:
+            if val == engine:
+                return lbl
+        return _VIDEO_ENGINE_OPTIONS[0][0]
+
+    def _video_esrgan_model_label(self, vid):
+        """The Real-ESRGAN model combobox label matching the saved fixed_ratio_model key."""
+        key = vid.get("fixed_ratio_model", _ESRGAN_DEFAULT_KEY)
+        for lbl, k in _ESRGAN_MODEL_OPTIONS:
+            if k == key:
+                return lbl
+        return _ESRGAN_MODEL_OPTIONS[0][0]
+
+    def _sync_esrgan_model_state(self):
+        """Grey the Real-ESRGAN model picklist unless the fast engine is selected (the
+        model is meaningless for SeedVR2). Fail-safe: never break the tab over a UI toggle."""
+        try:
+            is_fixed = any(val == "fixed_ratio" and lbl == self.video_engine_var.get()
+                           for lbl, val in _VIDEO_ENGINE_OPTIONS)
+            self._esrgan_model_cb.configure(state=("readonly" if is_fixed else "disabled"))
+        except Exception:                            # noqa: BLE001
+            pass
+
     def _video_section(self):
         """The proposed `video` config block from the form. Only the exposed keys
         are set; config-only keys (segment_seconds, spin_up_seconds, …) are left
@@ -983,7 +1068,13 @@ class SettingsTab(ttk.Frame):
         noise = 0.0 if ns.lower() in ("off", "") else float(ns)
         model = next((f for lbl, f in _VIDEO_MODEL_OPTIONS
                       if lbl == self.video_model_var.get()), _VIDEO_MODEL_OPTIONS[0][1])
+        engine = next((v for lbl, v in _VIDEO_ENGINE_OPTIONS
+                       if lbl == self.video_engine_var.get()), _VIDEO_ENGINE_OPTIONS[0][1])
+        esrgan_model = next((k for lbl, k in _ESRGAN_MODEL_OPTIONS
+                             if lbl == self.video_esrgan_model_var.get()), _ESRGAN_DEFAULT_KEY)
         return {
+            "engine":              engine,
+            "fixed_ratio_model":   esrgan_model,
             "target":              self.video_target_var.get(),
             "output_subdir":       self.video_outsub_var.get().strip() or "__upscaled__",
             "work_root":           self.video_workroot_var.get().strip(),
@@ -1203,6 +1294,9 @@ class SettingsTab(ttk.Frame):
         self.video_workroot_var.set(vid.get("work_root", ""))
         self.video_codec_var.set(self._video_codec_label(vid))
         self.video_model_var.set(self._video_model_label(vid))
+        self.video_engine_var.set(self._video_engine_label(vid))
+        self.video_esrgan_model_var.set(self._video_esrgan_model_label(vid))
+        self._sync_esrgan_model_state()
         _vbs = int(vid.get("batch_size", 0) or 0)
         self.video_batch_var.set("Auto" if _vbs <= 0 else str(_vbs))
         _vov = int(vid.get("temporal_overlap", -1))

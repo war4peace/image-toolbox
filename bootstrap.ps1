@@ -412,7 +412,10 @@ try {
         Step "Installing the remaining components"
         # certifi is listed explicitly (usually a transitive dep here) so net_ssl.py
         # always has a CA bundle to trust, independent of the OS root store.
-        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc", "certifi")
+        # spandrel (#11): loads the Real-ESRGAN-class models for the fast fixed-ratio local
+        # video engine. Tiny, pure-Python, reuses the torch already installed above; Local/
+        # Both only (a Remote-only install has no local GPU to run it on).
+        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc", "certifi", "spandrel")
     }
 
     # -- 5b. OpenSSH (Remote mode reaches the pod over SSH) -------------------

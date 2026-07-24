@@ -586,6 +586,15 @@ def resolve_video_cfg(cfg, overrides=None):
         # source of the local "stall at first segment" hangs. Opt back in with
         # video.local_use_subprocess=true only if you specifically need the killable watchdog.
         "local_use_subprocess": bool(v.get("local_use_subprocess", False)),
+        # LOCAL video engine selection (feature #11, docs/local-video-upscaler.md §11):
+        #   "seedvr2"      -> the diffusion engine (default; generative, slow, VRAM-heavy)
+        #   "fixed_ratio"  -> a Real-ESRGAN-class fixed-ratio GAN (fast, low-VRAM,
+        #                     deterministic, per-frame; runs on any GPU). Its model file is
+        #                     picked by `fixed_ratio_model` (a key in esrgan_models.MODELS).
+        # Only meaningful for --local runs; the remote path stays SeedVR2. An unknown value
+        # degrades to seedvr2.
+        "engine":              (v.get("engine") or "seedvr2"),
+        "fixed_ratio_model":   (v.get("fixed_ratio_model") or "realesr-general-x4v3"),
         # (The per-card benchmark suite's sources are now a fixed, SHA-256-pinned set baked into
         # benchmark_clip.SOURCES, downloaded on demand; no config knob for them, docs 22.)
         # Adaptive batch tuning (item 9): on a multi-segment video, seed the batch from the
@@ -1175,22 +1184,44 @@ def _clip_slug(label):
     return s[:40]
 
 
+def _row_get(row, key, default=None):
+    """Read a column from a sqlite3.Row by name, returning `default` if the column is not
+    present (an older query/schema) instead of raising IndexError. #11 uses it for the
+    engine/model columns so a Row without them (a pre-migration cache) stays safe."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _engine_tag(engine):
+    """The filename suffix that distinguishes a NON-default engine's output, so a fast
+    Real-ESRGAN result can't collide on disk with a SeedVR2 result of the same source +
+    target (#11). The default engine (seedvr2 / None / unknown) gets NO suffix, so every
+    pre-#11 output path is byte-for-byte unchanged. Kept short + human-readable."""
+    e = (engine or "seedvr2").lower()
+    return {"fixed_ratio": "realesrgan"}.get(e, "" if e == "seedvr2" else e)
+
+
 def _output_path(output_root, rel, target, clip_id=0, clip_label=None,
-                 clip_start=None, clip_end=None):
+                 clip_start=None, clip_end=None, engine=None):
     """Mirror the source tree under output_root, encoding the target in the name:
     <output_root>/<rel_dir>/<base>_<target>.mp4 (15.1). For a CLIP (clip_id > 0,
     section 16.6) the range is encoded too so two scenes of the same source+target
     never collide: <base>_<label-or-mmss-mmss>_<target>.mp4, with clip_id as the
-    last-resort uniquifier when two clips share a label/range."""
+    last-resort uniquifier when two clips share a label/range. A non-default `engine`
+    (#11) appends its tag (e.g. `_realesrgan`) so two engines' outputs never collide."""
     rel_dir = os.path.dirname(rel)
     base = os.path.splitext(os.path.basename(rel))[0]
+    etag = _engine_tag(engine)
+    esuf = f"_{etag}" if etag else ""
     if clip_id:
         tag = _clip_slug(clip_label)
         if not tag and clip_start is not None and clip_end is not None:
             tag = f"{_tc(clip_start)}-{_tc(clip_end)}"
         tag = tag or f"clip{clip_id}"
-        return os.path.join(output_root, rel_dir, f"{base}_{tag}_{target}.mp4")
-    return os.path.join(output_root, rel_dir, f"{base}_{target}.mp4")
+        return os.path.join(output_root, rel_dir, f"{base}_{tag}_{target}{esuf}.mp4")
+    return os.path.join(output_root, rel_dir, f"{base}_{target}{esuf}.mp4")
 
 
 def scan_file(conn, root_id, abs_path, rel):
@@ -1267,12 +1298,31 @@ def reconcile_outputs_from_disk(conn, root_id, output_root, rel):
     return adopted
 
 
-def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
+def _resolve_job_engine(vcfg, engine=None, model=None):
+    """Resolve a job's (engine, model) pair from an explicit choice or the vcfg defaults
+    (#11). engine -> 'seedvr2' | 'fixed_ratio'; model -> the SeedVR2 dit filename for
+    seedvr2, else the esrgan_models key for fixed_ratio. Kept in one place so the GUI
+    Prepare, the headless enqueue and any future caller agree on the defaulting."""
+    eng = (engine or vcfg.get("engine") or "seedvr2").lower()
+    if eng not in ("seedvr2", "fixed_ratio"):
+        eng = "seedvr2"
+    if eng == "fixed_ratio":
+        mdl = model or vcfg.get("fixed_ratio_model") or "realesr-general-x4v3"
+    else:
+        mdl = model or vcfg.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"
+    return eng, mdl
+
+
+def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
+                engine=None, model=None):
     """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
     CLI: do the EXACT pass for this (file, target) (counted frames — the header
     lies), then enqueue a video_outputs job. Returns a dict with nb_frames and an
     approximate segment count for the estimate. Idempotent: re-preparing an
-    existing job leaves its queue position and any progress intact."""
+    existing job leaves its queue position and any progress intact.
+
+    `engine`/`model` (#11) stamp the per-job method; omit to inherit the vcfg defaults
+    (so the headless `--engine` flag and the Settings default both flow through here)."""
     abs_path = os.path.join(source_root, rel)
     info = vp.probe(abs_path, count=True)         # exact frames for cost + drift
     # Never enqueue a DOWNSCALE (target box smaller than the source): SeedVR2 is an
@@ -1288,11 +1338,24 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg):
                          fps=float(info.fps), duration=info.duration,
                          nb_frames=info.nb_frames,
                          probe_version=db.VIDEO_PROBE_VERSION)
+    eng, mdl = _resolve_job_engine(vcfg, engine, model)
+    # Real-ESRGAN (#11): the Method picks a TIER (Compact/Quality); pick the best-scale weight
+    # in that tier for THIS target's ratio, so a 2x target uses the native x2 model instead of
+    # computing 4x and downscaling. Resolved at Prepare (target + dims are known) and stored,
+    # so the queue/router use the concrete model.
+    if eng == "fixed_ratio":
+        try:
+            import esrgan_models as _esr
+            ratio = ve.fit_scale(info.width, info.height, target) or _esr.spec(mdl).scale
+            mdl = _esr.resolve_for_ratio(_esr.spec(mdl).kind, ratio)
+        except Exception as exc:                       # noqa: BLE001 (fall back to the tier rep)
+            debug_log("prepare_job: resolve fixed_ratio model", exc=exc)
     existing = db.get_video_output(conn, root_id, rel, target)
     if existing is None:
         db.upsert_video_output(conn, root_id, rel, target, status="queued",
-                               output_path=_output_path(output_root, rel, target),
-                               queue_order=db.next_queue_order(conn, root_id))
+                               output_path=_output_path(output_root, rel, target, engine=eng),
+                               queue_order=db.next_queue_order(conn, root_id),
+                               engine=eng, model=mdl)
     seg_secs = vcfg["segment_seconds"]
     approx_segments = max(1, math.ceil((info.duration or 0) / seg_secs)) if seg_secs else 1
     return {"nb_frames": info.nb_frames, "duration": info.duration,
@@ -1381,6 +1444,9 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     gets each completed segment's rate for the notify-only slow-segment signal (item 6)."""
     rel, target = job["rel_path"], job["target"]
     clip_id = job["clip_id"] or 0                  # 0 = whole file; >0 = a virtual clip
+    # Per-job engine/model (#11): NULL -> the SeedVR2 default. `job_engine` is the STRING
+    # ("seedvr2"|"fixed_ratio"); the concrete engine object is passed in as `engine`.
+    job_engine = (_row_get(job, "engine") or "seedvr2")
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
@@ -1388,7 +1454,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
         clip_id=clip_id,
         clip_label=job["clip_label"] if clip_id else None,
         clip_start=job["clip_start"] if clip_id else None,
-        clip_end=job["clip_end"] if clip_id else None)
+        clip_end=job["clip_end"] if clip_id else None,
+        engine=job_engine)
     # Whole file: count frames now (CFR-mistag/drift). Clip: only dims/fps are needed
     # from the WHOLE source (a clip shares them); counting the whole 45-min source
     # would be wasted work, so probe metadata-only and count the extracted clip below.
@@ -1828,8 +1895,13 @@ def _job_frames(conn, root_id, job):
 def _job_exceeds_gpu(conn, root_id, job, max_out_mp, logged=None):
     """True if this job's OUTPUT megapixels exceed `max_out_mp` (the selected GPU's reach,
     #7), so it should be DEFERRED (left pending for a bigger card), not attempted. 0 =
-    no cap. Logs each deferral once. A clip shares its source video's frame size."""
-    if not max_out_mp:
+    no cap. Logs each deferral once. A clip shares its source video's frame size.
+
+    The output-MP ceiling is a SeedVR2 notion (its VRAM scales hard with output size).
+    Real-ESRGAN (#11) is fixed-ratio, low-VRAM and tiles, so this cap does NOT apply to it:
+    a fixed_ratio job is never deferred here. Its real limits are meant to come from a
+    real-footage benchmark later, not an assumed ceiling."""
+    if not max_out_mp or (_row_get(job, "engine") or "seedvr2") == "fixed_ratio":
         return False
     vf = db.get_video_file(conn, root_id, job["rel_path"])
     if not vf or not vf["width"] or not vf["height"]:
@@ -1848,10 +1920,85 @@ def _job_exceeds_gpu(conn, root_id, job, max_out_mp, logged=None):
     return True
 
 
+class LocalEngineRouter:
+    """Per-job LOCAL engine factory + one-resident cache (#11), so a single local queue can
+    MIX engines/models (SeedVR2 and Real-ESRGAN, 7B and 3B, Compact and Quality). `for_job`
+    returns the engine for a job's (engine, model), building it on first use and freeing the
+    previous one when the pair changes so two big models never sit in VRAM at once. Wraps the
+    construction each engine needs (SeedVR2 wants repo/model dirs + the compile gate; the
+    fixed-ratio engine wants a lazy hash-verified model file). `close()` frees the resident
+    engine (the runner's finally calls it)."""
+
+    def __init__(self, cfg, vcfg, worker_cfg, conn, log, log_file_only):
+        self.cfg = cfg
+        self.vcfg = vcfg
+        self._worker_cfg = worker_cfg            # callable -> the merged engine settings dict
+        self.conn = conn
+        self.log = log
+        self.log_file_only = log_file_only
+        self._cache = {}                         # {(etype, model): engine}, at most one entry
+
+    def for_job(self, job):
+        etype, model = _resolve_job_engine(
+            self.vcfg, _row_get(job, "engine"), _row_get(job, "model"))
+        key = (etype, model)
+        eng = self._cache.get(key)
+        if eng is not None:
+            return eng
+        if self._cache:                          # a different engine/model than the resident one
+            self._close_all()
+            self.log(f"    switching local engine to {etype} ({model}); reloading model.")
+        eng = self._build(etype, model)
+        self._cache[key] = eng
+        return eng
+
+    def _build(self, etype, model):
+        if etype == "fixed_ratio":
+            import esrgan_models as _esr
+            from fixed_ratio_engine import FixedRatioVideoEngine
+            sp = _esr.spec(model)
+            self.log(f"    engine: Real-ESRGAN, model '{sp.label}' (x{sp.scale}).")
+            mfile = _esr.ensure_model(model, log=lambda m: self.log("    " + str(m)))
+            return FixedRatioVideoEngine(mfile, self._worker_cfg(),
+                                         diag_sink=self.log_file_only)
+        from local_video_engine import LocalVideoEngine
+        repo_dir, model_dir = _local_seedvr2_paths(self.cfg)
+        local_cfg = self._worker_cfg()
+        local_cfg["dit_model"] = model
+        # Gate torch.compile on a real compile-capability probe (shared with the benchmark):
+        # without a C compiler it would HANG the first VAE compile under the GUI's piped
+        # stdio ("stuck at first segment"). See gate_local_compile.
+        gate_local_compile(local_cfg, self.log_file_only)
+        _sub = self.vcfg["local_use_subprocess"]
+        self.log(f"    engine: SeedVR2, model '{model}' "
+                 f"({'subprocess+thrash-watchdog' if _sub else 'in-process'}).")
+        return LocalVideoEngine(
+            repo_dir, model_dir, local_cfg, conn=self.conn, gpu_id=None,
+            use_subprocess=_sub, thrash_stall_seconds=self.vcfg["thrash_stall_seconds"],
+            diag_sink=self.log_file_only)
+
+    def _close_all(self):
+        for e in self._cache.values():
+            try:
+                e.close()
+            except Exception as exc:                 # noqa: BLE001 (fail-safe teardown)
+                debug_log("LocalEngineRouter._close_all", exc=exc)
+        self._cache = {}
+
+    def close(self):
+        self._close_all()
+
+
 def run_queue(engine, conn, root_id, source_root, vcfg, budget,
-              notify_settings=None, auto_resume=False, notify_summary=True):
+              notify_settings=None, auto_resume=False, notify_summary=True,
+              resolve_engine=None):
     """Process the durable queue (video_outputs not yet done) for this root against
     an injected engine. Returns a summary dict.
+
+    `resolve_engine` (#11, local mixed-engine queues): an optional callable(job) -> engine
+    that picks the engine PER JOB from the job's `engine`/`model` columns, so one queue can
+    mix SeedVR2 and Real-ESRGAN jobs. When None (remote / passthrough / auto-resume), the
+    single injected `engine` serves every job exactly as before.
 
     When `auto_resume` is set (the self-healing supervisor, #6), a job that fails because
     the POD died (a liveness/transport error, per `_is_pod_failure`) is NOT counted as a
@@ -1916,7 +2063,9 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         idx = done + failed + 1
         total = idx + len(pending) - 1
         try:
-            result = process_job(engine, conn, root_id, source_root, job, vcfg, budget,
+            # #11: pick the engine for THIS job (mixed local queue), else the single engine.
+            job_engine = resolve_engine(job) if resolve_engine else engine
+            result = process_job(job_engine, conn, root_id, source_root, job, vcfg, budget,
                                  idx, total, notify_settings=notify_settings,
                                  slow_watch=slow_watch)
             done += 1
@@ -2333,6 +2482,14 @@ def main(argv=None):
                       help="no pod: upscale on THIS machine's GPU (feature #7). Uses the "
                            "local SeedVR2 engine + the predictive VRAM sizer + the "
                            "mid-segment thrash watchdog.")
+    p.add_argument("--engine", choices=["seedvr2", "fixed_ratio"],
+                   help="LOCAL engine (feature #11): seedvr2 (generative, default) or "
+                        "fixed_ratio (a fast Real-ESRGAN-class fixed-ratio GAN). Overrides "
+                        "video.engine for this run.")
+    p.add_argument("--fixed-ratio-model",
+                   help="fixed_ratio engine only: the esrgan_models catalog key "
+                        "(e.g. realesr-general-x4v3, RealESRGAN_x4plus). Overrides "
+                        "video.fixed_ratio_model.")
     args = p.parse_args(argv)
 
     src_root = os.path.abspath(args.source)
@@ -2343,6 +2500,10 @@ def main(argv=None):
 
     cfg = _load_config()
     vcfg = resolve_video_cfg(cfg)
+    if args.engine:
+        vcfg["engine"] = args.engine
+    if args.fixed_ratio_model:
+        vcfg["fixed_ratio_model"] = args.fixed_ratio_model
     notify_settings = notifications.resolve_settings(cfg)
     out_root = os.path.abspath(args.output) if args.output \
         else os.path.join(src_root, vcfg["output_subdir"])
@@ -2462,29 +2623,17 @@ def main(argv=None):
             run_queue(engine, conn, root_id, src_root, vcfg, budget,
                       notify_settings=notify_settings)
         elif args.local:
-            # Local mode (#7): the SeedVR2 work runs on THIS machine's GPU, no pod. Same
-            # walk/split/reassemble/mux/resume pipeline as the remote path; only the injected
-            # engine changes. The predictive VRAM sizer picks the batch (conn + gpu self-ID give
-            # it learned self-calibration). DEFAULT is in-process (mirrors the image Batch
-            # Upscaler); the opt-in subprocess mode adds the mid-segment thrash-kill watchdog.
-            from local_video_engine import LocalVideoEngine
-            repo_dir, model_dir = _local_seedvr2_paths(cfg)
-            _sub = vcfg["local_use_subprocess"]
-            log(f"Local mode — upscaling on this machine's GPU (no pod). "
-                f"Engine: {'subprocess-per-attempt (thrash watchdog: ' + str(vcfg['thrash_stall_seconds']) + 's stall)' if _sub else 'in-process (like the image Batch Upscaler)'}.")
-            # Gate torch.compile on a real compile-capability probe (shared with the
-            # benchmark): without a C compiler it would HANG the first VAE compile under the
-            # GUI's piped stdio ("stuck at first segment"). See gate_local_compile.
-            local_cfg = _worker_cfg()
-            gate_local_compile(local_cfg, log_file_only)   # compile-gate detail: file only
-            engine = LocalVideoEngine(
-                repo_dir, model_dir, local_cfg,
-                conn=conn, gpu_id=None,
-                use_subprocess=vcfg["local_use_subprocess"],
-                thrash_stall_seconds=vcfg["thrash_stall_seconds"],
-                diag_sink=log_file_only)     # SeedVR2 engine banners -> run log only, not the terminal
-            run_queue(engine, conn, root_id, src_root, vcfg, budget,
-                      notify_settings=notify_settings)
+            # Local mode (#7 + #11): the GPU work runs on THIS machine, no pod. The queue may
+            # MIX engines per job (SeedVR2 and Real-ESRGAN), so an engine ROUTER builds the
+            # right engine per job from the job's engine/model columns and keeps ONE resident
+            # at a time (it closes + reloads on a change, to bound VRAM). Same
+            # walk/split/reassemble/mux/resume pipeline for every engine.
+            router = LocalEngineRouter(cfg, vcfg, _worker_cfg, conn, log, log_file_only)
+            engine = router                          # the finally-block closes it
+            log("Local mode: upscaling on this machine's GPU (no pod). "
+                "The engine is chosen per queued job (SeedVR2 or Real-ESRGAN).")
+            run_queue(None, conn, root_id, src_root, vcfg, budget,
+                      notify_settings=notify_settings, resolve_engine=router.for_job)
         elif auto_resume:
             import runpod_client as rp
             rcfg = cfg.get("runpod", {})

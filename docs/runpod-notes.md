@@ -7,6 +7,11 @@ backs the code; `CLAUDE.md` has the user-facing feature summary. (Originally
 distilled from the pre-0.1.0 ComfyUI-era `remote-*.ps1` scripts, long since
 removed; see git history before `baf6f8b`.)
 
+> **Engine scope:** the remote pod path is **always SeedVR2**. The 0.5.6 Real-ESRGAN
+> fixed-ratio engine (`docs/local-video-upscaler.md` section 11) is **local-only** (it runs
+> on the user's own GPU); the Video Upscaler tab offers it as a per-video method in Local
+> mode only, and the remote worker/provisioning are unaffected by it.
+
 ## Contents
 
 - [Performance findings](#performance-findings-measured-on-the-pod)

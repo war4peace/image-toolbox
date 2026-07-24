@@ -66,6 +66,48 @@ def _clip_tc(seconds):
     return f"{s // 60}:{s % 60:02d}"
 
 
+# The "Method / Model" selector's options (#11): (label, engine, model). The SeedVR2 half
+# mirrors tab_settings._VIDEO_MODEL_OPTIONS (kept short here for the combobox); the
+# Real-ESRGAN half comes from the shared esrgan_models catalog and is offered ONLY in Local
+# mode, since the remote path is always SeedVR2. Keep in sync with tab_settings if a SeedVR2
+# model is added.
+_SEEDVR2_METHODS = [
+    ("SeedVR2 / 7B FP16",  "seedvr2_ema_7b_fp16.safetensors"),
+    ("SeedVR2 / 7B Sharp", "seedvr2_ema_7b_sharp_fp16.safetensors"),
+    ("SeedVR2 / 3B Q8",    "seedvr2_ema_3b-Q8_0.gguf"),
+    ("SeedVR2 / 3B FP16",  "seedvr2_ema_3b_fp16.safetensors"),
+]
+
+
+def _method_options(local):
+    """The (label, engine, model) rows for the Method combobox. Real-ESRGAN rows are added
+    only when `local` (fixed-ratio is a local-GPU engine; remote is SeedVR2-only)."""
+    opts = [(lbl, "seedvr2", fname) for lbl, fname in _SEEDVR2_METHODS]
+    if local:
+        try:
+            import esrgan_models as em
+            opts += [(f"Real-ESRGAN / {m.kind.capitalize()}", "fixed_ratio", m.key)
+                     for m in em.catalog()]
+        except Exception:                            # noqa: BLE001 (fail-safe: SeedVR2 still works)
+            pass
+    return opts
+
+
+def _short_method(engine, model):
+    """A compact 'Method' label for the queue list, e.g. 'SeedVR2 7B FP16' / 'ESRGAN Compact'."""
+    e = (engine or "seedvr2").lower()
+    if e == "fixed_ratio":
+        try:
+            import esrgan_models as em
+            return "ESRGAN " + em.spec(model).kind.capitalize()
+        except Exception:                            # noqa: BLE001
+            return "ESRGAN"
+    for lbl, fname in _SEEDVR2_METHODS:
+        if fname == model:
+            return lbl.replace(" / ", " ")
+    return "SeedVR2"
+
+
 # ─────────────────────────────────────────────
 #  SEGMENTS MANAGER (virtual clip jobs, section 16.5)
 # ─────────────────────────────────────────────
@@ -592,34 +634,53 @@ class VideoTab(ttk.Frame):
                 "right-click for more actions. Click a column heading to sort.",
                 wraplength=W)
 
-        # 4) Source file + target + Prepare.
+        # 4) Source file + Method/Model + Target + Prepare. The engine is chosen PER video
+        # here (#11): the Method combobox picks engine+model, the Target combobox is then
+        # filtered to what that method can reach, so a queue can freely mix methods. The
+        # Source-file field is deliberately SHORT to leave room for the two selectors.
         pf = ttk.Frame(self)
         pf.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        pf.columnconfigure(1, weight=1)
         ttk.Label(pf, text="Source file:").grid(row=0, column=0, sticky="w")
         self.srcfile_var = tk.StringVar()
-        ttk.Entry(pf, textvariable=self.srcfile_var, state="readonly").grid(
-            row=0, column=1, sticky="ew", padx=6)
+        ttk.Entry(pf, textvariable=self.srcfile_var, state="readonly", width=24).grid(
+            row=0, column=1, sticky="w", padx=(6, 10))
+        method_lbl = ttk.Label(pf, text="Method:")
+        method_lbl.grid(row=0, column=2, sticky="e")
+        self.method_var = tk.StringVar()
+        self.method_combo = ttk.Combobox(pf, textvariable=self.method_var,
+                                         state="readonly", width=22, values=[])
+        self.method_combo.grid(row=0, column=3, padx=(4, 10))
+        self.method_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_method_change())
         target_lbl = ttk.Label(pf, text="Target:")
-        target_lbl.grid(row=0, column=2)
+        target_lbl.grid(row=0, column=4, sticky="e")
         self.target_var = tk.StringVar()
         self.target_combo = ttk.Combobox(pf, textvariable=self.target_var,
                                          state="readonly", width=15, values=[])
-        self.target_combo.grid(row=0, column=3, padx=4)
+        self.target_combo.grid(row=0, column=5, padx=4)
         self.target_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_prepare_btn())
         self.prepare_btn = ttk.Button(pf, text="Prepare ▾ add to queue",
                                      command=self._prepare, state="disabled")
-        self.prepare_btn.grid(row=0, column=4, padx=(6, 0))
+        self.prepare_btn.grid(row=0, column=6, padx=(6, 0))
+        self._method_label_to_val = {}       # method label -> (engine, model)
+        method_tip = ("How the video is upscaled. SeedVR2 invents new detail (best quality) "
+                      "but is slow and VRAM-heavy on a local card; Real-ESRGAN is a fast, "
+                      "light, fixed 2x/4x upscaler that runs on almost any GPU and keeps "
+                      "text/edges cleaner. You can pick a different method for each video, "
+                      "so one queue can mix them. Real-ESRGAN is offered in Local mode only.")
+        Tooltip(method_lbl, method_tip, wraplength=W)
+        Tooltip(self.method_combo, method_tip, wraplength=W)
         target_tip = ("How large the upscaled video should be. The video is fitted "
                       "inside the chosen size, keeping its shape, so the first edge "
-                      "to reach the limit decides the result. Bigger targets look "
-                      "better but cost much more GPU time.")
+                      "to reach the limit decides the result. The list changes with the "
+                      "chosen Method: what each method can reach on this machine differs. "
+                      "Bigger targets look better but cost much more GPU time.")
         Tooltip(target_lbl, target_tip, wraplength=W)
         Tooltip(self.target_combo, target_tip, wraplength=W)
         Tooltip(self.prepare_btn,
-                "Add the selected video, at the chosen target, to the queue below. "
-                "This works out how the video will be split into segments; no GPU "
+                "Add the selected video, at the chosen Method and Target, to the queue "
+                "below. This works out how the video will be split into segments; no GPU "
                 "work happens until you press Start Upscaling.", wraplength=W)
+        self._populate_method_combo()
 
         # 5) Queue list.
         qf = ttk.LabelFrame(self, text=" Upscale queue ", padding=4)
@@ -657,15 +718,16 @@ class VideoTab(ttk.Frame):
 
         # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
         # (a view-only sort) never hides where a job actually sits in the queue.
-        qcols = ("place", "target", "status", "res", "dur", "codec", "fps", "frames", "segs")
+        qcols = ("place", "method", "target", "status", "res", "dur", "codec", "fps",
+                 "frames", "segs")
         self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
         self._queue_sort = {}
         self._queue_rows = {}            # iid -> {rel, target, props} for sort/actions
         self._queue_order = []           # iids in true (unfiltered) queue order
         _q_titles = {"#0": "File"}
         self.queue_tree.column("#0", width=200, stretch=True)
-        for c, txt, w in (("place", "#", 36), ("target", "Target", 60),
-                          ("status", "Status", 80),
+        for c, txt, w in (("place", "#", 36), ("method", "Method", 120),
+                          ("target", "Target", 60), ("status", "Status", 80),
                           ("res", "Resolution", 90), ("dur", "Duration", 70),
                           ("codec", "Codec", 60), ("fps", "FPS", 50),
                           ("frames", "Frames", 70), ("segs", "Segments", 70)):
@@ -863,6 +925,10 @@ class VideoTab(ttk.Frame):
         self._apply_mode_ui()
         self._check_readiness()
         self._refresh_gpus()
+        # Real-ESRGAN is a local engine: the Method list gains/loses it with the mode, and the
+        # reachable Target list can change with it (#11).
+        self._populate_method_combo()
+        self._on_method_change()
 
     def _apply_mode_ui(self):
         """Enable/disable the mode-specific controls. Auto-resume heals a LOST POD, so it is
@@ -1506,21 +1572,80 @@ class VideoTab(ttk.Frame):
                                    self._conn()) if g else 0.0)
         if not max_mp:
             return max_mp, jobs, 0
+        # Real-ESRGAN (#11) is not bound by SeedVR2's output-MP ceiling, so a fixed_ratio job
+        # is always feasible here (its real limits come from a benchmark later, not this cap).
         feasible = [j for j in jobs
-                    if ve.target_is_feasible(j.get("width"), j.get("height"), j["target"], max_mp)]
+                    if j.get("engine") == "fixed_ratio"
+                    or ve.target_is_feasible(j.get("width"), j.get("height"), j["target"], max_mp)]
         return max_mp, feasible, len(jobs) - len(feasible)
 
+    def _populate_method_combo(self):
+        """Fill the Method combobox with engine+model options for the current run mode
+        (Real-ESRGAN is offered in Local mode only). Preserves the current selection when it
+        still exists, else pre-selects the configured default method (#11)."""
+        local = bool(getattr(self, "mode_var", None) and self.mode_var.get() == "local")
+        opts = _method_options(local)
+        self._method_label_to_val = {lbl: (eng, mdl) for lbl, eng, mdl in opts}
+        labels = [lbl for lbl, _e, _m in opts]
+        self.method_combo.configure(values=labels)
+        if self.method_var.get() not in self._method_label_to_val:
+            self.method_var.set(self._default_method_label(opts))
+
+    def _default_method_label(self, opts):
+        """The Method label pre-selected from Settings defaults (video.engine + its model),
+        falling back to the first option."""
+        vid = CFG.get("video", {})
+        eng = (vid.get("engine") or "seedvr2").lower()
+        want = vid.get("fixed_ratio_model") if eng == "fixed_ratio" else vid.get("dit_model")
+        for lbl, e, m in opts:
+            if e == eng and (m == want or want is None):
+                return lbl
+        for lbl, e, m in opts:                       # engine matched, model didn't: first of engine
+            if e == eng:
+                return lbl
+        return opts[0][0] if opts else ""
+
+    def _selected_method(self):
+        """(engine, model) for the chosen Method label; defaults to SeedVR2 if unset."""
+        return self._method_label_to_val.get(self.method_var.get()) or ("seedvr2", None)
+
+    def _on_method_change(self):
+        """Method changed: the reachable targets differ by engine, so re-filter the Target
+        combobox for the selected source, then re-sync the Prepare button."""
+        sel = self.scan_tree.selection()
+        if sel and sel[0] in self._scan_rows:
+            self._populate_target_combo(self._scan_rows[sel[0]])
+        self._sync_prepare_btn()
+
     def _populate_target_combo(self, row):
-        """Fill the Target combobox with the targets the source can reach on the SELECTED GPU
-        (feature #7): source-eligible ratios + presets, filtered by the card's feasibility, each
-        shown as a concrete output resolution. Stores a label->token map so Prepare gets the
-        canonical token."""
+        """Fill the Target combobox with the targets the source can reach for the SELECTED
+        METHOD on the selected GPU (#7/#11), each shown as a concrete output resolution.
+
+        SeedVR2: source-eligible ratios + presets, filtered by the card's VRAM feasibility.
+
+        Real-ESRGAN is fixed-ratio: it is NOT VRAM-capped, but it is restricted to targets whose
+        scale is EXACTLY a native model scale (2x / 4x), so the generated frame is never
+        ffmpeg-resized up or down. A preset that coincides with a native scale (e.g. 4K IS 2x of
+        1080p) is offered; a mismatched one (1440p from 1080p, 1.33x) is dropped, so that path
+        stays SeedVR2-only. Stores a label->token map for Prepare."""
         import video_estimate as ve
         r = row.get("r") or {}
         w, h = r.get("width"), r.get("height")
         done_targets = self._done_targets(row["rel"])
-        max_mp = self._current_max_mp()
-        feas = [t for t in row.get("elig", []) if ve.target_is_feasible(w, h, t, max_mp)]
+        engine, model = self._selected_method()
+        if engine == "fixed_ratio":
+            import esrgan_models as em
+            scales = em.tier_scales(em.spec(model).kind)
+
+            def _ok(t):
+                s = ve.fit_scale(w, h, t)
+                # Exact native scale only (small tolerance for odd source dims / rounding),
+                # so no resize of the generated frame is ever needed.
+                return s is not None and any(abs(s / ns - 1.0) <= 0.01 for ns in scales)
+            feas = [t for t in row.get("elig", []) if _ok(t)]
+        else:
+            max_mp = self._current_max_mp()
+            feas = [t for t in row.get("elig", []) if ve.target_is_feasible(w, h, t, max_mp)]
         labels = [ve.target_label(w, h, t) for t in feas]
         self._target_label_to_token = dict(zip(labels, feas))
         self.target_combo.configure(values=labels)
@@ -1765,12 +1890,15 @@ class VideoTab(ttk.Frame):
         # truth and shows the add/remove directly. Only a failure (below) is worth
         # surfacing, since it has no other on-screen home.
         self.prepare_btn.configure(state="disabled")
+        # Read the Method on the UI thread (tk vars aren't safe off it) and stamp the job.
+        engine, model = self._selected_method()
 
         def work():
             import batch_video_upscale as bv
             try:
                 info = bv.prepare_job(self._conn(), self._root_id, self._src_root,
-                                      self._out_root, row["rel"], target, self._vcfg())
+                                      self._out_root, row["rel"], target, self._vcfg(),
+                                      engine=engine, model=model)
             except Exception as exc:                     # noqa: BLE001
                 self.after(0, lambda e=exc: self.status_var.set(f"Prepare failed: {e}"))
                 return
@@ -1828,15 +1956,21 @@ class VideoTab(ttk.Frame):
                 frames = (vf["nb_frames"] if vf else None) or "?"
                 row_dur = (vf["duration"] if vf else 0) or 0.0
             abs_path = os.path.join(self._src_root, j["rel_path"]) if self._src_root else j["rel_path"]
+            jkeys = j.keys()
+            method = _short_method(j["engine"] if "engine" in jkeys else None,
+                                   j["model"] if "model" in jkeys else None)
             iid = self.queue_tree.insert(
                 "", "end", text=text,
-                values=(place, j["target"], j["status"], res, dur, codec, fps, frames, segtxt),
+                values=(place, method, j["target"], j["status"], res, dur, codec, fps,
+                        frames, segtxt),
                 tags=(j["rel_path"], j["target"], str(clip_id)))
             self._queue_order.append(iid)
             self._queue_rows[iid] = {
                 "rel": j["rel_path"], "target": j["target"], "clip_id": clip_id,
                 "abs": abs_path, "w": w or 0, "h": h or 0, "place": place,
                 "status": j["status"], "skip_reason": j["skip_reason"],
+                "method": method,
+                "engine": (j["engine"] if "engine" in jkeys else None) or "seedvr2",
                 "duration": row_dur,
                 "fps": (vf["fps"] if vf else 0) or 0.0,
                 "codec": codec}
@@ -1854,7 +1988,10 @@ class VideoTab(ttk.Frame):
         self.queue_tree.tag_configure("infeasible", foreground="#8a8f98")
         max_mp = self._current_max_mp()
         for iid, row in self._queue_rows.items():
-            feasible = ve.target_is_feasible(row.get("w"), row.get("h"), row["target"], max_mp)
+            # Real-ESRGAN is low-VRAM + fixed-ratio: not bound by SeedVR2's output-MP ceiling,
+            # so it stays feasible where SeedVR2 would be greyed (#11; Stage C refines this).
+            row_cap = 0.0 if row.get("engine") == "fixed_ratio" else max_mp
+            feasible = ve.target_is_feasible(row.get("w"), row.get("h"), row["target"], row_cap)
             row["feasible"] = feasible
             tags = [t for t in self.queue_tree.item(iid, "tags") if t != "infeasible"]
             if not feasible:
@@ -2194,7 +2331,8 @@ class VideoTab(ttk.Frame):
             segs = max(1, _m.ceil(dur / seg_secs)) if seg_secs else 1
             jobs.append({"frames": frames, "target": j["target"], "segments": segs,
                          "width": (vf["width"] if vf else None),
-                         "height": (vf["height"] if vf else None)})
+                         "height": (vf["height"] if vf else None),
+                         "engine": (j["engine"] if "engine" in j.keys() else None) or "seedvr2"})
         return jobs
 
     def _spin_up(self):
