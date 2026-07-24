@@ -72,10 +72,16 @@ The user installs and runs the application on their Unraid server.
   or packaging. With Home Assistant already done over MQTT, the old telemetry
   coupling no longer drives sequencing.
 - **#4 depends on #3** (headless Unraid needs a web UI).
-- **Follow-ons from the shipped #6/#7 (not yet scheduled):** generalise the
-  Auto-resume supervisor from video to the image runners (batch upscale / tag); and
-  #7's deferred Phase 2, a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class:
-  fast, low-VRAM, deterministic) dropping into the same engine seam.
+- **Follow-ons from the shipped #6/#7:** generalise the Auto-resume supervisor from
+  video to the image runners (batch upscale / tag) (not yet scheduled). #7's deferred
+  Phase 2, a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class: fast, low-VRAM,
+  deterministic) dropping into the same engine seam, **shipped LOCAL on 0.5.6-experimental**
+  (commit `42b971e`; see `docs/local-video-upscaler.md` section 11). **Next planned step:**
+  the **remote** Real-ESRGAN path (a lightweight no-volume pod worker) plus the queue change
+  it depends on, **per-item GPU binding + grouped multi-pod Start** (a general Video Upscaler
+  improvement: mixed-GPU SeedVR2 queues benefit too). Designed in `docs/video-upscaler.md`
+  section 18; the remote benchmark + estimator rates are deferred until a real remote
+  measurement exists.
 - **Follow-on from the shipped #8 (not yet scheduled): extend benchmark sharing
   to the IMAGE tasks.** Today the crowdsourced corpus covers `db.video_bench`
   only; per-card image throughput (`db.gpu_perf` for batch upscale and tag) is

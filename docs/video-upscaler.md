@@ -26,7 +26,9 @@ Upscaler"**.
 > alternative local engine (0.5.6):** a **Real-ESRGAN** fixed-ratio 2x/4x upscaler,
 > deterministic and per-frame (no temporal VAE, mild generative prior), selectable **per
 > video** next to SeedVR2 on a Local/Both install. Fast + low-VRAM; see
-> `docs/local-video-upscaler.md` section 11.
+> `docs/local-video-upscaler.md` section 11. A **remote** Real-ESRGAN path (a cheap
+> no-volume pod), together with the queue change it needs (**per-item GPU binding +
+> grouped multi-pod Start**), is **designed but not yet built**: see section 18.
 
 ---
 
@@ -48,6 +50,7 @@ Upscaler"**.
 - [15. GUI "Video Upscaler" tab (UX spec)](#15-gui-video-upscaler-tab-ux-spec)
 - [16. Segment extraction + real-time playback (0.4.7)](#16-segment-extraction--real-time-playback-047)
 - [17. Self-healing remote runs ("Auto-resume")](#17-self-healing-remote-runs-auto-resume-050-experimental)
+- [18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (planned, 0.5.6)](#18-per-item-gpu-binding--grouped-multi-pod-start-and-remote-real-esrgan-planned-056)
 
 ---
 
@@ -1748,5 +1751,143 @@ funds-trip / user-Stop / redeploy-race / first-start-failure paths.
 
 **Scope.** Video only for now (the long, most-exposed run). Generalising the same supervisor
 to the image runners (batch upscale / tag) is the follow-up if it proves out.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
+---
+
+## 18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (planned, 0.5.6)
+
+> **Status: DESIGNED, NOT BUILT.** This is the design of record for the next 0.5.6 remote
+> work. The local Real-ESRGAN engine (`docs/local-video-upscaler.md` section 11) shipped on
+> `0.5.6-experimental` (commit `42b971e`); what follows is the REMOTE half plus the general
+> queue change it depends on. Nothing here is in the code yet.
+
+### 18.1 Motivation
+
+Remote-only installs can today run **only SeedVR2** video. The fast, cheap, low-VRAM
+Real-ESRGAN engine is local-only, so a user with no strong local GPU cannot use it at all.
+That is the real gap: the primary remote-only workflow is an always-on low-power server VM
+driving long queues so the user's main PC can be off. Adding a remote Real-ESRGAN path is
+cheap (the transport, self-healing, resume, drift-check and reassembly are all engine-
+agnostic already) and makes the app feature-complete across local/remote x SeedVR2/Real-ESRGAN.
+
+The blocker is not the engine: it is that a mixed queue can legitimately need **different
+GPUs per item** (a cheap card for Real-ESRGAN, a >=32 GB card for SeedVR2 4K, a mid card for
+SeedVR2 1080p), and the current run model pins ONE GPU to the whole run. So the remote engine
+rides on a more general queue change, built first.
+
+### 18.2 Part A (build first): per-item GPU binding + grouped multi-pod Start
+
+The GPU stops being a single run-level selection and becomes a **per-queued-item attribute**,
+exactly like Method and Target already are. This is a general Video Upscaler improvement:
+mixed-GPU SeedVR2 queues benefit from it with zero Real-ESRGAN involved (e.g. PRO 4000 for the
+1080p jobs, PRO 6000 for the 4K jobs).
+
+**The picking mechanism already exists.** In remote mode the GPU combobox filters the Target
+list to what the selected card can reach (SeedVR2 VRAM-derived caps). The extension is to
+**persist the selected GPU on each row at queue time**, instead of re-evaluating every existing
+row against the currently-selected card.
+
+**Combobox semantic flip (confirmed with the user).**
+- *Today:* the GPU combobox means "the GPU for this whole run." Changing it re-greys every
+  queued row that does not fit the new card; Start refuses with "None of the queued videos
+  fit..." when none match.
+- *Planned:* it means "the GPU for the NEXT item I queue." Changing it leaves existing rows
+  untouched (each stays self-consistent with its own saved GPU). Start never refuses on fit:
+  it groups and runs. The only reason a group waits is **stock**, not fit (see the pendulum,
+  18.4). "Greyed = wrong GPU selected" goes away, replaced by "each row carries its own GPU."
+
+**Start = grouped multi-pod runner.** Start sorts the queue and groups it by **(method, GPU)**,
+then spins up **one pod per group, sequentially, one pod up at any time**:
+
+    group 1: Real-ESRGAN @ cheap card      -> deploy esrgan pod, run all, tear down
+    group 2: SeedVR2 1080p @ PRO 4000       -> deploy video pod,  run all, tear down
+    group 3: SeedVR2 4K    @ PRO 6000       -> deploy video pod,  run all, tear down
+
+Because only one pod is ever up, the shared pod name (`video-toolbox-remote`) never collides;
+the earlier "ESRGAN phase then SeedVR2 phase" idea is just the N=2 case of this. A group is
+processed to completion before its pod is torn down (already how `run_queue` behaves within one
+pod; the new part is the queue is partitioned into groups).
+
+**Ordering.** Cheapest groups first is the sensible default (least spent if the user stops
+early, and the cheap Real-ESRGAN work clears first), but the primary gate is **live stock**:
+skip to the next group whose pinned card is in stock rather than block on a sold-out one.
+
+**No GPU substitution, ever (0.4.0 preserved).** Each group runs on exactly the card its rows
+were queued against. A sold-out card is waited for or deferred, never swapped for a different
+model. This keeps the firm rule from section 17 intact.
+
+### 18.3 Data + UI ripple (Part A)
+
+- **DB:** `video_outputs` gains a nullable per-item **GPU column** (the picked `gpu_type_id`;
+  `NULL` = legacy / the run-level GPU, so old rows and image runs are unaffected, mirroring how
+  the `engine`/`model` columns were added additively for the local engine). Resume must
+  preserve each row's GPU binding across a stopped run, so a resumed group redeploys the same
+  card.
+- **Queue tree:** a **GPU column** beside the existing Method column, so each row shows what it
+  is bound to, and a row waiting on stock is visible.
+- **Estimate / cost readout:** sums **per group** (each group's GPU rate x its own time), not
+  one card x the whole queue. Each group is also its own installment boundary for the per-run
+  minute/cost cap.
+
+### 18.4 The pendulum (Auto-resume extended)
+
+The existing Auto-resume checkbox (section 17) becomes dual-purpose. When **every** remaining
+group's pinned card is out of stock, it waits (backoff, `$0` billed, no time cap) and spins up
+whichever pinned card returns to stock **first**, running that group. This is still **not** a
+substitution: it only chooses **which group goes first** by availability, never which card a
+group runs on. When Auto-resume is off, Start runs the groups whose cards are in stock now and
+leaves the rest `pending` for a later Start (the same installment philosophy as section 5).
+
+### 18.5 Part B: the lightweight remote Real-ESRGAN worker
+
+Once Part A can route a group to a specific (method, GPU) pod, Real-ESRGAN slots in as just
+another method group, on its own pod mode:
+
+- **New pod worker `--mode esrgan`:** loads `FixedRatioVideoEngine` (spandrel) instead of the
+  ~16 GB SeedVR2 `UpscaleEngine`. Fast cold-start, cheap low-VRAM card. The client stays
+  `RemoteVideoEngine` (submit / poll / fetch is unchanged); the submit query gains
+  `&engine=fixed_ratio&model=<key>`, and the pod's `_run_video_job` dispatches to
+  `process_segment` for esrgan mode vs `process_video` for video mode.
+- **No network volume.** Real-ESRGAN weights are ~65 MB and hash-pinned, so the pod
+  **self-downloads** the weight via the existing torch-free `esrgan_models.ensure_model`
+  (SHA-256 verified, `net_ssl` context). Remote SeedVR2's mandatory model volume
+  (`remote_run.py` hard-`raise`s without `network_volume_id`) is bypassed by a **no-volume
+  deploy path** for esrgan mode. If pod self-download proves troublesome, the fallback is to
+  host the weight on the volume during provisioning (the user's call); self-download is tried
+  first.
+- **Pod venv** gains `spandrel` (and `certifi`, for the self-download HTTPS trust) in
+  `provision.sh` / `runpod_provision.py`; neither is present today.
+- **Low VRAM floor.** The GPU picker's floor for a Real-ESRGAN group is ~8-12 GB, NOT SeedVR2's
+  `video_estimate.VRAM_FLOOR` (`{1080p:32, 1440p:80, 4K:90}`). That SeedVR2 floor is exactly
+  what would wrongly hide the cheap cards (e.g. the ~$0.24 RTX 2000 Ada) this path exists to
+  use. Real-ESRGAN stays uncapped on output-MP (section 11.2), so its target list is the exact-
+  ratio set (section 11.3), gated only by the small model's real VRAM, not a SeedVR2 ceiling.
+- **Tab gating:** Real-ESRGAN methods, hidden in remote mode today (`_method_options(local)`),
+  are shown in remote mode too, with the same exact-ratio target filtering.
+
+### 18.6 Deferred (caps come from real benchmarks, not assumptions)
+
+Two pieces wait for a real remote Real-ESRGAN measurement, matching the local engine's
+"benchmark, don't assume" rule:
+
+- **Cost / duration estimator.** `video_estimate`'s rate table is SeedVR2-shaped; Real-ESRGAN
+  rates (per model, per card) come from a real remote run, not a guess.
+- **Remote Real-ESRGAN benchmark.** The `/video/probe` sweep is a SeedVR2 batch/VRAM-ceiling
+  climb; a Real-ESRGAN benchmark is a simpler per-target seconds/frame measure (batch 1 is
+  optimal, low-VRAM). Build it, and the benchmark corpus `engine` column (section 11 /
+  `docs/benchmark-sharing.md`), when a real remote number exists.
+
+### 18.7 Build order
+
+1. **Part A on SeedVR2 alone:** per-item GPU binding (DB column + queue-tree GPU column +
+   combobox semantic flip), grouped multi-pod Start, pendulum. Prove it with a mixed-GPU
+   SeedVR2 queue (no Real-ESRGAN), so the orchestration is validated independently of the new
+   engine.
+2. **Part B:** the `esrgan` no-volume worker mode, model self-download, low VRAM floor, remote
+   tab gating. It drops in as one more (method, GPU) group.
+3. **Deferred:** the remote benchmark + estimator rates + corpus `engine` column, when a real
+   measurement lands.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
