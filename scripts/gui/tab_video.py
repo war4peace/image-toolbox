@@ -2005,17 +2005,23 @@ class VideoTab(ttk.Frame):
         self._update_estimate()
 
     def _apply_queue_feasibility(self):
-        """Grey out queued jobs whose target the SELECTED GPU can't reach (feature #7). The
-        row is tagged 'infeasible' (muted) and `row['feasible']` is set, which the Start gate
-        reads to refuse a run with nothing runnable and to defer the rest."""
+        """Grey a queued job only when ITS OWN card can't reach its target (18: per-item GPU
+        binding, the semantic flip). A remote row prepared under a specific GPU is feasible by
+        construction (the Target combo was filtered by that card at Prepare), so it is NEVER
+        re-greyed by the bottom picker's current selection: changing that picker only affects the
+        next Prepare. An UNBOUND row (a local run, or a legacy pre-binding row) falls back to the
+        selected card (feature #7), and Real-ESRGAN is never VRAM-capped (#11).
+
+        `row['feasible']` is set for the Start gate; the row is tagged 'infeasible' (muted)."""
         import video_estimate as ve
         self.queue_tree.tag_configure("infeasible", foreground="#8a8f98")
-        max_mp = self._current_max_mp()
+        sel_max = self._current_max_mp()
         for iid, row in self._queue_rows.items():
-            # Real-ESRGAN is low-VRAM + fixed-ratio: not bound by SeedVR2's output-MP ceiling,
-            # so it stays feasible where SeedVR2 would be greyed (#11; Stage C refines this).
-            row_cap = 0.0 if row.get("engine") == "fixed_ratio" else max_mp
-            feasible = ve.target_is_feasible(row.get("w"), row.get("h"), row["target"], row_cap)
+            if row.get("engine") == "fixed_ratio" or row.get("gpu"):
+                feasible = True          # Real-ESRGAN (uncapped) or bound to its own card
+            else:
+                feasible = ve.target_is_feasible(row.get("w"), row.get("h"),
+                                                 row["target"], sel_max)
             row["feasible"] = feasible
             tags = [t for t in self.queue_tree.item(iid, "tags") if t != "infeasible"]
             if not feasible:
@@ -2023,8 +2029,10 @@ class VideoTab(ttk.Frame):
             self.queue_tree.item(iid, tags=tags)
 
     def _on_gpu_change(self):
-        """The selected GPU changed: re-estimate, re-grey the queue by the new card's reach,
-        and re-filter the Target combobox for the currently selected scan row."""
+        """The selected GPU changed. With per-item GPU binding (18) this only sets the card for
+        the NEXT Prepare: it re-estimates and re-filters the Target combobox for the selected
+        scan row, but already-queued rows keep their own bound card (the feasibility pass no
+        longer re-greys a bound row, only unbound legacy/local ones)."""
         self._update_estimate()
         self._apply_queue_feasibility()
         sel = self.scan_tree.selection()
@@ -2353,10 +2361,15 @@ class VideoTab(ttk.Frame):
             seg_secs = self._vcfg()["segment_seconds"]
             import math as _m
             segs = max(1, _m.ceil(dur / seg_secs)) if seg_secs else 1
+            jkeys = j.keys()
             jobs.append({"frames": frames, "target": j["target"], "segments": segs,
                          "width": (vf["width"] if vf else None),
                          "height": (vf["height"] if vf else None),
-                         "engine": (j["engine"] if "engine" in j.keys() else None) or "seedvr2"})
+                         "engine": (j["engine"] if "engine" in jkeys else None) or "seedvr2",
+                         # Per-item GPU + identity (18): the grouped Start reorders/persists by
+                         # (engine, gpu) and estimates each group on its own card.
+                         "gpu": (j["gpu"] if "gpu" in jkeys else None) or "",
+                         "rel": j["rel_path"], "clip_id": j["clip_id"] or 0})
         return jobs
 
     def _spin_up(self):
@@ -2420,6 +2433,11 @@ class VideoTab(ttk.Frame):
             return
         if self.mode_var.get() == "local":
             return self._start_local(jobs)
+        # Grouped multi-pod Start (18): the queue mixes (engine, gpu) groups -> reorder it
+        # visibly and run one pod per group. A single-GPU queue takes the classic path below.
+        import batch_video_upscale as bv
+        if len(bv.distinct_group_keys(jobs)) > 1:
+            return self._start_grouped(jobs)
         g = self._selected_gpu()
         if not g:
             messagebox.showwarning(APP_TITLE, "Pick a GPU (press ↻ to load the list).")
@@ -2468,6 +2486,76 @@ class VideoTab(ttk.Frame):
             env["IMGTBX_AUTO_RESUME"] = "1"
         self._run_gpu = g.get("id") or g.get("name")     # for the time-based estimate
         self._begin_run(sum(j["frames"] for j in feasible))
+        self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
+
+    def _start_grouped(self, jobs):
+        """Grouped multi-pod Start (18): the queue mixes (engine, gpu) groups. Reorder the
+        queue so each group is contiguous, PERSIST + show that order (the user sees the run
+        order), estimate/confirm across all groups, then launch. The runner reads the per-item
+        gpu from the DB and deploys one pod per group, one at a time (the pendulum picks the
+        next by live stock). Each job was prepared under its own card, so no feasibility
+        deferral is needed here."""
+        import batch_video_upscale as bv
+        import video_estimate as ve
+        conn = self._conn()
+        # Rank groups cheapest-first using the live prices from the GPU picker list; a card with
+        # no known price sorts last so a real quote always wins.
+        price = {c.get("id"): c.get("price") for c in self._gpu_choices if c.get("id")}
+
+        def rank(key):
+            p = price.get(key[1])
+            return (p if isinstance(p, (int, float)) else 9e9, key[1] or "")
+
+        ordered = bv.group_queue_order(jobs, group_rank=rank)
+        # Persist the grouped order so the runner walks it AND the queue tree shows it.
+        for pos, jb in enumerate(ordered):
+            bv.db.set_queue_order(conn, self._root_id, jb["rel"], jb["target"], pos,
+                                  clip_id=jb.get("clip_id", 0))
+        self._load_queue()                     # renumbers + regroups the queue tree (visible)
+
+        # Per-group estimate: each group's jobs on its own card's price; sum for the total.
+        groups = bv.distinct_group_keys(ordered)
+        total_cost = 0.0
+        total_secs = 0.0
+        cost_known = True
+        lines = []
+        for key in groups:
+            gjobs = [jb for jb in ordered if bv.job_group_key(jb) == key]
+            gid = key[1]
+            gprice = price.get(gid)
+            est = ve.estimate_queue(gjobs, gid, gprice, self._spin_up(), conn=conn)
+            cost = est.get("cost") if est else None
+            if cost is None:
+                cost_known = False
+            else:
+                total_cost += cost
+            if est and est.get("duration_seconds"):
+                total_secs += est["duration_seconds"]
+            eng_lbl = "Real-ESRGAN" if key[0] == "fixed_ratio" else "SeedVR2"
+            gname = _short_gpu(gid) or "the selected GPU"
+            pstr = f"${gprice:.2f}/h" if isinstance(gprice, (int, float)) else "price ?"
+            lines.append(f"  {eng_lbl} on {gname} ({pstr}): {len(gjobs)} job(s)")
+
+        if CFG.get("video", {}).get("confirm_before_rent", True):
+            cost_s = f"${total_cost:.2f}" if cost_known else "?"
+            dur_s = ve.fmt_duration(total_secs) if total_secs else "?"
+            body = ("Grouped run: one rented pod per GPU group, one at a time (cheapest "
+                    "first). Only one pod is ever billed at once.\n\n"
+                    + "\n".join(lines)
+                    + f"\n\nEstimated total: {dur_s}, {cost_s}.\n\n"
+                    "Each group's pod is created and torn down when its jobs finish.")
+            if not messagebox.askyesno(APP_TITLE, body):
+                return
+
+        env = {}
+        if cost_known and total_cost:
+            env["IMGTBX_RUN_ESTIMATE"] = f"{total_cost:.4f}"   # funds floor spans the whole run
+        if self.auto_resume_var.get():
+            env["IMGTBX_AUTO_RESUME"] = "1"
+        # A mixed-GPU run has no single card; the per-segment time estimate falls back to a
+        # generic rate (the runner emits the live pod + $/h per group as each one deploys).
+        self._run_gpu = None
+        self._begin_run(sum(j["frames"] for j in jobs))
         self._launch("batch_video_upscale.py", [self._src_root, self._out_root], env)
 
     def _start_local(self, jobs):
