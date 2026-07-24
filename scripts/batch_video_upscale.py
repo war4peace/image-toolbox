@@ -1341,6 +1341,19 @@ def group_queue_order(jobs, group_rank=None):
     return sorted(jobs, key=lambda j: (rank(job_group_key(j)), first[job_group_key(j)]))
 
 
+def distinct_group_keys(jobs):
+    """The distinct (engine, gpu) group keys present in `jobs`, in first-appearance order (18).
+    The GUI persists the grouped queue_order, so walking the live queue here yields the groups
+    already contiguous and in run order. >1 key => the remote run uses grouped multi-pod Start;
+    1 key (or a legacy all-NULL queue) stays the single-pod path."""
+    keys = []
+    for j in jobs:
+        k = job_group_key(j)
+        if k not in keys:
+            keys.append(k)
+    return keys
+
+
 def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
                 engine=None, model=None, gpu=None):
     """The Prepare step (15.3 step 5), run in-process by the GUI or the headless
@@ -2373,6 +2386,48 @@ def _wait_for_gpu_stock(list_gpus, gpu_id, gpu_label, *, notify_settings=None,
     return False
 
 
+def _wait_for_any_gpu_stock(list_gpus, group_keys, *, notify_settings=None, source_root="",
+                            on_event=log, stop=None, sleep=None,
+                            first_interval=30.0, max_interval=300.0):
+    """Block until ANY of the pending groups' cards is deployable, and return THAT (engine, gpu)
+    key (grouped multi-pod Start, 18: the pendulum runs whichever card returns first). Returns
+    None if the user stops first. No time cap ($0 billed while waiting). list_gpus/stop/sleep are
+    injected for testing. Each key carries a real gpu (a '' default-card group is always 'in
+    stock', so it never reaches this wait). Best-effort: a stock-read error just retries."""
+    stop = stop or _STOP.is_set
+    sleep = sleep or _interruptible_sleep
+    wanted = [k for k in group_keys if k[1]]
+    labels = ", ".join(sorted({k[1] for k in wanted})) or "the remaining GPUs"
+    t0 = time.monotonic()
+    interval = first_interval
+    entered = False
+    while not stop():
+        try:
+            gpus = list_gpus()
+        except Exception as exc:                       # noqa: BLE001 (keep waiting)
+            on_event(f"Grouped run: could not read GPU stock ({exc}); will retry.")
+            gpus = []
+        for k in wanted:
+            if _gpu_in_stock(gpus, k[1]):
+                if entered:
+                    on_event(f"Grouped run: {k[1]} is back in stock after "
+                             f"{fmt_hhmmss(time.monotonic() - t0)}; deploying its group.")
+                    _notify_stock(notify_settings, source_root, k[1], recovered=True,
+                                  waited=time.monotonic() - t0)
+                return k
+        if not entered:
+            entered = True
+            on_event(f"Grouped run: every remaining group's GPU is out of stock ({labels}); "
+                     f"waiting for the first to return (no time cap, $0 billed while waiting).")
+            _notify_stock(notify_settings, source_root, labels, recovered=False)
+        else:
+            on_event(f"Grouped run: still waiting ({fmt_hhmmss(time.monotonic() - t0)} "
+                     f"elapsed, $0 billed).")
+        sleep(interval, stop)
+        interval = min(interval * 1.5, max_interval)    # back off (never a hard cap)
+    return None
+
+
 def _pod_still_running(list_pods, pod_id, name_prefix):
     """True if `pod_id` is still RUNNING under this run's pod-name prefix (a connectivity
     blip: reconnect, don't redeploy), False if it's gone (a real loss: redeploy). Any error
@@ -2423,7 +2478,8 @@ def _final_summary(done, failed, stopped, files=None):
 
 
 def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_stopped,
-                    funds_tripped, close_session, on_event, notify_settings, source_root):
+                    funds_tripped, close_session, on_event, notify_settings, source_root,
+                    notify_summary=True):
     """Drive a video run under Auto-resume (#6): loop deploy -> run one pass, healing a lost
     pod between passes, until the queue completes, the user stops, the funds guard trips, or
     a non-pod error escapes. Returns the accumulated final summary (and sends the ONE
@@ -2446,7 +2502,10 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
 
     def finish(stopped):
         summary = _final_summary(acc_done, acc_failed, stopped, acc_files)
-        _notify_summary(notify_settings, summary, source_root)
+        # In a grouped run (18) each group is supervised but the ONE end-of-run notification
+        # is sent by run_grouped's caller, so a per-group supervisor suppresses its own.
+        if notify_summary:
+            _notify_summary(notify_settings, summary, source_root)
         log(f"Summary: {acc_done} done, {acc_failed} failed of {acc_done + acc_failed}"
             + (f", stopped early ({stopped})" if stopped else "") + ".")
         return summary
@@ -2660,15 +2719,19 @@ def main(argv=None):
         wc["vram_resident_threshold_gb"] = vcfg["vram_resident_threshold_gb"]
         return wc
 
-    def make_session(first=True):
+    def make_session(first=True, gpu=None):
         """Deploy + start one video pod, wire telemetry, and tell the GUI which pod is
         live. Returns (session, engine). On a start failure it closes the partial session
         (no orphan pod) before re-raising. Called once (non-armed) or once per redeploy
         (supervised); a redeploy transparently reuses a surviving pod via RemoteSession's
-        _find_existing_pod (the blip path)."""
+        _find_existing_pod (the blip path).
+
+        `gpu` (18, grouped multi-pod Start): deploy THIS group's card (a `gpu_override`
+        passed to RemoteSession); None keeps the env/config single-pod selection."""
         from remote_run import RemoteSession
         sess = RemoteSession(cfg.get("runpod", {}), _worker_cfg(),
-                             APP_ROOT, on_event=log, mode="video")
+                             APP_ROOT, on_event=log, mode="video",
+                             gpu_override=(gpu or None))
         try:
             eng = sess.start()
         except Exception:
@@ -2726,6 +2789,83 @@ def main(argv=None):
                 "The engine is chosen per queued job (SeedVR2 or Real-ESRGAN).")
             run_queue(None, conn, root_id, src_root, vcfg, budget,
                       notify_settings=notify_settings, resolve_engine=router.for_job)
+        elif len(distinct_group_keys(db.get_video_queue(conn, root_id))) > 1:
+            # Grouped multi-pod Start (18): the queue holds >1 distinct (engine, gpu) group, so
+            # each group runs on its OWN pod, sequentially, one pod up at a time (the pendulum
+            # in run_grouped picks the next group by live stock). The GUI already persisted the
+            # grouped queue_order, so the groups are contiguous and in the order the user sees.
+            group_keys = distinct_group_keys(db.get_video_queue(conn, root_id))
+            import runpod_client as rp
+            rcfg = cfg.get("runpod", {})
+            api_key = rcfg.get("api_key", "")
+            region = None
+            try:
+                _vol = (rcfg.get("network_volume_id", "") or "").strip()
+                if _vol and api_key:
+                    region = rp.volume_region(api_key, _vol)
+            except Exception as exc:                   # noqa: BLE001 (best-effort region read)
+                debug_log("batch_video_upscale grouped region", exc=exc)
+            log(f"Grouped run: {len(group_keys)} pod session(s), one card each, processed one "
+                f"at a time in the queue order shown"
+                + (" (Auto-resume ON: a lost pod is healed per group)." if auto_resume else "."))
+
+            def _in_stock_ids():
+                try:
+                    return {g["id"] for g in rp.available_gpus(api_key, data_center_id=region)}
+                except Exception as exc:               # noqa: BLE001 (unknown -> fail-open)
+                    debug_log("batch_video_upscale grouped stock", exc=exc)
+                    return None
+
+            def gpu_in_stock(key):
+                gpu = key[1]
+                if not gpu:                            # '' = default card; can't check, assume ok
+                    return True
+                ids = _in_stock_ids()
+                return True if ids is None else (gpu in ids)
+
+            def wait_for_stock(pending):
+                return _wait_for_any_gpu_stock(
+                    lambda: rp.available_gpus(api_key, data_center_id=region), pending,
+                    notify_settings=notify_settings, source_root=src_root)
+
+            def run_group(key):
+                _gpu = key[1]
+                jf = (lambda j, k=key: job_group_key(j) == k)
+                if auto_resume:
+                    return _run_supervised(
+                        lambda first, g=_gpu: make_session(first, gpu=g),
+                        lambda e: run_queue(e, conn, root_id, src_root, vcfg, budget,
+                                            notify_settings=notify_settings, job_filter=jf,
+                                            auto_resume=True, notify_summary=False),
+                        pod_alive=lambda s: _pod_still_running(
+                            lambda: rp.list_pods(api_key), s.pod_id, s.pod_name_prefix),
+                        wait_for_stock=lambda g=_gpu: _wait_for_gpu_stock(
+                            lambda: rp.available_gpus(api_key, data_center_id=region),
+                            g, g, notify_settings=notify_settings, source_root=src_root),
+                        is_stopped=_STOP.is_set,
+                        funds_tripped=lambda s: getattr(s, "_funds_tripped", False),
+                        close_session=close_session, on_event=log,
+                        notify_settings=notify_settings, source_root=src_root,
+                        notify_summary=False)
+                sess, e = make_session(True, gpu=_gpu)
+                try:
+                    return run_queue(e, conn, root_id, src_root, vcfg, budget,
+                                     notify_settings=notify_settings, job_filter=jf,
+                                     notify_summary=False)
+                finally:
+                    close_session(sess, None)
+
+            summary = run_grouped(group_keys, run_group, gpu_in_stock=gpu_in_stock,
+                                  wait_for_stock=wait_for_stock, is_stopped=_STOP.is_set,
+                                  on_event=log)
+            _notify_summary(notify_settings,
+                            _final_summary(summary["done"], summary["failed"],
+                                           summary.get("stopped"), summary.get("files")),
+                            src_root)
+            log(f"Summary: {summary['done']} done, {summary['failed']} failed of "
+                f"{summary['total']}"
+                + (f", stopped early ({summary['stopped']})" if summary.get("stopped") else "")
+                + ".")
         elif auto_resume:
             import runpod_client as rp
             rcfg = cfg.get("runpod", {})

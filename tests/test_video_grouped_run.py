@@ -115,3 +115,63 @@ def test_failures_accumulate():
     result, _, _ = _harness([A, B], run_returns={A: _summary(done=0, failed=1),
                                                  B: _summary(done=2, failed=1)})
     assert result["done"] == 2 and result["failed"] == 2 and result["total"] == 4
+
+
+# ── distinct_group_keys ────────────────────────────────────────────────────────
+
+def _row(engine=None, gpu=None):
+    return {"rel_path": "x", "engine": engine, "gpu": gpu, "target": "4K", "clip_id": 0}
+
+
+def test_distinct_group_keys_first_appearance():
+    jobs = [_row("seedvr2", "PRO6000"), _row("fixed_ratio", "RTX2000"),
+            _row("seedvr2", "PRO6000")]
+    assert bv.distinct_group_keys(jobs) == [("seedvr2", "PRO6000"), ("fixed_ratio", "RTX2000")]
+
+
+def test_distinct_group_keys_legacy_single():
+    # A legacy all-NULL queue is ONE group, so the remote run stays single-pod.
+    jobs = [_row(), _row(), _row()]
+    assert bv.distinct_group_keys(jobs) == [("seedvr2", "")]
+
+
+# ── _wait_for_any_gpu_stock (the pendulum wait) ────────────────────────────────
+
+def _stock_waiter(stock_sequence, *, stop_after=None):
+    """Drive _wait_for_any_gpu_stock with a scripted sequence of available_gpus() results
+    (each a list of {'id':...}); `stop_after` stops the loop after N polls."""
+    calls = {"n": 0}
+
+    def list_gpus():
+        i = min(calls["n"], len(stock_sequence) - 1)
+        return stock_sequence[i]
+
+    def sleep(_interval, _stop):
+        calls["n"] += 1
+
+    def stop():
+        return stop_after is not None and calls["n"] >= stop_after
+
+    key = bv._wait_for_any_gpu_stock(
+        list_gpus, [("seedvr2", "PRO6000"), ("fixed_ratio", "RTX2000")],
+        on_event=lambda _m: None, stop=stop, sleep=sleep)
+    return key, calls["n"]
+
+
+def test_wait_returns_key_when_card_appears():
+    # Poll 1: nothing; poll 2: RTX2000 in stock -> return that group.
+    seq = [[], [{"id": "RTX2000"}]]
+    key, polls = _stock_waiter(seq)
+    assert key == ("fixed_ratio", "RTX2000")
+    assert polls >= 1
+
+
+def test_wait_returns_immediately_if_in_stock():
+    key, polls = _stock_waiter([[{"id": "PRO6000"}]])
+    assert key == ("seedvr2", "PRO6000")
+    assert polls == 0            # no sleep needed
+
+
+def test_wait_returns_none_on_stop():
+    key, _ = _stock_waiter([[]], stop_after=2)   # never in stock; stops after 2 polls
+    assert key is None

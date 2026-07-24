@@ -88,9 +88,14 @@ def _ssh_base(key, port, known_hosts):
 
 class RemoteSession:
     def __init__(self, runpod_cfg, upscale_cfg, app_root, on_event=None,
-                 attach=None, mode="upscale"):
+                 attach=None, mode="upscale", gpu_override=None):
         """`attach` = (pod_id, host, ssh_port) to reuse a running pod instead of
         creating one (dev/validation). `on_event(msg)` is for progress lines.
+
+        `gpu_override` (18, grouped multi-pod Start): the GPU type id (or a comma-
+        separated chain) to deploy, taking precedence over the `IMGTBX_GPU_OVERRIDE`
+        env. Grouped Start passes each (engine, gpu) group's own card here so one run
+        can deploy a different pod per group; None keeps the env/config behaviour.
 
         `mode`: "upscale" (full worker: SeedVR2 + /upscale + /orient), "tag"
         (remote Tag & Rename — the worker loads only /orient so the VRAM is free
@@ -102,6 +107,7 @@ class RemoteSession:
         self.upscale_cfg = upscale_cfg
         self.app_root = app_root
         self.mode = mode
+        self.gpu_override = (gpu_override or "").strip() or None
         self.worker_mode = {"tag": "tag", "video": "video"}.get(mode, "full")
         # Pod name is mode-aware so an image run and a video run never reuse each
         # other's pod: Image Upscaler + Tag & Rename share "image-toolbox-remote"
@@ -299,7 +305,10 @@ class RemoteSession:
         # actually deployable now. Without it (headless / picker failed) fall back
         # to the configured defaults: a curated cheap chain for tagging (the
         # vision model needs only ~6.6 GB), the single configured card for upscale.
-        override = os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
+        # A per-session gpu_override (grouped multi-pod Start, 18) wins over the env, which
+        # in turn wins over the config defaults, so one grouped run deploys a distinct card
+        # per (engine, gpu) group without disturbing the single-pod env path.
+        override = self.gpu_override or os.environ.get("IMGTBX_GPU_OVERRIDE", "").strip()
         if override:
             gpu_ids = [g.strip() for g in override.split(",") if g.strip()]
         elif self.mode == "tag":
