@@ -248,7 +248,8 @@ def test_supervisor_heals_loss_then_blip_then_completes():
         2: {"done": 1, "failed": 0, "stopped": None, "total": 1},
     }
     summary, sessions, waits, _ev = _supervise(plan, alive_map={0: False, 1: True})
-    assert summary == {"done": 3, "failed": 0, "stopped": None, "total": 3, "files": []}
+    assert summary == {"done": 3, "failed": 0, "stopped": None, "total": 3, "files": [],
+                       "attempted": set()}
     assert waits["n"] == 1                             # only the loss waited for stock
     real = [s for s in sessions if s is not None]
     assert real[0].closed_with is True                # loss: terminate the remnant
@@ -278,7 +279,7 @@ def test_supervisor_stops_when_wait_is_interrupted():
     # Wait-for-stock returned False (user Stop during the wait): end, keeping the counts
     # accrued before the loss.
     assert summary == {"done": 2, "failed": 1, "stopped": "stopped by user",
-                       "total": 3, "files": []}
+                       "total": 3, "files": [], "attempted": set()}
     assert waits["n"] == 1
 
 
@@ -289,7 +290,8 @@ def test_supervisor_redeploy_failure_waits_again():
     }
     summary, sessions, waits, _ev = _supervise(
         plan, alive_map={0: False}, factory_fail_first_redeploy=True)
-    assert summary == {"done": 1, "failed": 0, "stopped": None, "total": 1, "files": []}
+    assert summary == {"done": 1, "failed": 0, "stopped": None, "total": 1, "files": [],
+                       "attempted": set()}
     assert waits["n"] == 2                             # loss wait + post-redeploy-failure wait
 
 

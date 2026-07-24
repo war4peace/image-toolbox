@@ -435,12 +435,15 @@ class PodLost(Exception):
     accurate final summary across redeploys (each pass counts only its own jobs; a resumed
     pass never re-counts a `done` job, so summing is correct)."""
 
-    def __init__(self, reason, done=0, failed=0, done_frames=0, files=None):
+    def __init__(self, reason, done=0, failed=0, done_frames=0, files=None, attempted=None):
         super().__init__(reason)
         self.done = done
         self.failed = failed
         self.done_frames = done_frames
         self.files = files or []       # per-file records completed this pass (for the summary)
+        # Jobs tried before the loss (18): grouped Start unions these into its session-wide
+        # attempted set so a redeploy/re-group never re-attempts an already-tried job.
+        self.attempted = set(attempted or ())
 
 
 def _is_pod_failure(exc):
@@ -2156,7 +2159,8 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
             # normal per-job failure path below.
             if auto_resume and _is_pod_failure(exc):
                 raise PodLost(str(exc)[:300], done=done, failed=failed,
-                              done_frames=done_frames, files=completed) from exc
+                              done_frames=done_frames, files=completed,
+                              attempted=attempted) from exc
             failed += 1
             reason = str(exc)[:300]
             # The traceback, to logs/debug.log. `str(exc)` alone is often the LEAST useful
@@ -2180,7 +2184,10 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
         stopped = "stopped by user"
 
     summary = {"done": done, "failed": failed, "stopped": stopped,
-               "total": done + failed, "files": completed}
+               "total": done + failed, "files": completed,
+               # Which jobs this pass tried (18): grouped Start unions these into a session-wide
+               # attempted set so a failed job never re-triggers its group's pod on a later pass.
+               "attempted": set(attempted)}
     # The supervisor (#6) sends ONE accumulated summary across all its redeploys, so it
     # passes notify_summary=False here to suppress a per-pod notification.
     if notify_summary:
@@ -2499,9 +2506,11 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
     """
     acc_done = acc_failed = 0
     acc_files = []                    # per-file records accumulated across every redeploy
+    acc_attempted = set()             # jobs tried across every redeploy (for grouped Start, 18)
 
     def finish(stopped):
         summary = _final_summary(acc_done, acc_failed, stopped, acc_files)
+        summary["attempted"] = set(acc_attempted)
         # In a grouped run (18) each group is supervised but the ONE end-of-run notification
         # is sent by run_grouped's caller, so a per-group supervisor suppresses its own.
         if notify_summary:
@@ -2530,6 +2539,7 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
             acc_done += exc.done
             acc_failed += exc.failed
             acc_files.extend(exc.files)
+            acc_attempted |= exc.attempted
             reason = str(exc)
             # Hard stops (never redeploy): the funds guard deliberately stopped the pod, or
             # the user pressed Stop. Both look like a pod death to the engine; distinguishing
@@ -2557,56 +2567,81 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
             acc_done += summary["done"]
             acc_failed += summary["failed"]
             acc_files.extend(summary.get("files") or [])
+            acc_attempted |= set(summary.get("attempted") or ())
             close_session(session, None)               # default teardown for the run's end
             return finish(summary.get("stopped"))
 
 
-def run_grouped(group_keys, run_group, *, gpu_in_stock, wait_for_stock, is_stopped, on_event):
-    """Drive a grouped multi-pod run (18): a queue partitioned into (engine, gpu) GROUPS is
+def run_grouped(live_jobs, run_group, *, gpu_in_stock, wait_for_stock, is_stopped, on_event):
+    """Drive a grouped multi-pod run (18): the queue is partitioned into (engine, gpu) GROUPS,
     processed one pod per group, sequentially, ONE pod up at a time. This is the pendulum layer
     ABOVE the per-group run: it picks WHICH group runs next by live stock and NEVER substitutes
     a card (0.4.0). Each group's own pod lifecycle (deploy -> run_queue filtered to the group ->
     teardown) and any Auto-resume healing WITHIN a group live in `run_group`.
 
+    The group set is RE-DERIVED from the LIVE queue before every pod (not a fixed snapshot), so a
+    file the user adds mid-run is honoured: a job for the group currently running is drained by
+    that pod (run_queue re-reads the live queue), and a job for a group whose pod already finished
+    (or a brand-new GPU) RE-OPENS that group with a fresh pod once the current one is done. A
+    session-wide `attempted` set is kept so a FAILED job (which stays queued until GIVE_UP_AFTER)
+    never re-triggers its group's pod: without it a single doomed job would redeploy a pod on
+    every pass.
+
     All RunPod-touching seams are injected so the loop is offline-testable, mirroring
     _run_supervised:
-      group_keys                 ordered [(engine, gpu), ...] to run (cheapest-first from Start)
-      run_group(key) -> summary  run ONE group to completion on its pod; a summary dict whose
-                                 'stopped' (a user Stop or the funds guard) ends the WHOLE run
+      live_jobs() -> [job rows]  the current queue (re-read each pass; the source of new groups)
+      run_group(key, skip) -> summary   run ONE group to completion on its pod, NOT attempting any
+                                 job id in `skip`; returns a summary whose 'attempted' set feeds
+                                 the session skip and whose 'stopped' ends the WHOLE run
       gpu_in_stock(key) -> bool  is this group's card deployable right now?
-      wait_for_stock(keys) -> key|None   ALL remaining groups sold out: block until one of them
-                                 returns and give back that key; None if the user stopped
+      wait_for_stock(keys) -> key|None   ALL current groups sold out: block until one returns and
+                                 give back that key; None if the user stopped
       is_stopped() -> bool       user pressed Stop
       on_event(msg)              a progress line
 
-    Returns the accumulated summary. The caller sends the single end-of-run notification (each
-    group's run_queue suppresses its own), so grouping stays a pure orchestration layer here.
+    Returns the accumulated summary. The caller sends the single end-of-run notification.
 
-    A sold-out group is not failed: it is deferred (skip to the next in-stock group), and only
-    when it is the LAST group standing does the pendulum wait for its card. So a mixed queue
-    makes progress on whatever is available now and comes back to the rest."""
+    A sold-out group is deferred (skip to the next in-stock group), and only when it is the LAST
+    group standing does the pendulum wait for its card. So a mixed queue makes progress on
+    whatever is available now and comes back to the rest."""
     acc_done = acc_failed = 0
     acc_files = []
     acc_stopped = None
-    remaining = list(group_keys)
-    while remaining and not is_stopped():
-        # Run the first remaining group whose card is in stock; defer the sold-out ones.
-        ready = next((g for g in remaining if gpu_in_stock(g)), None)
+    attempted = set()                 # (rel, target, clip) tried this run, across all groups
+    while not is_stopped():
+        # Re-derive the still-pending groups from the LIVE queue, minus jobs already tried this
+        # run (a failed job lingers in the queue until give-up; excluding it stops a re-deploy
+        # loop). This is what lets a mid-run add re-open a finished group / a brand-new card.
+        pending = [j for j in live_jobs()
+                   if (j["rel_path"], j["target"], j["clip_id"]) not in attempted]
+        groups = distinct_group_keys(pending)
+        if not groups:
+            break
+        # Run the first group whose card is in stock; defer the sold-out ones.
+        ready = next((g for g in groups if gpu_in_stock(g)), None)
         if ready is None:
-            on_event("Grouped run: every remaining group's GPU is sold out; waiting for the "
+            on_event("Grouped run: every pending group's GPU is sold out; waiting for the "
                      "first to return (no time cap, $0 billed while waiting).")
-            ready = wait_for_stock(list(remaining))
+            ready = wait_for_stock(list(groups))
             if ready is None:
                 acc_stopped = "stopped by user"
                 break
-        remaining.remove(ready)
         eng, gpu = ready
+        after = len(groups) - 1
         on_event(f"Grouped run: starting the {eng} group on {gpu or 'the selected GPU'} "
-                 f"({len(remaining)} group(s) queued after it).")
-        summary = run_group(ready)
+                 f"({after} other group(s) pending).")
+        summary = run_group(ready, set(attempted))
         acc_done += summary.get("done", 0)
         acc_failed += summary.get("failed", 0)
         acc_files.extend(summary.get("files") or [])
+        # Mark every job this group tried as attempted, so a failed one (still in the queue)
+        # doesn't re-open the group next pass; a NEWLY added job (not in this set) still will.
+        attempted |= set(summary.get("attempted") or ())
+        # Belt-and-braces: if the group reported nothing attempted (an odd early return), mark
+        # the jobs that WERE pending for it, so the loop can never spin on the same group.
+        if not summary.get("attempted"):
+            attempted |= {(j["rel_path"], j["target"], j["clip_id"])
+                          for j in pending if job_group_key(j) == ready}
         if summary.get("stopped"):
             # A user Stop or the funds guard inside a group ends the whole run; the untouched
             # groups stay queued for a later Start (the installment philosophy, section 5).
@@ -2805,9 +2840,10 @@ def main(argv=None):
                     region = rp.volume_region(api_key, _vol)
             except Exception as exc:                   # noqa: BLE001 (best-effort region read)
                 debug_log("batch_video_upscale grouped region", exc=exc)
-            log(f"Grouped run: {len(group_keys)} pod session(s), one card each, processed one "
-                f"at a time in the queue order shown"
-                + (" (Auto-resume ON: a lost pod is healed per group)." if auto_resume else "."))
+            log(f"Grouped run: {len(group_keys)} pod session(s) to start, one card each, "
+                f"processed one at a time in the queue order shown. A file added mid-run is "
+                f"picked up (its group re-opens if already finished)"
+                + (" Auto-resume ON: a lost pod is healed per group." if auto_resume else "."))
 
             def _in_stock_ids():
                 try:
@@ -2828,9 +2864,12 @@ def main(argv=None):
                     lambda: rp.available_gpus(api_key, data_center_id=region), pending,
                     notify_settings=notify_settings, source_root=src_root)
 
-            def run_group(key):
+            def run_group(key, skip):
                 _gpu = key[1]
-                jf = (lambda j, k=key: job_group_key(j) == k)
+                # Filter to THIS group AND drop jobs already tried this run (a failed one lingers
+                # in the queue until give-up; without this a re-opened group would re-attempt it).
+                jf = (lambda j, k=key, s=skip: job_group_key(j) == k
+                      and (j["rel_path"], j["target"], j["clip_id"]) not in s)
                 if auto_resume:
                     return _run_supervised(
                         lambda first, g=_gpu: make_session(first, gpu=g),
@@ -2855,9 +2894,9 @@ def main(argv=None):
                 finally:
                     close_session(sess, None)
 
-            summary = run_grouped(group_keys, run_group, gpu_in_stock=gpu_in_stock,
-                                  wait_for_stock=wait_for_stock, is_stopped=_STOP.is_set,
-                                  on_event=log)
+            summary = run_grouped(lambda: db.get_video_queue(conn, root_id), run_group,
+                                  gpu_in_stock=gpu_in_stock, wait_for_stock=wait_for_stock,
+                                  is_stopped=_STOP.is_set, on_event=log)
             _notify_summary(notify_settings,
                             _final_summary(summary["done"], summary["failed"],
                                            summary.get("stopped"), summary.get("files")),

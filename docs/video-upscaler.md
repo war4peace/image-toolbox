@@ -1816,11 +1816,26 @@ Pressing Start rewrites `video_outputs.queue_order` so that same-`(engine, gpu)`
 by group rank), then **refreshes the queue tree** so the user literally sees the run order:
 the `#`/Place column renumbers and the rows visibly regroup before processing begins. The
 GUI already renders the queue in `queue_order`, so reflecting the plan is free once it is
-persisted. This also simplifies the runner: it needs no separate "grouping" concept, it just
-walks the queue in `queue_order` and treats each **maximal contiguous run of same-`(engine,
-gpu)` jobs as one pod session** (`group_queue_order` in `batch_video_upscale` is the pure,
-headless-tested reorder; Start persists its result and reloads the tree). The user's up/down
-reordering still works; grouping is one more reorder they can see, not a black box.
+persisted (`group_queue_order` in `batch_video_upscale` is the pure, headless-tested reorder;
+Start persists its result and reloads the tree). The user's up/down reordering still works;
+grouping is one more reorder they can see, not a black box.
+
+**The runner RE-DERIVES the groups from the LIVE queue before every pod, not from a fixed
+snapshot** (`run_grouped` calls `distinct_group_keys(live_jobs())` each pass). This is what
+makes the queue fully **dynamic**: a file the user adds mid-run is honoured three ways, with no
+GUI action beyond Prepare (the DB is the shared source of truth):
+- added to the group **currently running** -> that pod drains it (`run_queue` re-reads the live
+  queue before each job);
+- added to a group whose pod **already finished** -> that group **re-opens** with a fresh pod
+  once the current one is done (a new L4 job re-creates the L4 group);
+- added for a **brand-new GPU** never in the run -> it becomes a new group and runs in turn.
+
+The one correctness rule this needs: `run_grouped` keeps a **session-wide `attempted` set**
+(fed by each pass's `run_queue`, and by `PodLost`/`_run_supervised` under Auto-resume) and
+excludes those jobs when re-deriving groups. Without it a FAILED job (which lingers in the
+queue until `GIVE_UP_AFTER`) would re-open its group and **redeploy a pod on every pass**; with
+it, a failed job is tried once and then left for a later Start, while a genuinely new job (not
+in the set) still re-opens the group.
 
 **Group order.** Cheapest pod first is the default rank (least spent if the user stops early,
 and the cheap Real-ESRGAN group clears first), but the primary runtime gate is live **stock**
