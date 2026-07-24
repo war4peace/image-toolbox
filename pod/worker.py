@@ -82,6 +82,9 @@ _MODE = "full"          # "full" (SeedVR2 + /upscale), "tag" (/orient only),
 _ESR_ENGINE = None
 _ESR_MODEL = None
 _ESR_LOCK = threading.Lock()
+_GPU_NAME = None        # esrgan mode has no resident _ENGINE to name the card, so /health
+                        # reads this (queried once at startup); the card identity matters
+                        # for the wide-GPU benchmarking this mode exists for (#18 B)
 # GPU work (upscale + the orient CNN) is serialised through this lock so a
 # /telemetry or /health request can still be answered WHILE an upscale runs
 # (the server is multi-threaded; those two endpoints never take the lock).
@@ -272,6 +275,18 @@ def _parse_gpu_field(raw):
     try:
         return int(float(raw))
     except ValueError:
+        return None
+
+
+def _query_gpu_name():
+    """GPU 0's product name via nvidia-smi (esrgan /health, #18 B). None on failure."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, timeout=8)
+        name = out.strip().splitlines()[0].strip()
+        return name or None
+    except Exception:
         return None
 
 
@@ -1128,7 +1143,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             body = json.dumps({"status": "ok",
-                               "device": getattr(_ENGINE, "device_name", "?"),
+                               "device": (getattr(_ENGINE, "device_name", None)
+                                          or _GPU_NAME or "?"),
                                "resident": bool(getattr(_ENGINE, "resident", False)),
                                "version": _VERSION,
                                "mode": _MODE,
@@ -1498,7 +1514,7 @@ def _ctype_for(ext):
 
 
 def main(argv=None):
-    global _ENGINE, _HEARTBEAT, _VERSION, _MODE
+    global _ENGINE, _HEARTBEAT, _VERSION, _MODE, _GPU_NAME
     p = argparse.ArgumentParser(description="Resident upscale worker for a RunPod pod.")
     p.add_argument("--repo-dir", required=True)
     p.add_argument("--model-dir", required=True)
@@ -1533,8 +1549,9 @@ def main(argv=None):
         # esrgan mode (#18 B): no SeedVR2, no volume. The FixedRatioVideoEngine is built
         # lazily per job (the model key travels in each /video/submit), self-downloading a
         # ~65 MB verified weight, so /health answers immediately with nothing pre-loaded.
-        _log("esrgan mode: SeedVR2 NOT loaded; serving /video/* with per-job "
-             "fixed-ratio Real-ESRGAN models.")
+        _GPU_NAME = _query_gpu_name()          # name the card for /health (benchmarking)
+        _log(f"esrgan mode: SeedVR2 NOT loaded; serving /video/* with per-job "
+             f"fixed-ratio Real-ESRGAN models (GPU: {_GPU_NAME or '?'}).")
         _touch(_HEARTBEAT)
     else:
         # full and video both load SeedVR2 once; they differ only in which

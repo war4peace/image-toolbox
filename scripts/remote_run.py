@@ -38,6 +38,21 @@ except Exception:
         pass
 
 DEFAULT_IMAGE = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
+# esrgan (#18 B) runs region-wide on the CHEAPEST card anywhere, so its image must
+# clear the OLDEST driver in the fleet. The SeedVR2 image is cu1281 (CUDA 12.8.1) and
+# torch 2.9.1 hard-refuses a host driver even one PATCH below it (a real RTX 2000 Ada
+# deploy failed on a 12.8.0 driver: "driver too old, found 12080"). A CUDA 12.4 image
+# runs on any 12.4+ driver (essentially the whole Ampere/Ada fleet, incl. that 12.8.0
+# host), and Real-ESRGAN is a light GAN that needs nothing newer.
+#
+# It MUST be a runpod/* image, not a vanilla pytorch/pytorch one: only RunPod's images
+# boot sshd and honour the injected PUBLIC_KEY (a stock pytorch image has no SSH server,
+# so scp fails at exit 255 before anything runs). runpod/pytorch's 2.4.0-cuda12.4.1
+# -devel tag is a RunPod image (SSH works) AND low-CUDA (driver-compatible) AND -devel
+# (ships curl + pip, which the base-image setup needs). Blackwell (sm_120) needs cu128,
+# so a Blackwell esrgan run would need a cu128 image override, deferred with the rest of
+# the wide-card benchmarking. Overridable via runpod.esrgan_image_name.
+ESRGAN_IMAGE = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
 HEARTBEAT = "/tmp/upscale_heartbeat"
 
 
@@ -108,13 +123,23 @@ class RemoteSession:
         self.app_root = app_root
         self.mode = mode
         self.gpu_override = (gpu_override or "").strip() or None
-        self.worker_mode = {"tag": "tag", "video": "video"}.get(mode, "full")
-        # Pod name is mode-aware so an image run and a video run never reuse each
-        # other's pod: Image Upscaler + Tag & Rename share "image-toolbox-remote"
-        # (both are image-side, safe to share), the Video Upscaler gets its own
-        # "video-toolbox-remote". _find_existing_pod matches on this same prefix.
-        self.pod_name = "video-toolbox-remote" if mode == "video" else "image-toolbox-remote"
-        self.pod_name_prefix = "video-toolbox" if mode == "video" else "image-toolbox"
+        self.worker_mode = {"tag": "tag", "video": "video",
+                            "esrgan": "esrgan"}.get(mode, "full")
+        # Pod name is mode-aware so runs of different shapes never reuse each other's
+        # pod: Image Upscaler + Tag & Rename share "image-toolbox-remote" (both are
+        # image-side, safe to share), the SeedVR2 Video Upscaler gets "video-toolbox-
+        # remote", and remote Real-ESRGAN (#18 B) gets its OWN "esrgan-toolbox-remote".
+        # esrgan is deliberately NOT folded into the video pool: an esrgan pod is
+        # NO-VOLUME (base python + self-downloaded weight), structurally different from
+        # a volume-mounted SeedVR2 video pod, so _find_existing_pod (which matches on
+        # this prefix) must never adopt one for the other. Grouped Start runs one pod at
+        # a time anyway, so separate names cost nothing and remove the mismatch hazard.
+        if mode == "esrgan":
+            self.pod_name, self.pod_name_prefix = "esrgan-toolbox-remote", "esrgan-toolbox"
+        elif mode == "video":
+            self.pod_name, self.pod_name_prefix = "video-toolbox-remote", "video-toolbox"
+        else:
+            self.pod_name, self.pod_name_prefix = "image-toolbox-remote", "image-toolbox"
         self.ollama_url = None        # set in tag mode (local end of the tunnel)
         self._ollama_tunnel = None
         self.api_key = runpod_cfg.get("api_key", "")
@@ -155,11 +180,22 @@ class RemoteSession:
         """Short hash of the worker-side code (worker.py + the modules it loads).
         The worker reports it via /health; a reused pod whose worker reports a
         different version is restarted, so it never keeps serving stale code
-        after an app update."""
+        after an app update. The hashed file set is MODE-aware: esrgan mode ships the
+        fixed-ratio engine stack (not SeedVR2's upscale_engine), so editing one path's
+        code doesn't needlessly reload a pod running the other."""
+        if self.mode == "esrgan":
+            files = (("pod", "worker.py"),
+                     ("scripts", "fixed_ratio_engine.py"),
+                     ("scripts", "esrgan_models.py"),
+                     ("scripts", "video_pipeline.py"),
+                     ("scripts", "runner_common.py"),
+                     ("scripts", "net_ssl.py"))
+        else:
+            files = (("pod", "worker.py"),
+                     ("scripts", "upscale_engine.py"),
+                     ("scripts", "orientation.py"))
         h = hashlib.blake2b(digest_size=8)
-        for rel in (("pod", "worker.py"),
-                    ("scripts", "upscale_engine.py"),
-                    ("scripts", "orientation.py")):
+        for rel in files:
             try:
                 with open(os.path.join(self.app_root, *rel), "rb") as f:
                     h.update(f.read())
@@ -249,13 +285,17 @@ class RemoteSession:
         self._arm_deadman()
         self._arm_funds_guard()
         self._emit("Connecting to the worker …")
-        engine_cls = RemoteVideoEngine if self.mode == "video" else RemoteUpscaleEngine
+        engine_cls = (RemoteVideoEngine if self.mode in ("video", "esrgan")
+                      else RemoteUpscaleEngine)
         self.engine = engine_cls(
             self.host, self.ssh_port, self.key_path,
             worker_port=self.worker_port, known_hosts=self.known_hosts)
         if self.mode == "tag":
             self._open_ollama_tunnel()
             self._emit(f"Remote tagging ready (Ollama at {self.ollama_url}).")
+        elif self.mode == "esrgan":
+            self._emit(f"Remote Real-ESRGAN engine ready on {self.engine.device_name} "
+                       f"(fixed-ratio, per-job model, no network volume).")
         elif self.mode == "video":
             vram = (" (big-VRAM: DiT + VAE kept resident on the GPU)"
                     if getattr(self.engine, "resident", False)
@@ -293,12 +333,19 @@ class RemoteSession:
         return None
 
     def _create_pod(self):
-        vol_id = self.cfg.get("network_volume_id", "").strip()
-        if not vol_id:
-            raise rp.RunPodError("No runpod.network_volume_id configured.")
-        region = rp.volume_region(self.api_key, vol_id)
-        if not region:
-            raise rp.RunPodError(f"Could not read region of volume {vol_id}.")
+        # esrgan (#18 B) is VOLUME-FREE: the worker self-downloads its ~65 MB verified
+        # weight and pip-installs spandrel on the base image, so there is no model volume
+        # to bind and no region to lock to. That is what lets it deploy the cheapest card
+        # anywhere (the benchmarking goal): a volume would pin it to one datacenter.
+        if self.mode == "esrgan":
+            vol_id, region = "", None
+        else:
+            vol_id = self.cfg.get("network_volume_id", "").strip()
+            if not vol_id:
+                raise rp.RunPodError("No runpod.network_volume_id configured.")
+            region = rp.volume_region(self.api_key, vol_id)
+            if not region:
+                raise rp.RunPodError(f"Could not read region of volume {vol_id}.")
         # GPU choice. The GUI's live picker (filtered by VRAM, sorted by price
         # against real availability) passes its selection + fallbacks as a
         # comma-separated IMGTBX_GPU_OVERRIDE — preferred since it reflects what is
@@ -316,22 +363,35 @@ class RemoteSession:
             gpu_ids = [primary] + [gid for _l, gid in rp.TAG_GPU_TYPES if gid != primary]
         else:
             gpu_ids = [self.cfg.get("gpu_type_id", "NVIDIA GeForce RTX 5090")]
+        # esrgan has its OWN low-CUDA image default (see ESRGAN_IMAGE), separate from the
+        # SeedVR2 image_name config so the two pod types never share the wrong image.
+        if self.mode == "esrgan":
+            image = self.cfg.get("esrgan_image_name") or ESRGAN_IMAGE
+        else:
+            image = self.cfg.get("image_name") or DEFAULT_IMAGE
         spec = {
             "name": self.pod_name,
-            "imageName": self.cfg.get("image_name") or DEFAULT_IMAGE,
+            "imageName": image,
             "gpuTypeIds": gpu_ids,
             "gpuCount": 1, "cloudType": "SECURE",
-            "dataCenterIds": [region], "networkVolumeId": vol_id,
             "containerDiskInGb": int(self.cfg.get("container_disk_gb", 30)),
             "ports": ["22/tcp"],
         }
+        # Only pin a datacenter + bind a volume when there IS one (SeedVR2 modes). A
+        # volume-free esrgan pod deploys region-wide, so it omits both (passing a
+        # [None] dataCenterId would fail the deploy).
+        if region:
+            spec["dataCenterIds"] = [region]
+        if vol_id:
+            spec["networkVolumeId"] = vol_id
         # Inject the app's public key so the pod trusts it at boot (RunPod base
         # images append $PUBLIC_KEY to authorized_keys) — no account-level
         # registration needed. Additive: account keys still work too.
         if self.public_key:
             spec["env"] = {"PUBLIC_KEY": self.public_key}
         chain_note = "" if len(gpu_ids) == 1 else " (+ fallbacks)"
-        self._emit(f"Creating pod ({gpu_ids[0]}{chain_note} in {region}) …")
+        where = f"in {region}" if region else "region-wide (no volume)"
+        self._emit(f"Creating pod ({gpu_ids[0]}{chain_note} {where}) …")
 
         def ev(kind, attempt, pod_id, info):
             if kind == "created":
@@ -370,9 +430,17 @@ class RemoteSession:
 
     def _push_files(self):
         self._emit("Uploading worker + dead-man's switch to the pod …")
-        # orientation.py rides along so the worker can run the auto-straighten CNN
-        # on the pod (remote #1 option B) — the local side stays torch-free.
-        for name in ("upscale_engine.py", "orientation.py"):
+        if self.mode == "esrgan":
+            # The fixed-ratio engine stack (#18 B): the engine, its torch-free model
+            # catalog + verified downloader (net_ssl for the HTTPS trust), the ffmpeg
+            # container helpers, and runner_common (is_oom_error). No SeedVR2 modules.
+            scripts = ("fixed_ratio_engine.py", "esrgan_models.py", "video_pipeline.py",
+                       "runner_common.py", "net_ssl.py")
+        else:
+            # orientation.py rides along so the worker can run the auto-straighten CNN
+            # on the pod (remote #1 option B); the local side stays torch-free.
+            scripts = ("upscale_engine.py", "orientation.py")
+        for name in scripts:
             self._scp(os.path.join(self.app_root, "scripts", name), f"/root/{name}")
         for name in ("worker.py", "deadman.py"):
             self._scp(os.path.join(self.app_root, "pod", name), f"/root/{name}")
@@ -396,12 +464,10 @@ class RemoteSession:
         finally:
             os.remove(keyfile.name)
 
-    def _start_worker(self):
-        wp = self.worker_port
-        # Reuse a worker only if it is healthy AND running the CURRENT code
-        # version — otherwise a reused pod would keep serving a stale worker
-        # after an app update (e.g. the telemetry / straighten code changed).
-        # A matching version skips the needless ~97 s model reload.
+    def _worker_already_current(self, wp):
+        """True if a healthy worker of the CURRENT version AND mode is already on the
+        pod (reuse it, skip the reload). Otherwise emit why it must reload and return
+        False. Shared by the SeedVR2 and esrgan launch paths."""
         health = self._ssh(f"curl -sf localhost:{wp}/health || true",
                            check=False, timeout=30)
         if health.returncode == 0 and health.stdout.strip():
@@ -414,12 +480,67 @@ class RemoteSession:
             if running and running == self.worker_version and running_mode == self.worker_mode:
                 self._emit("Reusing the healthy worker already on the pod "
                            "(matching version + mode).")
-                return
+                return True
             if running_mode != self.worker_mode:
                 self._emit(f"Worker on the pod is in '{running_mode}' mode — "
                            f"reloading it in '{self.worker_mode}' mode.")
             else:
                 self._emit("Worker on the pod is a different version — reloading it.")
+        return False
+
+    def _verify_worker_launch(self, res):
+        """Inspect the launch ssh result and raise a helpful RunPodError if the
+        worker did not come up. Shared by both launch paths."""
+        out = self._ssh_output(res)
+        if "WORKER_FAILED" in out or res.returncode != 0:
+            tail = out[-1200:]
+            # The launch connection can still drop during a long first-load,
+            # blanking its captured output; pull the worker log over a FRESH
+            # connection (the pod is up until teardown) so a failure is never
+            # diagnosed blind.
+            if "Traceback" not in tail and "WORKER_" not in tail:
+                try:
+                    log = self._ssh("tail -n 60 /root/worker.log 2>/dev/null",
+                                    check=False, timeout=60)
+                    extra = self._ssh_output(log).strip()
+                    if extra:
+                        tail = (tail + "\n--- worker.log ---\n" + extra)[-2000:]
+                except Exception:                        # noqa: BLE001
+                    pass
+            if _is_transient_gpu_error(tail):
+                raise rp.RunPodError(
+                    "The rented pod's GPU was busy or unavailable during model load "
+                    "(CUDA cudaErrorDevicesUnavailable). That is a bad GPU allocation "
+                    "on RunPod's side, not your run or the 4K target. The pod was "
+                    "terminated. Press Start to retry: a fresh pod usually lands on a "
+                    "healthy GPU (or pick a different card with the picker's refresh).\n\n"
+                    + tail)
+            raise rp.RunPodError("Worker failed to become ready:\n" + tail)
+
+    def _health_wait_snippet(self, wp):
+        """The shell tail that polls /health, short-circuits on a dead worker
+        process, and reports WORKER_FAILED with the log tail. Shared verbatim by
+        both launch commands (see _start_worker for the design rationale)."""
+        return (
+            f"for i in $(seq 1 180); do "
+            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; "
+            "PID=$(cat /root/worker.pid 2>/dev/null); "
+            "if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then echo WORKER_DIED; break; fi; "
+            "[ $((i % 12)) -eq 0 ] && echo \"worker-wait $((i * 5))s ...\"; "
+            "sleep 5; done; "
+            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
+            "{ echo WORKER_FAILED; tail -n 40 /root/worker.log; exit 1; }")
+
+    def _start_worker(self):
+        if self.mode == "esrgan":
+            return self._start_esrgan_worker()
+        wp = self.worker_port
+        # Reuse a worker only if it is healthy AND running the CURRENT code
+        # version, otherwise a reused pod would keep serving a stale worker
+        # after an app update (e.g. the telemetry / straighten code changed).
+        # A matching version skips the needless ~97 s model reload.
+        if self._worker_already_current(wp):
+            return
         self._emit("Starting the resident worker (first model load is slow) …")
         # The launch must be `setsid sh -c '…' </dev/null >log 2>&1 &` with the
         # redirect on the backgrounded command — a `cd && nohup … &` wrapper
@@ -466,40 +587,69 @@ class RemoteSession:
             # the longer ceiling only costs time when it is genuinely still loading.
             # The periodic echo gives the channel real traffic (belt-and-suspenders
             # with ServerAlive) so the silent wait can't be proxy-dropped.
-            f"for i in $(seq 1 180); do "
-            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 && break; "
-            "PID=$(cat /root/worker.pid 2>/dev/null); "
-            "if [ -n \"$PID\" ] && ! kill -0 \"$PID\" 2>/dev/null; then echo WORKER_DIED; break; fi; "
-            "[ $((i % 12)) -eq 0 ] && echo \"worker-wait $((i * 5))s ...\"; "
-            "sleep 5; done; "
-            f"curl -sf localhost:{wp}/health >/dev/null 2>&1 || "
-            "{ echo WORKER_FAILED; tail -n 40 /root/worker.log; exit 1; }")
+            + self._health_wait_snippet(wp))
         res = self._ssh(launch, check=False, timeout=1080)
-        out = self._ssh_output(res)
-        if "WORKER_FAILED" in out or res.returncode != 0:
-            tail = out[-1200:]
-            # The launch connection can still drop during a long first-load,
-            # blanking its captured output; pull the worker log over a FRESH
-            # connection (the pod is up until teardown) so a failure is never
-            # diagnosed blind.
-            if "Traceback" not in tail and "WORKER_" not in tail:
-                try:
-                    log = self._ssh("tail -n 60 /root/worker.log 2>/dev/null",
-                                    check=False, timeout=60)
-                    extra = self._ssh_output(log).strip()
-                    if extra:
-                        tail = (tail + "\n--- worker.log ---\n" + extra)[-2000:]
-                except Exception:                        # noqa: BLE001
-                    pass
-            if _is_transient_gpu_error(tail):
-                raise rp.RunPodError(
-                    "The rented pod's GPU was busy or unavailable during model load "
-                    "(CUDA cudaErrorDevicesUnavailable). That is a bad GPU allocation "
-                    "on RunPod's side, not your run or the 4K target. The pod was "
-                    "terminated. Press Start to retry: a fresh pod usually lands on a "
-                    "healthy GPU (or pick a different card with the picker's refresh).\n\n"
-                    + tail)
-            raise rp.RunPodError("Worker failed to become ready:\n" + tail)
+        self._verify_worker_launch(res)
+
+    def _start_esrgan_worker(self):
+        """Start the fixed-ratio Real-ESRGAN worker (#18 B) on a VOLUME-FREE pod.
+        Unlike the SeedVR2 path there is no provisioned venv or model volume, so this
+        stands the worker up on the base image itself: find the image's torch python,
+        pip-install spandrel (+ certifi for the verified weight download), fetch a
+        static ffmpeg to /root/ffmpeg, then launch worker.py --mode esrgan. The ~65 MB
+        model is self-downloaded per job by the worker, so nothing model-side happens
+        here and /health answers as soon as the deps are in place (fast cold start)."""
+        wp = self.worker_port
+        if self._worker_already_current(wp):
+            return
+        self._emit("Setting up the Real-ESRGAN worker on the base image "
+                   "(python + spandrel + ffmpeg; no volume) …")
+        # The base RunPod pytorch image already ships torch; the model is self-
+        # downloaded, so this launch only needs spandrel + certifi + ffmpeg. PYBIN is
+        # resolved on the pod (the image's python layout varies) and EXPORTED so the
+        # backgrounded setsid inherits it. --model-dir is unused in esrgan mode (the
+        # weight goes to /root/models via ensure_model), passed only to satisfy argparse.
+        inner = (
+            "echo $$ > /root/worker.pid; "
+            "exec env PATH=/root/ffmpeg:$PATH \"$PYBIN\" /root/worker.py "
+            "--repo-dir /root --model-dir /root "
+            f"--settings /root/worker_settings.json --port {wp} --heartbeat {HEARTBEAT} "
+            f"--worker-version {self.worker_version} --mode esrgan")
+        launch = (
+            "([ -f /root/worker.pid ] && kill \"$(cat /root/worker.pid)\" 2>/dev/null); sleep 1; "
+            # Find a python that can import torch (the base image's env layout varies:
+            # a /venv, the system python3, or plain `python`). Bail loudly if none:
+            # a no-torch pod could never run the engine.
+            "PYBIN=''; for c in /venv/bin/python python python3 /usr/bin/python3; do "
+            "\"$c\" -c 'import torch' >/dev/null 2>&1 && { PYBIN=\"$c\"; break; }; done; "
+            "if [ -z \"$PYBIN\" ]; then echo WORKER_FAILED; echo 'no torch-capable python on the base image'; exit 1; fi; "
+            "export PYBIN; echo \"using python: $PYBIN\"; "
+            # Install spandrel (the model loader) + certifi (HTTPS trust for the weight
+            # download) into THAT python, only if missing. pip logs to a file so a
+            # failure is diagnosable without flooding the launch channel.
+            "\"$PYBIN\" -c 'import spandrel' >/dev/null 2>&1 || { echo 'installing spandrel + certifi ...'; "
+            "\"$PYBIN\" -m pip install --no-input spandrel certifi >/root/pip.log 2>&1 || "
+            "{ echo WORKER_FAILED; echo '--- pip.log ---'; tail -n 30 /root/pip.log; exit 1; }; }; "
+            # Fetch a static ffmpeg to /root/ffmpeg (no volume to cache it on). Same
+            # FUNCTIONAL gate as the SeedVR2 path: only keep the binary if it runs, so a
+            # truncated download can't poison the pod. A system ffmpeg still wins.
+            "if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /root/ffmpeg/ffmpeg ]; then "
+            "echo 'fetching static ffmpeg ...'; mkdir -p /root/ffmpeg; "
+            "FFURL=https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz; "
+            "{ curl -fsSL \"$FFURL\" -o /tmp/ff.txz || wget -qO /tmp/ff.txz \"$FFURL\"; } && "
+            "tar -xJf /tmp/ff.txz -C /tmp && "
+            "if /tmp/ffmpeg-*-amd64-static/ffmpeg -version >/dev/null 2>&1; then "
+            "cp /tmp/ffmpeg-*-amd64-static/ffmpeg /tmp/ffmpeg-*-amd64-static/ffprobe /root/ffmpeg/ && "
+            "chmod +x /root/ffmpeg/ffmpeg /root/ffmpeg/ffprobe; "
+            "else echo 'ffmpeg failed its sanity check - not keeping a bad build'; fi; "
+            "rm -rf /tmp/ff.txz /tmp/ffmpeg-*-amd64-static; fi; "
+            "rm -f /root/worker.pid; "
+            f"setsid sh -c '{inner}' < /dev/null > /root/worker.log 2>&1 & "
+            + self._health_wait_snippet(wp))
+        # The pip install + ffmpeg fetch are the long pole here (no 16 GB model load),
+        # so the same generous ceiling as the SeedVR2 launch is ample.
+        res = self._ssh(launch, check=False, timeout=1080)
+        self._verify_worker_launch(res)
 
     def _start_ollama(self):
         """Start `ollama serve` on the pod (remote Tag & Rename), serving the
@@ -573,9 +723,12 @@ class RemoteSession:
         # setsid fully detaches the daemon into its own session so the ssh
         # channel closes immediately (a plain `nohup … &` keeps ssh hanging).
         # The inner `sh -c` records the real python pid (echo $$ then exec).
+        # deadman.py is stdlib-only, so a volume-free esrgan pod (no /workspace/venv)
+        # runs it on the base image's python3; SeedVR2 modes use the provisioned venv.
+        dm_python = "python3" if self.mode == "esrgan" else "/workspace/venv/bin/python"
         inner = (
             "echo $$ > /root/deadman.pid; "
-            "exec env RUNPOD_API_KEY=\"$(cat /root/.rp_key)\" /workspace/venv/bin/python "
+            f"exec env RUNPOD_API_KEY=\"$(cat /root/.rp_key)\" {dm_python} "
             f"/root/deadman.py --pod-id {self.pod_id} {action} "
             f"--max-runtime-min {max_min} --idle-timeout-min {idle_min} "
             f"--heartbeat {HEARTBEAT}")

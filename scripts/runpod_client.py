@@ -302,13 +302,17 @@ KNOWN_CUDA_VERSIONS = (
 
 
 def _cuda_from_image(image):
-    """Parse the CUDA version a pod image needs from its tag (…cu128… or
-    …cu1281… → "12.8"), or None if not encoded."""
+    """Parse the CUDA version a pod image needs from its tag, or None if not
+    encoded. Handles both the RunPod short form (…cu128… / …cu1281… → "12.8")
+    and the official-PyTorch long form (…cuda12.4… → "12.4")."""
     m = re.search(r"cu(\d{3,4})", image or "")
-    if not m:
-        return None
-    d = m.group(1)
-    return f"{d[:2]}.{d[2]}"            # '128'/'1281' -> '12.8'
+    if m:
+        d = m.group(1)
+        return f"{d[:2]}.{d[2]}"        # '128'/'1281' -> '12.8'
+    m = re.search(r"cuda(\d+)\.(\d+)", image or "")
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    return None
 
 
 def allowed_cuda_versions(image):
