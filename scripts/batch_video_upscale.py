@@ -2022,7 +2022,7 @@ class LocalEngineRouter:
 
 def run_queue(engine, conn, root_id, source_root, vcfg, budget,
               notify_settings=None, auto_resume=False, notify_summary=True,
-              resolve_engine=None):
+              resolve_engine=None, job_filter=None):
     """Process the durable queue (video_outputs not yet done) for this root against
     an injected engine. Returns a summary dict.
 
@@ -2030,6 +2030,11 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     that picks the engine PER JOB from the job's `engine`/`model` columns, so one queue can
     mix SeedVR2 and Real-ESRGAN jobs. When None (remote / passthrough / auto-resume), the
     single injected `engine` serves every job exactly as before.
+
+    `job_filter` (18, grouped multi-pod Start): an optional callable(job) -> bool; when set,
+    ONLY jobs it accepts are processed, so one pod session can run just its (engine, gpu)
+    group while the rest of the queue stays pending for the next group's pod. None = the whole
+    queue (every existing single-pod path is unchanged).
 
     When `auto_resume` is set (the self-healing supervisor, #6), a job that fails because
     the POD died (a liveness/transport error, per `_is_pod_failure`) is NOT counted as a
@@ -2082,6 +2087,7 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
     while not _STOP.is_set():
         pending = [j for j in db.get_video_queue(conn, root_id)
                    if (j["rel_path"], j["target"], j["clip_id"]) not in attempted
+                   and (job_filter is None or job_filter(j))
                    and not _job_exceeds_gpu(conn, root_id, j, max_out_mp, deferred_logged)]
         # Keep the GUI's progress denominator honest as the live queue changes.
         live_total = done_frames + sum(_job_frames(conn, root_id, j) for j in pending)
@@ -2494,6 +2500,61 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
             acc_files.extend(summary.get("files") or [])
             close_session(session, None)               # default teardown for the run's end
             return finish(summary.get("stopped"))
+
+
+def run_grouped(group_keys, run_group, *, gpu_in_stock, wait_for_stock, is_stopped, on_event):
+    """Drive a grouped multi-pod run (18): a queue partitioned into (engine, gpu) GROUPS is
+    processed one pod per group, sequentially, ONE pod up at a time. This is the pendulum layer
+    ABOVE the per-group run: it picks WHICH group runs next by live stock and NEVER substitutes
+    a card (0.4.0). Each group's own pod lifecycle (deploy -> run_queue filtered to the group ->
+    teardown) and any Auto-resume healing WITHIN a group live in `run_group`.
+
+    All RunPod-touching seams are injected so the loop is offline-testable, mirroring
+    _run_supervised:
+      group_keys                 ordered [(engine, gpu), ...] to run (cheapest-first from Start)
+      run_group(key) -> summary  run ONE group to completion on its pod; a summary dict whose
+                                 'stopped' (a user Stop or the funds guard) ends the WHOLE run
+      gpu_in_stock(key) -> bool  is this group's card deployable right now?
+      wait_for_stock(keys) -> key|None   ALL remaining groups sold out: block until one of them
+                                 returns and give back that key; None if the user stopped
+      is_stopped() -> bool       user pressed Stop
+      on_event(msg)              a progress line
+
+    Returns the accumulated summary. The caller sends the single end-of-run notification (each
+    group's run_queue suppresses its own), so grouping stays a pure orchestration layer here.
+
+    A sold-out group is not failed: it is deferred (skip to the next in-stock group), and only
+    when it is the LAST group standing does the pendulum wait for its card. So a mixed queue
+    makes progress on whatever is available now and comes back to the rest."""
+    acc_done = acc_failed = 0
+    acc_files = []
+    acc_stopped = None
+    remaining = list(group_keys)
+    while remaining and not is_stopped():
+        # Run the first remaining group whose card is in stock; defer the sold-out ones.
+        ready = next((g for g in remaining if gpu_in_stock(g)), None)
+        if ready is None:
+            on_event("Grouped run: every remaining group's GPU is sold out; waiting for the "
+                     "first to return (no time cap, $0 billed while waiting).")
+            ready = wait_for_stock(list(remaining))
+            if ready is None:
+                acc_stopped = "stopped by user"
+                break
+        remaining.remove(ready)
+        eng, gpu = ready
+        on_event(f"Grouped run: starting the {eng} group on {gpu or 'the selected GPU'} "
+                 f"({len(remaining)} group(s) queued after it).")
+        summary = run_group(ready)
+        acc_done += summary.get("done", 0)
+        acc_failed += summary.get("failed", 0)
+        acc_files.extend(summary.get("files") or [])
+        if summary.get("stopped"):
+            # A user Stop or the funds guard inside a group ends the whole run; the untouched
+            # groups stay queued for a later Start (the installment philosophy, section 5).
+            acc_stopped = summary["stopped"]
+            break
+    return {"done": acc_done, "failed": acc_failed, "total": acc_done + acc_failed,
+            "stopped": acc_stopped, "files": acc_files}
 
 
 def main(argv=None):
