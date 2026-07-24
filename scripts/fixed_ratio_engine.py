@@ -232,15 +232,16 @@ class FixedRatioVideoEngine:
                         chunk_size=0, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
                         poll_interval=0, on_progress=None, should_stop=None,
-                        seg_index=None, seg_total=None):
+                        seg_index=None, seg_total=None, model=None):
         """Upscale one segment file to dest_path on the local GPU and return frames written.
 
         `resolution` is the box-fit output SHORT side the runner computed for the target.
         A fixed-ratio model produces src*scale; if that does not match `resolution` the
         result is resized to fit (so a preset box or a ratio != model-scale still lands on
         the requested size). `batch_size` is FRAMES per GPU forward (auto -> a small
-        default). `chunk_size` / `temporal_overlap` / `seed` are accepted for interface
-        parity and ignored (per-frame, deterministic)."""
+        default). `chunk_size` / `temporal_overlap` / `seed` / `model` are accepted for
+        interface parity and ignored (per-frame, deterministic; the model is fixed at
+        construction here, unlike the REMOTE esrgan worker which swaps it per job)."""
         import numpy as np
         self.last_segment_seconds = None
         self.last_phase = {}

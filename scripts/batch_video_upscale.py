@@ -972,7 +972,7 @@ class PassthroughVideoEngine:
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
                         poll_interval=0, on_progress=None, should_stop=None,
-                        seg_index=None, seg_total=None):
+                        seg_index=None, seg_total=None, model=None):
         ffmpeg, _ = vp.find_ffmpeg()
         t0 = time.time()
         # mjpeg/h264 -> mp4 with -c copy keeps it lossless and fast; the real
@@ -1494,6 +1494,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # Per-job engine/model (#11): NULL -> the SeedVR2 default. `job_engine` is the STRING
     # ("seedvr2"|"fixed_ratio"); the concrete engine object is passed in as `engine`.
     job_engine = (_row_get(job, "engine") or "seedvr2")
+    # For a REMOTE fixed_ratio group one esrgan pod serves every model, swapping the
+    # resident weight per job, so the per-job model key must travel to process_segment
+    # (#18 B). Only fixed_ratio jobs carry it: a local fixed_ratio engine bakes the model
+    # in at construction and ignores this, and a SeedVR2 worker ignores &model= entirely.
+    job_model = ((_row_get(job, "model") or None) if job_engine == "fixed_ratio" else None)
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
@@ -1726,7 +1731,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             seed=seed, video_backend=vcfg["video_backend"],
             use_10bit=vcfg["use_10bit"], on_progress=_progress,
             should_stop=_STOP.is_set,        # responsive Stop: abort the poll mid-segment
-            seg_index=s.index, seg_total=len(segs))   # labels the live per-chunk progress line
+            seg_index=s.index, seg_total=len(segs),   # labels the live per-chunk progress line
+            model=job_model)                 # remote esrgan: the per-job fixed-ratio model key
         secs = getattr(engine, "last_segment_seconds", None)
         db.upsert_video_segment(conn, root_id, rel, target, s.index, clip_id=clip_id,
                                 status="done", out_frames=n, output_path=up_path,
@@ -2754,7 +2760,7 @@ def main(argv=None):
         wc["vram_resident_threshold_gb"] = vcfg["vram_resident_threshold_gb"]
         return wc
 
-    def make_session(first=True, gpu=None):
+    def make_session(first=True, gpu=None, engine_kind="seedvr2"):
         """Deploy + start one video pod, wire telemetry, and tell the GUI which pod is
         live. Returns (session, engine). On a start failure it closes the partial session
         (no orphan pod) before re-raising. Called once (non-armed) or once per redeploy
@@ -2762,10 +2768,14 @@ def main(argv=None):
         _find_existing_pod (the blip path).
 
         `gpu` (18, grouped multi-pod Start): deploy THIS group's card (a `gpu_override`
-        passed to RemoteSession); None keeps the env/config single-pod selection."""
+        passed to RemoteSession); None keeps the env/config single-pod selection.
+        `engine_kind` (#18 B): "fixed_ratio" deploys a VOLUME-FREE esrgan pod (mode
+        "esrgan": base image + self-downloaded ~65 MB weight, cheap low-VRAM card);
+        "seedvr2" (default) keeps the SeedVR2 volume pod (mode "video")."""
         from remote_run import RemoteSession
+        pod_mode = "esrgan" if engine_kind == "fixed_ratio" else "video"
         sess = RemoteSession(cfg.get("runpod", {}), _worker_cfg(),
-                             APP_ROOT, on_event=log, mode="video",
+                             APP_ROOT, on_event=log, mode=pod_mode,
                              gpu_override=(gpu or None))
         try:
             eng = sess.start()
@@ -2824,9 +2834,12 @@ def main(argv=None):
                 "The engine is chosen per queued job (SeedVR2 or Real-ESRGAN).")
             run_queue(None, conn, root_id, src_root, vcfg, budget,
                       notify_settings=notify_settings, resolve_engine=router.for_job)
-        elif len(distinct_group_keys(db.get_video_queue(conn, root_id))) > 1:
-            # Grouped multi-pod Start (18): the queue holds >1 distinct (engine, gpu) group, so
-            # each group runs on its OWN pod, sequentially, one pod up at a time (the pendulum
+        elif (len(distinct_group_keys(db.get_video_queue(conn, root_id))) > 1
+              or any(k[0] == "fixed_ratio"
+                     for k in distinct_group_keys(db.get_video_queue(conn, root_id)))):
+            # Grouped multi-pod Start (18): the queue holds >1 distinct (engine, gpu) group OR
+            # a fixed_ratio group (which needs the volume-free esrgan pod, #18 B, even alone),
+            # so each group runs on its OWN pod, sequentially, one pod up at a time (the pendulum
             # in run_grouped picks the next group by live stock). The GUI already persisted the
             # grouped queue_order, so the groups are contiguous and in the order the user sees.
             group_keys = distinct_group_keys(db.get_video_queue(conn, root_id))
@@ -2845,48 +2858,59 @@ def main(argv=None):
                 f"picked up (its group re-opens if already finished)"
                 + (" Auto-resume ON: a lost pod is healed per group." if auto_resume else "."))
 
-            def _in_stock_ids():
+            def _in_stock_ids(dc):
                 try:
-                    return {g["id"] for g in rp.available_gpus(api_key, data_center_id=region)}
+                    return {g["id"] for g in rp.available_gpus(api_key, data_center_id=dc)}
                 except Exception as exc:               # noqa: BLE001 (unknown -> fail-open)
                     debug_log("batch_video_upscale grouped stock", exc=exc)
                     return None
+
+            def _stock_region(key):
+                # A fixed_ratio (esrgan) group is VOLUME-FREE and deploys region-wide, so its
+                # card's stock is checked GLOBALLY (region=None); a SeedVR2 group is pinned to
+                # the model volume's region and must be checked there.
+                return None if key[0] == "fixed_ratio" else region
 
             def gpu_in_stock(key):
                 gpu = key[1]
                 if not gpu:                            # '' = default card; can't check, assume ok
                     return True
-                ids = _in_stock_ids()
+                ids = _in_stock_ids(_stock_region(key))
                 return True if ids is None else (gpu in ids)
 
             def wait_for_stock(pending):
+                # If any waiting group deploys region-wide (fixed_ratio), read stock globally so
+                # its card is seen wherever it returns; otherwise scope to the volume region.
+                dc = None if any(k[0] == "fixed_ratio" for k in pending) else region
                 return _wait_for_any_gpu_stock(
-                    lambda: rp.available_gpus(api_key, data_center_id=region), pending,
+                    lambda: rp.available_gpus(api_key, data_center_id=dc), pending,
                     notify_settings=notify_settings, source_root=src_root)
 
             def run_group(key, skip):
-                _gpu = key[1]
+                _engine_kind, _gpu = key[0], key[1]
                 # Filter to THIS group AND drop jobs already tried this run (a failed one lingers
                 # in the queue until give-up; without this a re-opened group would re-attempt it).
                 jf = (lambda j, k=key, s=skip: job_group_key(j) == k
                       and (j["rel_path"], j["target"], j["clip_id"]) not in s)
                 if auto_resume:
                     return _run_supervised(
-                        lambda first, g=_gpu: make_session(first, gpu=g),
+                        lambda first, g=_gpu, ek=_engine_kind: make_session(first, gpu=g,
+                                                                            engine_kind=ek),
                         lambda e: run_queue(e, conn, root_id, src_root, vcfg, budget,
                                             notify_settings=notify_settings, job_filter=jf,
                                             auto_resume=True, notify_summary=False),
                         pod_alive=lambda s: _pod_still_running(
                             lambda: rp.list_pods(api_key), s.pod_id, s.pod_name_prefix),
-                        wait_for_stock=lambda g=_gpu: _wait_for_gpu_stock(
-                            lambda: rp.available_gpus(api_key, data_center_id=region),
+                        wait_for_stock=lambda g=_gpu, ek=_engine_kind: _wait_for_gpu_stock(
+                            lambda: rp.available_gpus(
+                                api_key, data_center_id=(None if ek == "fixed_ratio" else region)),
                             g, g, notify_settings=notify_settings, source_root=src_root),
                         is_stopped=_STOP.is_set,
                         funds_tripped=lambda s: getattr(s, "_funds_tripped", False),
                         close_session=close_session, on_event=log,
                         notify_settings=notify_settings, source_root=src_root,
                         notify_summary=False)
-                sess, e = make_session(True, gpu=_gpu)
+                sess, e = make_session(True, gpu=_gpu, engine_kind=_engine_kind)
                 try:
                     return run_queue(e, conn, root_id, src_root, vcfg, budget,
                                      notify_settings=notify_settings, job_filter=jf,

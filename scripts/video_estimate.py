@@ -58,6 +58,19 @@ BENCH_OUT_MP = {"1080p": 1.5552, "1440p": 2.7648, "4K": 6.2208}
 # big-VRAM card (~140 GB) for a usable continuity window, so the floor admits
 # 96 GB+ cards only (section 7 / 15.7).
 VRAM_FLOOR = {"1080p": 32, "1440p": 80, "4K": 90}
+# Real-ESRGAN (#18 B) is a LIGHT fixed-ratio GAN that tiles on OOM, so it runs on any
+# modern card regardless of target; its floor is a low constant, NOT the SeedVR2 target
+# floors above (which would wrongly exclude the cheap low-VRAM cards the remote esrgan
+# path exists to use). 8 GB clears every deployable RunPod card.
+ESRGAN_VRAM_FLOOR = 8
+
+
+def job_vram_floor(job):
+    """The VRAM floor one queued job imposes: the low ESRGAN floor for a fixed_ratio job,
+    else the SeedVR2 per-target floor. Engine defaults to seedvr2 when the column is NULL."""
+    if (job.get("engine") or "seedvr2") == "fixed_ratio":
+        return ESRGAN_VRAM_FLOOR
+    return VRAM_FLOOR.get(job["target"], 0)
 
 # Pod boot + worker model load, billed once per Start (measured ~354 s worker-ready
 # on a 5090). Overridable via config video.spin_up_seconds.
@@ -477,8 +490,9 @@ def estimate_queue_local(jobs, gpu_id, conn=None):
 
 
 def max_target_floor(jobs):
-    """The VRAM floor the queue's most demanding target imposes."""
-    return max((VRAM_FLOOR.get(j["target"], 0) for j in jobs), default=0)
+    """The VRAM floor the queue's most demanding job imposes (engine-aware: a fixed_ratio
+    job is light, a SeedVR2 job scales with its target)."""
+    return max((job_vram_floor(j) for j in jobs), default=0)
 
 
 def recommend_gpus(available, jobs, spin_up_seconds=DEFAULT_SPIN_UP_SECONDS,

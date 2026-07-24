@@ -366,7 +366,7 @@ class LocalVideoEngine:
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
                         poll_interval=0, on_progress=None, should_stop=None,
-                        seg_index=None, seg_total=None):
+                        seg_index=None, seg_total=None, model=None):
         """Upscale one segment file to dest_path on the LOCAL GPU and return the frame
         count written. Emits runner-compatible `on_progress` status dicts. On a CUDA
         OOM it retries at a smaller window (down to BATCH_FLOOR) so an optimistic batch

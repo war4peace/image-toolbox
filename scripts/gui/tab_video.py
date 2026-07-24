@@ -68,9 +68,9 @@ def _clip_tc(seconds):
 
 # The "Method / Model" selector's options (#11): (label, engine, model). The SeedVR2 half
 # mirrors tab_settings._VIDEO_MODEL_OPTIONS (kept short here for the combobox); the
-# Real-ESRGAN half comes from the shared esrgan_models catalog and is offered ONLY in Local
-# mode, since the remote path is always SeedVR2. Keep in sync with tab_settings if a SeedVR2
-# model is added.
+# Real-ESRGAN half comes from the shared esrgan_models catalog. It runs BOTH locally (#11)
+# and remotely (#18 B: a volume-free esrgan pod), so it is offered in both modes. Keep in
+# sync with tab_settings if a SeedVR2 model is added.
 _SEEDVR2_METHODS = [
     ("SeedVR2 / 7B FP16",  "seedvr2_ema_7b_fp16.safetensors"),
     ("SeedVR2 / 7B Sharp", "seedvr2_ema_7b_sharp_fp16.safetensors"),
@@ -80,16 +80,16 @@ _SEEDVR2_METHODS = [
 
 
 def _method_options(local):
-    """The (label, engine, model) rows for the Method combobox. Real-ESRGAN rows are added
-    only when `local` (fixed-ratio is a local-GPU engine; remote is SeedVR2-only)."""
+    """The (label, engine, model) rows for the Method combobox. Real-ESRGAN rows are offered
+    in BOTH modes now (local #11 and the remote volume-free esrgan pod #18 B). `local` is kept
+    for signature stability (callers pass the current mode); it no longer gates the rows."""
     opts = [(lbl, "seedvr2", fname) for lbl, fname in _SEEDVR2_METHODS]
-    if local:
-        try:
-            import esrgan_models as em
-            opts += [(f"Real-ESRGAN / {m.kind.capitalize()}", "fixed_ratio", m.key)
-                     for m in em.catalog()]
-        except Exception:                            # noqa: BLE001 (fail-safe: SeedVR2 still works)
-            pass
+    try:
+        import esrgan_models as em
+        opts += [(f"Real-ESRGAN / {m.kind.capitalize()}", "fixed_ratio", m.key)
+                 for m in em.catalog()]
+    except Exception:                                # noqa: BLE001 (fail-safe: SeedVR2 still works)
+        pass
     return opts
 
 
@@ -679,7 +679,9 @@ class VideoTab(ttk.Frame):
                       "but is slow and VRAM-heavy on a local card; Real-ESRGAN is a fast, "
                       "light, fixed 2x/4x upscaler that runs on almost any GPU and keeps "
                       "text/edges cleaner. You can pick a different method for each video, "
-                      "so one queue can mix them. Real-ESRGAN is offered in Local mode only.")
+                      "so one queue can mix them. Both run locally and on a remote pod "
+                      "(Real-ESRGAN's remote pod is cheap: it needs no model volume and "
+                      "runs on a low-cost GPU).")
         Tooltip(method_lbl, method_tip, wraplength=W)
         Tooltip(self.method_combo, method_tip, wraplength=W)
         target_tip = ("How large the upscaled video should be. The video is fitted "
@@ -1625,10 +1627,14 @@ class VideoTab(ttk.Frame):
 
     def _on_method_change(self):
         """Method changed: the reachable targets differ by engine, so re-filter the Target
-        combobox for the selected source, then re-sync the Prepare button."""
+        combobox for the selected source, then re-sync the Prepare button. In remote mode the
+        GPU picker's VRAM floor + region also depend on the engine (Real-ESRGAN uses a low
+        floor + region-wide, #18 B), so refresh the card list too."""
         sel = self.scan_tree.selection()
         if sel and sel[0] in self._scan_rows:
             self._populate_target_combo(self._scan_rows[sel[0]])
+        if self.mode_var.get() != "local":
+            self._refresh_gpus()
         self._sync_prepare_btn()
 
     def _populate_target_combo(self, row):
@@ -2268,9 +2274,17 @@ class VideoTab(ttk.Frame):
                 import runpod_client as rp
                 import video_estimate as ve
                 key = rpc["api_key"]
-                vol = (rpc.get("network_volume_id") or "").strip()
-                dc = rp.volume_region(key, vol) if vol else None
-                floor = ve.max_target_floor(self._queue_jobs()) or 24
+                # Real-ESRGAN (#18 B) deploys a VOLUME-FREE pod region-wide, so its picker
+                # is NOT scoped to the SeedVR2 model volume's region and uses the LOW esrgan
+                # VRAM floor (cheap cards), not SeedVR2's 32/80/90. SeedVR2 keeps the volume
+                # region + its target floor.
+                engine, _model = self._selected_method()
+                if engine == "fixed_ratio":
+                    dc, floor = None, ve.ESRGAN_VRAM_FLOOR
+                else:
+                    vol = (rpc.get("network_volume_id") or "").strip()
+                    dc = rp.volume_region(key, vol) if vol else None
+                    floor = ve.max_target_floor(self._queue_jobs()) or 24
                 gpus = rp.available_gpus(key, dc, min_memory_gb=floor)
                 self.after(0, lambda: self._populate_gpus(gpus))
             except Exception as exc:                     # noqa: BLE001
@@ -2434,9 +2448,13 @@ class VideoTab(ttk.Frame):
         if self.mode_var.get() == "local":
             return self._start_local(jobs)
         # Grouped multi-pod Start (18): the queue mixes (engine, gpu) groups -> reorder it
-        # visibly and run one pod per group. A single-GPU queue takes the classic path below.
+        # visibly and run one pod per group. Any fixed_ratio (Real-ESRGAN, #18 B) group ALSO
+        # takes the grouped path even alone, because it needs the volume-free esrgan pod, not
+        # the classic SeedVR2 single-pod path below (which a lone fixed_ratio group would
+        # otherwise wrongly deploy as a SeedVR2 video pod). A single SeedVR2 group is unchanged.
         import batch_video_upscale as bv
-        if len(bv.distinct_group_keys(jobs)) > 1:
+        group_keys = bv.distinct_group_keys(jobs)
+        if len(group_keys) > 1 or any(k[0] == "fixed_ratio" for k in group_keys):
             return self._start_grouped(jobs)
         g = self._selected_gpu()
         if not g:

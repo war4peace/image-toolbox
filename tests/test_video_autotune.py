@@ -136,7 +136,7 @@ class _FakeTuningEngine(bv.PassthroughVideoEngine):
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
                         poll_interval=0, on_progress=None, should_stop=None,
-                        seg_index=None, seg_total=None):
+                        seg_index=None, seg_total=None, model=None):
         self.requested.append(batch_size)
         n = super().process_segment(src_path, dest_path, resolution=resolution,
                                     batch_size=batch_size, chunk_size=chunk_size,
