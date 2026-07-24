@@ -108,6 +108,19 @@ def _short_method(engine, model):
     return "SeedVR2"
 
 
+def _short_gpu(gpu_id):
+    """A compact 'GPU' label for the queue list from a stored per-item GPU type id (18).
+    Trims the noisy vendor/generation words a RunPod id carries (e.g. 'NVIDIA RTX 6000 Ada
+    Generation' -> 'RTX 6000 Ada') so the column stays narrow. Empty for an unbound row (a
+    local run, or a legacy row queued before per-item binding)."""
+    s = (gpu_id or "").strip()
+    if not s:
+        return ""
+    for drop in ("NVIDIA ", " Generation"):
+        s = s.replace(drop, "")
+    return s.strip()
+
+
 # ─────────────────────────────────────────────
 #  SEGMENTS MANAGER (virtual clip jobs, section 16.5)
 # ─────────────────────────────────────────────
@@ -718,7 +731,7 @@ class VideoTab(ttk.Frame):
 
         # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
         # (a view-only sort) never hides where a job actually sits in the queue.
-        qcols = ("place", "method", "target", "status", "res", "dur", "codec", "fps",
+        qcols = ("place", "method", "gpu", "target", "status", "res", "dur", "codec", "fps",
                  "frames", "segs")
         self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
         self._queue_sort = {}
@@ -727,6 +740,7 @@ class VideoTab(ttk.Frame):
         _q_titles = {"#0": "File"}
         self.queue_tree.column("#0", width=200, stretch=True)
         for c, txt, w in (("place", "#", 36), ("method", "Method", 120),
+                          ("gpu", "GPU", 110),
                           ("target", "Target", 60), ("status", "Status", 80),
                           ("res", "Resolution", 90), ("dur", "Duration", 70),
                           ("codec", "Codec", 60), ("fps", "FPS", 50),
@@ -1890,15 +1904,22 @@ class VideoTab(ttk.Frame):
         # truth and shows the add/remove directly. Only a failure (below) is worth
         # surfacing, since it has no other on-screen home.
         self.prepare_btn.configure(state="disabled")
-        # Read the Method on the UI thread (tk vars aren't safe off it) and stamp the job.
+        # Read the Method + GPU on the UI thread (tk vars aren't safe off it) and stamp the job.
         engine, model = self._selected_method()
+        # Per-item GPU binding (18): remote runs stamp the card selected right now, so a mixed
+        # queue can route each job to its own pod at Start. Local runs leave it NULL (there is
+        # one local GPU; grouping is a remote concept).
+        gpu_id = None
+        if self.mode_var.get() == "remote":
+            g = self._selected_gpu()
+            gpu_id = (g.get("id") or g.get("name")) if g else None
 
         def work():
             import batch_video_upscale as bv
             try:
                 info = bv.prepare_job(self._conn(), self._root_id, self._src_root,
                                       self._out_root, row["rel"], target, self._vcfg(),
-                                      engine=engine, model=model)
+                                      engine=engine, model=model, gpu=gpu_id)
             except Exception as exc:                     # noqa: BLE001
                 self.after(0, lambda e=exc: self.status_var.set(f"Prepare failed: {e}"))
                 return
@@ -1959,9 +1980,11 @@ class VideoTab(ttk.Frame):
             jkeys = j.keys()
             method = _short_method(j["engine"] if "engine" in jkeys else None,
                                    j["model"] if "model" in jkeys else None)
+            gpu_id = (j["gpu"] if "gpu" in jkeys else None) or None
+            gpu_lbl = _short_gpu(gpu_id)
             iid = self.queue_tree.insert(
                 "", "end", text=text,
-                values=(place, method, j["target"], j["status"], res, dur, codec, fps,
+                values=(place, method, gpu_lbl, j["target"], j["status"], res, dur, codec, fps,
                         frames, segtxt),
                 tags=(j["rel_path"], j["target"], str(clip_id)))
             self._queue_order.append(iid)
@@ -1971,6 +1994,7 @@ class VideoTab(ttk.Frame):
                 "status": j["status"], "skip_reason": j["skip_reason"],
                 "method": method,
                 "engine": (j["engine"] if "engine" in jkeys else None) or "seedvr2",
+                "gpu": gpu_id,
                 "duration": row_dur,
                 "fps": (vf["fps"] if vf else 0) or 0.0,
                 "codec": codec}
