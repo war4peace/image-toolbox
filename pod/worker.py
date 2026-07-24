@@ -72,9 +72,16 @@ _HEARTBEAT = None
 _COUNT = 0
 _VERSION = ""           # worker-code version (hash of the pushed .py files); a
                         # reused pod reloads the worker when this stops matching
-_MODE = "full"          # "full" (SeedVR2 + /upscale), "tag" (/orient only), or
-                        # "video" (SeedVR2 + /video/*); a reused pod also reloads
-                        # when the requested mode differs
+_MODE = "full"          # "full" (SeedVR2 + /upscale), "tag" (/orient only),
+                        # "video" (SeedVR2 + /video/*), or "esrgan" (fixed-ratio
+                        # Real-ESRGAN + /video/*, no SeedVR2, no volume, #18 Part B);
+                        # a reused pod reloads the worker when the requested mode differs
+# esrgan mode (#18 B): ONE resident FixedRatioVideoEngine + the model key it holds. The
+# model is per JOB (from the submit query), tiny (~65 MB) and fast to load, so the worker
+# lazily (re)builds this on a model change instead of loading a fixed model at startup.
+_ESR_ENGINE = None
+_ESR_MODEL = None
+_ESR_LOCK = threading.Lock()
 # GPU work (upscale + the orient CNN) is serialised through this lock so a
 # /telemetry or /health request can still be answered WHILE an upscale runs
 # (the server is multi-threaded; those two endpoints never take the lock).
@@ -776,6 +783,81 @@ def _resolve_auto_params(job, params):
              f"~{nb} batch(es) over {frames} frames")
 
 
+def _get_esr_engine(model_key):
+    """The resident FixedRatioVideoEngine for `model_key` (#18 B), (re)built on a model change.
+    ensure_model self-downloads + SHA-verifies the ~65 MB weight to /root/models/ESRGAN on the
+    pod (no volume). One engine is kept resident; switching models closes the old one first so a
+    tiny extra weight never leaks VRAM. Called under _ESR_LOCK."""
+    global _ESR_ENGINE, _ESR_MODEL
+    if _ESR_ENGINE is not None and _ESR_MODEL == model_key:
+        return _ESR_ENGINE
+    if _ESR_ENGINE is not None:
+        try:
+            _ESR_ENGINE.close()
+        except Exception:                              # noqa: BLE001 (best-effort teardown)
+            pass
+        _ESR_ENGINE = None
+    import esrgan_models as _esr
+    from fixed_ratio_engine import FixedRatioVideoEngine
+    here = os.path.dirname(os.path.abspath(__file__))   # /root on the pod
+    path = _esr.ensure_model(model_key, app_root=here, log=_log)
+    _ESR_ENGINE = FixedRatioVideoEngine(path)
+    _ESR_MODEL = model_key
+    return _ESR_ENGINE
+
+
+def _run_esrgan_job(job, params):
+    """Upscale one segment with a fixed-ratio Real-ESRGAN model (#18 B): no SeedVR2, no batch/
+    overlap tuning (the engine does its own tiled OOM back-off). Mirrors _run_video_job's
+    bookkeeping (state, frames, seconds, peak VRAM) so /video/status + /video/fetch are
+    identical to the SeedVR2 path from the client's side."""
+    global _COUNT
+    job["state"] = "running"
+    _touch(_HEARTBEAT)
+    tee = _HeartbeatTee(sys.stdout, job)
+    model_key = job.get("model") or "realesr-general-x4v3"
+    try:
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            with _GPU_LOCK:
+                try:
+                    import torch
+                    torch.cuda.reset_peak_memory_stats()
+                except Exception:                      # noqa: BLE001
+                    pass
+                with _ESR_LOCK:
+                    eng = _get_esr_engine(model_key)
+                t0 = time.time()
+                n = eng.process_segment(
+                    job["input"], job["output"],
+                    resolution=params["resolution"], batch_size=params["batch_size"])
+                dt = time.time() - t0
+        try:
+            out_bytes = os.path.getsize(job["output"])
+        except OSError:
+            out_bytes = 0
+        try:
+            import torch
+            gb = 1024 ** 3
+            job["peak_alloc_gb"] = round(torch.cuda.max_memory_allocated() / gb, 1)
+            job["peak_reserved_gb"] = round(torch.cuda.max_memory_reserved() / gb, 1)
+        except Exception:                              # noqa: BLE001
+            pass
+        job["frames_written"] = n
+        job["frames_processed"] = job.get("total_frames") or n or job.get("frames_processed")
+        job["output_bytes"] = out_bytes
+        job["seconds"] = dt
+        job["resolved_batch"] = getattr(eng, "last_resolved_batch", None)
+        job["state"] = "done"
+        _COUNT += 1
+        _log(f"esrgan job {job['id'][:8]} done: {n} frames in {dt:.1f}s -> {out_bytes}B "
+             f"(model={model_key} res={params['resolution']} "
+             f"peakVRAM={job.get('peak_alloc_gb')}GB)")
+    except Exception as exc:                           # noqa: BLE001 (never kill the worker)
+        job["state"] = "error"
+        job["error"] = str(exc)[:500]
+        _log(f"esrgan job {job['id'][:8]} FAILED: {exc}")
+
+
 def _run_video_job(job, params):
     """Upscale one segment to job['output'] (its own thread). GPU work is
     serialised through _GPU_LOCK; progress is teed to the heartbeat. Fail-safe:
@@ -1182,7 +1264,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_video_submit(self, parsed):
         global _VIDEO_JOB
         data = self._read_body()           # always drain first
-        if _ENGINE is None:
+        # esrgan mode has no resident _ENGINE (the FixedRatioVideoEngine is built per job);
+        # only SeedVR2 'video' mode requires _ENGINE be loaded up front.
+        if _MODE != "esrgan" and _ENGINE is None:
             self._send(503, b"video engine not loaded (worker not in video mode)",
                        "text/plain")
             return
@@ -1208,6 +1292,8 @@ class Handler(BaseHTTPRequestHandler):
         ext = q.get("ext", [".mkv"])[0]
         if not ext.startswith("."):
             ext = "." + ext
+        # esrgan mode (#18 B): the per-job fixed-ratio model key travels in the query.
+        model_key = q.get("model", [""])[0] or None
 
         with _VIDEO_LOCK:
             if _VIDEO_JOB is not None and _VIDEO_JOB["state"] in ("queued", "running"):
@@ -1232,10 +1318,11 @@ class Handler(BaseHTTPRequestHandler):
                 "error": None,
                 "started": time.time(),
                 "last_output_t": time.time(),
+                "model": model_key,
             }
             _VIDEO_JOB = job
-            threading.Thread(target=_run_video_job, args=(job, params),
-                             daemon=True).start()
+            runner = _run_esrgan_job if _MODE == "esrgan" else _run_video_job
+            threading.Thread(target=runner, args=(job, params), daemon=True).start()
         _log(f"video job {job['id'][:8]} accepted: {len(data)}B "
              f"({job['total_frames']} frames) res={params['resolution']} "
              f"bs={params['batch_size']} chunk={params['chunk_size']}")
@@ -1422,11 +1509,13 @@ def main(argv=None):
     p.add_argument("--worker-version", default="",
                    help="code version reported by /health so a reused pod can "
                         "detect a stale worker and reload it")
-    p.add_argument("--mode", choices=("full", "tag", "video"), default="full",
+    p.add_argument("--mode", choices=("full", "tag", "video", "esrgan"), default="full",
                    help="full = load SeedVR2 and serve /upscale + /orient; "
                         "tag = skip the SeedVR2 load and serve /orient only "
                         "(remote Tag & Rename — leaves the VRAM for Ollama); "
-                        "video = load SeedVR2 and serve /video/* (Video Upscaler)")
+                        "video = load SeedVR2 and serve /video/* (Video Upscaler); "
+                        "esrgan = load NO SeedVR2, serve /video/* with a fixed-ratio "
+                        "Real-ESRGAN model built per job (#18 B, no volume)")
     args = p.parse_args(argv)
 
     _HEARTBEAT = args.heartbeat
@@ -1439,6 +1528,13 @@ def main(argv=None):
         # Tag mode: no SeedVR2 (orientation is lazy-loaded on the first /orient).
         # /health answers immediately so the client knows the pod is reachable.
         _log("tag mode — SeedVR2 engine NOT loaded; serving /orient + /telemetry.")
+        _touch(_HEARTBEAT)
+    elif args.mode == "esrgan":
+        # esrgan mode (#18 B): no SeedVR2, no volume. The FixedRatioVideoEngine is built
+        # lazily per job (the model key travels in each /video/submit), self-downloading a
+        # ~65 MB verified weight, so /health answers immediately with nothing pre-loaded.
+        _log("esrgan mode: SeedVR2 NOT loaded; serving /video/* with per-job "
+             "fixed-ratio Real-ESRGAN models.")
         _touch(_HEARTBEAT)
     else:
         # full and video both load SeedVR2 once; they differ only in which

@@ -24,6 +24,7 @@ import json
 import shutil
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from remote_upscale_engine import RemoteUpscaleEngine, RemoteUpscaleError
 
@@ -71,7 +72,7 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
                         chunk_size, temporal_overlap=0, seed=None,
                         video_backend="opencv", use_10bit=False,
                         poll_interval=5, on_progress=None, should_stop=None,
-                        seg_index=None, seg_total=None):
+                        seg_index=None, seg_total=None, model=None):
         """Upscale one segment file on the pod and write the result to dest_path
         atomically. Returns the number of frames the worker wrote. Raises
         RemoteVideoError on a worker error, a lost job, or a dropped tunnel.
@@ -97,7 +98,7 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         self.last_phase = {}
         t0 = time.monotonic()
         job_id = self._submit(src_path, ext, resolution, batch_size, chunk_size,
-                              temporal_overlap, seed, video_backend, use_10bit)
+                              temporal_overlap, seed, video_backend, use_10bit, model)
         t_submit = time.monotonic()
         frames = self._await(job_id, poll_interval, on_progress, should_stop)
         t_await = time.monotonic()
@@ -159,13 +160,15 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
     # ── protocol steps ──────────────────────────────────────────────────────
 
     def _submit(self, src_path, ext, resolution, batch_size, chunk_size,
-                temporal_overlap, seed, video_backend, use_10bit):
+                temporal_overlap, seed, video_backend, use_10bit, model=None):
         q = (f"?resolution={int(resolution)}&batch_size={int(batch_size)}"
              f"&chunk_size={int(chunk_size)}&temporal_overlap={int(temporal_overlap)}"
              f"&video_backend={video_backend}&use_10bit={'1' if use_10bit else '0'}"
              f"&ext={ext}")
         if seed is not None:
             q += f"&seed={int(seed)}"
+        if model:                                      # esrgan mode (#18 B): the fixed-ratio model
+            q += f"&model={urllib.parse.quote(str(model))}"
         # Stream the segment straight from the file: an explicit Content-Length lets
         # http.client send the open file object in blocks (no chunked encoding, so the
         # worker still reads a normal Content-Length body) WITHOUT us buffering it in RAM.
