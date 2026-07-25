@@ -731,11 +731,11 @@ class VideoTab(ttk.Frame):
         Tooltip(reset_queue, "Clear both filters and show the whole queue.",
                 wraplength=W)
 
-        # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
-        # (a view-only sort) never hides where a job actually sits in the queue.
-        # "#" (run order) is deliberately the FIRST column, then the file, then the rest. The
-        # file lives in a normal column (not the tree #0 column) so "#" can precede it; the queue
-        # is flat, so dropping the tree column costs nothing.
+        # "#" = the job's position in the queue (grouping by method+GPU at Start decides the
+        # actual run order). Kept visible so re-sorting other columns (a view-only sort) never
+        # hides where a job sits. It is deliberately the FIRST column, then the file, then the
+        # rest; the file lives in a normal column (not the tree #0 column) so "#" can precede it,
+        # and the queue is flat so dropping the tree column costs nothing.
         qcols = ("place", "file", "method", "gpu", "target", "status", "res", "dur", "codec",
                  "fps", "frames", "segs")
         self.queue_tree = ttk.Treeview(qf, columns=qcols, show="headings", height=5)
@@ -771,13 +771,18 @@ class VideoTab(ttk.Frame):
         remove_btn = ttk.Button(qf, text="Remove", command=self._queue_remove)
         remove_btn.grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
         Tooltip(self.queue_tree,
-                "The videos waiting to be upscaled, in run order (the # column, "
-                "1 = next). Double-click to open a video, right-click for more "
-                "actions. Sorting by a heading changes the view only, never the "
-                "order they actually run in.", wraplength=W)
-        Tooltip(up_btn, "Move the selected job one place earlier in the run order.",
+                "The videos waiting to be upscaled. Double-click to open a video, "
+                "right-click for more actions. When you press Start, jobs are grouped "
+                "by upscaling method and GPU and each group runs together, so the final "
+                "run order follows those groups. Sorting by a heading changes the view "
+                "only.", wraplength=W)
+        Tooltip(up_btn,
+                "Move the selected job earlier in the queue. At Start, jobs regroup by "
+                "method and GPU, so this mainly sets the order within a group.",
                 wraplength=W)
-        Tooltip(down_btn, "Move the selected job one place later in the run order.",
+        Tooltip(down_btn,
+                "Move the selected job later in the queue. At Start, jobs regroup by "
+                "method and GPU, so this mainly sets the order within a group.",
                 wraplength=W)
         Tooltip(remove_btn,
                 "Take the selected job off the queue and delete the part-finished "
@@ -1110,8 +1115,17 @@ class VideoTab(ttk.Frame):
                 return ("Not ready: no NVIDIA GPU detected (nvidia-smi). Local upscaling "
                         "needs a CUDA GPU; use Remote instead.", False)
             vram = f"{g['gpu_total_mb'] / 1024:.0f} GB" if g.get("gpu_total_mb") else "?"
-            return (f"Local ready — {name or 'GPU'}, {vram} VRAM. The first segment "
-                    f"calibrates the batch size for your card.", True)
+            # Batch size comes from this card's benchmark when one exists; otherwise the sizer
+            # picks it from VRAM and refines it as the run proceeds. Reflect which applies.
+            try:
+                import db
+                benched = bool(name) and name in db.bench_gpu_ids(self._conn())
+            except Exception:                              # noqa: BLE001 (fail-safe: assume none)
+                benched = False
+            tail = ("Batch size comes from this card's benchmark." if benched
+                    else "Batch size is picked from VRAM and refined as it runs; "
+                         "press Benchmark GPU to calibrate it.")
+            return (f"Local ready: {name or 'GPU'}, {vram} VRAM. {tail}", True)
         # Local ffmpeg first (a purely local check): every video job needs the
         # local split/reassemble/mux, so without it nothing else matters. Only
         # a successful lookup is cached, so installing ffmpeg later and
@@ -1130,7 +1144,7 @@ class VideoTab(ttk.Frame):
         except Exception:
             key = os.path.expandvars(rpc.get("ssh_key_path", ""))
         if not (key and os.path.exists(key)):
-            return "Not ready: no SSH key — use 'Set up SSH key' (Settings).", False
+            return "Not ready: no SSH key (use 'Set up SSH key' in Settings).", False
         vol = (rpc.get("network_volume_id") or "").strip()
         if not vol:
             return "Not ready: no model network volume configured (Settings).", False
@@ -1141,7 +1155,7 @@ class VideoTab(ttk.Frame):
             return f"Not ready: could not reach RunPod ({exc}).", False
         if not region:
             return "Not ready: configured network volume not found.", False
-        return f"Remote ready — models in {region}.", True
+        return f"Remote ready: models in {region}.", True
 
     def _set_ready(self, msg, ok):
         self.ready_var.set(msg)
