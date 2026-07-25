@@ -774,13 +774,19 @@ def max_feasible_output_mp(conn, gpu_id):
     guard): the biggest 'ok' probe in video_bench plus the biggest learned key in
     video_batch_learn (a present key means a real run fit that output class). Returns None
     when there is no proof yet (the caller then uses the VRAM-tier seed). The learned
-    key -> MP is a conservative lower edge (mp_key * MP_KEY_UNIT)."""
+    key -> MP is a conservative lower edge (mp_key * MP_KEY_UNIT).
+
+    This is SeedVR2's VAE-decode ceiling, so Real-ESRGAN probes are EXCLUDED (model
+    'esrgan-*'): a fixed-ratio GAN tiles on OOM and reaches 4K on a 16 GB card SeedVR2
+    could never fit, so counting an ESRGAN 4K probe here would wrongly mark that card
+    feasible for a 4K SeedVR2 job. ESRGAN has no such ceiling and never consults this."""
     if not gpu_id:
         return None
     best = 0.0
     try:
         for r in conn.execute(
-                "SELECT out_w, out_h FROM video_bench WHERE gpu_id=? AND outcome='ok'",
+                "SELECT out_w, out_h FROM video_bench WHERE gpu_id=? AND outcome='ok' "
+                "AND model NOT LIKE 'esrgan-%'",
                 (gpu_id,)):
             if r["out_w"] and r["out_h"]:
                 best = max(best, (r["out_w"] * r["out_h"]) / 1_000_000.0)
