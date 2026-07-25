@@ -6,19 +6,59 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-The remaining open milestones are two lower-priority ones that each introduce a
-new process model, networking, or packaging (HTTP interface #3, Unraid #4). The
+The remaining open milestones are a medium Video Upscaler feature (a mixed
+local+remote queue, #12) and two lower-priority ones that each introduce a new
+process model, networking, or packaging (HTTP interface #3, Unraid #4). The
 **shipped** milestones are kept below as a numbering legend, after the open work.
 
 ---
 
 ## Contents
 
+- [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [3. HTTP interface](#3-http-interface-hard-low-priority)
 - [4. Unraid Community Apps integration](#4-unraid-community-apps-integration-hardest-low-priority)
 - [Sequencing & dependencies](#sequencing--dependencies)
 - [Shipped milestones (numbering legend)](#shipped-milestones-numbering-legend)
 - [Decided against / constraints](#decided-against--constraints)
+
+---
+
+## 12. Local+remote mixed queue: Medium
+Let a single Video Upscaler queue run some jobs on local GPU(s) AND others on
+rented RunPod pods in one Start, instead of the whole run being local **or**
+remote.
+
+- **Today's constraint:** the "Run on" switch is one mode for the entire run
+  (`_start` branches to `_start_local` for the whole queue, or the remote
+  single-/multi-pod path). Per-item GPU binding only distinguishes among
+  **remote** cards; a local job stores no GPU (there is one implicit local card).
+  As of 0.5.7 the selector is **locked while the queue is non-empty**, so a queue
+  can't be half-built in one mode and switched, which is the correct interim
+  behaviour until mixing exists.
+- **Foundation already in place:** the `(engine, gpu)` queue grouping
+  (`job_group_key` / `group_queue_order` / `distinct_group_keys`), the multi-pod
+  orchestrator `_start_grouped` (one runner per group), the GPU picker combobox,
+  and the per-item GPU column (which now renders the local card as
+  "Local <name>", 0.5.7).
+- **Work needed:** (a) a local GPU **identity** scheme so a job can bind a
+  specific local card (e.g. `local:0` / `local:1` from `nvidia-smi -L`), not just
+  an implicit single GPU; (b) let the GPU picker offer local card(s) as bindable
+  options alongside live remote cards; (c) a launcher that dispatches **local
+  groups to the in-process/subprocess local engine and remote groups to pods,
+  concurrently** (the current grouped path is remote-only and serial); (d)
+  per-source telemetry rows + estimates that already exist, wired per group; (e)
+  scope the funds guard / confirm-before-rent to the **remote** groups only.
+- **Clean stepping stone:** **multiple local GPUs within Local mode** alone
+  (bind + run local groups on several local cards) is a smaller, self-contained
+  first step that exercises (a)+(b)+(c-local) without any remote concurrency.
+  Rare on consumer hardware but real (e.g. a multi-card workstation).
+- **Risks:** concurrent orchestration of heterogeneous runners (a local
+  in-process engine holding the GPU + N remote pods) is more moving parts than
+  the current pendulum; a degrading local card (the watchdog) must not stall the
+  remote groups; VRAM feasibility is per-card.
+
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -67,10 +107,13 @@ The user installs and runs the application on their Unraid server.
   RunPod video; video conciliation; self-healing remote runs; local video; benchmark
   sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN engine),
   so the remaining sequencing is only among the low-priority open milestones below.
-- **#3 and #4 are the only open milestones**, and both are much lower priority:
-  large, mostly independent, and each introducing a new process model, networking,
-  or packaging. With Home Assistant already done over MQTT, the old telemetry
-  coupling no longer drives sequencing.
+- **Open milestones: #12, #3, #4.** #12 (mixed local+remote queue) is a
+  medium, self-contained Video Upscaler feature that builds on the shipped
+  `(engine, gpu)` grouping; #3 and #4 are lower priority and larger, each
+  introducing a new process model, networking, or packaging. With Home Assistant
+  already done over MQTT, the old telemetry coupling no longer drives sequencing.
+- **#12 has a clean stepping stone** (multiple local GPUs within Local mode)
+  that can land first without any remote-concurrency work.
 - **#4 depends on #3** (headless Unraid needs a web UI).
 - **Follow-on from the shipped #6/#7:** generalise the Auto-resume supervisor from
   video to the image runners (batch upscale / tag) (not yet scheduled).

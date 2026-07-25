@@ -506,16 +506,18 @@ class VideoTab(ttk.Frame):
         self.mode_local_rb.grid(row=0, column=2, padx=(6, 0))
         # One Tooltip per radio, retargeted (not a second one added) when an install
         # mode disables a choice: two Tooltips on one widget would both pop up.
-        self.mode_remote_tip = Tooltip(
-            self.mode_remote_rb,
+        self._remote_base_tip = (
             "Do the GPU work on a rented RunPod machine, streaming one segment at "
             "a time. Costs money per hour and needs a RunPod API key, but leaves "
-            "this PC's graphics card free.", wraplength=W)
-        self.mode_local_tip = Tooltip(
-            self.mode_local_rb,
+            "this PC's graphics card free.")
+        self._local_base_tip = (
             "Do the GPU work on this PC's graphics card. Free, but the card is "
-            "fully busy for the whole run, which can take hours per video.",
-            wraplength=W)
+            "fully busy for the whole run, which can take hours per video.")
+        self.mode_remote_tip = Tooltip(self.mode_remote_rb, self._remote_base_tip, wraplength=W)
+        self.mode_local_tip = Tooltip(self.mode_local_rb, self._local_base_tip, wraplength=W)
+        # Which modes this install even offers (queue-locking must never re-enable a mode the
+        # install disabled). remote-only disables Local; local-only disables Remote; both = both.
+        self._mode_allowed = {"remote": imode != "local", "local": imode != "remote"}
         if imode == "remote":
             self.mode_local_rb.configure(state="disabled")
             self.mode_local_tip.set_text(
@@ -942,6 +944,26 @@ class VideoTab(ttk.Frame):
         # list which hits the RunPod API and stays user-triggered via ↻).
         if self.mode_var.get() == "local":
             self._refresh_gpus()
+
+    _MODE_LOCK_TIP = ("Locked while the queue has videos: a run is all-local or all-remote, so a "
+                      "queue can't mix the two. Clear the queue to switch where it runs.")
+
+    def _refresh_mode_lock(self):
+        """Lock the 'Run on' selector while the queue holds any video, so the user can't switch a
+        queue between Local and Remote mid-build (a run is one or the other; mixing is a future
+        feature). An empty queue re-opens it. Install-mode restrictions win: a mode the install
+        doesn't offer stays disabled with its own reason. Called from _load_queue (the one funnel
+        every queue change passes through)."""
+        if not hasattr(self, "mode_remote_rb"):
+            return                                     # called before the UI is built
+        locked = bool(getattr(self, "_queue_order", None))
+        for mode, rb, tip, base in (
+                ("remote", self.mode_remote_rb, self.mode_remote_tip, self._remote_base_tip),
+                ("local", self.mode_local_rb, self.mode_local_tip, self._local_base_tip)):
+            if not self._mode_allowed.get(mode, True):
+                continue                               # install-mode already disabled it
+            rb.configure(state="disabled" if locked else "normal")
+            tip.set_text(self._MODE_LOCK_TIP if locked else base)
 
     def _on_mode_change(self):
         """Local/Remote radio flipped: persist the choice (a 'both' install remembers
@@ -2056,6 +2078,7 @@ class VideoTab(ttk.Frame):
         self._apply_queue_feasibility()
         self._refresh_scan_outputs()
         self._update_estimate()
+        self._refresh_mode_lock()          # lock Run-on while the queue is non-empty
 
     def _local_gpu_label(self):
         """'Local <card>' for the queue GPU column in local mode (a local job stores no per-item
