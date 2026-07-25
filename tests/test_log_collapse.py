@@ -88,3 +88,26 @@ def test_non_processing_lines_are_untouched(pane):
     pane.feed("    SeedVR2: short-side 1080px\n")
     pane.feed("[1/3] DONE movie.mp4\n")
     assert len(_lines(pane)) == 3
+
+
+def test_model_download_progress_collapses_but_keeps_the_header(pane):
+    # The SeedVR2 weight pre-download prints a run of "<file>: NN% (X/Y MB)" lines under a
+    # non-matching "downloading ..." header. The header stays; the progress collapses to the last.
+    pane.set_collapse(True, COLLAPSE_PROCESSING_RE)
+    pane.feed("    SeedVR2 model 'seedvr2_ema_3b-Q8_0.gguf' not found locally; downloading …\n")
+    for done in (0, 31, 62, 3491):
+        pct = int(done * 100 / 3491)
+        pane.feed(f"    seedvr2_ema_3b-Q8_0.gguf: {pct}% ({done}/3491 MB)\n")
+    lines = _lines(pane)
+    assert len(lines) == 2                                   # header + one refreshing progress line
+    assert "downloading" in lines[0]
+    assert "100% (3491/3491 MB)" in lines[1]
+
+
+def test_byte_only_download_progress_collapses(pane):
+    # When the server sends no Content-Length the progress is byte-only ("<file>: N MB").
+    pane.set_collapse(True, COLLAPSE_PROCESSING_RE)
+    for mb in (10, 20, 30):
+        pane.feed(f"    ema_vae_fp16.safetensors: {mb} MB\n")
+    lines = _lines(pane)
+    assert len(lines) == 1 and "30 MB" in lines[0]

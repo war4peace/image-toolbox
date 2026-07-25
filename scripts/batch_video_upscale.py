@@ -137,9 +137,35 @@ def _disarm_vec_isa_probe():
     check is redundant here, not lost. Worst case degrades from an unkillable hang to a
     visible compile error.
 
-    Only set when we are about to enable compile, and never over an explicit user value.
+    Set as early as possible and never over an explicit user value.
+
+    The env var is only READ when torch._inductor.config is first imported (config.py
+    vec_isa_ok_default). In a MIXED local queue a Real-ESRGAN job imports torch -- and
+    inductor.config -- BEFORE a later SeedVR2 job's gate runs, freezing vec_isa_ok=None; the env
+    var then arrives too late and the probe still fires. Worse, each probe child re-imports torch
+    and spawns ANOTHER probe (vec_isa_ok is None there too): an unbounded subprocess recursion that
+    wedges the run with the GPU idle. So besides the env var we also set the RESOLVED config value
+    directly when inductor.config is already imported -- that holds regardless of import order.
+    `_arm_vec_isa_ok_early()` additionally sets the env var before the first job's torch import.
     """
     os.environ.setdefault("TORCHINDUCTOR_VEC_ISA_OK", "1")
+    try:
+        cfg = sys.modules.get("torch._inductor.config")
+        if cfg is not None and getattr(cfg.cpp, "vec_isa_ok", True) is None:
+            cfg.cpp.vec_isa_ok = True                  # override the frozen None (import too early)
+    except Exception as exc:                           # noqa: BLE001 (old/renamed torch: env var stands)
+        debug_log("_disarm_vec_isa_probe: direct config set", exc=exc)
+
+
+def _arm_vec_isa_ok_early(settings):
+    """Set TORCHINDUCTOR_VEC_ISA_OK=1 BEFORE the first job imports torch, so inductor.config reads
+    it at import time (in-process AND in every child that inherits the env) and the vec_isa probe
+    never fires. Called once at the start of a local run. Only when compile is configured (so a
+    no-compile run is untouched) and never over an explicit user value. See _disarm_vec_isa_probe
+    for why the per-job gate alone is too late in a mixed engine queue."""
+    if (settings.get("compile") or settings.get("compile_dit")
+            or settings.get("compile_vae")):
+        os.environ.setdefault("TORCHINDUCTOR_VEC_ISA_OK", "1")
 
 
 def gate_local_compile(settings, log=None):
@@ -2005,6 +2031,23 @@ class LocalEngineRouter:
         self._cache[key] = eng
         return eng
 
+    def _dl_progress(self, filename):
+        """A throttled progress callback for a model download: logs '<file>: NN% (X/Y MB)' to the
+        GUI about every 3 s (or on each whole-percent step), so a multi-GB fetch shows movement
+        without flooding the log. total==0 (no Content-Length) logs bytes only."""
+        state = {"t": 0.0, "pct": -1}
+        def _cb(done, total):
+            pct = int(done * 100 / total) if total else -1
+            now = time.monotonic()
+            if pct == state["pct"] and (now - state["t"]) < 3.0:
+                return
+            state["t"], state["pct"] = now, pct
+            if total:
+                self.log(f"    {filename}: {pct}% ({done // (1 << 20)}/{total // (1 << 20)} MB)")
+            else:
+                self.log(f"    {filename}: {done // (1 << 20)} MB")
+        return _cb
+
     def _build(self, etype, model):
         if etype == "fixed_ratio":
             import esrgan_models as _esr
@@ -2016,6 +2059,17 @@ class LocalEngineRouter:
                                          diag_sink=self.log_file_only)
         from local_video_engine import LocalVideoEngine
         repo_dir, model_dir = _local_seedvr2_paths(self.cfg)
+        # Fetch a missing DiT/VAE with a visible, resumable, timing-out download BEFORE the engine
+        # loads. seedvr2's own downloader runs with stdout captured to the file sink AND did not
+        # recover from a stalled HuggingFace connection, so a missing weight looked like a dead
+        # hang (a 0-byte .download parked for 10+ minutes). This reports progress to the GUI and
+        # retries instead; fail-safe, so on any issue the engine's own download_weight still runs.
+        try:
+            from upscale_engine import ensure_seedvr2_weights
+            ensure_seedvr2_weights(model_dir, model, log=self.log,
+                                   progress=self._dl_progress(model))
+        except Exception as exc:                     # noqa: BLE001 (never block the run)
+            debug_log("LocalEngineRouter._build.ensure_seedvr2_weights", exc=exc)
         local_cfg = self._worker_cfg()
         local_cfg["dit_model"] = model
         # Gate torch.compile on a real compile-capability probe (shared with the benchmark):
@@ -2697,6 +2751,12 @@ def main(argv=None):
     if args.fixed_ratio_model:
         vcfg["fixed_ratio_model"] = args.fixed_ratio_model
     notify_settings = notifications.resolve_settings(cfg)
+    # Arm the inductor vec_isa flag BEFORE any job imports torch, so a compiled SeedVR2 job later in
+    # a mixed queue can't hit the probe-subprocess recursion (a Real-ESRGAN job would otherwise
+    # import torch + inductor.config first, freezing the flag before the per-job gate can set it).
+    # Local only; remote compiles on the pod. See _arm_vec_isa_ok_early / _disarm_vec_isa_probe.
+    if args.local:
+        _arm_vec_isa_ok_early(vcfg)
     out_root = os.path.abspath(args.output) if args.output \
         else os.path.join(src_root, vcfg["output_subdir"])
     log_video_settings(vcfg)          # record the run's settings up front

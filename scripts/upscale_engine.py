@@ -31,8 +31,11 @@ Usage:
 import io
 import os
 import sys
+import time
 import random
+import hashlib
 import contextlib
+import urllib.request
 
 try:
     from debug_log import debug_log
@@ -40,7 +43,162 @@ except Exception:                                  # noqa: BLE001 (old install)
     def debug_log(*_a, **_k):
         pass
 
+try:
+    from net_ssl import ssl_context as _ssl_context   # shared certifi HTTPS trust (fresh-VM safe)
+except Exception:                                  # noqa: BLE001 (old install / missing certifi)
+    import ssl
+    def _ssl_context():
+        return ssl.create_default_context()
+
 _TRUTHINESS_FIXED = False
+
+
+# ── SeedVR2 weight pre-download (robust, GUI-visible) ────────────────────────
+# seedvr2's own downloader (src/utils/downloads.py) is a poor fit for a MISSING weight on the
+# local video path: its progress goes to stdout, which that path captures to a file-only sink (so
+# the GUI shows nothing), and a transient dead CDN connection left a 0-byte .download parked for
+# 10+ minutes with no recovery -- looking like a total hang. We pre-fetch the file ourselves
+# first, with GUI progress, a real read-timeout, retries and resume, into the SAME model_dir
+# seedvr2 falls back to -- so its download_weight then finds the file present and skips. Fail-safe:
+# any problem falls through to seedvr2 unchanged.
+#
+# Mirror of seedvr2/src/utils/model_registry.py MODEL_REGISTRY (repo + sha256), kept here so this
+# stays torch-free (importing the real registry pulls in the DiT model classes). seedvr2 is
+# vendored + pinned so this rarely changes; a filename absent here is simply left to seedvr2.
+_HF_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
+_NUMZ = "numz/SeedVR2_comfyUI"
+_AINVFX = "AInVFX/SeedVR2_comfyUI"
+_SEEDVR2_WEIGHTS = {
+    "seedvr2_ema_3b-Q4_K_M.gguf": (_AINVFX, "e665e3909de1a8c88a69c609bca9d43ff5a134647face2ce4497640cc3597f0e"),
+    "seedvr2_ema_3b-Q8_0.gguf": (_AINVFX, "be0d60083a2051a265eb4b77f28edf494e6db67ffc250216f32b72292e5cbd96"),
+    "seedvr2_ema_3b_fp8_e4m3fn.safetensors": (_NUMZ, "3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff"),
+    "seedvr2_ema_3b_fp16.safetensors": (_NUMZ, "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"),
+    "seedvr2_ema_7b-Q4_K_M.gguf": (_AINVFX, "db9cb2ad90ebd40d2e8c29da2b3fc6fd03ba87cd58cbadceccca13ad27162789"),
+    "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors": (_AINVFX, "3d68b5ec0b295ae28092e355c8cad870edd00b817b26587d0cb8f9dd2df19bb2"),
+    "seedvr2_ema_7b_fp16.safetensors": (_NUMZ, "7b8241aa957606ab6cfb66edabc96d43234f9819c5392b44d2492d9f0b0bbe4a"),
+    "seedvr2_ema_7b_sharp-Q4_K_M.gguf": (_AINVFX, "7aed800ac4eb8e0d18569a954c0ff35f5a1caa3ed5d920e66cc31405f75b6e69"),
+    "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors": (_AINVFX, "0d2c5b8be0fda94351149c5115da26aef4f4932a7a2a928c6f184dda9186e0be"),
+    "seedvr2_ema_7b_sharp_fp16.safetensors": (_NUMZ, "20a93e01ff24beaeebc5de4e4e5be924359606c356c9c51509fba245bd2d77dd"),
+    "ema_vae_fp16.safetensors": (_NUMZ, "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+}
+_SEEDVR2_DEFAULT_VAE = "ema_vae_fp16.safetensors"
+
+
+def _sha256_file(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _download_verified(url, dest, sha256, *, log=None, progress=None, retries=4, timeout=60):
+    """Stream `url` to `dest` (atomic replace), resuming a `.part` across retries and verifying
+    sha256. A firing socket timeout + retry loop means a stalled connection recovers instead of
+    hanging forever. Raises on final failure (caller falls back to seedvr2's downloader)."""
+    tmp = dest + ".part"
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+        headers = {"User-Agent": "Mozilla/5.0"}     # conventional UA (as the esrgan downloader uses)
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, context=_ssl_context(), timeout=timeout) as resp:
+                if have and getattr(resp, "status", 200) == 200:
+                    have = 0                          # server ignored Range: restart from scratch
+                total = have + int(resp.headers.get("Content-Length") or 0)
+                done = have
+                with open(tmp, "ab" if have else "wb") as out:
+                    if progress:
+                        try: progress(done, total)
+                        except Exception: pass        # noqa: BLE001 (progress is best-effort)
+                    while True:
+                        block = resp.read(1 << 16)
+                        if not block:
+                            break
+                        out.write(block)
+                        done += len(block)
+                        if progress:
+                            try: progress(done, total)
+                            except Exception: pass     # noqa: BLE001
+            got = _sha256_file(tmp)
+            if sha256 and got != sha256:
+                try: os.remove(tmp)                    # corrupt/truncated: drop it, retry fresh
+                except OSError: pass
+                raise RuntimeError(f"sha256 mismatch (expected {sha256[:12]}, got {got[:12]})")
+            os.replace(tmp, dest)
+            return
+        except Exception as exc:                       # noqa: BLE001
+            last_exc = exc
+            if attempt < retries:
+                if log:
+                    log(f"    download attempt {attempt}/{retries} failed "
+                        f"({type(exc).__name__}); retrying …")
+                time.sleep(min(2 * attempt, 10))       # brief backoff before the next try
+    raise RuntimeError(f"could not download {os.path.basename(dest)}: {last_exc}")
+
+
+def _seed_validation_cache(model_dir, filename, sha):
+    """Record `filename` in seedvr2's `.validation_cache.json` (size + mtime + hash) so its engine
+    TRUSTS our just-verified download instead of re-hashing the multi-GB file on first load (which
+    would be yet another silent, minutes-long pause). Matches seedvr2's own cache format. The
+    engine's fast check compares size + mtime, so this must run after the file is in place.
+    Fail-safe."""
+    try:
+        import json
+        path = os.path.join(model_dir, ".validation_cache.json")
+        cache = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    cache = json.load(f) or {}
+            except Exception:                          # noqa: BLE001 (corrupt cache: rewrite it)
+                cache = {}
+        dest = os.path.join(model_dir, filename)
+        cache[filename] = {"size": os.path.getsize(dest),
+                           "mtime": os.path.getmtime(dest), "hash": sha}
+        with open(path, "w") as f:
+            json.dump(cache, f)
+    except Exception as exc:                           # noqa: BLE001
+        debug_log("upscale_engine._seed_validation_cache", exc=exc)
+
+
+def ensure_seedvr2_weights(model_dir, dit_model, *, log=None, progress=None):
+    """Pre-fetch the SeedVR2 DiT (+ default VAE) into `model_dir` with a robust, visible download
+    BEFORE the engine loads, so a missing weight is a reported download (progress, firing timeout,
+    retries) instead of seedvr2's silent stall. Only fetches a file ABSENT from model_dir (a
+    present file is left for the engine to validate). Fail-safe: any error falls through to
+    seedvr2's own download_weight. Returns the count downloaded."""
+    if not model_dir or not dit_model:
+        return 0
+    n = 0
+    for filename in (dit_model, _SEEDVR2_DEFAULT_VAE):
+        entry = _SEEDVR2_WEIGHTS.get(filename)
+        if not entry:
+            continue                                   # unknown to us: let seedvr2 handle it
+        dest = os.path.join(model_dir, filename)
+        if os.path.exists(dest):
+            continue                                   # present: the engine validates it
+        repo, sha = entry
+        try:
+            os.makedirs(model_dir, exist_ok=True)
+            if log:
+                log(f"    SeedVR2 model '{filename}' not found locally; downloading from "
+                    f"HuggingFace (this can take a few minutes) …")
+            _download_verified(_HF_BASE_URL.format(repo=repo, filename=filename), dest, sha,
+                               log=log, progress=progress)
+            _seed_validation_cache(model_dir, filename, sha)   # skip the engine's re-hash
+            if log:
+                log(f"    {filename} ready ({os.path.getsize(dest) // (1 << 20)} MB, verified).")
+            n += 1
+        except Exception as exc:                       # noqa: BLE001 (fall through to seedvr2)
+            debug_log("upscale_engine.ensure_seedvr2_weights", exc=exc)
+            if log:
+                log(f"    pre-download of {filename} failed ({type(exc).__name__}); the engine "
+                    f"will try its own download next.")
+    return n
 
 
 def _fix_compiled_dit_truthiness():

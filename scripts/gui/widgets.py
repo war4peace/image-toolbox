@@ -18,9 +18,15 @@ from tkinter import ttk
 
 from gui.common import _geometry_on_screen, save_settings, PROGRESS_RE
 
-# The per-minute video heartbeat ("... Processing: 4482/4874 frames ..."). Optionally
-# collapsed to a single refreshing line in the log window (LogPane.set_collapse).
-COLLAPSE_PROCESSING_RE = re.compile(r"Processing:\s+\d+/\d+\s+frames")
+# Repeating progress heartbeats optionally collapsed to a single refreshing line in the log
+# window (LogPane.set_collapse): the per-minute video line ("... Processing: 4482/4874 frames
+# ..."), and a model-download progress line ("seedvr2_ema_3b-Q8_0.gguf: 1% (62/3491 MB)", or its
+# byte-only form when the server sends no Content-Length). A run of matching lines collapses to
+# the latest; the non-matching "downloading ..." header before it is left in place.
+COLLAPSE_PROCESSING_RE = re.compile(
+    r"Processing:\s+\d+/\d+\s+frames"          # per-minute video heartbeat
+    r"|\d+%\s+\(\d+/\d+\s*MB\)"                # model-download progress (percent + N/N MB)
+    r"|:\s+\d+\s+MB\s*$")                      # ... byte-only form (no Content-Length)
 
 
 # ─────────────────────────────────────────────

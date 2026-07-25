@@ -189,6 +189,55 @@ def test_vec_isa_probe_is_left_alone_when_compile_is_disabled(monkeypatch):
     assert "TORCHINDUCTOR_VEC_ISA_OK" not in os.environ
 
 
+# ── mixed-queue regression: the vec_isa flag must be armed BEFORE torch import ──
+
+def test_arm_vec_isa_ok_early_sets_when_compile_configured(monkeypatch):
+    """A mixed local queue imports torch (via a Real-ESRGAN job) before the SeedVR2 gate runs, so
+    the env var must be armed up front from the run's compile setting -- otherwise inductor.config
+    freezes vec_isa_ok=None and the probe subprocess recurses. Off when compile is not configured."""
+    monkeypatch.delenv("TORCHINDUCTOR_VEC_ISA_OK", raising=False)
+    bv._arm_vec_isa_ok_early({"compile": True})
+    assert os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "1"
+
+    monkeypatch.delenv("TORCHINDUCTOR_VEC_ISA_OK", raising=False)
+    bv._arm_vec_isa_ok_early({"compile": False})
+    assert "TORCHINDUCTOR_VEC_ISA_OK" not in os.environ
+
+
+def test_arm_vec_isa_ok_early_respects_explicit_value(monkeypatch):
+    monkeypatch.setenv("TORCHINDUCTOR_VEC_ISA_OK", "0")     # a dev re-enabling the probe wins
+    bv._arm_vec_isa_ok_early({"compile": True})
+    assert os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "0"
+
+
+def test_disarm_overrides_a_frozen_none_config(monkeypatch):
+    """If torch._inductor.config is ALREADY imported (earlier torch use) its vec_isa_ok is frozen
+    from the env at import time. When that froze to None the env var alone is too late, so the
+    disarm sets the resolved config value directly."""
+    import sys
+    import types
+    fake = types.ModuleType("torch._inductor.config")
+    fake.cpp = types.SimpleNamespace(vec_isa_ok=None)
+    monkeypatch.setitem(sys.modules, "torch._inductor.config", fake)
+    monkeypatch.delenv("TORCHINDUCTOR_VEC_ISA_OK", raising=False)
+    bv._disarm_vec_isa_probe()
+    assert os.environ.get("TORCHINDUCTOR_VEC_ISA_OK") == "1"
+    assert fake.cpp.vec_isa_ok is True                      # frozen None overridden directly
+
+
+def test_disarm_leaves_an_already_resolved_config_alone(monkeypatch):
+    """A config that already resolved (True/False, e.g. the env was set at its import) is a real
+    decision -- never clobber it."""
+    import sys
+    import types
+    for val in (True, False):
+        fake = types.ModuleType("torch._inductor.config")
+        fake.cpp = types.SimpleNamespace(vec_isa_ok=val)
+        monkeypatch.setitem(sys.modules, "torch._inductor.config", fake)
+        bv._disarm_vec_isa_probe()
+        assert fake.cpp.vec_isa_ok is val
+
+
 # ── seedvr2 path resolution ──────────────────────────────────────────────────
 
 def test_local_seedvr2_paths_defaults_to_app_root():
