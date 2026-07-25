@@ -63,25 +63,17 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9 and #10 are complete** (remote upscaling + funds-floor;
+- **#1, #2, #5, #6, #7, #8, #9, #10 and #11 are complete** (remote upscaling + funds-floor;
   RunPod video; video conciliation; self-healing remote runs; local video; benchmark
-  sharing; telemetry usage graphs; Home Assistant dashboard samples), so the remaining
-  sequencing is only among the low-priority open milestones below.
+  sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN engine),
+  so the remaining sequencing is only among the low-priority open milestones below.
 - **#3 and #4 are the only open milestones**, and both are much lower priority:
   large, mostly independent, and each introducing a new process model, networking,
   or packaging. With Home Assistant already done over MQTT, the old telemetry
   coupling no longer drives sequencing.
 - **#4 depends on #3** (headless Unraid needs a web UI).
-- **Follow-ons from the shipped #6/#7:** generalise the Auto-resume supervisor from
-  video to the image runners (batch upscale / tag) (not yet scheduled). #7's deferred
-  Phase 2, a non-SeedVR fixed-ratio 2x/4x engine (Real-ESRGAN-class: fast, low-VRAM,
-  deterministic) dropping into the same engine seam, **shipped LOCAL on 0.5.6-experimental**
-  (commit `42b971e`; see `docs/local-video-upscaler.md` section 11). **Next planned step:**
-  the **remote** Real-ESRGAN path (a lightweight no-volume pod worker) plus the queue change
-  it depends on, **per-item GPU binding + grouped multi-pod Start** (a general Video Upscaler
-  improvement: mixed-GPU SeedVR2 queues benefit too). Designed in `docs/video-upscaler.md`
-  section 18; the remote benchmark + estimator rates are deferred until a real remote
-  measurement exists.
+- **Follow-on from the shipped #6/#7:** generalise the Auto-resume supervisor from
+  video to the image runners (batch upscale / tag) (not yet scheduled).
 - **Follow-on from the shipped #8 (not yet scheduled): extend benchmark sharing
   to the IMAGE tasks.** Today the crowdsourced corpus covers `db.video_bench`
   only; per-card image throughput (`db.gpu_perf` for batch upscale and tag) is
@@ -145,6 +137,17 @@ The numbers survive only because code and other docs cite the roadmap by them
   Mushroom/ApexCharts one, plus the MQTT sensor + derived-percent template YAML)
   that render the app's existing `image-toolbox/*` MQTT telemetry live. Docs/samples
   only, no pipeline change. See `samples/home-assistant/`.
+- **#11: Real-ESRGAN engine (fixed-ratio 2X/4X alternative to SeedVR2).** Shipped
+  0.5.6: a second video upscaling engine (a GAN: fast, VRAM-light, deterministic)
+  dropping into the same engine seam, local (`FixedRatioVideoEngine`) and remote (a
+  volume-free esrgan pod, `pod/worker.py --mode esrgan`, models self-downloaded). Two
+  tiers (Compact / Quality), native-scale only. It required a general Video Upscaler
+  change that mixed-GPU SeedVR2 queues benefit from too: **per-item GPU binding +
+  grouped multi-pod Start** (each job carries its engine + picked card; the queue
+  groups by (engine, GPU) and runs one pod per group, re-grouping mid-run). The
+  Benchmark GPU window + estimator treat ESRGAN as a distinct method (single s/frame
+  + peak-VRAM probe per cell, a separate rate namespace). See `CLAUDE.md` (Real-ESRGAN
+  engine cluster), `docs/local-video-upscaler.md` §23 and `docs/video-upscaler.md` §18.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
