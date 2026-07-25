@@ -2395,15 +2395,23 @@ class VideoTab(ttk.Frame):
     def _populate_gpus(self, gpus):
         import video_estimate as ve
         jobs = self._queue_jobs()
+        # Rank the cards we have a rate for cheapest-first (with a cost estimate), then append
+        # EVERY other live-available card so the picker never hides a valid GPU. Per-item binding
+        # means the user picks a card for the NEXT video, which may differ from anything queued;
+        # an un-benchmarked card has no rate yet but must still be selectable (just without a cost
+        # quote). Filtering the list down to rate-having cards was the bug that stranded a queue
+        # on the one GPU it already used, blocking other pods for other videos.
         ranked = ve.recommend_gpus(gpus, jobs, self._spin_up(),
                                    conn=self._conn()) if jobs else []
-        self._gpu_choices = ranked or gpus
+        seen = {g.get("id") or g.get("name") for g in ranked}
+        rest = [g for g in (gpus or []) if (g.get("id") or g.get("name")) not in seen]
+        self._gpu_choices = ranked + rest
         labels = []
         for g in self._gpu_choices:
             price = f"${g['price']:.2f}/h" if g.get("price") is not None else "n/a"
             est = g.get("estimate")
             tail = f" → ${est['cost']:.2f}" if est else ""
-            labels.append(f"{g['name']} — {g['memory_gb']} GB — {price} ({g['stock']}){tail}")
+            labels.append(f"{g['name']} · {g['memory_gb']} GB · {price} ({g['stock']}){tail}")
         self.gpu_combo.configure(values=labels)
         if labels:
             self.gpu_combo.current(0)
