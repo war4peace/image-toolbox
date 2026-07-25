@@ -116,7 +116,7 @@ def _short_gpu(gpu_id):
     s = (gpu_id or "").strip()
     if not s:
         return ""
-    for drop in ("NVIDIA ", " Generation"):
+    for drop in ("NVIDIA ", "GeForce ", " Generation"):
         s = s.replace(drop, "")
     return s.strip()
 
@@ -435,6 +435,7 @@ class VideoTab(ttk.Frame):
         self.tool_name = "Video Upscaler"
         self.active_pod_id = None
         self._gpu_choices = []
+        self._local_gpu_name = None      # cached nvidia-smi name for the queue's Local GPU label
         self._scan_rows = {}        # tree iid -> dict(rel, abs, width, height, ...)
         self._scan_order = []       # iids in insertion order (filtered detach/reattach)
         self._root_id = None
@@ -955,6 +956,10 @@ class VideoTab(ttk.Frame):
         self._apply_mode_ui()
         self._check_readiness()
         self._refresh_gpus()
+        # The queue's GPU column depends on the mode (a local run shows the local card; an unbound
+        # remote row shows nothing), so reload it to re-render that column for the new mode.
+        if self._root_id is not None:
+            self._load_queue()
         # Real-ESRGAN is a local engine: the Method list gains/loses it with the mode, and the
         # reachable Target list can change with it (#11).
         self._populate_method_combo()
@@ -1114,6 +1119,7 @@ class VideoTab(ttk.Frame):
             if not g:
                 return ("Not ready: no NVIDIA GPU detected (nvidia-smi). Local upscaling "
                         "needs a CUDA GPU; use Remote instead.", False)
+            self._local_gpu_name = name or ""          # cache for the queue's Local GPU label
             vram = f"{g['gpu_total_mb'] / 1024:.0f} GB" if g.get("gpu_total_mb") else "?"
             # Batch size comes from this card's benchmark when one exists; otherwise the sizer
             # picks it from VRAM and refines it as the run proceeds. Reflect which applies.
@@ -2021,7 +2027,14 @@ class VideoTab(ttk.Frame):
             method = _short_method(j["engine"] if "engine" in jkeys else None,
                                    j["model"] if "model" in jkeys else None)
             gpu_id = (j["gpu"] if "gpu" in jkeys else None) or None
-            gpu_lbl = _short_gpu(gpu_id)
+            # A local run stores no per-item GPU (there is only one), so the column was blank.
+            # Fill it with the local card so the user sees where a queued job will run.
+            if gpu_id:
+                gpu_lbl = _short_gpu(gpu_id)
+            elif self.mode_var.get() == "local":
+                gpu_lbl = self._local_gpu_label()
+            else:
+                gpu_lbl = ""
             iid = self.queue_tree.insert(
                 "", "end",
                 values=(place, text, method, gpu_lbl, j["target"], j["status"], res, dur, codec,
@@ -2043,6 +2056,19 @@ class VideoTab(ttk.Frame):
         self._apply_queue_feasibility()
         self._refresh_scan_outputs()
         self._update_estimate()
+
+    def _local_gpu_label(self):
+        """'Local <card>' for the queue GPU column in local mode (a local job stores no per-item
+        GPU). The name is cached: readiness sets it; this fetches it once on demand if the queue
+        renders before readiness ran. Falls back to a plain 'Local GPU'."""
+        if self._local_gpu_name is None:
+            try:
+                import system_telemetry as st
+                self._local_gpu_name = st.gpu_name() or ""
+            except Exception:                              # noqa: BLE001 (fail-safe)
+                self._local_gpu_name = ""
+        short = _short_gpu(self._local_gpu_name)
+        return f"Local {short}" if short else "Local GPU"
 
     def _apply_queue_feasibility(self):
         """Grey a queued job only when ITS OWN card can't reach its target (18: per-item GPU
