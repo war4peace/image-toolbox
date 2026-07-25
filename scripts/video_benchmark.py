@@ -149,10 +149,14 @@ def build_plan(targets, frames=DEFAULT_FRAMES):
 # = 4x only, quality = 2x + 4x), so a generated frame is never ffmpeg-resized.
 ESRGAN_RATIOS = ["2X", "4X"]
 
-# ratio token -> the native source keys (benchmark_clip.SOURCES) benchmarked at that ratio.
+# ratio token -> the native source keys (benchmark_clip.SOURCES) benchmarked at that ratio,
+# small source first. `p4x3` is the shared 320x240 SeedVR2 source, reused here (#18 B). Several
+# sources appear at BOTH ratios (e.g. 640x480 at 2X -> 1280x960 and 4X -> 2560x1920), which is the
+# point: it maps the fixed-ratio cost across the input sizes a real SD/HD-revival run spans.
 ESRGAN_CELL_SOURCES = {
-    "2X": ["e720", "e1080"],       # 1280x720 -> 2560x1440 ; 1920x1080 -> 3840x2160 (4K)
-    "4X": ["e480"],                # 640x480 -> 2560x1920 (1920p tall)
+    "2X": ["p4x3", "e480", "e720", "e1080"],   # 320x240->640x480, 640x480->1280x960,
+                                               # 1280x720->2560x1440, 1920x1080->3840x2160
+    "4X": ["p4x3", "e480"],                    # 320x240->1280x960, 640x480->2560x1920
 }
 # A fixed-ratio probe measures s/frame over a fixed DURATION of footage (not a fixed frame count):
 # a GAN is per-frame so any length measures the steady state, but a clip of a few hundred frames
@@ -236,6 +240,36 @@ def build_esrgan_plan(ratios, tier, seconds=DEFAULT_ESR_SECONDS):
         for source in ESRGAN_CELL_SOURCES.get(r, []):
             plan.append(build_esrgan_cell(r, source, tier, seconds))
     return plan
+
+
+def esrgan_all_tiers():
+    """The Real-ESRGAN tiers the unified 'Real-ESRGAN' method benchmarks (compact + quality, in
+    catalog order). A single run/pod measures them all -- the fixed-ratio worker swaps the model
+    per job, so a remote sweep never terminates + redeploys between tiers."""
+    try:
+        import esrgan_models as em
+        return [kind for kind, _rep in em.TIERS]
+    except Exception:                                  # noqa: BLE001
+        return ["compact", "quality"]
+
+
+def build_esrgan_multi_plan(ratios, tiers, seconds=DEFAULT_ESR_SECONDS):
+    """Cells across MULTIPLE tiers (the unified method): each tier's plan concatenated. Every cell
+    carries its own tier + resolved model, so one run benchmarks compact AND quality; a ratio a
+    tier lacks natively is skipped for that tier only."""
+    plan = []
+    for tier in tiers:
+        plan += build_esrgan_plan(ratios, tier, seconds)
+    return plan
+
+
+def esrgan_pending_cells(conn, gpu_id, plan):
+    """The cells in `plan` NOT yet measured on this card (resume). Each ESRGAN cell is a single
+    probe, so one saved db.video_bench row for its (out_w, out_h) under its own tier's bench model
+    means it is done. Order preserved. Empty history => every cell is pending."""
+    return [c for c in plan
+            if not db.get_bench_probes(conn, gpu_id, esrgan_bench_model(c["tier"]),
+                                       c["out_w"], c["out_h"])]
 
 
 # If a recorded failure happened with at least this much LESS free VRAM than is available
@@ -1419,13 +1453,14 @@ def _run_esrgan_cell(engine, cell, work, stop_now):
             pass
 
 
-def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS, resume=True):
-    """Benchmark Real-ESRGAN (fixed-ratio) on the LOCAL card or a rented esrgan pod (#18 B). For
-    each (ratio, native source) cell it runs ONE probe (no batch sweep) and records the s/frame +
-    peak VRAM into db.video_bench (keyed by the esrgan tier model) plus the per-tier rate into the
-    estimate store (ve.record_esrgan_rate), so a fixed_ratio queue estimates from measured data.
-    Persists each probe immediately (Stop is graceful, resume skips a measured cell) and, remote,
-    tears the pod down. Returns a summary."""
+def run_esrgan_benchmark(ratios, tiers, remote=False, seconds=DEFAULT_ESR_SECONDS, resume=True):
+    """Benchmark Real-ESRGAN (fixed-ratio) across one or MORE tiers on the LOCAL card or a rented
+    esrgan pod (#18 B). `tiers` is a list (compact/quality): the unified 'Real-ESRGAN' method sweeps
+    them all in ONE run so a REMOTE pod is deployed ONCE and reused for every tier + cell (the
+    worker swaps the model per job, no terminate/redeploy between tiers). Each cell is one probe
+    (no batch sweep); s/frame + peak VRAM go to db.video_bench keyed by the cell's OWN tier model,
+    and the per-tier rate into the estimate store. Persists each probe (Stop graceful, resume skips
+    a measured cell) and, remote, tears the pod down once at the end. Returns a summary."""
     cfg = bv._load_config()
     notify_settings = notifications.resolve_settings(cfg)
     t_start = time.monotonic()
@@ -1433,7 +1468,8 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
     work = os.path.join(bv.resolve_video_cfg(cfg)["work_root"], "benchmark")
     os.makedirs(work, exist_ok=True)
 
-    plan = build_esrgan_plan(ratios, tier, seconds)
+    tiers = list(dict.fromkeys(tiers or []))           # de-dup, keep order
+    plan = build_esrgan_multi_plan(ratios, tiers, seconds)
     if not plan:
         log("No valid Real-ESRGAN benchmark cells selected; nothing to do.")
         return {"cells": 0, "stopped": None}
@@ -1448,28 +1484,46 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
         from local_video_engine import _query_gpu_name
         gpu_id = _query_gpu_name() or "local"
 
-    bench_model = esrgan_bench_model(tier)
     if not resume:
-        db.clear_bench(conn, gpu_id, bench_model,
-                       cells=[(c["out_w"], c["out_h"]) for c in plan])
+        # Clear each tier's saved cells (each tier is its own bench model).
+        for _tier in tiers:
+            db.clear_bench(conn, gpu_id, esrgan_bench_model(_tier),
+                           cells=[(c["out_w"], c["out_h"]) for c in plan if c["tier"] == _tier])
 
-    tier_label = tier.capitalize()
+    # Resume: skip cells already measured on THIS card (each ESRGAN cell is a single probe, so one
+    # saved row for its (out_w, out_h) under its tier model means it is done). Pre-filtering here
+    # (not inside the loop) means a resume with nothing pending never deploys a remote pod, and the
+    # status count / notification reflect the real work. Already-measured rows stay from _load_prior.
+    full_plan = plan
+    skipped = 0
+    if resume:
+        pending = esrgan_pending_cells(conn, gpu_id, plan)
+        skipped = len(plan) - len(pending)
+        plan = pending
+        if not plan:
+            log(f"All {len(full_plan)} selected Real-ESRGAN cell(s) already measured on {gpu_id}; "
+                "nothing to do (press Restart to re-measure).")
+            gui_event("BDONE", {"cells": 0, "stopped": None})
+            return {"cells": 0, "stopped": None, "skipped": skipped}
+
+    tiers_label = " + ".join(t.capitalize() for t in tiers)
     where = "on a RunPod pod" if remote else "locally"
-    gui_event("BSTART", {"gpu": gpu_id, "model": f"Real-ESRGAN {tier_label}",
-                         "remote": bool(remote), "engine": "fixed_ratio",
+    gui_event("BSTART", {"gpu": gpu_id, "model": "Real-ESRGAN", "remote": bool(remote),
+                         "engine": "fixed_ratio",
                          "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
-                                   "mp": round(c["mp"], 2), "ratio": c["ratio"]} for c in plan],
-                         "modes": [tier]})
-    log(f"Benchmarking {gpu_id} (Real-ESRGAN {tier_label}) {where}: {len(plan)} cell(s), "
+                                   "mp": round(c["mp"], 2), "ratio": c["ratio"],
+                                   "tier": c["tier"]} for c in plan],
+                         "modes": list(tiers)})
+    log(f"Benchmarking {gpu_id} (Real-ESRGAN {tiers_label}) {where}: {len(plan)} cell(s), "
         f"{int(seconds)}s of footage each.")
     if remote:
-        log("Note: the volume-free esrgan pod installs spandrel + ffmpeg and self-downloads the "
-            "model (a minute or two) before the first probe. Stop is safe -- finished probes are "
-            "saved and resume next time.")
+        log("Note: the volume-free esrgan pod installs spandrel + ffmpeg and self-downloads each "
+            "model (a minute or two) before its first probe; ALL tiers share this one pod. Stop is "
+            "safe -- finished probes are saved and resume next time.")
 
     engine = session = tele_stop = None
     stopped = None
-    results = []                                       # (name, spf) per finished cell
+    results = []                                       # (label, spf) per finished cell
     try:
         if remote:
             engine, session = _deploy_remote_esrgan_engine(cfg)
@@ -1486,9 +1540,11 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
             if stop_now():
                 stopped = "funds guard" if funds_tripped() else "stopped by user"
                 break
+            tier = cell["tier"]
+            bench_model = esrgan_bench_model(tier)
             gui_event("BCELL", {"name": cell["name"], "out_w": cell["out_w"],
                                 "out_h": cell["out_h"], "compile": tier})
-            log(f"\n[{cell['name']}] Real-ESRGAN {cell['ratio']} "
+            log(f"\n[{cell['name']} · {tier}] Real-ESRGAN {cell['ratio']} "
                 f"{cell['src_w']}x{cell['src_h']} -> {cell['out_w']}x{cell['out_h']} "
                 f"({cell['mp']:.2f} MP), model {cell['model']}:")
             gui_event("BPROBE", {"name": cell["name"], "batch": 1, "state": "running",
@@ -1523,7 +1579,7 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
             if spf:
                 ve.record_esrgan_rate(conn, gpu_id, tier, res["frames"] * cell["mp"],
                                       res["seconds"])
-                log(f"    {cell['name']}: {res['seconds']:.0f}s ({spf:.3f} s/frame), "
+                log(f"    {cell['name']} ({tier}): {res['seconds']:.0f}s ({spf:.3f} s/frame), "
                     f"peak {res.get('peak_alloc')}/{res.get('peak_reserved')} GB")
             gui_event("BPROBE", {"name": cell["name"], "batch": 1, "state": "done",
                                  "compile": tier, "outcome": "ok",
@@ -1533,7 +1589,7 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
                                  "peak_reserved": res.get("peak_reserved")})
             gui_event("BCEILING", {"name": cell["name"], "compile": tier, "ceiling": 1,
                                    "saved": 1, "overlap": None})
-            results.append((cell["name"], spf))
+            results.append((f"{cell['name']} ({tier})", spf))
     finally:
         if tele_stop is not None:
             tele_stop.set()
@@ -1544,15 +1600,16 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
                 pass
             gui_event("POD", "")
 
-    gui_event("BDONE", {"cells": len(plan), "stopped": stopped})
-    log(f"\nReal-ESRGAN benchmark {'stopped' if stopped else 'complete'}: {len(plan)} cell(s). "
+    gui_event("BDONE", {"cells": len(plan), "stopped": stopped, "skipped": skipped})
+    log(f"\nReal-ESRGAN benchmark {'stopped' if stopped else 'complete'}: {len(plan)} cell(s)"
+        + (f" ({skipped} already measured, skipped)" if skipped else "") + ". "
         + ("Rates saved; runs and estimates on this card now use them."))
     try:
         if notify_settings:
             fitted = sum(1 for _n, s in results if s)
             color = 0xE67E22 if stopped else 0x2ECC71
             title = "Real-ESRGAN benchmark " + ("stopped" if stopped else "complete")
-            desc = (f"{gpu_id} (Real-ESRGAN {tier_label}) on the "
+            desc = (f"{gpu_id} (Real-ESRGAN {tiers_label}) on the "
                     f"{'remote pod' if remote else 'local card'}: {fitted}/{len(plan)} cell(s) "
                     f"measured in {fmt_hhmmss(time.monotonic() - t_start)}.")
             fields = [{"name": n, "value": (f"{s:.3f} s/frame" if s else "measured")}
@@ -1560,7 +1617,7 @@ def run_esrgan_benchmark(ratios, tier, remote=False, seconds=DEFAULT_ESR_SECONDS
             notifications.notify(notify_settings, title, desc, color, fields=fields)
     except Exception:                                  # noqa: BLE001
         pass
-    return {"cells": len(plan), "stopped": stopped}
+    return {"cells": len(plan), "stopped": stopped, "skipped": skipped}
 
 
 def main(argv=None):
@@ -1586,9 +1643,9 @@ def main(argv=None):
     p.add_argument("--ratios", default="2X,4X",
                    help="Real-ESRGAN only: comma list of ratio cells to benchmark (2X,4X). A "
                         "ratio the chosen tier has no native model for is skipped.")
-    p.add_argument("--esrgan-model", default=None,
-                   help="Real-ESRGAN only: the model tier or key to benchmark (a compact/quality "
-                        "tier key from esrgan_models). Defaults to the configured fixed_ratio_model.")
+    p.add_argument("--esrgan-tiers", default=None,
+                   help="Real-ESRGAN only: comma list of model TIERS to benchmark (compact,quality). "
+                        "The unified method sweeps all of them in one run/pod. Omit for all tiers.")
     p.add_argument("--esr-seconds", type=int, default=DEFAULT_ESR_SECONDS,
                    help="Real-ESRGAN only: seconds of footage per cell (default 10). A longer clip "
                         "gives a more representative sustained rate but takes proportionally longer.")
@@ -1648,15 +1705,15 @@ def main(argv=None):
         threading.Thread(target=_watch_stdin_for_stop, daemon=True).start()
 
     if args.engine == "esrgan":
-        # Real-ESRGAN (#18 B): resolve the tier from the model key (a compact/quality tier rep
-        # or the configured fixed_ratio_model), then benchmark the selected ratio cells.
-        import esrgan_models as em
-        model_key = args.esrgan_model or bv.resolve_video_cfg(bv._load_config()).get(
-            "fixed_ratio_model") or em.DEFAULT_MODEL
-        tier = em.spec(model_key).kind
+        # Real-ESRGAN (#18 B): benchmark the selected ratio cells across the selected TIERS (all
+        # tiers by default -- the unified method), one run/pod for all of them.
+        if args.esrgan_tiers:
+            tiers = [t.strip().lower() for t in args.esrgan_tiers.split(",") if t.strip()]
+        else:
+            tiers = esrgan_all_tiers()
         ratios = [r.strip().upper() for r in args.ratios.split(",") if r.strip()]
         try:
-            run_esrgan_benchmark(ratios, tier, remote=args.remote,
+            run_esrgan_benchmark(ratios, tiers, remote=args.remote,
                                  seconds=args.esr_seconds, resume=not args.restart)
         except Exception as exc:                        # noqa: BLE001
             import traceback

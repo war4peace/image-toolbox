@@ -57,10 +57,12 @@ SOURCES = {
         "url": "https://upload.wikimedia.org/wikipedia/commons/8/83/USMC_reelistment_cermony.ogv",
         "sha256": "6739a5ba0f04dbe2a7f6ac8e202e5e7e7ffa85964fd952b48bd282d4624f9960",
         "w": 240, "h": 320},
-    "p4x3": {                                 # 4:3 landscape 320x240 -> the four 4:3 cells
+    "p4x3": {                                 # 4:3 landscape 320x240 -> the four 4:3 cells AND the
+                                              # Real-ESRGAN 320x240 2X/4X cells (#18 B); fps for the
+                                              # esrgan duration-based clip sizing (SeedVR2 ignores it).
         "url": "https://upload.wikimedia.org/wikipedia/commons/b/be/01stoomedewageningen.ogv",
         "sha256": "653a97f2693f7898ef963c82cafe87f65ab9273242c258d640d6a19d16bcb560",
-        "w": 320, "h": 240},
+        "w": 320, "h": 240, "fps": 15},
     "w360": {                                 # 16:9 640x360 -> the 1080p cell (source is 640x359)
         "url": "https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_640x360.m4v",
         "sha256": "738e2f999860553d056dd79c952f58f63cbb73892a57c72342ce9e5330d9d2d7",

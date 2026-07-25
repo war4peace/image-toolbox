@@ -1042,14 +1042,13 @@ class VideoTab(ttk.Frame):
             return
         # Open on the tab's currently-selected method (SeedVR2 vs a Real-ESRGAN tier), so the
         # window matches what the user is about to run; it stays switchable in the window.
+        # Real-ESRGAN is one unified benchmark entry (tier=None -> sweeps all tiers), so only
+        # the engine carries over; passing a specific tier would miss the tier-None method label
+        # and leave the combobox falling back to "SeedVR2" while the body shows Real-ESRGAN.
         method = None
         try:
-            engine, model = self._selected_method()
-            if engine == "fixed_ratio":
-                import esrgan_models as em
-                method = ("fixed_ratio", em.spec(model).kind)
-            else:
-                method = ("seedvr2", None)
+            engine, _model = self._selected_method()
+            method = ("fixed_ratio", None) if engine == "fixed_ratio" else ("seedvr2", None)
         except Exception:                              # noqa: BLE001
             method = None
         try:

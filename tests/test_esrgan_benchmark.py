@@ -32,6 +32,15 @@ def test_esrgan_sources_present_with_exact_native_dims():
         assert s.get("name")                          # a tidy cache filename (URLs are %-escaped)
 
 
+def test_all_esrgan_cell_sources_carry_fps():
+    # Duration-based sizing needs each source's fps; every source referenced by a cell must have it
+    # (incl. the reused 320x240 SeedVR2 source p4x3, which got an fps for this).
+    assert bclip.SOURCES["p4x3"]["fps"] == 15
+    used = {src for srcs in vb.ESRGAN_CELL_SOURCES.values() for src in srcs}
+    for key in used:
+        assert bclip.SOURCES[key].get("fps"), f"{key} has no fps for duration sizing"
+
+
 def test_ratio_outputs_are_whole_number_upscales():
     # 640x480 x4 -> 2560x1920 ; 1280x720 x2 -> 2560x1440 ; 1920x1080 x2 -> 3840x2160.
     assert (640 * 4, 480 * 4) == (2560, 1920)
@@ -49,8 +58,9 @@ def test_esrgan_targets_gated_by_tier_native_scales():
 
 def test_build_esrgan_plan_compact_is_4x_only():
     plan = vb.build_esrgan_plan(["2X", "4X"], "compact")
-    assert [c["name"] for c in plan] == ["4X-480"]
-    c = plan[0]
+    # Compact has only a native x4 weight -> 4X cells only (from 320x240 and 640x480), no 2X.
+    assert sorted(c["name"] for c in plan) == ["4X-240", "4X-480"]
+    c = {x["name"]: x for x in plan}["4X-480"]
     assert (c["out_w"], c["out_h"]) == (2560, 1920)
     assert c["resolution"] == 1920                     # output short side, == 480 * 4 (no resize)
     assert c["engine"] == "fixed_ratio"
@@ -61,20 +71,40 @@ def test_build_esrgan_plan_compact_is_4x_only():
 def test_build_esrgan_plan_quality_covers_both_ratios_natively():
     plan = vb.build_esrgan_plan(["2X", "4X"], "quality")
     by_name = {c["name"]: c for c in plan}
-    assert set(by_name) == {"2X-720", "2X-1080", "4X-480"}
+    # Quality: 2X from 320x240 / 640x480 / 720p / 1080p, and 4X from 320x240 / 640x480.
+    assert set(by_name) == {"2X-240", "2X-480", "2X-720", "2X-1080", "4X-240", "4X-480"}
     # 2x targets use the NATIVE x2 weight (not x4-then-downscale); 4x uses x4plus.
-    assert by_name["2X-720"]["model"] == "RealESRGAN_x2plus"
-    assert by_name["2X-1080"]["model"] == "RealESRGAN_x2plus"
+    for n in ("2X-240", "2X-480", "2X-720", "2X-1080"):
+        assert by_name[n]["model"] == "RealESRGAN_x2plus"
     assert by_name["4X-480"]["model"] == "RealESRGAN_x4plus"
     assert (by_name["2X-1080"]["out_w"], by_name["2X-1080"]["out_h"]) == (3840, 2160)
+    assert (by_name["2X-480"]["out_w"], by_name["2X-480"]["out_h"]) == (1280, 960)   # 640x480 x2
+    assert (by_name["4X-240"]["out_w"], by_name["4X-240"]["out_h"]) == (1280, 960)   # 320x240 x4
 
 
 def test_build_esrgan_plan_respects_selected_ratios():
-    # Only the ticked ratios expand to cells (quality, 2X only -> the two 2x cells).
+    # Only the ticked ratios expand to cells (quality, 2X only -> the four 2x cells).
     plan = vb.build_esrgan_plan(["2X"], "quality")
-    assert sorted(c["name"] for c in plan) == ["2X-1080", "2X-720"]
-    assert vb.build_esrgan_plan(["4X"], "quality")[0]["name"] == "4X-480"
+    assert sorted(c["name"] for c in plan) == ["2X-1080", "2X-240", "2X-480", "2X-720"]
+    assert sorted(c["name"] for c in vb.build_esrgan_plan(["4X"], "quality")) == ["4X-240", "4X-480"]
     assert vb.build_esrgan_plan(["2X"], "compact") == []     # compact has no native 2x
+
+
+def test_build_esrgan_multi_plan_sweeps_both_tiers_in_one_run():
+    # The unified method (#18 B UX): one plan across BOTH tiers, each cell carrying its own tier +
+    # model, so a single run/pod measures compact AND quality (a 4X cell appears once per tier).
+    assert vb.esrgan_all_tiers() == ["compact", "quality"]
+    plan = vb.build_esrgan_multi_plan(["2X", "4X"], vb.esrgan_all_tiers())
+    pairs = sorted((c["name"], c["tier"]) for c in plan)
+    assert pairs == sorted([
+        ("4X-240", "compact"), ("4X-480", "compact"),          # compact: 4X only
+        ("2X-240", "quality"), ("2X-480", "quality"),
+        ("2X-720", "quality"), ("2X-1080", "quality"),
+        ("4X-240", "quality"), ("4X-480", "quality")])
+    # A 4X cell exists for BOTH tiers with the tier's own weight.
+    m = {(c["name"], c["tier"]): c["model"] for c in plan}
+    assert m[("4X-480", "compact")] == "realesr-general-x4v3"
+    assert m[("4X-480", "quality")] == "RealESRGAN_x4plus"
 
 
 def test_esrgan_cells_size_to_a_fixed_duration():
@@ -150,6 +180,32 @@ def test_estimate_queue_local_fixed_ratio(db_conn):
     assert est["duration_seconds"] == pytest.approx(50 * 4.9152 * 0.5, rel=0.02)
     # An UNmeasured card returns None (honest: no rate yet), not a wrong SeedVR2 guess.
     assert ve.estimate_queue_local(jobs, "OTHER-CARD", db_conn) is None
+
+
+# ── resume: only unmeasured cells are re-run ─────────────────────────────────
+
+def test_esrgan_pending_cells_skips_already_measured(db_conn):
+    """Bug fix: a resume must benchmark ONLY the missing cells, not every cell under a checked
+    ratio. Given the 2X plan (quality: 240/480/720/1080), recording 3 of them leaves just the
+    unmeasured one pending -- keyed per cell's own (out_w, out_h) under its tier bench model."""
+    plan = vb.build_esrgan_multi_plan(["2X"], ["quality"])
+    names = {c["name"] for c in plan}
+    assert names == {"2X-240", "2X-480", "2X-720", "2X-1080"}
+    gpu = "CARD-X"
+    # Measure everything except 2X-240 (the one the user wanted).
+    for c in plan:
+        if c["name"] == "2X-240":
+            continue
+        db.record_bench_probe(db_conn, gpu, vb.esrgan_bench_model(c["tier"]),
+                              c["out_w"], c["out_h"], 1, "ok", frames=10, seconds=5.0)
+    pending = vb.esrgan_pending_cells(db_conn, gpu, plan)
+    assert [c["name"] for c in pending] == ["2X-240"]
+    # A card with no history has every cell pending; a fully-measured card has none.
+    assert len(vb.esrgan_pending_cells(db_conn, "FRESH-CARD", plan)) == len(plan)
+    for c in plan:
+        db.record_bench_probe(db_conn, gpu, vb.esrgan_bench_model(c["tier"]),
+                              c["out_w"], c["out_h"], 1, "ok", frames=10, seconds=5.0)
+    assert vb.esrgan_pending_cells(db_conn, gpu, plan) == []
 
 
 def test_job_vram_floor_low_for_fixed_ratio():

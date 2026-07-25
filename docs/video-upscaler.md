@@ -1970,15 +1970,17 @@ output, clean teardown, 64 s total.
 ### 18.9 As-built: the Real-ESRGAN benchmark (0.5.6, closes the 18.6 deferral)
 
 The two 18.6-deferred pieces (the Real-ESRGAN estimator rates + the remote Real-ESRGAN benchmark)
-shipped together, LOCAL and REMOTE. The Benchmark GPU window gained a **Method** selector
-(SeedVR2 vs a Real-ESRGAN tier) with ESRGAN-exclusive **2X / 4X** ratio checkmarks; each ticked
-ratio runs a single per-cell s/frame + VRAM probe (no batch sweep) against three pinned real-
-footage sources (640x480 4X->1920p, 720p 2X->1440p, 1080p 2X->4K). Probes persist to `video_bench`
-under `esrgan-<tier>`; the per-tier rate feeds a NEW `esrgan-mp-<tier>` estimator namespace so a
-`fixed_ratio` queue estimates from measured data instead of the ~100x-too-slow SeedVR2 table.
-Local and remote share one `process_segment` cell runner; remote reuses the B2 esrgan pod +
-the SeedVR2 remote-benchmark deploy/funds/telemetry path. Full design + code map:
-`docs/local-video-upscaler.md` section 23. Still deferred: the benchmark-corpus `engine` column
-and a Blackwell cu128 esrgan image override.
+shipped together, LOCAL and REMOTE. The Benchmark GPU window gained a **Method** selector with a
+single unified **Real-ESRGAN** entry (both tiers at once) and ESRGAN-exclusive **2X / 4X** ratio
+checkmarks; each ticked ratio runs a single per-cell s/frame + VRAM probe (no batch sweep) against
+pinned real-footage sources spanning the input sizes a real run covers (320x240 & 640x480 at 2X/4X,
+720p/1080p at 2X). One run sweeps compact AND quality: on a REMOTE pod that means ONE volume-free
+esrgan pod is deployed and reused for every tier (the worker swaps models per job), never
+terminated/redeployed between tiers. Probes persist to `video_bench` under `esrgan-<tier>`; the
+per-tier rate feeds a NEW `esrgan-mp-<tier>` estimator namespace so a `fixed_ratio` queue estimates
+from measured data instead of the ~100x-too-slow SeedVR2 table. Local and remote share one
+`process_segment` cell runner; remote reuses the B2 esrgan pod + the SeedVR2 remote-benchmark
+deploy/funds/telemetry path. Full design + code map: `docs/local-video-upscaler.md` section 23.
+Still deferred: the benchmark-corpus `engine` column and a Blackwell cu128 esrgan image override.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
