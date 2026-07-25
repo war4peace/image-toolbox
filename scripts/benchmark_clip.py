@@ -74,6 +74,35 @@ SOURCES = {
         "sha256": "ae51005850b0ff757fe60c3dd7a12d754d3cd2397d87d939b55235e457f97658",
         "w": 1920, "h": 1080,
         "zip_member": "bbb_sunflower_1080p_30fps_normal.mp4"},
+
+    # Real-ESRGAN (fixed-ratio) benchmark sources (#18 B benchmark). REAL footage from
+    # Wikimedia Commons at the exact native sizes the ratio cells need, so a 2x/4x upscale
+    # lands on a whole-number output with NO rescale (640x480 x4 -> 2560x1920; 1280x720 x2
+    # -> 2560x1440; 1920x1080 x2 -> 3840x2160). Content is irrelevant to the throughput /
+    # VRAM measured (same rule as the SeedVR2 cells, docs 14); these are picked only so every
+    # user benchmarks identical footage. Each is a native .webm (VP8/VP9), decoded by the
+    # bundled ffmpeg like any source. `name` gives the cache file a tidy name (the URLs are
+    # heavily %-escaped). Downloaded on demand, SHA-256 pinned (verify-third-party-downloads).
+    "e480": {                                 # 640x480 4:3 -> ESRGAN 4X -> 2560x1920 (1920p tall)
+        "url": "https://upload.wikimedia.org/wikipedia/commons/c/cf/"
+               "%22Kolberg%22_Hurdy_gurdy_players_playing_Christmas_carolers_"
+               "%22at_the_Walddeutschen%22.webm",
+        "name": "kolberg_hurdygurdy_640x480.webm",
+        "sha256": "9a814409c70e3e89a072659e27f6230a68198b1fff048cb90422f44bc62adb2d",
+        "w": 640, "h": 480, "fps": 25},
+    "e720": {                                 # 1280x720 16:9 -> ESRGAN 2X -> 2560x1440
+        "url": "https://upload.wikimedia.org/wikipedia/commons/1/14/"
+               "Stampbanan_2013-04-27_%28720p%29.webm",
+        "name": "stampbanan_1280x720.webm",
+        "sha256": "9f203eb6abbfcb4c53eab58aed0ad507f54e0140cd86711af059bcd430fba821",
+        "w": 1280, "h": 720, "fps": 25},
+    "e1080": {                                # 1920x1080 16:9 -> ESRGAN 2X -> 3840x2160 (4K)
+        "url": "https://upload.wikimedia.org/wikipedia/commons/6/67/"
+               "%28B-ROLL%29_1st_Armor_Battalion_Combat_Team%2C_1st_Armor_Division%2C_"
+               "Task_Force_Danger_%281014896%29.webm",
+        "name": "usmc_broll_1920x1080.webm",
+        "sha256": "97a43f6ce846f936f185ebae7072cba4131f8e820e87fa2225f699f0b5d0b677",
+        "w": 1920, "h": 1080, "fps": 30},
 }
 
 
@@ -175,7 +204,7 @@ def ensure_source(source_key, cache_dir=None, log=None):
     if s.get("zip_member"):
         dest = os.path.join(cache_dir, s["zip_member"])
         return download_zip_member(s["url"], s["sha256"], dest, log=log)
-    name = os.path.basename(urllib.parse.urlparse(s["url"]).path)
+    name = s.get("name") or os.path.basename(urllib.parse.urlparse(s["url"]).path)
     dest = os.path.join(cache_dir, name)
     return download_base_clip(s["url"], s["sha256"], dest, log=log)
 

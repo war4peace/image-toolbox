@@ -1040,10 +1040,22 @@ class VideoTab(ttk.Frame):
             existing.lift()
             existing.focus_set()
             return
+        # Open on the tab's currently-selected method (SeedVR2 vs a Real-ESRGAN tier), so the
+        # window matches what the user is about to run; it stays switchable in the window.
+        method = None
+        try:
+            engine, model = self._selected_method()
+            if engine == "fixed_ratio":
+                import esrgan_models as em
+                method = ("fixed_ratio", em.spec(model).kind)
+            else:
+                method = ("seedvr2", None)
+        except Exception:                              # noqa: BLE001
+            method = None
         try:
             from gui.video_benchmark import BenchmarkWindow
             self._benchmark_win = BenchmarkWindow(self.winfo_toplevel(), self,
-                                                  remote=remote, gpu=gpu)
+                                                  remote=remote, gpu=gpu, method=method)
         except Exception as exc:                       # noqa: BLE001
             messagebox.showerror(APP_TITLE, f"Could not open the benchmark window:\n{exc}")
 
@@ -2380,6 +2392,8 @@ class VideoTab(ttk.Frame):
                          "width": (vf["width"] if vf else None),
                          "height": (vf["height"] if vf else None),
                          "engine": (j["engine"] if "engine" in jkeys else None) or "seedvr2",
+                         # model drives the Real-ESRGAN rate lookup (rate is per model tier).
+                         "model": (j["model"] if "model" in jkeys else None),
                          # Per-item GPU + identity (18): the grouped Start reorders/persists by
                          # (engine, gpu) and estimates each group on its own card.
                          "gpu": (j["gpu"] if "gpu" in jkeys else None) or "",

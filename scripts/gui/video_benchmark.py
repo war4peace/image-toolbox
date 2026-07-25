@@ -38,6 +38,20 @@ def _fmt_hms(seconds):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _benchmark_methods():
+    """(label, engine, tier) rows for the benchmark Method combobox: SeedVR2 (batch sweep) then
+    each Real-ESRGAN tier (fixed-ratio, #18 B). Fail-safe: SeedVR2 alone if the esrgan catalog
+    can't be read."""
+    opts = [("SeedVR2", "seedvr2", None)]
+    try:
+        import esrgan_models as em
+        for m in em.catalog():
+            opts.append((f"Real-ESRGAN / {m.kind.capitalize()}", "fixed_ratio", m.kind))
+    except Exception:                                  # noqa: BLE001
+        pass
+    return opts
+
+
 class BenchmarkWindow(tk.Toplevel):
     """Modal benchmark window. Standalone (not a ToolTab): it owns a small subprocess pump
     for the video_benchmark runner's @@TBX@@ events (BSTART / BCELL / BPROBE / BCEILING /
@@ -49,7 +63,7 @@ class BenchmarkWindow(tk.Toplevel):
     # holding VRAM and a benchmark would under-report the ceiling: warn (but don't block).
     VRAM_BUSY_WARN_GB = 2.5
 
-    def __init__(self, master, tab, remote=False, gpu=None):
+    def __init__(self, master, tab, remote=False, gpu=None, method=None):
         super().__init__(master)
         # Build hidden, reveal once fully laid out: a Toplevel is mapped at a default size
         # first, which flashed a tiny square before our geometry + widgets applied.
@@ -89,6 +103,13 @@ class BenchmarkWindow(tk.Toplevel):
         self._hold = ""
         self._marker_buf = None
         self.gpu_id = None
+        # Which upscaling METHOD this window benchmarks: SeedVR2 (batch sweep) or Real-ESRGAN
+        # (fixed-ratio, #18 B). Switchable live via the Method combobox. `method` (engine, tier)
+        # from the caller pre-selects it; else the configured video.engine wins.
+        self._methods = _benchmark_methods()
+        self._method_label_to_val = {lbl: (e, t) for lbl, e, t in self._methods}
+        self._engine, self._tier = method or self._default_method()
+        self._configure_method()            # sets self._cells + self._ratio_tokens
         # Per-compile-mode video_bench keys + whether compile-ON is benchmarkable on THIS machine.
         # Resolved via the runner's own helpers so the table reads exactly the keys the runner writes.
         # Sets self._bench_keys / self._display_modes / self._compile_available / self._compile_why /
@@ -154,6 +175,76 @@ class BenchmarkWindow(tk.Toplevel):
 
     # ── layout ───────────────────────────────────────────────────────────────
 
+    # ── method (SeedVR2 vs Real-ESRGAN, #18 B) ────────────────────────────────
+
+    def _default_method(self):
+        """(engine, tier) pre-selected from the configured video.engine + its model tier."""
+        vid = CFG.get("video", {})
+        eng = (vid.get("engine") or "seedvr2").lower()
+        if eng == "fixed_ratio":
+            try:
+                import esrgan_models as em
+                return "fixed_ratio", em.spec(vid.get("fixed_ratio_model")).kind
+            except Exception:                          # noqa: BLE001
+                return "fixed_ratio", "compact"
+        return "seedvr2", None
+
+    def _method_label(self, engine, tier):
+        for lbl, e, t in self._methods:
+            if e == engine and t == tier:
+                return lbl
+        return self._methods[0][0]
+
+    def _configure_method(self):
+        """Recompute the per-method row/checkbox sets. SeedVR2: checkboxes AND rows are the
+        vb.TARGETS tokens (1:1). Real-ESRGAN: checkboxes are the RATIO tokens (2X/4X) while rows
+        are the CELLS (a ratio can expand to several native-source cells, e.g. 2X -> 720p + 1080p),
+        so the two sets differ and are looked up separately."""
+        if self.is_esrgan:
+            self._ratio_tokens = vb.esrgan_targets(self._tier)
+            cells = vb.build_esrgan_plan(self._ratio_tokens, self._tier)
+            self._cells = {c["name"]: c for c in cells}
+        else:
+            self._ratio_tokens = []
+            self._cells = {}
+
+    @property
+    def is_esrgan(self):
+        return self._engine == "fixed_ratio"
+
+    def _row_tokens(self):
+        """Tokens that get a results-table ROW (SeedVR2 targets, or ESRGAN cell names)."""
+        return list(self._cells) if self.is_esrgan else list(self.ALL_TARGETS)
+
+    def _checkbox_tokens(self):
+        """Tokens that get a benchmark CHECKBOX (SeedVR2 targets, or ESRGAN ratio tokens)."""
+        return list(self._ratio_tokens) if self.is_esrgan else list(self.ALL_TARGETS)
+
+    def _dims(self, token):
+        """Output (w, h) for a row/target token, method-aware (ESRGAN cell or SeedVR2 preset)."""
+        if token in self._cells:
+            c = self._cells[token]
+            return c["out_w"], c["out_h"]
+        if token in vb.TARGETS:
+            return vb.TARGETS[token][:2]
+        return (0, 0)
+
+    def _mp(self, token):
+        w, h = self._dims(token)
+        return w * h / 1_000_000.0
+
+    def _tier_model_key(self):
+        """The representative model key for the selected ESRGAN tier (what --esrgan-model wants,
+        so the runner resolves the same tier). Falls back to the catalog default."""
+        try:
+            import esrgan_models as em
+            for m in em.catalog():
+                if m.kind == self._tier:
+                    return m.key
+            return em.DEFAULT_MODEL
+        except Exception:                              # noqa: BLE001
+            return "realesr-general-x4v3"
+
     def _resolve_keys(self):
         """Resolve the per-torch.compile-mode video_bench keys the runner will WRITE, plus whether
         compile-ON can actually run here. Sets:
@@ -167,10 +258,18 @@ class BenchmarkWindow(tk.Toplevel):
         both compile modes is a local-GPU feature; a pod owns its own compile. Resolved ONCE at open
         (the local gate verifies by compiling, ~1 s, cached per process). Fail-safe: any problem
         degrades to a single OFF row keyed by the bare model tag, so the window still opens."""
-        self.model_tag = sizer.model_tag(CFG.get("video", {}).get(
-            "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
         self._compile_available = False
         self._compile_why = None
+        if self.is_esrgan:
+            # Real-ESRGAN has no torch.compile and no batch sweep: ONE regime (the tier), keyed by
+            # the esrgan tier bench model. `mode` == the tier, so the shared (token, mode) row
+            # machinery still applies (the #0 column shows the tier instead of a compile state).
+            self.model_tag = f"Real-ESRGAN {self._tier.capitalize()}"
+            self._bench_keys = {self._tier: vb.esrgan_bench_model(self._tier)}
+            self._display_modes = [self._tier]
+            return
+        self.model_tag = sizer.model_tag(CFG.get("video", {}).get(
+            "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
         try:
             if self.remote:
                 key = vb.resolve_bench_key(remote=True, log_fn=lambda *_a, **_k: None)
@@ -199,6 +298,8 @@ class BenchmarkWindow(tk.Toplevel):
         """The compile modes the NEXT run will benchmark. LOCAL: the no-compile baseline always,
         plus compile-ON when 'Also use Torch Compile' is ticked (and available). REMOTE: the single
         config-derived mode (the runner reads config; no --compile-modes is passed)."""
+        if self.is_esrgan:
+            return list(self._display_modes)            # a single mode: the tier (no compile)
         if self.remote:
             return list(self._display_modes)
         modes = ["off"]
@@ -224,11 +325,15 @@ class BenchmarkWindow(tk.Toplevel):
                 "This is independent of the Torch Compile checkbox in Settings; it only affects "
                 "this benchmark.")
 
-    @staticmethod
-    def _target_label(t):
-        """Checkbox text: dims-named ladder cells show the dimensions (with ×) + aspect, preset
-        names keep their name; both carry the output megapixels so the VRAM cost is visible at a
-        glance (the ceiling scales with output MP)."""
+    def _target_label(self, t):
+        """Checkbox text. SeedVR2: dims-named ladder cells show dimensions + aspect, presets keep
+        their name, both carry output MP. Real-ESRGAN: a ratio token (2X/4X) shows the native
+        upscale + the cell output(s) it covers (e.g. '2X · 720p→1440p, 1080p→4K')."""
+        if self.is_esrgan:
+            cells = [c for c in self._cells.values() if c["ratio"] == t]
+            parts = ", ".join(f"{c['src_h']}p→{min(c['out_w'], c['out_h'])}p"
+                              for c in cells) or "native"
+            return f"{t} · {parts}"
         w, h = vb.TARGETS[t][:2]
         mp = w * h / 1_000_000.0
         if "x" in t:
@@ -237,7 +342,128 @@ class BenchmarkWindow(tk.Toplevel):
 
     def _is_ladder(self, t):
         """True for a dims-named 4:3 ladder cell (vs a 16:9 preset like 1080p/1440p/4K)."""
-        return "x" in t
+        return "x" in t and t in vb.TARGETS
+
+    def _row_label(self, t):
+        """The Target-column text for a row token: the bare token for SeedVR2, a friendly
+        'ratio · short-side' for a Real-ESRGAN cell (e.g. '2X · 1440p')."""
+        if t in self._cells:
+            c = self._cells[t]
+            return f"{c['ratio']} · {min(c['out_w'], c['out_h'])}p"
+        return t
+
+    def _rebuild_targets(self):
+        """(Re)build the checkbox area for the current method. SeedVR2: the 4:3 ladder + presets
+        + 'Also use Torch Compile' + Restart. Real-ESRGAN: the 2X/4X ratio checkmarks + Restart
+        (no compile). Rebuilt on a method switch; the persistent Method combobox is untouched."""
+        for w in self._targets_holder.winfo_children():
+            w.destroy()
+        self._toggles = []
+        self._target_cb = {}
+        self.target_vars = {}
+        holder = self._targets_holder
+        tokens = self._checkbox_tokens()
+        cols = 1 if self.is_esrgan else 4         # ESRGAN ratios stack; SeedVR2 grid wraps
+        for i, t in enumerate(tokens):
+            v = tk.BooleanVar(value=False)
+            v.trace_add("write", lambda *_a: self._refresh_estimate())
+            self.target_vars[t] = v
+            cb = ttk.Checkbutton(holder, text=self._target_label(t), variable=v)
+            cb.grid(row=i // cols, column=i % cols, padx=(0, 16), pady=(0, 4), sticky="w")
+            self._toggles.append(cb)
+            self._target_cb[t] = cb
+        base_row = (len(tokens) + cols - 1) // cols
+        span = max(cols, 1)
+        if not self.is_esrgan:
+            # "Also use Torch Compile": benchmark both compile modes at once (SeedVR2 only).
+            self.also_compile_var.set(bool(self._compile_available and not self.remote))
+            self.also_compile_cb = ttk.Checkbutton(
+                holder, text="Also use Torch Compile (benchmark with AND without compile)",
+                variable=self.also_compile_var, command=self._refresh_estimate)
+            self.also_compile_cb.grid(row=base_row, column=0, columnspan=span,
+                                      sticky="w", pady=(6, 0))
+            if not (self._compile_available and not self.remote):
+                self.also_compile_cb.configure(state="disabled")
+            else:
+                self._toggles.append(self.also_compile_cb)   # locked while a run is in flight
+            self.also_compile_tip = Tooltip(self.also_compile_cb, self._also_compile_tip_text())
+            base_row += 1
+        self.restart_var.set(False)
+        rb = ttk.Checkbutton(holder, text="Restart (discard saved results for the ticked targets)",
+                             variable=self.restart_var, command=self._refresh_estimate)
+        rb.grid(row=base_row, column=0, columnspan=span, sticky="w", pady=(2, 0))
+        self._toggles.append(rb)
+        Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
+                    "On: clears the saved probes for the TICKED targets only and measures\n"
+                    "them from scratch. Targets you did not tick keep their results.")
+
+    def _on_method_change(self):
+        """Method combobox changed: switch engine/tier, then rebuild the checkbox area and the
+        results table for the new method. No-op mid-run (the combobox is read-only but a switch
+        would strand a running sweep), and no-op when the selection did not actually change."""
+        if self.proc is not None:
+            self.method_var.set(self._method_label(self._engine, self._tier))
+            return
+        eng, tier = self._method_label_to_val.get(self.method_var.get(),
+                                                  (self._engine, self._tier))
+        if (eng, tier) == (self._engine, self._tier):
+            return
+        self._engine, self._tier = eng, tier
+        self._configure_method()
+        self._resolve_keys()
+        self._rebuild_targets()
+        self._rebuild_rows()
+        if self.gpu_id:
+            self.header_var.set(
+                f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
+            self._default_check_targets()
+        self._refresh_estimate()
+
+    def _rebuild_rows(self):
+        """Clear + repopulate the results table for the current method (used on a method switch).
+        Relabels the #0 column to name the regime: compile mode (SeedVR2) or model tier (ESRGAN)."""
+        for iid in self.tree.get_children(""):
+            self.tree.delete(iid)
+        self._rows.clear()
+        self._row_meta.clear()
+        self._row_order.clear()
+        h0 = "Model" if self.is_esrgan else "Torch Compile"
+        self.tree.heading("#0", text=h0, command=lambda: self._sort_tree("#0"))
+        if "_titles" in self._bench_sort:
+            self._bench_sort["_titles"]["#0"] = h0
+        if self.gpu_id:
+            self._load_prior()
+            self._populate_bench_filters()
+            self._apply_feasibility()
+
+    def _default_check_targets(self):
+        """Pre-tick sensible defaults for the current method. SeedVR2: the feasible landscape
+        ladder cells + presets the card's VRAM can reach. Real-ESRGAN: every native ratio (it is
+        light, so a default run covers them all)."""
+        if self.is_esrgan:
+            for t in self._checkbox_tokens():
+                self.target_vars[t].set(True)
+            return
+        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
+        for t in self.ALL_TARGETS:
+            if self._is_ladder(t):
+                w, h = vb.TARGETS[t][:2]
+                if max_mp and w >= h and (w * h / 1_000_000.0) <= max_mp + 1e-6:
+                    self.target_vars[t].set(True)
+        if self.total_vram_gb >= 40 and "1440p" in self.target_vars:
+            self.target_vars["1440p"].set(True)
+        if self.total_vram_gb >= 80 and "4K" in self.target_vars:
+            self.target_vars["4K"].set(True)
+
+    def _set_esrgan_row(self, t, m, probes):
+        """Render a Real-ESRGAN cell row from its probes: the batch columns are '—' (a GAN has no
+        batch), the s/frame + Peak VRAM come from the single probe, status = saved."""
+        iid = self._ensure_row(t, m)
+        for col in ("ceiling", "saved", "overlap"):
+            self.tree.set(iid, col, "—")
+        self.tree.set(iid, "status", "saved" if probes else "not benchmarked")
+        self._set_saved_metrics(t, m, probes)
+        self._set_runtime(t, m)
 
     def _build(self):
         self.columnconfigure(0, weight=1)
@@ -262,44 +488,31 @@ class BenchmarkWindow(tk.Toplevel):
         tk.Message(self, text=info, width=680, anchor="w", justify="left",
                    fg="#7f8a99").grid(row=1, column=0, sticky="ew", **pad)
 
-        # Target selection. Too many for one row now (4:3 ladder + presets), so wrap into a grid;
-        # the default check-state is set later in _fill_gpu, once the card's VRAM is known.
-        tf = ttk.LabelFrame(self, text=" Targets to benchmark ", padding=8)
+        # Method + target selection. The Method combobox (SeedVR2 vs a Real-ESRGAN tier, #18 B)
+        # is persistent; the checkbox area below it is rebuilt when the method changes (the
+        # targets differ: SeedVR2 has its 4:3 ladder + presets, Real-ESRGAN has 2X/4X ratios).
+        tf = ttk.LabelFrame(self, text=" Method & targets ", padding=8)
         tf.grid(row=2, column=0, sticky="ew", pady=(8, 0), **pad)
-        self._toggles = []
-        self._target_cb = {}
-        cols = 4
-        for i, t in enumerate(self.ALL_TARGETS):
-            v = tk.BooleanVar(value=False)
-            v.trace_add("write", lambda *_a: self._refresh_estimate())
-            self.target_vars[t] = v
-            cb = ttk.Checkbutton(tf, text=self._target_label(t), variable=v)
-            cb.grid(row=i // cols, column=i % cols, padx=(0, 16), pady=(0, 4), sticky="w")
-            self._toggles.append(cb)
-            self._target_cb[t] = cb
-        base_row = (len(self.ALL_TARGETS) + cols - 1) // cols
-        # "Also use Torch Compile" (before Restart): benchmark both compile modes at once. Default
-        # ticked when the machine can compile; disabled + unticked otherwise (remote, or no toolchain).
-        self.also_compile_var = tk.BooleanVar(
-            value=bool(self._compile_available and not self.remote))
-        self.also_compile_cb = ttk.Checkbutton(
-            tf, text="Also use Torch Compile (benchmark with AND without compile)",
-            variable=self.also_compile_var, command=self._refresh_estimate)
-        self.also_compile_cb.grid(row=base_row, column=0, columnspan=cols, sticky="w", pady=(6, 0))
-        if not (self._compile_available and not self.remote):
-            self.also_compile_cb.configure(state="disabled")
-        else:
-            self._toggles.append(self.also_compile_cb)      # locked while a run is in flight
-        self.also_compile_tip = Tooltip(self.also_compile_cb, self._also_compile_tip_text())
-
+        tf.columnconfigure(0, weight=1)
+        mrow = ttk.Frame(tf)
+        mrow.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(mrow, text="Method:").pack(side="left")
+        self.method_var = tk.StringVar(value=self._method_label(self._engine, self._tier))
+        self.method_combo = ttk.Combobox(
+            mrow, textvariable=self.method_var, state="readonly", width=26,
+            values=[lbl for lbl, _e, _t in self._methods])
+        self.method_combo.pack(side="left", padx=(4, 0))
+        self.method_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_method_change())
+        Tooltip(self.method_combo,
+                "What to benchmark. SeedVR2 sweeps the batch size upward to each target's VRAM "
+                "ceiling. Real-ESRGAN is a light fixed-ratio (2x/4x) upscaler: it measures one "
+                "speed + VRAM point per ratio (no batch sweep), on almost any GPU.")
+        # Rebuildable checkbox holder (its contents depend on the method).
+        self._targets_holder = ttk.Frame(tf)
+        self._targets_holder.grid(row=1, column=0, sticky="ew")
         self.restart_var = tk.BooleanVar(value=False)
-        rb = ttk.Checkbutton(tf, text="Restart (discard saved results for the ticked targets)",
-                             variable=self.restart_var, command=self._refresh_estimate)
-        rb.grid(row=base_row + 1, column=0, columnspan=cols, sticky="w", pady=(2, 0))
-        self._toggles.append(rb)
-        Tooltip(rb, "Off (default): a new run RESUMES, keeping finished probes.\n"
-                    "On: clears the saved probes for the TICKED targets only and measures\n"
-                    "them from scratch. Targets you did not tick keep their results.")
+        self.also_compile_var = tk.BooleanVar(value=False)
+        self._rebuild_targets()
 
         # Results table (fixed 5 rows) + the program-output log below it, filling the rest.
         rf = ttk.LabelFrame(self, text=" Results & log ", padding=4)
@@ -495,20 +708,10 @@ class BenchmarkWindow(tk.Toplevel):
         self.gpu_id = name or "local"
         self.total_vram_gb = round((g.get("gpu_total_mb") or 0) / 1024.0)
         self.header_var.set(f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
-        # Default-check the targets this card can plausibly reach (all stay toggleable). Pre-check
-        # every feasible LANDSCAPE 4:3 ladder cell (the common old-camera case); PORTRAIT cells
-        # stay available but unchecked (you only need them if you shot portrait, and they'd double
-        # the default run time). Add the 16:9 presets only on cards big enough for them.
-        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
-        for t in self.ALL_TARGETS:
-            if self._is_ladder(t):
-                w, h = vb.TARGETS[t][:2]
-                if max_mp and w >= h and (w * h / 1_000_000.0) <= max_mp + 1e-6:
-                    self.target_vars[t].set(True)
-        if self.total_vram_gb >= 40:
-            self.target_vars["1440p"].set(True)
-        if self.total_vram_gb >= 80:
-            self.target_vars["4K"].set(True)
+        # Default-check the targets this card can plausibly reach (all stay toggleable). SeedVR2:
+        # every feasible LANDSCAPE 4:3 ladder cell + the presets a big card can do. Real-ESRGAN:
+        # every native ratio (it is light). See _default_check_targets.
+        self._default_check_targets()
         self._load_prior()
         self._populate_bench_filters()      # rows now exist: fill the filter combos
         self._apply_feasibility()
@@ -523,6 +726,14 @@ class BenchmarkWindow(tk.Toplevel):
         benchmarking them is a guaranteed failure. Gate on the same max-output-MP model the
         Target picker uses (seed by VRAM, raised by whatever this card has already proven), so
         anything measured feasible stays selectable."""
+        if self.is_esrgan:
+            # Real-ESRGAN is a light fixed-ratio GAN that tiles on OOM, so no cell is VRAM-gated;
+            # keep every ratio checkbox enabled.
+            for t in self._checkbox_tokens():
+                cb = self._target_cb.get(t)
+                if cb is not None:
+                    cb.configure(state="normal")
+            return
         max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
         if not max_mp:
             return
@@ -576,15 +787,18 @@ class BenchmarkWindow(tk.Toplevel):
         """Pre-fill the table from saved probes (a resumable prior run), one row per (target,
         compile-mode). Each mode reads its OWN key, so the with- and without-compile results show
         side by side."""
-        for t in self.ALL_TARGETS:
-            box = vb.TARGETS[t]
+        for t in self._row_tokens():
+            w, h = self._dims(t)
             for m in self._display_modes:
                 self._ensure_row(t, m)
                 probes = vb.drop_collapsed(db.get_bench_probes(
-                    self.conn, self.gpu_id, self._bench_key(m), box[0], box[1]))
+                    self.conn, self.gpu_id, self._bench_key(m), w, h))
                 if not probes:
                     self.tree.set(self._rows[(t, m)], "status", "not benchmarked")
                     self._set_runtime(t, m)
+                    continue
+                if self.is_esrgan:
+                    self._set_esrgan_row(t, m, probes)
                     continue
                 ceil = vb.cell_ceiling(probes)
                 saved = vb.throughput_optimal_batch(probes)
@@ -601,8 +815,8 @@ class BenchmarkWindow(tk.Toplevel):
         key = (target, mode)
         if key not in self._rows:
             iid = self.tree.insert(
-                "", "end", text=mode.upper(),          # "OFF" / "ON" in the Torch Compile column
-                values=(target, "", "", "", "", "", "", ""))
+                "", "end", text=mode.upper(),          # "OFF"/"ON" (compile) or the tier (ESRGAN)
+                values=(self._row_label(target), "", "", "", "", "", "", ""))
             self._rows[key] = iid
             self._row_meta[iid] = (target, mode)
             self._row_order.append(iid)
@@ -677,7 +891,7 @@ class BenchmarkWindow(tk.Toplevel):
             if col == "#0":
                 return 0 if m == "off" else 1
             if col == "target":
-                w, h = vb.TARGETS[t][:2]
+                w, h = self._dims(t)
                 return w * h
             if col in ("ceiling", "saved", "overlap", "spf", "peak"):
                 return self._num(self.tree.set(iid, col))
@@ -710,6 +924,14 @@ class BenchmarkWindow(tk.Toplevel):
 
     def _set_ceiling(self, target, mode, ceil, status, saved=None):
         iid = self._ensure_row(target, mode)
+        if self.is_esrgan:
+            # A fixed-ratio GAN has no batch/overlap: those columns stay '—'; s/frame + Peak
+            # VRAM (from _set_saved_metrics / live BPROBE) carry the result.
+            for col in ("ceiling", "saved", "overlap"):
+                self.tree.set(iid, col, "—")
+            self.tree.set(iid, "status", status)
+            self._set_runtime(target, mode)
+            return
         self.tree.set(iid, "ceiling", str(ceil) if ceil else "—")
         self.tree.set(iid, "saved", str(saved) if saved else "—")
         # Overlap reflects the batch AUTO will actually run: the saved (fastest) one, else the
@@ -745,7 +967,7 @@ class BenchmarkWindow(tk.Toplevel):
         re-accumulates on resume."""
         if not self.gpu_id:
             return 0.0
-        w, h = vb.TARGETS[target][:2]
+        w, h = self._dims(target)
         probes = db.get_bench_probes(self.conn, self.gpu_id, self._bench_key(mode), w, h)
         return sum((p["seconds"] or 0) for p in probes)
 
@@ -754,7 +976,12 @@ class BenchmarkWindow(tk.Toplevel):
         self.tree.set(self._ensure_row(target, mode), "runtime", _fmt_hms(s) if s else "—")
 
     def _selected_targets(self):
-        return [t for t in self.ALL_TARGETS if self.target_vars[t].get()]
+        return [t for t in self._checkbox_tokens()
+                if self.target_vars.get(t) and self.target_vars[t].get()]
+
+    def _selected_cells(self, ratios):
+        """The Real-ESRGAN cells covered by the ticked ratio tokens."""
+        return [c for c in self._cells.values() if c["ratio"] in ratios]
 
     def _refresh_estimate(self):
         if not self.gpu_id:
@@ -765,6 +992,8 @@ class BenchmarkWindow(tk.Toplevel):
             self.start_btn.configure(state="disabled")
             return
         self.start_btn.configure(state="normal" if self.proc is None else "disabled")
+        if self.is_esrgan:
+            return self._refresh_esrgan_estimate(targets)
         plan = vb.build_plan(targets)
         run_modes = self._run_modes()
         # Estimate + done count sum over every compile mode the run will sweep (each is a full pass).
@@ -784,6 +1013,25 @@ class BenchmarkWindow(tk.Toplevel):
         self.estimate_var.set(f"{verb}: {len(targets)} target(s){modes_note} · estimated "
                               f"~{_fmt_hms(est)} (rough; the card's real speed is unknown until "
                               f"measured).")
+
+    def _refresh_esrgan_estimate(self, ratios):
+        """Estimate line for a Real-ESRGAN run: one probe per cell (no sweep). If this card+tier
+        already has a measured rate the runtime is shown; otherwise the run itself measures it."""
+        cells = self._selected_cells(ratios)
+        key = self._bench_key(self._tier)
+        done = sum(1 for c in cells
+                   if db.get_bench_probes(self.conn, self.gpu_id, key, c["out_w"], c["out_h"]))
+        verb = "Restart" if self.restart_var.get() else ("Resume" if done else "Run")
+        self.start_btn.configure(text=verb)
+        spm = ve.esrgan_seconds_per_mp(self.gpu_id, self._tier, self.conn)
+        if spm:
+            est = sum(c["frames"] * c["mp"] * spm for c in cells)
+            tail = f" · ~{_fmt_hms(est)}"
+        else:
+            tail = " · measured on this run (fast)"
+        self.estimate_var.set(
+            f"{verb}: {len(cells)} cell(s){tail} · Real-ESRGAN {self._tier.capitalize()} "
+            f"(fixed {'/'.join(ratios)}).")
 
     # ── run / stop ───────────────────────────────────────────────────────────
 
@@ -820,17 +1068,29 @@ class BenchmarkWindow(tk.Toplevel):
                     parent=self):
                 return
         run_modes = self._run_modes()
-        cmd = [PYTHON_EXE, "-u", os.path.join(SCRIPT_DIR, "video_benchmark.py"),
-               "--targets", ",".join(targets)]
-        if self.remote:
-            cmd.append("--remote")                     # remote uses the config compile setting
+        script = os.path.join(SCRIPT_DIR, "video_benchmark.py")
+        if self.is_esrgan:
+            # Real-ESRGAN (#18 B): pass the ratio tokens + the tier's model key; the runner has
+            # no batch sweep and no compile modes.
+            cmd = [PYTHON_EXE, "-u", script, "--engine", "esrgan",
+                   "--ratios", ",".join(targets), "--esrgan-model", self._tier_model_key()]
+            if self.remote:
+                cmd.append("--remote")
+            if self.restart_var.get():
+                cmd.append("--restart")
+                for c in self._selected_cells(targets):     # clear the cell rows we're redoing
+                    self._set_ceiling(c["name"], self._tier, None, "queued")
         else:
-            cmd += ["--compile-modes", ",".join(run_modes)]
-        if self.restart_var.get():
-            cmd.append("--restart")
-            for t in targets:                          # clear the table rows we're redoing
-                for m in run_modes:
-                    self._set_ceiling(t, m, None, "queued")
+            cmd = [PYTHON_EXE, "-u", script, "--targets", ",".join(targets)]
+            if self.remote:
+                cmd.append("--remote")                 # remote uses the config compile setting
+            else:
+                cmd += ["--compile-modes", ",".join(run_modes)]
+            if self.restart_var.get():
+                cmd.append("--restart")
+                for t in targets:                      # clear the table rows we're redoing
+                    for m in run_modes:
+                        self._set_ceiling(t, m, None, "queued")
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
@@ -1046,6 +1306,13 @@ class BenchmarkWindow(tk.Toplevel):
         """Human label for a set of shared cards (issue title / status line)."""
         return gpu_ids[0] if len(gpu_ids) == 1 else f"{len(gpu_ids)} GPUs"
 
+    @staticmethod
+    def _cards_in_rows(rows):
+        """The distinct gpu_ids present in a set of share rows, in first-appearance order. The
+        title/filename derive from THIS (what is actually submitted), not the selection, so the
+        community dedup dropping a card entirely can't leave a '3 GPUs' title over a 1-card body."""
+        return list(dict.fromkeys(r.get("gpu_id") for r in rows if r.get("gpu_id")))
+
     def _export(self):
         picked = self._pick_and_rows()
         if picked is None:
@@ -1095,16 +1362,20 @@ class BenchmarkWindow(tk.Toplevel):
 
     def _contribute_ready(self, gpu_ids, to_send, total, checked, err):
         self.contribute_btn.configure(state="normal")
-        label = self._share_label(gpu_ids)
         dropped = total - len(to_send)
         if not to_send:
             self.status_var.set("Nothing new to contribute.")
             messagebox.showinfo(
-                APP_TITLE, f"All of {label}'s results are already in the community data set. "
-                "Nothing new to submit.", parent=self)
+                APP_TITLE, f"All of {self._share_label(gpu_ids)}'s results are already in the "
+                "community data set. Nothing new to submit.", parent=self)
             return
+        # After the community dedup, to_send can cover FEWER cards than were selected (a card whose
+        # every row is already published drops out entirely). Title/filename/label MUST come from
+        # the cards actually IN to_send, or a "3 GPUs" title sits over a one-card body (the bug).
+        sent_ids = self._cards_in_rows(to_send)
+        label = self._share_label(sent_ids)
         import bench_share
-        path = os.path.join(APP_ROOT, "logs", self._default_csv_name(gpu_ids))
+        path = os.path.join(APP_ROOT, "logs", self._default_csv_name(sent_ids))
         try:
             bench_share.write_csv(path, to_send)        # copy on disk for the attach fallback
             csv_text = bench_share.to_text(to_send)
@@ -1113,6 +1384,10 @@ class BenchmarkWindow(tk.Toplevel):
             return
         # How the dedup went, appended to every outcome message.
         note = (f" ({dropped} already in the community set were skipped)" if dropped else "")
+        # Name any SELECTED cards that contributed nothing new, so submitting 1 of 3 isn't a surprise.
+        fully_done = [g for g in gpu_ids if g not in sent_ids]
+        if fully_done:
+            note += (f"; already up to date: {', '.join(fully_done)}")
         if not checked and err is not None:
             note = " (could not check the community set, so all rows are included)"
         mode = contribute_benchmark(label, csv_text, path)
@@ -1241,7 +1516,19 @@ class BenchmarkWindow(tk.Toplevel):
             elif data.get("state") == "done":
                 iid = self._ensure_row(t, mode)
                 oc = data.get("outcome")
-                if oc == "ok":
+                if self.is_esrgan:
+                    # No batch: just the speed + VRAM point (batch columns stay '—').
+                    if oc == "ok":
+                        if data.get("spf") is not None:
+                            self.tree.set(iid, "spf", f"{data['spf']:.2f}")
+                        pa, pr = data.get("peak_alloc"), data.get("peak_reserved")
+                        if pa or pr:
+                            self.tree.set(iid, "peak", f"{pa or '?'}/{pr or '?'} GB")
+                        self.tree.set(iid, "status", "measured")
+                    else:
+                        self.tree.set(iid, "status", oc or "error")
+                    self._set_runtime(t, mode)
+                elif oc == "ok":
                     self.tree.set(iid, "ceiling", str(data.get("batch")))
                     self.tree.set(iid, "overlap", str(sizer.auto_overlap(data.get("batch") or 0)))
                     if data.get("spf") is not None:
@@ -1250,15 +1537,21 @@ class BenchmarkWindow(tk.Toplevel):
                     if pa or pr:
                         self.tree.set(iid, "peak", f"{pa or '?'}/{pr or '?'} GB")
                     self.tree.set(iid, "status", f"batch {data.get('batch')} ok")
+                    self._set_runtime(t, mode)
                 else:
                     self.tree.set(iid, "status", f"batch {data.get('batch')} {oc}")
-                self._set_runtime(t, mode)             # probe recorded -> refresh the cell's total
+                    self._set_runtime(t, mode)
         elif kind == "BCEILING" and data:
-            ceil = data.get("ceiling")
-            saved = data.get("saved")
-            status = (f"done — uses {saved} (max fit {ceil})" if saved and ceil and saved != ceil
-                      else f"done — batch {saved}" if saved else "can't do this target")
-            self._set_ceiling(data["name"], data.get("compile", "off"), ceil, status, saved=saved)
+            if self.is_esrgan:
+                self._set_ceiling(data["name"], data.get("compile", "off"), None, "saved")
+            else:
+                ceil = data.get("ceiling")
+                saved = data.get("saved")
+                status = (f"done — uses {saved} (max fit {ceil})"
+                          if saved and ceil and saved != ceil
+                          else f"done — batch {saved}" if saved else "can't do this target")
+                self._set_ceiling(data["name"], data.get("compile", "off"), ceil, status,
+                                  saved=saved)
         elif kind == "BDONE" and data:
             self.status_var.set("Benchmark stopped." if data.get("stopped") else "Benchmark complete.")
 
@@ -1277,12 +1570,15 @@ class BenchmarkWindow(tk.Toplevel):
             except Exception:                          # noqa: BLE001
                 pass
         self._apply_feasibility()                      # keep infeasible targets gated
-        for t in self.ALL_TARGETS:                     # reflect the persisted final state per mode
-            box = vb.TARGETS[t]
+        for t in self._row_tokens():                   # reflect the persisted final state per mode
+            w, h = self._dims(t)
             for m in self._display_modes:
                 probes = vb.drop_collapsed(db.get_bench_probes(
-                    self.conn, self.gpu_id, self._bench_key(m), box[0], box[1]))
+                    self.conn, self.gpu_id, self._bench_key(m), w, h))
                 if not probes:
+                    continue
+                if self.is_esrgan:
+                    self._set_esrgan_row(t, m, probes)
                     continue
                 ceil = vb.cell_ceiling(probes)
                 saved = vb.throughput_optimal_batch(probes)

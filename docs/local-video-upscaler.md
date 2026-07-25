@@ -1128,3 +1128,47 @@ The benchmark needs a deployed pod, wired the same way a run is (`remote_run.Rem
 Public/shared benchmark aggregation (results surfaced in the GPU picker as expected
 performance) stays a later phase; this section is the scaffolding that makes a remote card
 benchmarkable and its result consumed by the user's own remote runs.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
+## 23. As built: benchmarking the Real-ESRGAN method (local + remote, 0.5.6)
+
+The per-card benchmark grew a second METHOD alongside SeedVR2, so the fixed-ratio Real-ESRGAN
+engine (#11, remote #18 B) is measurable on the same card the same way. A Real-ESRGAN benchmark
+is fundamentally different from a SeedVR2 one and the code reflects that:
+
+- **No batch sweep.** A fixed-ratio GAN runs at batch 1 (batching only raises VRAM, never
+  throughput, docs 14 / `fixed_ratio_engine`), so there is no VRAM ceiling to climb. Each cell is
+  a SINGLE probe measuring **s/frame + peak VRAM**. No `torch.compile` modes either. The clip is
+  sized by DURATION (`DEFAULT_ESR_SECONDS`, 10 s) from each source's native fps (`_esr_frames`,
+  looping a shorter source), not a fixed frame count: ~250-300 frames averages out per-frame noise
+  without a long benchmark (~3-7 min/cell at the quality tier). Tunable headless via `--esr-seconds`.
+- **Cells are (ratio, native source).** The output is `source x ratio` with NO rescale:
+  `4X` = 640x480 -> 2560x1920 (1920p tall), `2X` = 1280x720 -> 2560x1440 AND 1920x1080 -> 3840x2160
+  (4K). The three sources are pinned Wikimedia clips (`benchmark_clip.SOURCES` `e480`/`e720`/`e1080`,
+  fetched on demand like the SeedVR2 ones). Ratios are gated to a tier's NATIVE scales
+  (`esrgan_targets`): compact = `4X` only, quality = `2X` + `4X`, so a probed frame is never
+  ffmpeg-resized (the 2x cells use the native `RealESRGAN_x2plus`, not x4-then-downscale).
+- **Storage reuses `video_bench`.** Probes are keyed by `model = esrgan-<tier>` (`esrgan_bench_model`),
+  `out_w`/`out_h` = the cell, `batch = 1`. No schema change. The GUI renders the batch columns as
+  `—` for these rows and shows s/frame + Peak VRAM instead.
+- **The estimator closes the loop.** Each probe records the per-tier rate via
+  `video_estimate.record_esrgan_rate` (a NEW `esrgan-mp-<tier>` gpu_perf namespace, since a GAN is
+  ~100x cheaper than diffusion so it must NOT read the SeedVR2 RATES table). `estimate_job` /
+  `estimate_queue*` route a `fixed_ratio` job to `esrgan_seconds_per_mp(gpu, tier)`; exact-tier
+  only (compact and quality differ ~16x, never proxied), and an unmeasured card estimates as
+  "unknown" (None) rather than a wrong guess. This is what filled the "fixed_ratio RATES" gap the
+  #18 B as-built deferred.
+- **Local vs remote, one code path.** Both engines share `process_segment`, so `_run_esrgan_cell`
+  drives either. LOCAL builds a `FixedRatioVideoEngine` per cell (2x and 4x are different weights,
+  lazy-downloaded + hash-verified). REMOTE deploys the volume-free esrgan pod
+  (`RemoteSession(mode="esrgan")`, #18 B) once and streams each cell as a normal `/video/submit`
+  job (the worker already reports `seconds` + peak VRAM), reusing the SeedVR2 remote benchmark's
+  deploy/telemetry/funds/teardown. Driven by `video_benchmark.run_esrgan_benchmark`;
+  `--engine esrgan --ratios 2X,4X --esrgan-model <tier key>` headless.
+- **GUI.** The Benchmark window gained a persistent **Method** combobox (SeedVR2 vs each
+  Real-ESRGAN tier). Switching it rebuilds the checkbox area (SeedVR2 ladder/presets vs the 2X/4X
+  ratio checkmarks) and the results table (the #0 column shows the tier instead of a compile mode),
+  with the model chosen by tier so a user can benchmark compact and quality side by side.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>

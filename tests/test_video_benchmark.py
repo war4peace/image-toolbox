@@ -105,11 +105,16 @@ def test_gui_target_labels_build_for_every_target():
     """Guard the 3-tuple TARGETS regression: the Benchmark window builds a checkbox label for
     EVERY target on open (BenchmarkWindow._target_label unpacks TARGETS[t]). When TARGETS grew a
     source key, a `w, h = TARGETS[t]` there crashed window open ('too many values to unpack').
-    The staticmethod needs no Tk root, so exercise it for every target so that can't regress."""
+    `_target_label` is now method-aware (#18 B: a Real-ESRGAN ratio label needs self._cells), so
+    exercise it via a minimal SeedVR2-mode stand-in (no Tk root) for every target."""
     pytest.importorskip("tkinter")
     from gui.video_benchmark import BenchmarkWindow
+
+    class _Stub:                                        # just enough state for the SeedVR2 branch
+        is_esrgan = False
+        _cells = {}
     for t in vb.TARGETS:
-        label = BenchmarkWindow._target_label(t)
+        label = BenchmarkWindow._target_label(_Stub(), t)
         assert str(vb.TARGETS[t][0]) in label or t in label
 
 

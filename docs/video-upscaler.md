@@ -1901,6 +1901,9 @@ another method group, on its own pod mode:
 
 ### 18.6 Deferred (caps come from real benchmarks, not assumptions)
 
+> **Shipped in 0.5.6** (both pieces below): see section 18.9 and
+> `docs/local-video-upscaler.md` section 23.
+
 Two pieces wait for a real remote Real-ESRGAN measurement, matching the local engine's
 "benchmark, don't assume" rule:
 
@@ -1963,5 +1966,19 @@ override (`runpod.esrgan_image_name`), deferred with the rest of the wide-card b
 **Live validation (B2, RTX 2000 Ada $0.24):** no-volume region-wide deploy on the first attempt,
 worker ready in 56 s, a 320x180 clip upscaled x4 to 1280x720 (29 frames in 6.2 s), correct HEVC
 output, clean teardown, 64 s total.
+
+### 18.9 As-built: the Real-ESRGAN benchmark (0.5.6, closes the 18.6 deferral)
+
+The two 18.6-deferred pieces (the Real-ESRGAN estimator rates + the remote Real-ESRGAN benchmark)
+shipped together, LOCAL and REMOTE. The Benchmark GPU window gained a **Method** selector
+(SeedVR2 vs a Real-ESRGAN tier) with ESRGAN-exclusive **2X / 4X** ratio checkmarks; each ticked
+ratio runs a single per-cell s/frame + VRAM probe (no batch sweep) against three pinned real-
+footage sources (640x480 4X->1920p, 720p 2X->1440p, 1080p 2X->4K). Probes persist to `video_bench`
+under `esrgan-<tier>`; the per-tier rate feeds a NEW `esrgan-mp-<tier>` estimator namespace so a
+`fixed_ratio` queue estimates from measured data instead of the ~100x-too-slow SeedVR2 table.
+Local and remote share one `process_segment` cell runner; remote reuses the B2 esrgan pod +
+the SeedVR2 remote-benchmark deploy/funds/telemetry path. Full design + code map:
+`docs/local-video-upscaler.md` section 23. Still deferred: the benchmark-corpus `engine` column
+and a Blackwell cu128 esrgan image override.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>

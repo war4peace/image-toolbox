@@ -335,6 +335,56 @@ def seconds_per_mp(gpu_id, target, conn=None):
     return rate / bench_mp
 
 
+# ─────────────────────────────────────────────
+#  Real-ESRGAN (fixed-ratio) rates (#18 B benchmark)
+# ─────────────────────────────────────────────
+# A fixed-ratio GAN is per-frame and FAR faster than SeedVR2 diffusion, so its cost cannot be
+# read from the SeedVR2 RATES/BENCH_OUT_MP table (that path over-estimated a Real-ESRGAN job by
+# ~100x). Its cost still scales with OUTPUT megapixels (~output pixels per frame), so the rate is
+# stored the same way -- seconds per output-MP -- but in its OWN gpu_perf namespace, keyed by
+# card + MODEL TIER (compact | quality), which differ ~16x in speed. There is NO author seed
+# table: the numbers come only from the user's benchmark (record_esrgan_rate, one clean probe
+# calibrates), so an un-benchmarked card estimates as "unknown" (None) rather than a wrong guess.
+
+
+def _esrgan_tier(model):
+    """The Real-ESRGAN tier ('compact' | 'quality') for a model key, defaulting to 'compact'.
+    Torch-free (esrgan_models is stdlib); fail-safe to the default so a stale key still estimates."""
+    try:
+        import esrgan_models as em
+        return em.spec(model).kind
+    except Exception:
+        return "compact"
+
+
+def esrgan_seconds_per_mp(gpu_id, tier, conn=None):
+    """Seconds per OUTPUT megapixel for a Real-ESRGAN (gpu, tier), from the user's benchmark /
+    run history (db.gpu_perf, task `esrgan-mp-<tier>`). None when this card+tier is unmeasured
+    (no author seed exists). Exact-tier only: compact and quality differ far too much (~16x) for
+    one to proxy the other, so a compact measurement never estimates a quality run."""
+    if conn is None:
+        return None
+    try:
+        import db
+        per_100 = db.get_gpu_perf(conn, f"esrgan-mp-{tier}", gpu_id, min_images=1)
+        if per_100:
+            return per_100 / 100.0
+    except Exception:
+        pass
+    return None
+
+
+def record_esrgan_rate(conn, gpu_id, tier, out_megapixels, seconds):
+    """Record a Real-ESRGAN benchmark/run rate for (gpu, tier). Low trust floor (min_images=1):
+    a benchmark clip is short but a controlled single measurement, so one probe calibrates."""
+    try:
+        import db
+        db.record_gpu_perf(conn, f"esrgan-mp-{tier}", gpu_id, out_megapixels, seconds,
+                           min_images=1)
+    except Exception:
+        pass
+
+
 def record_run(conn, gpu_id, target, out_megapixels, seconds):
     """Accumulate a finished video run's timing so future estimates self-improve
     (db.gpu_perf, task `video-mp-<target>`). The unit is OUTPUT MEGAPIXELS, not
@@ -347,12 +397,19 @@ def record_run(conn, gpu_id, target, out_megapixels, seconds):
         pass
 
 
-def estimate_job(frames, target, gpu_id, conn=None, src_w=None, src_h=None):
+def estimate_job(frames, target, gpu_id, conn=None, src_w=None, src_h=None,
+                 engine=None, model=None):
     """Processing seconds for one (frames, target) job on a GPU, or None if the
     card has no rate for that target. Cost scales with OUTPUT megapixels, so pass
     the source `src_w`/`src_h` for an aspect-correct estimate; without them it
-    assumes the 4:3 benchmark aspect (the old behaviour)."""
-    spm = seconds_per_mp(gpu_id, target, conn)
+    assumes the 4:3 benchmark aspect (the old behaviour).
+
+    A fixed_ratio (Real-ESRGAN) job reads the ESRGAN rate namespace keyed by model tier
+    (esrgan_seconds_per_mp), never the SeedVR2 diffusion table -- a GAN is ~100x cheaper."""
+    if (engine or "seedvr2") == "fixed_ratio":
+        spm = esrgan_seconds_per_mp(gpu_id, _esrgan_tier(model), conn)
+    else:
+        spm = seconds_per_mp(gpu_id, target, conn)
     mp_per_frame = output_megapixels(src_w, src_h, target)
     if spm is None or mp_per_frame is None:
         return None
@@ -372,7 +429,8 @@ def estimate_queue(jobs, gpu_id, price_per_hour, spin_up_seconds=DEFAULT_SPIN_UP
     total_segments = 0
     for j in jobs:
         secs = estimate_job(j.get("frames") or 0, j["target"], gpu_id, conn,
-                            src_w=j.get("width"), src_h=j.get("height"))
+                            src_w=j.get("width"), src_h=j.get("height"),
+                            engine=j.get("engine"), model=j.get("model"))
         if secs is None:
             return None                          # card can't do one of the targets
         total_proc += secs
@@ -472,7 +530,11 @@ def estimate_queue_local(jobs, gpu_id, conn=None):
     total_segments = 0
     calibrated = True
     for j in jobs:
-        spm, cal = local_seconds_per_mp(gpu_id, j["target"], conn)
+        if (j.get("engine") or "seedvr2") == "fixed_ratio":
+            spm = esrgan_seconds_per_mp(gpu_id, _esrgan_tier(j.get("model")), conn)
+            cal = spm is not None            # a Real-ESRGAN rate is benchmark-measured or absent
+        else:
+            spm, cal = local_seconds_per_mp(gpu_id, j["target"], conn)
         mp_per_frame = output_megapixels(j.get("width"), j.get("height"), j["target"])
         if spm is None or mp_per_frame is None:
             return None
