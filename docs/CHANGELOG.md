@@ -8,11 +8,50 @@ Releases page.
 
 ## Contents
 
+- [0.5.7](#057)
 - [0.5.5](#055)
 - [0.5.4](#054)
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.5.7
+
+Video Upscaler UI/UX polish, focused on the remote GPU picker and the queue.
+
+### A job-aware remote GPU picker
+The GPU list now reflects the video you are about to add, not just what is already
+queued:
+
+- It lists **only cards that can actually run the job**. For SeedVR2 that means the
+  selected target's VRAM floor: a 16 GB card is no longer offered for a 4K SeedVR2
+  upscale it can't run. A card you benchmarked for SeedVR2 still shows for the sizes
+  it proved. (A Real-ESRGAN benchmark of the same card does not count: a GAN tiles on
+  out-of-memory and reaches sizes SeedVR2's diffusion can't, so that success was
+  wrongly whitelisting small cards.)
+- It **no longer hides valid cards once the queue has items**, so you can pick a
+  different pod for each video (which was the point of per-video GPU binding).
+- **Prepare is disabled when no GPU is selected**, so a video can't be queued with no
+  card to run it on.
+
+### Queue and segment-extractor consistency
+- The **"#" position column comes first**, and **Remove** now removes every selected
+  row (multi-select works).
+- The queue's **GPU column shows the local card's name** ("Local RTX 3090") for local
+  jobs instead of being blank.
+- The **Extract Segment** window now inherits the picked GPU and Method and offers
+  only the targets that card can reach, and its clips are queued bound to that GPU
+  (so they route to the right pod), instead of being queued with no GPU.
+
+### Smaller clarifications
+- The **Run on** switch (Local / Remote) **locks while the queue is non-empty**: a
+  queue is one mode for now, so this prevents a half-built queue in the wrong mode.
+- Clearer wording: the remote-ready line names the **network volume** region (only
+  SeedVR2 needs it; Real-ESRGAN's pod is volume-free), queue tooltips no longer imply
+  a strict run order (jobs are grouped by method + GPU at Start), and each telemetry
+  row's hint says it expands to a usage graph only while a run is in progress.
 
 ---
 

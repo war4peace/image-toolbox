@@ -151,7 +151,16 @@ wins, per-video from the frame dimensions). A **Method** switch (0.5.6, feature
 a fast, VRAM-light alternative to SeedVR2's per-frame diffusion, local or on a
 volume-free esrgan pod; each queued job carries its engine + picked GPU so a mixed
 queue is grouped and run one pod per (engine, GPU). See the Real-ESRGAN engine
-cluster below. Runs on a **rented RunPod pod** OR on
+cluster below. **The remote GPU picker is job-aware** (0.5.7): it lists only the
+cards that can actually run the video being added and never hides a valid card once
+the queue is non-empty. For SeedVR2 it gates by the selected target's VRAM floor (a
+16 GB card is not offered for a 4K SeedVR2 job, but a card proven by its OWN SeedVR2
+benchmark is; a Real-ESRGAN benchmark of the same card does NOT qualify it, since a
+GAN tiles on OOM and reaches sizes SeedVR2 can't). Prepare is disabled with no GPU
+selected, the **Run on** switch locks while the queue is non-empty (a queue is one
+mode until the mixed local+remote milestone #12), and the segment extractor inherits
+the picked GPU + Method and offers only the targets that card can reach. Runs on a
+**rented RunPod pod** OR on
 **your own local GPU** (local path #7, 0.5.0): a **Run on** switch picks Local or
 Remote (following the install mode), and the same walk, split, reassemble, mux,
 drift check, resume and notification pipeline runs locally either way; only where
