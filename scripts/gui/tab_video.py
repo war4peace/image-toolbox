@@ -1183,7 +1183,7 @@ class VideoTab(ttk.Frame):
             return f"Not ready: could not reach RunPod ({exc}).", False
         if not region:
             return "Not ready: configured network volume not found.", False
-        return f"Remote ready: models in {region}.", True
+        return f"Remote ready. Network volume: {region}.", True
 
     def _set_ready(self, msg, ok):
         self.ready_var.set(msg)
