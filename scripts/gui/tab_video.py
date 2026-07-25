@@ -1766,6 +1766,11 @@ class VideoTab(ttk.Frame):
         ok = bool(row and target)
         if ok and target in self._done_targets(row["rel"]):
             ok = False                           # already upscaled to this target (15.1 step 5)
+        # A queued job binds the currently picked GPU, so there must be one. An empty picker
+        # (no live remote card yet, or no local GPU detected) would bind nothing, letting a
+        # video be queued with no card to run it on.
+        if ok and self._selected_gpu() is None:
+            ok = False
         self.prepare_btn.configure(state="normal" if ok else "disabled")
 
     def _on_scan_double(self, event):
