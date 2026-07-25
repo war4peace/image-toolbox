@@ -673,7 +673,7 @@ class VideoTab(ttk.Frame):
         self.target_combo = ttk.Combobox(pf, textvariable=self.target_var,
                                          state="readonly", width=15, values=[])
         self.target_combo.grid(row=0, column=5, padx=4)
-        self.target_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_prepare_btn())
+        self.target_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_target_change())
         self.prepare_btn = ttk.Button(pf, text="Prepare ▾ add to queue",
                                      command=self._prepare, state="disabled")
         self.prepare_btn.grid(row=0, column=6, padx=(6, 0))
@@ -1629,6 +1629,17 @@ class VideoTab(ttk.Frame):
             return
         self.srcfile_var.set(row["abs"])
         self._populate_target_combo(row)
+        # The source's dimensions changed, so the SeedVR2 feasibility gate may differ: re-apply
+        # it (network-free) against the already-fetched card list. Remote only (local has one card).
+        if self.mode_var.get() != "local" and getattr(self, "_gpus_raw", None):
+            self._apply_gpu_filter()
+        self._sync_prepare_btn()
+
+    def _on_target_change(self):
+        """Target changed: re-gate the GPU picker for the new target (a bigger SeedVR2 target
+        needs more VRAM), then re-sync Prepare. Remote only; network-free (no GPU refetch)."""
+        if self.mode_var.get() != "local" and getattr(self, "_gpus_raw", None):
+            self._apply_gpu_filter()
         self._sync_prepare_btn()
 
     def _current_max_mp(self):
@@ -1732,8 +1743,15 @@ class VideoTab(ttk.Frame):
         self._target_label_to_token = dict(zip(labels, feas))
         self.target_combo.configure(values=labels)
         if feas:
-            nxt = next((t for t in feas if t not in done_targets), feas[0])
-            self.target_var.set(ve.target_label(w, h, nxt))
+            # Keep the user's current target if it is still feasible (this runs on every GPU
+            # change too, and must not snap a deliberate pick back to the default); else default
+            # to the first not-yet-done target. A fresh source has a stale label that won't match.
+            cur = self.target_var.get()
+            if cur in labels:
+                self.target_var.set(cur)
+            else:
+                nxt = next((t for t in feas if t not in done_targets), feas[0])
+                self.target_var.set(ve.target_label(w, h, nxt))
         else:
             self.target_var.set("")
 
@@ -2393,18 +2411,55 @@ class VideoTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _populate_gpus(self, gpus):
+        # Cache the raw live list; the actual picker is (re)built by _apply_gpu_filter, which
+        # is also called (network-free) when the Method/Target/source changes so the SeedVR2
+        # feasibility gate stays in sync with what the NEXT video would be queued as.
+        self._gpus_raw = list(gpus or [])
+        self._apply_gpu_filter()
+
+    def _seedvr2_gpu_ok(self, g, target, w, h):
+        """Whether a card may be offered for a SeedVR2 job at `target`. SeedVR2 needs real VRAM
+        (a 16 GB card can't do 4K), so a card qualifies only when it clears the target's VRAM
+        floor (>= 32 GB, and the higher per-target floor for 1440p/4K) OR has been successfully
+        benchmarked / already run to at least this target's output size (db proof, so a proven
+        smaller card like a 24 GB 3090 measured at 1080p still shows)."""
         import video_estimate as ve
+        floor = max(32, ve.VRAM_FLOOR.get(target, 0))
+        if (g.get("memory_gb") or 0) >= floor:
+            return True
+        try:
+            import db
+            proven = db.max_feasible_output_mp(self._conn(), g.get("id") or g.get("name"))
+        except Exception:                                # noqa: BLE001 (fail-safe: no proof)
+            proven = None
+        if not proven:
+            return False
+        mp = ve.output_megapixels(w, h, target)
+        return mp is not None and mp <= proven + 1e-6
+
+    def _apply_gpu_filter(self):
+        """(Re)build the GPU picker from the last-fetched live list. For a SeedVR2 job the list
+        is gated to cards that can actually run the selected target (_seedvr2_gpu_ok), so a
+        too-small card is never offered for e.g. a 4K SeedVR2 job. Real-ESRGAN is a light
+        fixed-ratio GAN that tiles on OOM, so it is NOT gated here. The remaining cards are then
+        ranked cheapest-first for any card we have a rate for, followed by every other eligible
+        card (so the picker never strands a queue on one GPU). Network-free; safe to call on
+        every Method/Target/source change. Preserves the current selection when it survives."""
+        import video_estimate as ve
+        gpus = list(getattr(self, "_gpus_raw", []) or [])
+        engine, _model = self._selected_method()
+        if engine != "fixed_ratio":
+            target = self._selected_target_token()
+            if target:
+                w, h = self._selected_source_dims()
+                gpus = [g for g in gpus if self._seedvr2_gpu_ok(g, target, w, h)]
+        g0 = self._selected_gpu()
+        prev = (g0.get("id") or g0.get("name")) if g0 else None
         jobs = self._queue_jobs()
-        # Rank the cards we have a rate for cheapest-first (with a cost estimate), then append
-        # EVERY other live-available card so the picker never hides a valid GPU. Per-item binding
-        # means the user picks a card for the NEXT video, which may differ from anything queued;
-        # an un-benchmarked card has no rate yet but must still be selectable (just without a cost
-        # quote). Filtering the list down to rate-having cards was the bug that stranded a queue
-        # on the one GPU it already used, blocking other pods for other videos.
         ranked = ve.recommend_gpus(gpus, jobs, self._spin_up(),
                                    conn=self._conn()) if jobs else []
         seen = {g.get("id") or g.get("name") for g in ranked}
-        rest = [g for g in (gpus or []) if (g.get("id") or g.get("name")) not in seen]
+        rest = [g for g in gpus if (g.get("id") or g.get("name")) not in seen]
         self._gpu_choices = ranked + rest
         labels = []
         for g in self._gpu_choices:
@@ -2414,10 +2469,24 @@ class VideoTab(ttk.Frame):
             labels.append(f"{g['name']} · {g['memory_gb']} GB · {price} ({g['stock']}){tail}")
         self.gpu_combo.configure(values=labels)
         if labels:
-            self.gpu_combo.current(0)
+            idx = 0
+            if prev:
+                for i, g in enumerate(self._gpu_choices):
+                    if (g.get("id") or g.get("name")) == prev:
+                        idx = i
+                        break
+            self.gpu_combo.current(idx)
         else:
             self.gpu_var.set("no eligible GPU available right now")
         self._on_gpu_change()
+
+    def _selected_source_dims(self):
+        """(width, height) of the currently selected scan-list source, or (None, None)."""
+        sel = self.scan_tree.selection()
+        if sel and sel[0] in self._scan_rows:
+            r = self._scan_rows[sel[0]].get("r") or {}
+            return r.get("width"), r.get("height")
+        return None, None
 
     def _refresh_local_gpu(self):
         """Local mode (#7): the 'GPU' is simply this machine's card (no live list / price /
