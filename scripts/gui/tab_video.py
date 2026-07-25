@@ -733,22 +733,24 @@ class VideoTab(ttk.Frame):
 
         # "Place" = the run order (1 = next). Kept visible so re-sorting other columns
         # (a view-only sort) never hides where a job actually sits in the queue.
-        qcols = ("place", "method", "gpu", "target", "status", "res", "dur", "codec", "fps",
-                 "frames", "segs")
-        self.queue_tree = ttk.Treeview(qf, columns=qcols, show="tree headings", height=5)
+        # "#" (run order) is deliberately the FIRST column, then the file, then the rest. The
+        # file lives in a normal column (not the tree #0 column) so "#" can precede it; the queue
+        # is flat, so dropping the tree column costs nothing.
+        qcols = ("place", "file", "method", "gpu", "target", "status", "res", "dur", "codec",
+                 "fps", "frames", "segs")
+        self.queue_tree = ttk.Treeview(qf, columns=qcols, show="headings", height=5)
         self._queue_sort = {}
         self._queue_rows = {}            # iid -> {rel, target, props} for sort/actions
         self._queue_order = []           # iids in true (unfiltered) queue order
-        _q_titles = {"#0": "File"}
-        self.queue_tree.column("#0", width=200, stretch=True)
-        for c, txt, w in (("place", "#", 36), ("method", "Method", 120),
-                          ("gpu", "GPU", 110),
+        _q_titles = {}
+        for c, txt, w in (("place", "#", 40), ("file", "File", 200),
+                          ("method", "Method", 120), ("gpu", "GPU", 110),
                           ("target", "Target", 60), ("status", "Status", 80),
                           ("res", "Resolution", 90), ("dur", "Duration", 70),
                           ("codec", "Codec", 60), ("fps", "FPS", 50),
                           ("frames", "Frames", 70), ("segs", "Segments", 70)):
             _q_titles[c] = txt
-            self.queue_tree.column(c, width=w, stretch=False,
+            self.queue_tree.column(c, width=w, stretch=(c == "file"),
                                    anchor="e" if c == "place" else "w")
         self._queue_sort["_titles"] = _q_titles
         for c, txt in _q_titles.items():
@@ -827,8 +829,15 @@ class VideoTab(ttk.Frame):
                 "the same speedup the rented-pod runs use. Without it, local runs work fine "
                 "but skip compile.")
         self.estimate_var = tk.StringVar(value="Add videos to the queue for an estimate.")
-        ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
-                  foreground="#2f6f3f").grid(row=0, column=5, sticky="ew", padx=(12, 0))
+        self.estimate_lbl = ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
+                                      foreground="#2f6f3f")
+        self.estimate_lbl.grid(row=0, column=5, sticky="ew", padx=(12, 0))
+        Tooltip(self.estimate_lbl,
+                "How long the queue will take (and, for a rented pod, what it will cost), shown "
+                "before anything starts. Time depends on the target resolution; the first segment "
+                "calibrates the estimate and it sharpens as the run proceeds. '(rough)' means it "
+                "is seeded from benchmark data, not from your own measured runs yet.",
+                wraplength=W)
 
         # 7) Start / Stop + Auto-resume + progress + status.
         af = ttk.Frame(self)
@@ -2000,9 +2009,9 @@ class VideoTab(ttk.Frame):
             gpu_id = (j["gpu"] if "gpu" in jkeys else None) or None
             gpu_lbl = _short_gpu(gpu_id)
             iid = self.queue_tree.insert(
-                "", "end", text=text,
-                values=(place, method, gpu_lbl, j["target"], j["status"], res, dur, codec, fps,
-                        frames, segtxt),
+                "", "end",
+                values=(place, text, method, gpu_lbl, j["target"], j["status"], res, dur, codec,
+                        fps, frames, segtxt),
                 tags=(j["rel_path"], j["target"], str(clip_id)))
             self._queue_order.append(iid)
             self._queue_rows[iid] = {
@@ -2126,19 +2135,33 @@ class VideoTab(ttk.Frame):
         clip_id = int(tags[2]) if len(tags) >= 3 else 0
         return (tags[0], tags[1], clip_id)
 
+    def _selected_queue_jobs(self):
+        """(rel, target, clip_id) for EVERY selected queue row, in selection order. The list is
+        multi-select ('extended'), so Remove and the context menu act on all of them."""
+        jobs = []
+        for iid in self.queue_tree.selection():
+            tags = self.queue_tree.item(iid, "tags")
+            if len(tags) >= 2:
+                clip_id = int(tags[2]) if len(tags) >= 3 else 0
+                jobs.append((tags[0], tags[1], clip_id))
+        return jobs
+
     def _queue_remove(self):
-        job = self._selected_queue_job()
-        if not job:
+        jobs = self._selected_queue_jobs()
+        if not jobs:
             return
         import batch_video_upscale as bv
         conn = self._conn()
-        # Reclaim the removed job's staging dir (its segments are gigabytes and only got
-        # cleaned on success before). Look up its output_path before deleting the rows.
-        row = bv.db.get_video_output(conn, self._root_id, job[0], job[1], clip_id=job[2])
-        bv.db.delete_video_output(conn, self._root_id, job[0], job[1], clip_id=job[2])
-        if row is not None:
-            bv._remove_job_staging(row["output_path"], self._vcfg().get("work_root"))
+        for rel, target, clip_id in jobs:
+            # Reclaim each removed job's staging dir (segments are gigabytes and only got
+            # cleaned on success before). Look up its output_path before deleting the rows.
+            row = bv.db.get_video_output(conn, self._root_id, rel, target, clip_id=clip_id)
+            bv.db.delete_video_output(conn, self._root_id, rel, target, clip_id=clip_id)
+            if row is not None:
+                bv._remove_job_staging(row["output_path"], self._vcfg().get("work_root"))
         self._load_queue()
+        if len(jobs) > 1:
+            self.status_var.set(f"Removed {len(jobs)} jobs from the queue.")
 
     def _retry_job(self, rel, target, clip_id=0):
         """Re-queue a failed / gave-up job (item 4): zero its fail_count and set it
@@ -2210,7 +2233,7 @@ class VideoTab(ttk.Frame):
         """Sort key for a queue row, by the underlying property where numeric."""
         def key(iid):
             row = self._queue_rows.get(iid) or {}
-            if col == "#0":
+            if col == "file":
                 return (row.get("rel") or "").lower()
             if col == "place":
                 return row.get("place") or 0
@@ -2237,7 +2260,10 @@ class VideoTab(ttk.Frame):
         iid = self.queue_tree.identify_row(event.y)
         if not iid:
             return
-        self.queue_tree.selection_set(iid)
+        # Keep an existing multi-selection when right-clicking inside it (so Remove acts on all);
+        # otherwise select just the row under the cursor.
+        if iid not in self.queue_tree.selection():
+            self.queue_tree.selection_set(iid)
         row = self._queue_rows.get(iid)
         if not row:
             return
@@ -2442,9 +2468,11 @@ class VideoTab(ttk.Frame):
                 f"{segs} segments · runs on your GPU (no cost).")
             return
         frames = sum(j.get("frames") or 0 for j in jobs)
+        # The "time depends on the target / first segment calibrates" explanation lives in the
+        # label's tooltip now (it trimmed off the end of the line anyway).
         self.estimate_var.set(
             f"{len(jobs)} job(s) · {frames:,} frames · {segs} segments · runs on your GPU "
-            f"(no cost). Time depends on the target; the first segment calibrates it.")
+            f"(no cost).")
 
     # ── start / stop / run ───────────────────────────────────────────────────
 

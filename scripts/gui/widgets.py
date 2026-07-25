@@ -96,6 +96,13 @@ class Tooltip:
         self.wraplength = wraplength
         self._after = None
         self._tip   = None
+        self.attach(widget)
+
+    def attach(self, widget):
+        """Also show this tooltip when hovering `widget`. Useful for a composite row whose
+        sub-widgets (labels) are recreated on each update: re-attach the fresh children so a
+        hover anywhere on the row raises the same hint. Bindings use add='+', so this never
+        clobbers a widget's own handlers."""
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonPress>", self._hide, add="+")
@@ -248,11 +255,16 @@ class TelemetryRow(ttk.Frame):
             return "#b58900"   # dark yellow
         return "#d11a2a"       # red
 
+    TOOLTIP = ("Live CPU, memory, GPU and temperature. Click the row to open a usage-graph "
+               "window for the run: it can be expanded only while files are being processed "
+               "(the graph records that run, then stays browsable until the next one starts).")
+
     def __init__(self, master, prefix=""):
         super().__init__(master)
         self._prefix = prefix      # optional leading label, e.g. "Remote pod"
         self._labels = []
         self._on_click = None      # callback set by App to open the graph window
+        self._tooltip = Tooltip(self, self.TOOLTIP, wraplength=Tooltip.WRAP_NARROW)
         self._set([(self.IDLE, self.GREY)])
 
     def set_on_click(self, callback):
@@ -286,6 +298,8 @@ class TelemetryRow(ttk.Frame):
             lbl.pack(side="left")
             self._labels.append(lbl)
         self._apply_click_binding()     # labels were recreated: re-bind the click
+        for w in self._labels:          # ... and re-attach the hover tooltip to them
+            self._tooltip.attach(w)
 
     @staticmethod
     def _gb(used_mb, total_mb):
