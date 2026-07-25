@@ -1726,19 +1726,7 @@ class VideoTab(ttk.Frame):
         w, h = r.get("width"), r.get("height")
         done_targets = self._done_targets(row["rel"])
         engine, model = self._selected_method()
-        if engine == "fixed_ratio":
-            import esrgan_models as em
-            scales = em.tier_scales(em.spec(model).kind)
-
-            def _ok(t):
-                s = ve.fit_scale(w, h, t)
-                # Exact native scale only (small tolerance for odd source dims / rounding),
-                # so no resize of the generated frame is ever needed.
-                return s is not None and any(abs(s / ns - 1.0) <= 0.01 for ns in scales)
-            feas = [t for t in row.get("elig", []) if _ok(t)]
-        else:
-            max_mp = self._current_max_mp()
-            feas = [t for t in row.get("elig", []) if ve.target_is_feasible(w, h, t, max_mp)]
+        feas = self._feasible_targets(w, h, row.get("elig", []), engine, model)
         labels = [ve.target_label(w, h, t) for t in feas]
         self._target_label_to_token = dict(zip(labels, feas))
         self.target_combo.configure(values=labels)
@@ -1754,6 +1742,25 @@ class VideoTab(ttk.Frame):
                 self.target_var.set(ve.target_label(w, h, nxt))
         else:
             self.target_var.set("")
+
+    def _feasible_targets(self, w, h, elig, engine, model):
+        """The targets in `elig` that (engine, model) can reach on the currently selected GPU.
+        SeedVR2: filtered by the card's max feasible output-MP (a small card can't do 4K).
+        Real-ESRGAN: exact native scale only (2x/4x), never a resized frame. Shared by the
+        Target combobox and the segment extractor so both offer the same GPU-valid set."""
+        import video_estimate as ve
+        if engine == "fixed_ratio":
+            import esrgan_models as em
+            scales = em.tier_scales(em.spec(model).kind)
+
+            def _ok(t):
+                s = ve.fit_scale(w, h, t)
+                # Exact native scale only (small tolerance for odd source dims / rounding),
+                # so no resize of the generated frame is ever needed.
+                return s is not None and any(abs(s / ns - 1.0) <= 0.01 for ns in scales)
+            return [t for t in elig if _ok(t)]
+        max_mp = self._current_max_mp()
+        return [t for t in elig if ve.target_is_feasible(w, h, t, max_mp)]
 
     def _selected_target_token(self):
         """The canonical target token ('1080p' / '2X' …) for the label shown in the combobox."""
@@ -1797,9 +1804,13 @@ class VideoTab(ttk.Frame):
         if not row:
             return
         m = tk.Menu(self, tearoff=0)
+        # A clip is queued exactly like a whole video: it binds the currently picked GPU and
+        # its targets are gated to that card. With no GPU selected there is nothing to bind, so
+        # the entry is disabled (mirrors Prepare) rather than queueing a card-less clip.
+        can_extract = bool(row.get("elig")) and self._selected_gpu() is not None
         m.add_command(label="Extract segment…",
                       command=lambda: self._open_segment_picker(row),
-                      state="normal" if row.get("elig") else "disabled")
+                      state="normal" if can_extract else "disabled")
         m.add_separator()
         m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
         m.add_command(label="Open source folder",
@@ -1832,18 +1843,40 @@ class VideoTab(ttk.Frame):
     # ── segment extractor (section 16.4/16.5) ─────────────────────────────────
 
     def _open_segment_picker(self, row):
-        """Open the picker for one scanned video; its Queue commits virtual clip
-        jobs via _queue_clips."""
+        """Open the picker for one scanned video; its Queue commits virtual clip jobs via
+        _queue_clips, stamped with the Method + GPU picked RIGHT NOW (captured in the on_queue
+        closure so a later combo change can't rebind an open picker). The offered targets are
+        filtered to what that method + card can actually reach, like the main Target combo."""
         if not row.get("elig"):
             messagebox.showinfo(APP_TITLE, "This video is already at/above the "
                                            "largest target — nothing to upscale.")
             return
+        g = self._selected_gpu()
+        if g is None:
+            messagebox.showinfo(APP_TITLE, "Pick a GPU first (a clip runs on the selected "
+                                           "card, like a whole video).")
+            return
+        engine, model = self._selected_method()
+        r = row.get("r") or {}
+        feas = self._feasible_targets(r.get("width"), r.get("height"),
+                                      row.get("elig", []), engine, model)
+        if not feas:
+            messagebox.showinfo(APP_TITLE, "The selected GPU can't reach any target for this "
+                                           "video with the chosen method.")
+            return
+        # Local runs leave the GPU NULL (one implicit local card); remote stamps the picked card.
+        gpu_id = None
+        if self.mode_var.get() == "remote":
+            gpu_id = (g.get("id") or g.get("name"))
         from gui.video_segment_picker import VideoSegmentPicker
-        VideoSegmentPicker(self.app, self.app, row["abs"], row["rel"],
-                           row["elig"], on_queue=self._queue_clips)
+        VideoSegmentPicker(self.app, self.app, row["abs"], row["rel"], feas,
+                           on_queue=lambda rel, clips: self._queue_clips(
+                               rel, clips, engine, model, gpu_id))
 
-    def _queue_clips(self, rel, clips):
-        """Enqueue the picker's pending clips as virtual jobs (off the UI thread)."""
+    def _queue_clips(self, rel, clips, engine=None, model=None, gpu_id=None):
+        """Enqueue the picker's pending clips as virtual jobs (off the UI thread), stamped with
+        the Method (engine/model) + GPU captured when the picker was opened so a clip routes to
+        the right pod at Start like a whole-video job."""
         if self._root_id is None or not clips:
             return
         # Same queue-add guard as Prepare, per distinct target (all clips share the
@@ -1881,7 +1914,8 @@ class VideoTab(ttk.Frame):
                 try:
                     bv.prepare_clip(conn, self._root_id, self._src_root, self._out_root,
                                     rel, c["target"], c["start"], c["end"],
-                                    c["label"], self._vcfg())
+                                    c["label"], self._vcfg(),
+                                    engine=engine, model=model, gpu=gpu_id)
                 except Exception as exc:             # noqa: BLE001
                     errs.append(str(exc))
             self.after(0, lambda: self._after_queue_clips(len(clips) - len(errs), errs))

@@ -223,6 +223,28 @@ def test_prepare_clip_enqueues_a_virtual_job(db_conn, tmp_path):
     assert len(db.get_video_clips(db_conn, root)) == 2
 
 
+@needs_ffmpeg
+def test_prepare_clip_stamps_method_and_gpu(db_conn, tmp_path):
+    """A clip queued from the segment extractor must carry the picked Method + GPU (18/#11),
+    exactly like a whole-video Prepare, so a mixed queue routes it to its own pod at Start."""
+    src_root = str(tmp_path / "src")
+    out_root = str(tmp_path / "out")
+    _make_source(os.path.join(src_root, "v.avi"), seconds=10)
+    root = db.get_video_root_id(db_conn, src_root, out_root)
+    vcfg = bv.resolve_video_cfg({})
+
+    bv.prepare_clip(db_conn, root, src_root, out_root, "v.avi", "1080p", 1.0, 5.0, "a",
+                    vcfg, engine="seedvr2", model="7b", gpu="RTX 5090")
+    c = db.get_video_clips(db_conn, root)[0]
+    assert c["engine"] == "seedvr2" and c["model"] == "7b" and c["gpu"] == "RTX 5090"
+
+    # Omitting the binding still works (legacy / local): engine inherits the vcfg default,
+    # GPU stays NULL (the implicit local card).
+    bv.prepare_clip(db_conn, root, src_root, out_root, "v.avi", "1080p", 6.0, 8.0, "b", vcfg)
+    c2 = [c for c in db.get_video_clips(db_conn, root) if c["clip_label"] == "b"][0]
+    assert c2["gpu"] is None
+
+
 # ── keyframe_times (picker navigation) ───────────────────────────────────────
 
 @needs_ffmpeg

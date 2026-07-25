@@ -1437,7 +1437,7 @@ def prepare_job(conn, root_id, source_root, output_root, rel, target, vcfg,
 
 
 def prepare_clip(conn, root_id, source_root, output_root, rel, target,
-                 start, end, label, vcfg):
+                 start, end, label, vcfg, engine=None, model=None, gpu=None):
     """Enqueue a VIRTUAL clip job (the segment extractor, section 16.6/16.7): a new
     video_outputs row with a fresh clip_id and the marked [start, end) range. Unlike
     prepare_job this does NOT extract or count frames here — the subclip is
@@ -1446,7 +1446,11 @@ def prepare_clip(conn, root_id, source_root, output_root, rel, target,
     drift reference come from the extracted clip's segments at run time. Caches the
     source properties (fast metadata) so the queue list can show them. Returns a dict
     with the assigned clip_id and the estimate inputs. Always adds a new clip (clip
-    ids are unique per source), so calling twice makes two clips."""
+    ids are unique per source), so calling twice makes two clips.
+
+    `engine`/`model`/`gpu` (18/#11) stamp the per-clip Method + remote GPU exactly like
+    prepare_job, so a clip is grouped and routed to its own pod at Start; omit to inherit the
+    vcfg defaults / leave the GPU NULL (a local or legacy single-GPU remote run)."""
     abs_path = os.path.join(source_root, rel)
     start, end = float(start), float(end)
     if end <= start:
@@ -1457,6 +1461,16 @@ def prepare_clip(conn, root_id, source_root, output_root, rel, target,
         raise ValueError(f"{rel} is already {info.width}x{info.height}; target {target} "
                          f"would downscale it, not upscale.")
     end = min(end, info.duration or end)           # clamp to the source length
+    eng, mdl = _resolve_job_engine(vcfg, engine, model)
+    # Resolve the concrete Real-ESRGAN weight for this target's ratio (same as prepare_job), so
+    # a clip queued as Real-ESRGAN uses the native-scale model, not the tier representative.
+    if eng == "fixed_ratio":
+        try:
+            import esrgan_models as _esr
+            ratio = ve.fit_scale(info.width, info.height, target) or _esr.spec(mdl).scale
+            mdl = _esr.resolve_for_ratio(_esr.spec(mdl).kind, ratio)
+        except Exception as exc:                       # noqa: BLE001 (fall back to the tier rep)
+            debug_log("prepare_clip: resolve fixed_ratio model", exc=exc)
     try:
         st = os.stat(abs_path)
         db.upsert_video_file(conn, root_id, rel,
@@ -1471,12 +1485,13 @@ def prepare_clip(conn, root_id, source_root, output_root, rel, target,
     clip_frames = max(1, round((end - start) * fps)) if fps else 0
     clip_id = db.next_clip_id(conn, root_id, rel)
     out_path = _output_path(output_root, rel, target, clip_id=clip_id,
-                            clip_label=label, clip_start=start, clip_end=end)
+                            clip_label=label, clip_start=start, clip_end=end, engine=eng)
     db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id,
                            status="queued", output_path=out_path,
                            queue_order=db.next_queue_order(conn, root_id),
                            clip_start=start, clip_end=end,
-                           clip_label=(label or None), clip_frames=clip_frames)
+                           clip_label=(label or None), clip_frames=clip_frames,
+                           engine=eng, model=mdl, gpu=(gpu or None))
     seg_secs = vcfg["segment_seconds"]
     approx_segments = max(1, math.ceil((end - start) / seg_secs)) if seg_secs else 1
     return {"clip_id": clip_id, "nb_frames": clip_frames, "duration": end - start,
