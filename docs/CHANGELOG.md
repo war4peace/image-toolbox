@@ -8,12 +8,24 @@ Releases page.
 
 ## Contents
 
+- [0.5.8](#058)
 - [0.5.7](#057)
 - [0.5.5](#055)
 - [0.5.4](#054)
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.5.8
+
+### A "Buy me a coffee" link
+The bottom status bar now carries an optional support link next to **Report an issue**.
+It is a link and nothing more: clicking it opens buymeacoffee.com in your browser, the
+app never contacts that site by itself, and there is no counter, ping or tracking of any
+kind. It appears in that one place only, never as a popup, a setup step or a prompt after
+a run. The app is free and stays free.
 
 ---
 

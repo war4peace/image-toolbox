@@ -39,7 +39,7 @@ from tkinter import ttk, messagebox
 # the package). Only what App itself references; each tab imports its own needs.
 from gui.common import (
     APP_ROOT, APP_TITLE, APP_VERSION, CFG, save_config,
-    update_auto_check_enabled, update_skipped_version, report_issue,
+    update_auto_check_enabled, update_skipped_version, report_issue, open_donate,
     _FUNDS_GREY, funds_color, config_funds_floor, fmt_funds,
     mqtt_config, mqtt_enabled, load_settings, save_settings, _geometry_on_screen,
 )
@@ -226,10 +226,11 @@ class App(tk.Tk):
         return "break"
 
     def _build_statusbar(self):
-        """A thin bottom strip with a right-aligned 'Report an issue' link (Future
-        Feature #3) and a left-aligned RunPod 'Funds' readout. The link opens a
-        pre-filled GitHub new-issue page; the funds readout shows the account
-        balance (coloured against the funds floor) on the remote-capable tabs."""
+        """A thin bottom strip with two right-aligned links ('Report an issue',
+        Future Feature #3, and the optional 'Buy me a coffee' support link) plus a
+        left-aligned RunPod 'Funds' readout. The issue link opens a pre-filled
+        GitHub new-issue page; the funds readout shows the account balance
+        (coloured against the funds floor) on the remote-capable tabs."""
         bar = ttk.Frame(self)
         bar.pack(side="bottom", fill="x", padx=10, pady=(0, 4))
         link = tk.Label(bar, text="Report an issue", fg="#3a86ff",
@@ -239,6 +240,21 @@ class App(tk.Tk):
         # Subtle hover feedback (darker blue) so it reads as a link.
         link.bind("<Enter>", lambda _e: link.configure(fg="#1a5fd0"))
         link.bind("<Leave>", lambda _e: link.configure(fg="#3a86ff"))
+        # Support link, to the LEFT of the issue link: with side="right" the first
+        # widget packed sits furthest right, so packing this one second leaves
+        # "Report an issue" exactly where it has always been. A grey separator keeps
+        # the two from reading as one long link. This is the ONLY place the donation
+        # link appears anywhere in the app.
+        ttk.Label(bar, text="·", foreground="#999").pack(side="right", padx=8)
+        coffee = tk.Label(bar, text="Buy me a coffee", fg="#3a86ff",
+                          cursor="hand2", font=("Segoe UI", 9, "underline"))
+        coffee.pack(side="right")
+        coffee.bind("<Button-1>", lambda _e: open_donate())
+        coffee.bind("<Enter>", lambda _e: coffee.configure(fg="#1a5fd0"))
+        coffee.bind("<Leave>", lambda _e: coffee.configure(fg="#3a86ff"))
+        Tooltip(coffee,
+                "Optional: opens buymeacoffee.com in your browser. The app is free "
+                "and stays free, and nothing is sent anywhere: this is just a link.")
         # Funds readout on the far left of the same row. Disabled (grey) unless the
         # active tab bills a remote pod: Batch Upscaler / Tag & Rename only when
         # 'Run on remote pod' is ticked; the Video Upscaler always.

@@ -57,6 +57,12 @@ GUI_MARKER = "@@TBX@@"
 RUN_ON_LOCAL  = "Local GPU"
 RUN_ON_REMOTE = "Remote: RunPod"
 
+# Optional support link, shown ONLY as a label in the main window's bottom status
+# bar next to "Report an issue" (deliberately nowhere else: no Settings entry, no
+# wizard step, no installer checkbox). Opening it is a plain browser call - the app
+# never contacts this host itself, so there is nothing to count and nothing to send.
+DONATE_URL = "https://buymeacoffee.com/war4peace"
+
 
 # ─────────────────────────────────────────────
 #  CONFIG / INTERPRETER
@@ -192,6 +198,15 @@ def _issue_url(attach_path=None, attach_desc=None):
     )
     params = urllib.parse.urlencode({"title": "", "body": body})
     return f"https://github.com/{updater.GITHUB_REPO}/issues/new?{params}"
+
+
+def open_donate():
+    """Open the support page in the default browser. Fail-safe like report_issue:
+    a link that cannot open must never take the app down with it."""
+    try:
+        webbrowser.open(DONATE_URL)
+    except Exception:
+        pass
 
 
 def report_issue(attach_path=None, attach_desc=None):
