@@ -16,7 +16,7 @@ from tkinter import ttk, filedialog, messagebox
 import runpod_client
 import ssh_setup
 import taskbar_progress
-from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode
+from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE
 from gui.widgets import (ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip,
                          use_window_button_style)
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
@@ -477,15 +477,20 @@ class VideoTab(ttk.Frame):
     def _build(self):
         self.columnconfigure(0, weight=1)
 
-        # 1) Mode selector + readiness strip. "Run on" picks REMOTE (a rented RunPod
-        # GPU) or LOCAL (this machine's GPU, feature #7). The install mode gates it: a
-        # Remote-only install can't run locally (no torch/SeedVR2) and a Local-only
-        # install has no remote path, so the unavailable radio is disabled. On a "both"
+        # 1) "Run on" selector + GPU picker + readiness strip, all on one row (the
+        # same shape the Batch Upscaler and Tag & Rename tabs use). "Run on" picks
+        # REMOTE (a rented RunPod GPU) or LOCAL (this machine's GPU, feature #7).
+        # The install mode gates it: a Remote-only install can't run locally (no
+        # torch/SeedVR2) and a Local-only install has no remote path, so a
+        # single-mode install gets a pinned, greyed-out selector. On a "both"
         # install the last choice is remembered.
+        # Built first but gridded SECOND (row 1): it sits under the folder fields,
+        # right above the eligible-videos list, matching the other tabs where the
+        # row follows the folders it acts on.
         W = Tooltip.WRAP_NARROW
         top = ttk.Frame(self)
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        top.columnconfigure(3, weight=1)
+        top.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        top.columnconfigure(5, weight=1)
         ttk.Label(top, text="Run on:").grid(row=0, column=0, sticky="w")
         imode = get_install_mode()
         if imode == "remote":
@@ -495,46 +500,82 @@ class VideoTab(ttk.Frame):
         else:
             default_mode = (self.app.settings.get("video_mode", "remote")
                             if getattr(self.app, "settings", None) else "remote")
+        # mode_var stays the "remote"/"local" token every other method reads; the
+        # combobox holds the shared display label and drives it.
         self.mode_var = tk.StringVar(value=default_mode)
-        self.mode_remote_rb = ttk.Radiobutton(
-            top, text="Remote (RunPod)", value="remote",
-            variable=self.mode_var, command=self._on_mode_change)
-        self.mode_remote_rb.grid(row=0, column=1, padx=(6, 0))
-        self.mode_local_rb = ttk.Radiobutton(
-            top, text="Local GPU", value="local",
-            variable=self.mode_var, command=self._on_mode_change)
-        self.mode_local_rb.grid(row=0, column=2, padx=(6, 0))
-        # One Tooltip per radio, retargeted (not a second one added) when an install
-        # mode disables a choice: two Tooltips on one widget would both pop up.
-        self._remote_base_tip = (
-            "Do the GPU work on a rented RunPod machine, streaming one segment at "
-            "a time. Costs money per hour and needs a RunPod API key, but leaves "
-            "this PC's graphics card free.")
-        self._local_base_tip = (
-            "Do the GPU work on this PC's graphics card. Free, but the card is "
-            "fully busy for the whole run, which can take hours per video.")
-        self.mode_remote_tip = Tooltip(self.mode_remote_rb, self._remote_base_tip, wraplength=W)
-        self.mode_local_tip = Tooltip(self.mode_local_rb, self._local_base_tip, wraplength=W)
         # Which modes this install even offers (queue-locking must never re-enable a mode the
-        # install disabled). remote-only disables Local; local-only disables Remote; both = both.
+        # install disabled). remote-only offers Remote only; local-only offers Local only.
         self._mode_allowed = {"remote": imode != "local", "local": imode != "remote"}
+        self._mode_labels = {"local": RUN_ON_LOCAL, "remote": RUN_ON_REMOTE}
+        self._mode_tokens = {v: k for k, v in self._mode_labels.items()}
+        mode_values = [self._mode_labels[m] for m in ("local", "remote")
+                       if self._mode_allowed[m]]
+        self.mode_pick_var = tk.StringVar(value=self._mode_labels[default_mode])
+        self.mode_combo = ttk.Combobox(
+            top, textvariable=self.mode_pick_var, values=mode_values, width=15,
+            state="disabled" if len(mode_values) == 1 else "readonly")
+        self.mode_combo.grid(row=0, column=1, padx=(6, 0))
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mode_change())
+        # One Tooltip, retargeted (not a second one added) when the install mode or the
+        # queue lock removes the choice: two Tooltips on one widget would both pop up.
+        self._mode_base_tip = (
+            "Where the GPU work happens. Remote rents a RunPod machine and streams "
+            "one segment at a time: it costs money per hour and needs a RunPod API "
+            "key, but leaves this PC's graphics card free. Local uses this PC's "
+            "card: free, but the card is fully busy for the whole run, which can "
+            "take hours per video.")
+        self.mode_tip = Tooltip(self.mode_combo, self._mode_base_tip, wraplength=W)
         if imode == "remote":
-            self.mode_local_rb.configure(state="disabled")
-            self.mode_local_tip.set_text(
-                "This is a Remote-only install (no local SeedVR2 / torch). "
-                "Re-run setup as Local or Both to upscale on this machine.")
+            self.mode_tip.set_text(
+                "This is a Remote-only install (no local SeedVR2 / torch), so every "
+                "run goes to a rented pod. Re-run setup as Local or Both to upscale "
+                "on this machine.")
         elif imode == "local":
-            self.mode_remote_rb.configure(state="disabled")
-            self.mode_remote_tip.set_text(
-                "This is a Local-only install (no RunPod remote stack).")
+            self.mode_tip.set_text(
+                "This is a Local-only install (no RunPod remote stack), so every run "
+                "uses this PC's graphics card.")
+
+        # The GPU picker rides the same row (its refresh button included); the
+        # benchmark / compile buttons and the estimate stay down by the queue.
+        gpu_lbl = ttk.Label(top, text="GPU:")
+        gpu_lbl.grid(row=0, column=2, sticky="w", padx=(16, 4))
+        self.gpu_var = tk.StringVar()
+        self.gpu_combo = ttk.Combobox(top, textvariable=self.gpu_var, state="readonly",
+                                      width=40, values=[])
+        self.gpu_combo.grid(row=0, column=3)
+        self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_gpu_change())
+        refresh_gpu = ttk.Button(top, text="↻", width=3, command=self._refresh_gpus)
+        refresh_gpu.grid(row=0, column=4, padx=(4, 0))
+        gpu_tip = ("Which graphics card runs the queue. For a rented pod this lists "
+                   "the cards actually available right now with their hourly price, "
+                   "cheapest first; the card you pick is the card you get, never a "
+                   "substitute. The estimate below follows your choice.")
+        Tooltip(gpu_lbl, gpu_tip, wraplength=W)
+        Tooltip(self.gpu_combo, gpu_tip, wraplength=W)
+        Tooltip(refresh_gpu,
+                "Re-check which cards are in stock and at what price. Worth "
+                "pressing if a run refused to start because the card sold out.",
+                wraplength=W)
+
         self.ready_var = tk.StringVar(value="Checking readiness …")
         self.ready_lbl = tk.Label(top, textvariable=self.ready_var, anchor="w",
                                   fg="#7f8a99", font=("Segoe UI", 9))
-        self.ready_lbl.grid(row=0, column=3, sticky="ew", padx=(16, 0))
+        self.ready_lbl.grid(row=0, column=5, sticky="ew", padx=(16, 0))
 
-        # 2) Source / output folders.
+        # Benchmark the picked card: it acts on the GPU chosen on this row, so it
+        # rides the same row, pushed to the far right by the readiness label's
+        # expanding column. Shown/hidden + locked by _apply_mode_ui.
+        self.benchmark_btn = ttk.Button(top, text="Benchmark GPU…", command=self._open_benchmark)
+        self.benchmark_btn.grid(row=0, column=6, sticky="e", padx=(12, 0))
+        use_window_button_style(self.benchmark_btn)    # opens its own window
+        Tooltip(self.benchmark_btn,
+                "Measure the largest safe batch (and the real speed) for each target on "
+                "this GPU. Runs a short test-till-it-breaks sweep; results calibrate local "
+                "batch sizing + the time estimate. Safe to stop and resume.", wraplength=W)
+
+        # 2) Source / output folders. Gridded FIRST (row 0) — see the note above.
         ff = ttk.Frame(self)
-        ff.grid(row=1, column=0, sticky="ew")
+        ff.grid(row=0, column=0, sticky="ew")
         ff.columnconfigure(1, weight=1)
         ttk.Label(ff, text="Video folder:").grid(row=0, column=0, sticky="w")
         self.src_var = tk.StringVar()
@@ -792,45 +833,17 @@ class VideoTab(ttk.Frame):
                 "segment files it was holding (often several GB). The source video "
                 "and any finished output are untouched.", wraplength=W)
 
-        # 6) GPU picker + estimate.
+        # 6) Estimate + the compile offer. (The GPU picker and its Benchmark button
+        # sit on the top row, next to "Run on".)
         gf = ttk.Frame(self)
         gf.grid(row=5, column=0, sticky="ew", pady=(8, 0))
-        gf.columnconfigure(5, weight=1)
-        gpu_lbl = ttk.Label(gf, text="GPU:")
-        gpu_lbl.grid(row=0, column=0, sticky="w")
-        self.gpu_var = tk.StringVar()
-        self.gpu_combo = ttk.Combobox(gf, textvariable=self.gpu_var, state="readonly",
-                                     width=40, values=[])
-        self.gpu_combo.grid(row=0, column=1, padx=4)
-        self.gpu_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_gpu_change())
-        refresh_gpu = ttk.Button(gf, text="↻", width=3, command=self._refresh_gpus)
-        refresh_gpu.grid(row=0, column=2)
-        gpu_tip = ("Which graphics card runs the queue. For a rented pod this lists "
-                   "the cards actually available right now with their hourly price, "
-                   "cheapest first; the card you pick is the card you get, never a "
-                   "substitute. The estimate on the right follows your choice.")
-        Tooltip(gpu_lbl, gpu_tip, wraplength=W)
-        Tooltip(self.gpu_combo, gpu_tip, wraplength=W)
-        Tooltip(refresh_gpu,
-                "Re-check which cards are in stock and at what price. Worth "
-                "pressing if a run refused to start because the card sold out.",
-                wraplength=W)
-        # Local-only: benchmark THIS card to find its real per-target batch ceiling +
-        # speed (feature #7). Created here, shown/hidden by _apply_mode_ui (pod runs
-        # have no local benchmark). Column 3 so it sits right of the refresh button.
-        self.benchmark_btn = ttk.Button(gf, text="Benchmark GPU…", command=self._open_benchmark)
-        self.benchmark_btn.grid(row=0, column=3, padx=(8, 0))
-        use_window_button_style(self.benchmark_btn)    # opens its own window
-        Tooltip(self.benchmark_btn,
-                "Measure the largest safe batch (and the real speed) for each target on "
-                "this GPU. Runs a short test-till-it-breaks sweep; results calibrate local "
-                "batch sizing + the time estimate. Safe to stop and resume.")
+        gf.columnconfigure(1, weight=1)
         # Local-only, on-demand: install Triton so the local engine can use torch.compile
         # (a pod-grade speedup). Shown only in Local mode when Triton is missing but a pinned
         # wheel exists for this Python/torch; hidden once installed. See _refresh_compile_offer.
         self.compile_btn = ttk.Button(gf, text="Enable compile speedup…",
                                       command=self._install_triton)
-        self.compile_btn.grid(row=0, column=4, padx=(8, 0))
+        self.compile_btn.grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.compile_btn.grid_remove()
         Tooltip(self.compile_btn,
                 "Install Triton (verified download) so local runs can use torch.compile, "
@@ -839,7 +852,7 @@ class VideoTab(ttk.Frame):
         self.estimate_var = tk.StringVar(value="Add videos to the queue for an estimate.")
         self.estimate_lbl = ttk.Label(gf, textvariable=self.estimate_var, anchor="w",
                                       foreground="#2f6f3f")
-        self.estimate_lbl.grid(row=0, column=5, sticky="ew", padx=(12, 0))
+        self.estimate_lbl.grid(row=0, column=1, sticky="ew")
         Tooltip(self.estimate_lbl,
                 "How long the queue will take (and, for a rented pod, what it will cost), shown "
                 "before anything starts. Time depends on the target resolution; the first segment "
@@ -951,24 +964,22 @@ class VideoTab(ttk.Frame):
     def _refresh_mode_lock(self):
         """Lock the 'Run on' selector while the queue holds any video, so the user can't switch a
         queue between Local and Remote mid-build (a run is one or the other; mixing is a future
-        feature). An empty queue re-opens it. Install-mode restrictions win: a mode the install
-        doesn't offer stays disabled with its own reason. Called from _load_queue (the one funnel
-        every queue change passes through)."""
-        if not hasattr(self, "mode_remote_rb"):
+        feature). An empty queue re-opens it. Install-mode restrictions win: a single-mode install
+        has nothing to choose, so its pinned selector (and its own reason) is left alone. Called
+        from _load_queue (the one funnel every queue change passes through)."""
+        if not hasattr(self, "mode_combo"):
             return                                     # called before the UI is built
+        if sum(1 for m in self._mode_allowed.values() if m) < 2:
+            return                                     # single-mode install: already pinned
         locked = bool(getattr(self, "_queue_order", None))
-        for mode, rb, tip, base in (
-                ("remote", self.mode_remote_rb, self.mode_remote_tip, self._remote_base_tip),
-                ("local", self.mode_local_rb, self.mode_local_tip, self._local_base_tip)):
-            if not self._mode_allowed.get(mode, True):
-                continue                               # install-mode already disabled it
-            rb.configure(state="disabled" if locked else "normal")
-            tip.set_text(self._MODE_LOCK_TIP if locked else base)
+        self.mode_combo.configure(state="disabled" if locked else "readonly")
+        self.mode_tip.set_text(self._MODE_LOCK_TIP if locked else self._mode_base_tip)
 
     def _on_mode_change(self):
-        """Local/Remote radio flipped: persist the choice (a 'both' install remembers
-        it), re-check readiness, adapt the auto-resume control (pod-only) and refresh the
-        GPU display + estimate for the new mode."""
+        """'Run on' changed: adopt the new mode, persist the choice (a 'both' install
+        remembers it), re-check readiness, adapt the auto-resume control (pod-only) and
+        refresh the GPU display + estimate for the new mode."""
+        self.mode_var.set(self._mode_tokens.get(self.mode_pick_var.get(), "remote"))
         try:
             if getattr(self.app, "settings", None) is not None:
                 self.app.settings["video_mode"] = self.mode_var.get()
@@ -1142,18 +1153,18 @@ class VideoTab(ttk.Frame):
                 return ("Not ready: no NVIDIA GPU detected (nvidia-smi). Local upscaling "
                         "needs a CUDA GPU; use Remote instead.", False)
             self._local_gpu_name = name or ""          # cache for the queue's Local GPU label
-            vram = f"{g['gpu_total_mb'] / 1024:.0f} GB" if g.get("gpu_total_mb") else "?"
-            # Batch size comes from this card's benchmark when one exists; otherwise the sizer
-            # picks it from VRAM and refines it as the run proceeds. Reflect which applies.
+            # The card's name + VRAM are no longer repeated here: the GPU picker sits on
+            # this very row and already shows both. Only the batch-size story is left, which
+            # nothing else says. Batch size comes from this card's benchmark when one exists;
+            # otherwise the sizer picks it from VRAM and refines it as the run proceeds.
             try:
                 import db
                 benched = bool(name) and name in db.bench_gpu_ids(self._conn())
             except Exception:                              # noqa: BLE001 (fail-safe: assume none)
                 benched = False
-            tail = ("Batch size comes from this card's benchmark." if benched
-                    else "Batch size is picked from VRAM and refined as it runs; "
-                         "press Benchmark GPU to calibrate it.")
-            return (f"Local ready: {name or 'GPU'}, {vram} VRAM. {tail}", True)
+            return (("Batch size comes from this card's benchmark." if benched
+                     else "Batch size is picked from VRAM and refined as it runs; "
+                          "press Benchmark GPU to calibrate it."), True)
         # Local ffmpeg first (a purely local check): every video job needs the
         # local split/reassemble/mux, so without it nothing else matters. Only
         # a successful lookup is cached, so installing ffmpeg later and

@@ -50,6 +50,13 @@ PROGRESS_RE = re.compile(r"\[(\d+)/(\d+)\]")
 # side has its own copy in runner_common (they must agree on the literal).
 GUI_MARKER = "@@TBX@@"
 
+# "Run on:" selector labels. Every tool tab that can run on either the local card
+# or a rented pod uses this ONE pair, so the wording is identical across tabs (the
+# Batch Upscaler, Tag & Rename and the Video Upscaler each pair it with a GPU
+# picker on the same row).
+RUN_ON_LOCAL  = "Local GPU"
+RUN_ON_REMOTE = "Remote: RunPod"
+
 
 # ─────────────────────────────────────────────
 #  CONFIG / INTERPRETER
@@ -95,8 +102,8 @@ def get_install_mode():
 
     Read from install_mode.txt (written by the installer; see bootstrap.ps1). A
     Remote-only install has NO local upscaling engine (torch + SeedVR2 are
-    skipped), so the GUI defaults the 'Run on remote pod' toggle on and refuses a
-    local run. Missing/unknown marker → 'both' (a from-source run or a pre-0.3.2
+    skipped), so the GUI pins every tab's 'Run on' selector to Remote and refuses
+    a local run. Missing/unknown marker → 'both' (a from-source run or a pre-0.3.2
     install supports everything)."""
     try:
         with open(os.path.join(APP_ROOT, "install_mode.txt"), encoding="utf-8") as f:

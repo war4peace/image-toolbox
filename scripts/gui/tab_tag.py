@@ -111,8 +111,10 @@ class TagTab(ToolTab):
                 "default name such as IMG_1234. Descriptions are written either "
                 "way.", wraplength=W)
 
+        # The "Run on" row is gridded above the action buttons (row 2 vs row 3): the
+        # user picks where the run happens, then presses Start.
         btns = ttk.Frame(self)
-        btns.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self.start_btn  = ttk.Button(btns, text="Start tagging", command=self._start)
         # Dual-purpose: "Pause" during normal tagging, "Resume" while paused,
         # "Resume after error" while an outage holds the run. The runner owns
@@ -139,18 +141,19 @@ class TagTab(ToolTab):
                 "Open the log window with this run's full output. Available once "
                 "a run has started.", wraplength=W)
 
-        # "Run on remote pod" + the live GPU picker share a dedicated row. The
-        # checkbox tooltip is RETARGETED here (set_text on the one the base row
-        # made, not a second Tooltip, which would stack) because remote tagging is
-        # the unusual case: tagging runs locally, only the model calls go over the
-        # tunnel.
-        self._build_remote_row(row=3)
-        self.remote_tip.set_text(
-                "Run the vision model (and the auto-straighten CNN) on a rented "
-                "RunPod GPU instead of this PC (roadmap #1, experimental). Tagging "
-                "itself runs locally; only the model calls go over an SSH tunnel. "
-                "Creates a billed pod and terminates it when done. Needs a RunPod "
-                "API key + model volume in the RunPod tab.")
+        # The "Run on" selector + the GPU picker share a dedicated row. Its tooltip
+        # is RETARGETED here (set_text on the one the base row made, not a second
+        # Tooltip, which would stack) because remote tagging is the unusual case:
+        # tagging runs locally, only the model calls go over the tunnel. A
+        # single-mode install has its own pinned text, so leave that one alone.
+        self._build_remote_row(row=2)
+        if get_install_mode() == "both":
+            self.remote_tip.set_text(
+                "Where the vision model (and the auto-straighten CNN) runs: this "
+                "PC, or a rented RunPod GPU (roadmap #1, experimental). Tagging "
+                "itself always runs locally; only the model calls go over an SSH "
+                "tunnel. A remote run creates a billed pod and terminates it when "
+                "done. Needs a RunPod API key + model volume in the RunPod tab.")
 
         undo = ttk.LabelFrame(self, text=" Undo previous runs ", padding=(8, 4))
         undo.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 0))
@@ -273,13 +276,17 @@ class TagTab(ToolTab):
                     APP_TITLE,
                     "This is a Remote-only install — the local vision model "
                     "(Ollama) and PyTorch aren't installed.\n\n"
-                    "Tick 'Run on remote pod (RunPod)' to tag on a rented GPU, or "
+                    "Set 'Run on' to 'Remote: RunPod' to tag on a rented GPU, or "
                     "reinstall and choose Local or Both to tag on this PC.")
                 return
             if not self._ensure_ollama_model():
                 return
             if not self.confirm_gpu_overlap():
                 return
+            # Multi-GPU machine: pin the run to the card picked next to 'Run on'.
+            # This binds the auto-straighten CNN, which runs in the runner; Ollama
+            # is a separate server process and picks its own device.
+            extra_env = self._local_gpu_env()
         args = [folder, "--no-prompt"]
         if self.ftag_var.get():
             args.append("-ftag")

@@ -2,8 +2,8 @@
 
 Design notes for **local video upscaling**: running the Video Upscaler's SeedVR2
 work **on the user's own GPU**, in-process, instead of (or as an alternative to)
-a rented RunPod pod. UI: a **local / remote toggle** on the existing **Video
-Upscaler** tab, mirroring the image tabs' "Run on remote pod" checkbox.
+a rented RunPod pod. UI: a **local / remote selector** on the existing **Video
+Upscaler** tab, mirroring the image tabs' "Run on" picker.
 
 > Status: **PLANNED (0.5.0-experimental).** This doc is the design of record and
 > the decision reversal it depends on. Nothing is built yet. The first code step
@@ -304,8 +304,15 @@ chosen **per queued video** next to SeedVR2, so one queue can mix methods.
   4 SeedVR2 variants always, +2 Real-ESRGAN in Local mode only) and a **Target** combobox
   whose options DEPEND on the method (engine-aware feasibility). The queue list shows a
   **Method** column. So a user builds a mixed queue and presses Start once.
-- **Settings** hold only the **default** method + Real-ESRGAN model (pre-selects the tab's
-  comboboxes); the real choice is per video.
+- **Settings** hold only the **default** method + model (pre-selects the tab's comboboxes);
+  the real choice is per video. Since 0.5.8 that is ONE "Model:" picklist under "Method:",
+  listing the SeedVR2 weights or the Real-ESRGAN models depending on the method selected
+  above it. The two picks are stored separately (`video.dit_model` /
+  `video.fixed_ratio_model`), so flipping Method never loses the other engine's choice;
+  the combobox is just a view onto the active one (`_model_store_var` /
+  `_sync_model_choices` in `gui/tab_settings.py`). This replaced the old pair: a standalone
+  SeedVR2 "Model:" row higher up in the section plus a "Real-ESRGAN model:" row that was
+  greyed out whenever the method was SeedVR2.
 
 ### 11.2 No cap for Real-ESRGAN (limits are benchmark-derived, later)
 
@@ -790,13 +797,18 @@ resume orchestration runs; only the **injected engine** changes and a **mode sel
     resume-hinted** summary notification. `auto_resume` is forced off for `--local` (there is no pod
     to lose). Guarded import so the remote/passthrough trees load without the local stack.
 
-**GUI (`gui/tab_video.py`).** A **"Run on:" selector** (Remote (RunPod) / Local GPU) at the top of
-the tab, gated by the install mode: **Remote-only** disables Local (tooltip: re-run setup as
-Local/Both), **Local-only** disables Remote, **Both** remembers the last choice
+**GUI (`gui/tab_video.py`).** A **"Run on:" combobox** ("Local GPU" / "Remote: RunPod", the shared
+`gui.common.RUN_ON_*` labels every tool tab uses) at the top of the tab, with the GPU picker on the
+same row, gated by the install mode: a single-mode install gets a pinned, greyed-out selector
+offering only what it can run (**Remote-only** = Remote, tooltip: re-run setup as Local/Both;
+**Local-only** = Local), **Both** offers both and remembers the last choice
 (`gui_settings.video_mode`). The mode re-skins the tab without duplicating it:
   * **Readiness:** Local checks only ffmpeg + a local NVIDIA GPU (nvidia-smi via
-    `system_telemetry.sample_gpu` / `gpu_name`), not the RunPod key/SSH/volume; shows
-    "Local ready -- <card>, <VRAM> GB. The first segment calibrates the batch size."
+    `system_telemetry.sample_gpu` / `gpu_name`), not the RunPod key/SSH/volume. It states
+    only where the batch size comes from ("Batch size comes from this card's benchmark." /
+    "... picked from VRAM and refined as it runs; press Benchmark GPU to calibrate it.");
+    the card name + VRAM it used to lead with were dropped once the GPU picker moved onto
+    the same row and showed both.
   * **GPU display:** Local detects THIS machine's card (a cheap nvidia-smi, auto-run on entry,
     unlike the remote list which hits the API and stays behind `↻`) and shows it as the single
     choice, shaped like a remote GPU dict (`price=None` marks it free) so `_selected_gpu` / the

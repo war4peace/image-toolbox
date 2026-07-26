@@ -56,8 +56,8 @@ class RunPodTab(ttk.Frame):
         desc = ttk.Frame(sec)
         desc.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
         ttk.Label(desc, wraplength=560, foreground="#666",
-                  text=("Process images on a rented remote pod (RunPod.io). Tick "
-                        "'Run on remote pod (RunPod)' in the appropriate tab. The API "
+                  text=("Process images on a rented remote pod (RunPod.io). Set "
+                        "'Run on' to 'Remote: RunPod' in the appropriate tab. The API "
                         "key authenticates the pod control plane; the auto-stop / "
                         "runtime limits below are the safety net that keeps a "
                         "billed pod from being left running.")

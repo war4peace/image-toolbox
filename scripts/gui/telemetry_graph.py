@@ -68,8 +68,10 @@ class TelemetryGraphWindow(tk.Toplevel):
 
         self.title(title)
         geo = app.settings.get("telemetry_geometry") if app is not None else None
-        # Default AND minimum size match the main window's default (980x720); the
-        # remembered geometry wins after the first open.
+        # 980x720 as both the default AND the minimum: four stacked charts need that
+        # much to stay readable. (Deliberately its own number — the main window's
+        # minimum is set by the video queue's column count, not by this content.)
+        # The remembered geometry wins after the first open.
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
         self.minsize(980, 720)
 

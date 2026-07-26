@@ -323,6 +323,41 @@ class TelemetryHistory:
         return times, values
 
 
+def list_gpus(timeout=5):
+    """
+    Every local NVIDIA GPU as a list of ``{"index", "name", "memory_gb"}`` dicts,
+    in nvidia-smi order (so ``index`` is the CUDA device number). Empty list if
+    ``nvidia-smi`` is missing / fails / prints nothing parseable.
+
+    ``sample_gpu`` deliberately reads only the FIRST card (the telemetry row shows
+    one); this is the enumeration the GUI's "Run on -> Local GPU" picker needs.
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    gpus = []
+    for line in proc.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        idx  = _parse_gpu_field(parts[0])
+        name = parts[1]
+        vram = _parse_gpu_field(parts[2])
+        if idx is None or not name:
+            continue
+        gpus.append({"index": idx, "name": name,
+                     "memory_gb": round((vram or 0) / 1024.0)})
+    return gpus
+
+
 def gpu_name(timeout=5):
     """
     The first NVIDIA GPU's model name via ``nvidia-smi`` (e.g. "NVIDIA GeForce

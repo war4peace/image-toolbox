@@ -250,14 +250,16 @@ class SettingsTab(ttk.Frame):
                 "1280 px is plenty for describing and titling. Higher = more detail "
                 "+ more VRAM. 0 = full resolution (not recommended).")
 
-        # ── Upscaling targets ──────────────────────────────────────────────────
-        sec = self._section(body, "Upscaling")
+        # ── Batch Upscaler ─────────────────────────────────────────────────────
+        sec = self._section(body, "Batch Upscaler")
 
-        # Two aligned columns on a shared grid: column 0 holds the Resolution
-        # Target and the two checkboxes; column 1 (Skip images over / Confidence
-        # threshold / Slowdown factor) lines up vertically because column 0 sizes
-        # to its widest item (the watchdog checkbox), so column 1's left edge is
-        # the same on every row.
+        # THREE grid columns, not two: column 0 holds the Resolution Target and the
+        # two checkboxes, column 1 the right-hand LABEL and column 2 its value box.
+        # Splitting the label off is what makes the three value boxes line up: they
+        # used to sit in packed sub-frames, so each started wherever its own label
+        # ("Skip images over:" / "Confidence threshold:" / "Slowdown factor:")
+        # happened to end. Now grid sizes column 1 to the widest label and every
+        # box starts at the same x.
         c0 = ttk.Frame(sec)
         c0.grid(row=0, column=0, sticky="w", pady=3)
         ttk.Label(c0, text="Resolution Target:").pack(side="left", padx=(0, 4))
@@ -267,9 +269,10 @@ class SettingsTab(ttk.Frame):
         restarget_cmb.pack(side="left")
         Tooltip(restarget_cmb, "longer edge / shorter edge, in pixels")
 
+        ttk.Label(sec, text="Skip images over:").grid(row=0, column=1, sticky="w",
+                                                      padx=(18, 4), pady=3)
         skip = ttk.Frame(sec)
-        skip.grid(row=0, column=1, sticky="w", padx=(18, 0), pady=3)
-        ttk.Label(skip, text="Skip images over:").pack(side="left", padx=(0, 4))
+        skip.grid(row=0, column=2, sticky="w", pady=3)
         self.cutoff_var = tk.IntVar(value=int(ups.get("upscale_cutoff_pct", 66)))
         cut_spin = ttk.Spinbox(skip, from_=0, to=99, width=4, textvariable=self.cutoff_var)
         cut_spin.pack(side="left")
@@ -285,14 +288,13 @@ class SettingsTab(ttk.Frame):
                         "fits a 4K screen. Without this, the upscaler targets the wrong axis and "
                         "the image no longer fits once Tag & Rename straightens it. The source is "
                         "never modified (a temp copy is rotated and upscaled).")
-        conf = ttk.Frame(sec)
-        conf.grid(row=1, column=1, sticky="w", padx=(18, 0), pady=3)
-        ttk.Label(conf, text="Confidence threshold:").pack(side="left", padx=(0, 4))
+        ttk.Label(sec, text="Confidence threshold:").grid(row=1, column=1, sticky="w",
+                                                          padx=(18, 4), pady=3)
         self.up_straighten_conf_var = tk.DoubleVar(
             value=float(ups.get("straighten_min_confidence", 0.9)))
-        up_spin = ttk.Spinbox(conf, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
+        up_spin = ttk.Spinbox(sec, from_=0.50, to=1.00, increment=0.05, width=6, format="%.2f",
                               textvariable=self.up_straighten_conf_var)
-        up_spin.pack(side="left")
+        up_spin.grid(row=1, column=2, sticky="w", pady=3)
         Tooltip(up_spin, "0.50–1.00   (higher = fewer, safer rotations)   "
                          "Recommended: 0.90")
 
@@ -306,9 +308,10 @@ class SettingsTab(ttk.Frame):
                 "normal speed (the GPU thrashing VRAM into system RAM) OR hits a hard out-of-memory "
                 "error, the run auto-stops after the current image and you're notified (log, Discord, "
                 "taskbar flash). The resume cache continues the queue after you reboot — the known cure.")
+        ttk.Label(sec, text="Slowdown factor:").grid(row=2, column=1, sticky="w",
+                                                     padx=(18, 4), pady=3)
         wd = ttk.Frame(sec)
-        wd.grid(row=2, column=1, sticky="w", padx=(18, 0), pady=3)
-        ttk.Label(wd, text="Slowdown factor:").pack(side="left", padx=(0, 4))
+        wd.grid(row=2, column=2, sticky="w", pady=3)
         self.watchdog_factor_var = tk.DoubleVar(value=float(ups.get("watchdog_factor", 3.0)))
         wf_spin = ttk.Spinbox(wd, from_=1.5, to=10.0, increment=0.5, width=6, format="%.1f",
                               textvariable=self.watchdog_factor_var)
@@ -323,7 +326,203 @@ class SettingsTab(ttk.Frame):
         Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a "
                          "single odd image).   Recommended: 2")
 
+        # ── Video Upscaler (#2) ───────────────────────────────────────────────────
+        vid = CFG.get("video", {})
+        sec = self._section(body, "Video Upscaler")
+        # THREE label+widget column pairs (0/1, 2/3, 4/5) so the section reads as a
+        # compact grid instead of one long stack: the settings rows below reuse the
+        # SAME six columns, which is what keeps "Batch size / Temporal overlap / 4K
+        # input noise" and the three checkboxes lined up under the row above them.
+        # Only the last widget column stretches, so the groups keep even gaps.
+        sec.columnconfigure(5, weight=1)
+        _G2 = (24, 4)                     # left pad that opens the 2nd/3rd column pair
+        ttk.Label(sec, text="Default target:").grid(row=0, column=0, sticky="w",
+                                                    padx=(0, 4), pady=3)
+        self.video_target_var = tk.StringVar(value=vid.get("target", "1080p"))
+        vt_cb = ttk.Combobox(sec, textvariable=self.video_target_var, state="readonly",
+                             width=10, values=["1080p", "1440p", "4K"])
+        vt_cb.grid(row=0, column=1, sticky="w", pady=3)
+        Tooltip(vt_cb,
+                "The size pre-selected on the Video Upscaler tab. You can still "
+                "pick a different one per video before queueing it.", wraplength=W)
+        ttk.Label(sec, text="Output subfolder:").grid(row=0, column=2, sticky="w",
+                                                      padx=_G2, pady=3)
+        self.video_outsub_var = tk.StringVar(value=vid.get("output_subdir", "__upscaled__"))
+        vo_ent = ttk.Entry(sec, textvariable=self.video_outsub_var, width=20)
+        vo_ent.grid(row=0, column=3, sticky="w", pady=3)
+        Tooltip(vo_ent,
+                "Name of the folder created for upscaled videos when you have not "
+                "chosen an output folder yourself.", wraplength=W)
+        ttk.Label(sec, text="Work folder (staging):").grid(row=11, column=0, sticky="w",
+                                                           padx=(0, 4), pady=3)
+        self.video_workroot_var = tk.StringVar(value=vid.get("work_root", ""))
+        wr = ttk.Frame(sec)
+        wr.grid(row=11, column=1, columnspan=5, sticky="ew", pady=3)
+        wr.columnconfigure(0, weight=1)
+        wr_entry = ttk.Entry(wr, textvariable=self.video_workroot_var)
+        wr_entry.grid(row=0, column=0, sticky="ew")
+        wr_btn = ttk.Button(wr, text="Browse", width=8,
+                            command=self._pick_video_workroot)
+        wr_btn.grid(row=0, column=1, padx=(6, 0))
+        Tooltip(wr_btn,
+                "Choose the staging folder. Leave the box empty for the "
+                "recommended default on the app drive.", wraplength=W)
+        Tooltip(wr_entry,
+                "Where segments are staged during a run. Leave EMPTY to use a fast "
+                "local folder on the app drive (recommended). Staging locally means a "
+                "network hiccup on the OUTPUT drive can't strand a run in progress: only "
+                "the first read of the source and the final write of the output touch "
+                "the network. If you set a custom path, keep it OUTSIDE your source "
+                "folder or the scanner may re-read its own segments.")
+        ttk.Label(sec, text="Output quality:").grid(row=0, column=4, sticky="w",
+                                                    padx=_G2, pady=3)
+        self.video_codec_var = tk.StringVar(value=self._video_codec_label(vid))
+        vc_cb = ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
+                             width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS])
+        vc_cb.grid(row=0, column=5, sticky="w", pady=3)
+        Tooltip(vc_cb,
+                "How the finished video is compressed. Higher quality means a "
+                "bigger file for the same picture; it does not change how long the "
+                "upscaling itself takes.", wraplength=W)
+        # The SeedVR2 weights used to have their own "Model:" row here. It is gone: the
+        # single "Model:" picklist under "Default method for new queue items" now covers
+        # BOTH engines, following the Method above it. The var lives on as the store for
+        # the SeedVR2 half of that picklist (row 3 is deliberately left empty rather than
+        # renumbering the whole grid).
+        self.video_model_var = tk.StringVar(value=self._video_model_label(vid))
+        # ── Advanced (leave on Auto) ──────────────────────────────────────────────
+        # Batch (temporal window) and overlap default to Auto: the pod sizes them from
+        # its real VRAM + the output resolution, so a user never has to learn SeedVR2's
+        # knobs. These are overrides for power users; a wrong value self-corrects on the
+        # pod (OOM auto-recovery). The picklists only offer valid 4n+1 / in-range values.
+        ttk.Label(sec, text="Advanced (leave on Auto):", foreground="#888").grid(
+            row=4, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ttk.Label(sec, text="Batch size (window):").grid(row=5, column=0, sticky="w",
+                                                         padx=(0, 4), pady=3)
+        _bs = int(vid.get("batch_size", 0) or 0)
+        self.video_batch_var = tk.StringVar(value=("Auto" if _bs <= 0 else str(_bs)))
+        _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 126)]   # 5,9,…,501
+        bs_cb = ttk.Combobox(sec, textvariable=self.video_batch_var, state="readonly",
+                             width=10, values=_batch_choices)
+        bs_cb.grid(row=5, column=1, sticky="w", pady=3)
+        Tooltip(bs_cb, "Frames SeedVR2 processes together (4n+1). Auto = the largest the "
+                       "pod's VRAM safely allows for the target (more = smoother motion, "
+                       "fewer seams). Big values past ~33 mostly cut overlap redundancy, not "
+                       "boost quality, and need a big card (4K caps near 33 on 180 GB; bigger "
+                       "fits only at 1440p/1080p). A too-large pick self-corrects via the pod's "
+                       "OOM-recovery. Leave on Auto unless you're benchmarking.")
+        ttk.Label(sec, text="Temporal overlap:").grid(row=5, column=2, sticky="w",
+                                                      padx=_G2, pady=3)
+        _ov = int(vid.get("temporal_overlap", -1))
+        self.video_overlap_var = tk.StringVar(value=("Auto" if _ov < 0 else str(_ov)))
+        ov_cb = ttk.Combobox(sec, textvariable=self.video_overlap_var, state="readonly",
+                             width=10, values=["Auto"] + [str(n) for n in range(0, 13)])
+        ov_cb.grid(row=5, column=3, sticky="w", pady=3)
+        Tooltip(ov_cb, "Frames blended between batches to hide the seam (a quality floor, "
+                       "not a cost knob: 3 left a visible break, 6 was undetectable). Auto "
+                       "uses at least 6, more for large windows. 0 = hard cut. The pod caps "
+                       "it below the batch.")
+        self.video_compile_var = tk.BooleanVar(value=bool(vid.get("compile", True)))
+        cmp_cb = ttk.Checkbutton(sec, text="Speed up with torch.compile (recommended)",
+                                 variable=self.video_compile_var)
+        cmp_cb.grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        Tooltip(cmp_cb, "Compiles the SeedVR2 model on the first segment of a run (that "
+                        "segment is slower), then later segments run faster. Best on long "
+                        "videos, where the one-time cost is spread over many segments.\n\n"
+                        "It is not free: compiling raises VRAM use, so the largest batch "
+                        "that still fits gets smaller (measured on a 24 GB card: about half "
+                        "the frames per window). A smaller window can cost more speed than "
+                        "compiling gains, so on a small card it can be a net loss. Benchmark "
+                        "your card both ways if you care.\n\n"
+                        "Local runs also need a C compiler and Triton; without them the run "
+                        "goes ahead uncompiled and the log says so.")
+        self.video_uniform_var = tk.BooleanVar(value=bool(vid.get("uniform_batch_size", True)))
+        uni_cb = ttk.Checkbutton(sec, text="Uniform batch size (cleaner seams)",
+                                 variable=self.video_uniform_var)
+        uni_cb.grid(row=6, column=2, columnspan=2, sticky="w", padx=_G2, pady=(4, 0))
+        Tooltip(uni_cb, "Pads the last (ragged) batch so it matches the rest, preventing a "
+                        "flicker at the end of each chunk. Tiny extra compute, recommended on.")
+        self.video_autotune_var = tk.BooleanVar(value=bool(vid.get("auto_tune_batch", True)))
+        at_cb = ttk.Checkbutton(sec, text="Auto-tune batch size (long videos)",
+                                variable=self.video_autotune_var)
+        at_cb.grid(row=6, column=4, columnspan=2, sticky="w", padx=_G2, pady=(4, 0))
+        Tooltip(at_cb, "On a multi-segment video, learns the largest batch size that fits "
+                       "this card at this output size from the first segment's real VRAM use, "
+                       "then reuses it (and remembers it for next time). Speeds up long runs "
+                       "and avoids repeated out-of-memory back-offs. Only affects the AUTO "
+                       "batch size (an explicit Advanced batch overrides it).")
+        ttk.Label(sec, text="4K input noise:").grid(row=5, column=4, sticky="w",
+                                                    padx=_G2, pady=3)
+        _ns = float(vid.get("input_noise_scale", 0.0) or 0.0)
+        self.video_noise_var = tk.StringVar(value=("Off" if _ns <= 0 else f"{_ns:g}"))
+        ns_cb = ttk.Combobox(sec, textvariable=self.video_noise_var, state="readonly",
+                             width=10, values=["Off", "0.02", "0.03", "0.05"])
+        ns_cb.grid(row=5, column=5, sticky="w", pady=3)
+        Tooltip(ns_cb, "Injects a little noise into the input to counter the soft, "
+                       "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
+                       "try 0.02 if your 4K output looks plasticky.")
+        self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
+        # row 12, NOT 11: row 11 already holds the work-folder row above. Two widgets in one
+        # grid cell do not push each other aside, they DRAW ON TOP of each other, so this
+        # checkbox silently covered the "Work folder (staging)" label and its entry.
+        confirm_chk = ttk.Checkbutton(
+            sec, text="Confirm (show the cost estimate) before renting a pod",
+            variable=self.video_confirm_var)
+        confirm_chk.grid(row=12, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        Tooltip(confirm_chk,
+                "Ask first, showing what the queue is expected to cost and how "
+                "long it should take, before any billed machine is created. "
+                "Leave this on unless the prompt is getting in your way.",
+                wraplength=W)
+
+        # ── Default method for new queue items ────────────────────────────────────
+        # These are just the DEFAULTS pre-selected on the Video Upscaler tab; the actual
+        # method is chosen PER VIDEO there (a queue can mix methods), so this is not a global
+        # switch (rows 13+ so the existing grid is untouched).
+        ttk.Label(sec, text="Default method for new queue items:", foreground="#888").grid(
+            row=13, column=0, columnspan=6, sticky="w", pady=(10, 0))
+        # Method + Model share one row, in their OWN frame: both comboboxes are 40 chars
+        # wide, so gridding them into the six-column grid above would stretch its first
+        # two columns and pull the three-across rows out of shape.
+        mrow = ttk.Frame(sec)
+        mrow.grid(row=14, column=0, columnspan=6, sticky="w", pady=3)
+        ttk.Label(mrow, text="Method:").pack(side="left", padx=(0, 4))
+        self.video_engine_var = tk.StringVar(value=self._video_engine_label(vid))
+        eng_cb = ttk.Combobox(mrow, textvariable=self.video_engine_var, state="readonly",
+                              width=40, values=[lbl for lbl, _v in _VIDEO_ENGINE_OPTIONS])
+        eng_cb.pack(side="left")
+        Tooltip(eng_cb,
+                "The method PRE-SELECTED for a new video on the Video Upscaler tab. You still "
+                "pick the method per video there, so one queue can mix SeedVR2 and Real-ESRGAN; "
+                "this only sets the starting choice. (Real-ESRGAN is a local-GPU engine; remote "
+                "pod runs are always SeedVR2.)\n\n"
+                "SeedVR2 invents new detail (best quality) but is slow and VRAM-hungry on a "
+                "local card. Real-ESRGAN is a fast, light, fixed 2x/4x upscaler that runs on "
+                "almost any GPU and keeps text/edges cleaner, at some loss of fine invented "
+                "detail. Try Real-ESRGAN if SeedVR2 is too slow on your machine.",
+                wraplength=W)
+        # ONE "Model:" picklist for both engines: it lists the SeedVR2 weights or the
+        # Real-ESRGAN models depending on the Method above it. The two choices are stored
+        # SEPARATELY (video_model_var -> dit_model, video_esrgan_model_var ->
+        # fixed_ratio_model), so flipping Method back and forth never loses the other
+        # engine's pick; this combobox is only the view onto whichever one is active.
+        ttk.Label(mrow, text="Model:").pack(side="left", padx=(24, 4))
+        self.video_esrgan_model_var = tk.StringVar(value=self._video_esrgan_model_label(vid))
+        self.video_model_pick_var = tk.StringVar()
+        self._model_cb = ttk.Combobox(
+            mrow, textvariable=self.video_model_pick_var, state="readonly", width=40)
+        self._model_cb.pack(side="left")
+        self._model_tip = Tooltip(self._model_cb, self.MODEL_TIP_SEEDVR2, wraplength=W)
+        self._model_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_model_pick())
+        # The Method drives which list this shows, so refresh it on every change.
+        eng_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_model_choices())
+        self._sync_model_choices()
+
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
+        # Placed AFTER the two tabs it serves (Batch Upscaler + Video Upscaler): these
+        # are engine internals both of them share, so they read as a footnote to the
+        # pair rather than as part of the still-image settings. Sections are packed in
+        # creation order, so this position IS the on-screen order.
         sec = self._section(body, "SeedVR Settings")
         present = {k: v for k, v in ups.items() if k not in _SEEDVR_EXCLUDE}
 
@@ -387,186 +586,6 @@ class SettingsTab(ttk.Frame):
             ttk.Label(sec, text=f"{_lbl(key)}:").grid(row=row, column=0, sticky="w", pady=3, padx=(0, 4))
             self._make_seedvr_control(sec, key, value).grid(row=row, column=1, sticky="w", pady=3)
             row += 1
-
-        # ── Video Upscaler (#2) ───────────────────────────────────────────────────
-        vid = CFG.get("video", {})
-        sec = self._section(body, "Video Upscaler")
-        sec.columnconfigure(1, weight=1)
-        ttk.Label(sec, text="Default target:").grid(row=0, column=0, sticky="w", pady=3)
-        self.video_target_var = tk.StringVar(value=vid.get("target", "1080p"))
-        vt_cb = ttk.Combobox(sec, textvariable=self.video_target_var, state="readonly",
-                             width=10, values=["1080p", "1440p", "4K"])
-        vt_cb.grid(row=0, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(vt_cb,
-                "The size pre-selected on the Video Upscaler tab. You can still "
-                "pick a different one per video before queueing it.", wraplength=W)
-        ttk.Label(sec, text="Output subfolder:").grid(row=1, column=0, sticky="w", pady=3)
-        self.video_outsub_var = tk.StringVar(value=vid.get("output_subdir", "__upscaled__"))
-        vo_ent = ttk.Entry(sec, textvariable=self.video_outsub_var, width=20)
-        vo_ent.grid(row=1, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(vo_ent,
-                "Name of the folder created for upscaled videos when you have not "
-                "chosen an output folder yourself.", wraplength=W)
-        ttk.Label(sec, text="Work folder (staging):").grid(row=11, column=0, sticky="w", pady=3)
-        self.video_workroot_var = tk.StringVar(value=vid.get("work_root", ""))
-        wr = ttk.Frame(sec)
-        wr.grid(row=11, column=1, sticky="ew", padx=6, pady=3)
-        wr.columnconfigure(0, weight=1)
-        wr_entry = ttk.Entry(wr, textvariable=self.video_workroot_var)
-        wr_entry.grid(row=0, column=0, sticky="ew")
-        wr_btn = ttk.Button(wr, text="Browse", width=8,
-                            command=self._pick_video_workroot)
-        wr_btn.grid(row=0, column=1, padx=(6, 0))
-        Tooltip(wr_btn,
-                "Choose the staging folder. Leave the box empty for the "
-                "recommended default on the app drive.", wraplength=W)
-        Tooltip(wr_entry,
-                "Where segments are staged during a run. Leave EMPTY to use a fast "
-                "local folder on the app drive (recommended). Staging locally means a "
-                "network hiccup on the OUTPUT drive can't strand a run in progress: only "
-                "the first read of the source and the final write of the output touch "
-                "the network. If you set a custom path, keep it OUTSIDE your source "
-                "folder or the scanner may re-read its own segments.")
-        ttk.Label(sec, text="Output quality:").grid(row=2, column=0, sticky="w", pady=3)
-        self.video_codec_var = tk.StringVar(value=self._video_codec_label(vid))
-        vc_cb = ttk.Combobox(sec, textvariable=self.video_codec_var, state="readonly",
-                             width=34, values=[lbl for lbl, _b, _t in _VIDEO_CODEC_OPTIONS])
-        vc_cb.grid(row=2, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(vc_cb,
-                "How the finished video is compressed. Higher quality means a "
-                "bigger file for the same picture; it does not change how long the "
-                "upscaling itself takes.", wraplength=W)
-        ttk.Label(sec, text="Model:").grid(row=3, column=0, sticky="w", pady=3)
-        self.video_model_var = tk.StringVar(value=self._video_model_label(vid))
-        model_cb = ttk.Combobox(sec, textvariable=self.video_model_var, state="readonly",
-                                width=34, values=[lbl for lbl, _f in _VIDEO_MODEL_OPTIONS])
-        model_cb.grid(row=3, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(model_cb, "SeedVR2 weights the pod loads (video only; the Batch Upscaler "
-                          "keeps its own). 7B FP16 = best detail. 3B Q8 = smaller, frees "
-                          "VRAM for bigger windows. The pod downloads the chosen file to "
-                          "the volume on first use (one-time), so switching needs no "
-                          "reprovision; that first run is slower while it downloads.")
-        # ── Advanced (leave on Auto) ──────────────────────────────────────────────
-        # Batch (temporal window) and overlap default to Auto: the pod sizes them from
-        # its real VRAM + the output resolution, so a user never has to learn SeedVR2's
-        # knobs. These are overrides for power users; a wrong value self-corrects on the
-        # pod (OOM auto-recovery). The picklists only offer valid 4n+1 / in-range values.
-        ttk.Label(sec, text="Advanced (leave on Auto):", foreground="#888").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(sec, text="Batch size (window):").grid(row=5, column=0, sticky="w", pady=3)
-        _bs = int(vid.get("batch_size", 0) or 0)
-        self.video_batch_var = tk.StringVar(value=("Auto" if _bs <= 0 else str(_bs)))
-        _batch_choices = ["Auto"] + [str(4 * n + 1) for n in range(1, 126)]   # 5,9,…,501
-        bs_cb = ttk.Combobox(sec, textvariable=self.video_batch_var, state="readonly",
-                             width=10, values=_batch_choices)
-        bs_cb.grid(row=5, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(bs_cb, "Frames SeedVR2 processes together (4n+1). Auto = the largest the "
-                       "pod's VRAM safely allows for the target (more = smoother motion, "
-                       "fewer seams). Big values past ~33 mostly cut overlap redundancy, not "
-                       "boost quality, and need a big card (4K caps near 33 on 180 GB; bigger "
-                       "fits only at 1440p/1080p). A too-large pick self-corrects via the pod's "
-                       "OOM-recovery. Leave on Auto unless you're benchmarking.")
-        ttk.Label(sec, text="Temporal overlap:").grid(row=6, column=0, sticky="w", pady=3)
-        _ov = int(vid.get("temporal_overlap", -1))
-        self.video_overlap_var = tk.StringVar(value=("Auto" if _ov < 0 else str(_ov)))
-        ov_cb = ttk.Combobox(sec, textvariable=self.video_overlap_var, state="readonly",
-                             width=10, values=["Auto"] + [str(n) for n in range(0, 13)])
-        ov_cb.grid(row=6, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(ov_cb, "Frames blended between batches to hide the seam (a quality floor, "
-                       "not a cost knob: 3 left a visible break, 6 was undetectable). Auto "
-                       "uses at least 6, more for large windows. 0 = hard cut. The pod caps "
-                       "it below the batch.")
-        self.video_compile_var = tk.BooleanVar(value=bool(vid.get("compile", True)))
-        cmp_cb = ttk.Checkbutton(sec, text="Speed up with torch.compile (recommended)",
-                                 variable=self.video_compile_var)
-        cmp_cb.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        Tooltip(cmp_cb, "Compiles the SeedVR2 model on the first segment of a run (that "
-                        "segment is slower), then later segments run faster. Best on long "
-                        "videos, where the one-time cost is spread over many segments.\n\n"
-                        "It is not free: compiling raises VRAM use, so the largest batch "
-                        "that still fits gets smaller (measured on a 24 GB card: about half "
-                        "the frames per window). A smaller window can cost more speed than "
-                        "compiling gains, so on a small card it can be a net loss. Benchmark "
-                        "your card both ways if you care.\n\n"
-                        "Local runs also need a C compiler and Triton; without them the run "
-                        "goes ahead uncompiled and the log says so.")
-        self.video_uniform_var = tk.BooleanVar(value=bool(vid.get("uniform_batch_size", True)))
-        uni_cb = ttk.Checkbutton(sec, text="Uniform batch size (cleaner seams)",
-                                 variable=self.video_uniform_var)
-        uni_cb.grid(row=8, column=0, columnspan=2, sticky="w")
-        Tooltip(uni_cb, "Pads the last (ragged) batch so it matches the rest, preventing a "
-                        "flicker at the end of each chunk. Tiny extra compute, recommended on.")
-        self.video_autotune_var = tk.BooleanVar(value=bool(vid.get("auto_tune_batch", True)))
-        at_cb = ttk.Checkbutton(sec, text="Auto-tune batch size (long videos)",
-                                variable=self.video_autotune_var)
-        at_cb.grid(row=9, column=0, columnspan=2, sticky="w")
-        Tooltip(at_cb, "On a multi-segment video, learns the largest batch size that fits "
-                       "this card at this output size from the first segment's real VRAM use, "
-                       "then reuses it (and remembers it for next time). Speeds up long runs "
-                       "and avoids repeated out-of-memory back-offs. Only affects the AUTO "
-                       "batch size (an explicit Advanced batch overrides it).")
-        ttk.Label(sec, text="4K input noise:").grid(row=10, column=0, sticky="w", pady=3)
-        _ns = float(vid.get("input_noise_scale", 0.0) or 0.0)
-        self.video_noise_var = tk.StringVar(value=("Off" if _ns <= 0 else f"{_ns:g}"))
-        ns_cb = ttk.Combobox(sec, textvariable=self.video_noise_var, state="readonly",
-                             width=10, values=["Off", "0.02", "0.03", "0.05"])
-        ns_cb.grid(row=10, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(ns_cb, "Injects a little noise into the input to counter the soft, "
-                       "over-smoothed look 4K upscales can have. Off is fine for 1080p/1440p; "
-                       "try 0.02 if your 4K output looks plasticky.")
-        self.video_confirm_var = tk.BooleanVar(value=bool(vid.get("confirm_before_rent", True)))
-        # row 12, NOT 11: row 11 already holds the work-folder row above. Two widgets in one
-        # grid cell do not push each other aside, they DRAW ON TOP of each other, so this
-        # checkbox silently covered the "Work folder (staging)" label and its entry.
-        confirm_chk = ttk.Checkbutton(
-            sec, text="Confirm (show the cost estimate) before renting a pod",
-            variable=self.video_confirm_var)
-        confirm_chk.grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        Tooltip(confirm_chk,
-                "Ask first, showing what the queue is expected to cost and how "
-                "long it should take, before any billed machine is created. "
-                "Leave this on unless the prompt is getting in your way.",
-                wraplength=W)
-
-        # ── Default method for new queue items ────────────────────────────────────
-        # These are just the DEFAULTS pre-selected on the Video Upscaler tab; the actual
-        # method is chosen PER VIDEO there (a queue can mix methods), so this is not a global
-        # switch (rows 13+ so the existing grid is untouched).
-        ttk.Label(sec, text="Default method for new queue items:", foreground="#888").grid(
-            row=13, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(sec, text="Method:").grid(row=14, column=0, sticky="w", pady=3)
-        self.video_engine_var = tk.StringVar(value=self._video_engine_label(vid))
-        eng_cb = ttk.Combobox(sec, textvariable=self.video_engine_var, state="readonly",
-                              width=40, values=[lbl for lbl, _v in _VIDEO_ENGINE_OPTIONS])
-        eng_cb.grid(row=14, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(eng_cb,
-                "The method PRE-SELECTED for a new video on the Video Upscaler tab. You still "
-                "pick the method per video there, so one queue can mix SeedVR2 and Real-ESRGAN; "
-                "this only sets the starting choice. (Real-ESRGAN is a local-GPU engine; remote "
-                "pod runs are always SeedVR2.)\n\n"
-                "SeedVR2 invents new detail (best quality) but is slow and VRAM-hungry on a "
-                "local card. Real-ESRGAN is a fast, light, fixed 2x/4x upscaler that runs on "
-                "almost any GPU and keeps text/edges cleaner, at some loss of fine invented "
-                "detail. Try Real-ESRGAN if SeedVR2 is too slow on your machine.",
-                wraplength=W)
-        ttk.Label(sec, text="Real-ESRGAN model:").grid(row=15, column=0, sticky="w", pady=3)
-        self.video_esrgan_model_var = tk.StringVar(value=self._video_esrgan_model_label(vid))
-        self._esrgan_model_cb = ttk.Combobox(
-            sec, textvariable=self.video_esrgan_model_var, state="readonly",
-            width=40, values=[lbl for lbl, _k in _ESRGAN_MODEL_OPTIONS])
-        self._esrgan_model_cb.grid(row=15, column=1, sticky="w", padx=6, pady=3)
-        Tooltip(self._esrgan_model_cb,
-                "The Real-ESRGAN model pre-selected when the default method above is "
-                "Real-ESRGAN. You still choose the exact method and model per video on the "
-                "Video Upscaler tab.\n\n"
-                "Compact is fast and low-VRAM (the recommended default). Quality gives sharper "
-                "fine detail but is much slower and needs more VRAM. The chosen model is "
-                "downloaded (and checked) on first use.",
-                wraplength=W)
-        # Grey the model picklist out unless Real-ESRGAN is selected (it does nothing for
-        # SeedVR2). Bound live so the state follows the engine combobox.
-        eng_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_esrgan_model_state())
-        self._sync_esrgan_model_state()
 
         # ── Notifications ───────────────────────────────────────────────────────
         # Settings live in the "notifications" config section; resolve_settings()
@@ -659,34 +678,33 @@ class SettingsTab(ttk.Frame):
         self.mqtt_cid_var  = tk.StringVar(
             value=mqtt.get("client_id", mqtt_publisher.DEFAULT_CLIENT_ID))
 
-        # Broker host with a fixed "mqtt://" hint so it's clear only the hostname
-        # or IP goes in the field (the scheme/port aren't typed here).
-        ttk.Label(sec, text="Broker host:").grid(row=1, column=0, sticky="w", pady=3)
-        hostrow = ttk.Frame(sec)
-        hostrow.grid(row=1, column=1, sticky="ew", padx=6, pady=3)
-        ttk.Label(hostrow, text="mqtt://").pack(side="left")
-        ttk.Entry(hostrow, textvariable=self.mqtt_host_var).pack(side="left", fill="x", expand=True)
-        ttk.Label(sec, text="Port:").grid(row=1, column=2, sticky="e", pady=3)
-        port_spin = ttk.Spinbox(sec, from_=1, to=65535, width=7,
+        # The whole broker connection on ONE row: host, port, credentials and both
+        # buttons. The host entry is a fixed 22 chars (it used to stretch to fill the
+        # section) — that is what makes the row fit inside the app's 1200 px minimum
+        # width, and a hostname or IP needs no more. The fixed "mqtt://" hint keeps it
+        # clear that only the host goes in the field, not the scheme or port. Client ID
+        # has no control (mqtt_cid_var still carries it through to config.json): it's an
+        # advanced field a non-technical user never needs; edit config.json to change.
+        brow = ttk.Frame(sec)
+        brow.grid(row=1, column=0, columnspan=4, sticky="w", pady=3)
+        ttk.Label(brow, text="Broker host:").pack(side="left", padx=(0, 4))
+        ttk.Label(brow, text="mqtt://").pack(side="left")
+        ttk.Entry(brow, textvariable=self.mqtt_host_var, width=22).pack(side="left")
+        ttk.Label(brow, text="Port:").pack(side="left", padx=(12, 4))
+        port_spin = ttk.Spinbox(brow, from_=1, to=65535, width=7,
                                 textvariable=self.mqtt_port_var)
-        port_spin.grid(row=1, column=3, sticky="w", padx=6, pady=3)
+        port_spin.pack(side="left")
         Tooltip(port_spin,
                 "The broker's port. 1883 is the standard, and is almost always "
                 "right; change it only if your broker was set up differently.",
                 wraplength=W)
-
-        # Username, Password, Test and Publish now share one row. Client ID has no
-        # control (mqtt_cid_var still carries it through to config.json) — it's an
-        # advanced field a non-technical user never needs; edit config.json to change.
-        urow = ttk.Frame(sec)
-        urow.grid(row=2, column=0, columnspan=4, sticky="w", pady=3)
-        ttk.Label(urow, text="Username:").pack(side="left")
-        ttk.Entry(urow, textvariable=self.mqtt_user_var, width=16).pack(side="left", padx=(4, 0))
-        ttk.Label(urow, text="Password:").pack(side="left", padx=(12, 0))
-        ttk.Entry(urow, textvariable=self.mqtt_pass_var, show="•", width=16).pack(side="left", padx=(4, 0))
-        self.mqtt_test_btn = ttk.Button(urow, text="Test", command=self._test_mqtt)
+        ttk.Label(brow, text="Username:").pack(side="left", padx=(12, 4))
+        ttk.Entry(brow, textvariable=self.mqtt_user_var, width=14).pack(side="left")
+        ttk.Label(brow, text="Password:").pack(side="left", padx=(12, 4))
+        ttk.Entry(brow, textvariable=self.mqtt_pass_var, show="•", width=14).pack(side="left")
+        self.mqtt_test_btn = ttk.Button(brow, text="Test", command=self._test_mqtt)
         self.mqtt_test_btn.pack(side="left", padx=(12, 0))
-        pub_btn = ttk.Button(urow, text="Publish now", command=self._publish_mqtt)
+        pub_btn = ttk.Button(brow, text="Publish now", command=self._publish_mqtt)
         pub_btn.pack(side="left", padx=(6, 0))
         Tooltip(self.mqtt_test_btn,
                 "Try connecting to the broker with these details and report "
@@ -1041,13 +1059,47 @@ class SettingsTab(ttk.Frame):
                 return lbl
         return _ESRGAN_MODEL_OPTIONS[0][0]
 
-    def _sync_esrgan_model_state(self):
-        """Grey the Real-ESRGAN model picklist unless the fast engine is selected (the
-        model is meaningless for SeedVR2). Fail-safe: never break the tab over a UI toggle."""
+    MODEL_TIP_SEEDVR2 = (
+        "The SeedVR2 weights used when the default method above is SeedVR2 (video only; "
+        "the Batch Upscaler keeps its own). You still choose the method and model per "
+        "video on the Video Upscaler tab.\n\n"
+        "7B FP16 = best detail. 3B Q8 = smaller, frees VRAM for bigger windows. A remote "
+        "pod downloads the chosen file to the volume on first use (one-time), so switching "
+        "needs no reprovision; that first run is slower while it downloads.")
+    MODEL_TIP_ESRGAN = (
+        "The Real-ESRGAN model used when the default method above is Real-ESRGAN. You "
+        "still choose the method and model per video on the Video Upscaler tab.\n\n"
+        "Compact is fast and low-VRAM (the recommended default). Quality gives sharper "
+        "fine detail but is much slower and needs more VRAM. The chosen model is "
+        "downloaded (and checked) on first use.")
+
+    def _model_store_var(self):
+        """The var holding the model choice for the currently selected Method, paired
+        with that engine's option list. SeedVR2 and Real-ESRGAN keep separate stores so
+        neither is lost when the Method is flipped."""
+        is_fixed = any(val == "fixed_ratio" and lbl == self.video_engine_var.get()
+                       for lbl, val in _VIDEO_ENGINE_OPTIONS)
+        if is_fixed:
+            return self.video_esrgan_model_var, _ESRGAN_MODEL_OPTIONS, self.MODEL_TIP_ESRGAN
+        return self.video_model_var, _VIDEO_MODEL_OPTIONS, self.MODEL_TIP_SEEDVR2
+
+    def _sync_model_choices(self):
+        """Point the one "Model:" picklist at the selected Method's model list and show
+        that engine's stored choice. Fail-safe: never break the tab over a UI refresh."""
         try:
-            is_fixed = any(val == "fixed_ratio" and lbl == self.video_engine_var.get()
-                           for lbl, val in _VIDEO_ENGINE_OPTIONS)
-            self._esrgan_model_cb.configure(state=("readonly" if is_fixed else "disabled"))
+            store, options, tip = self._model_store_var()
+            self._model_cb.configure(values=[lbl for lbl, _v in options])
+            self.video_model_pick_var.set(store.get() or options[0][0])
+            self._model_tip.set_text(tip)
+        except Exception:                            # noqa: BLE001
+            pass
+
+    def _on_model_pick(self):
+        """Write the picked label back into the ACTIVE engine's store var (the combobox
+        itself is only a view; _video_section reads the two stores)."""
+        try:
+            store, _options, _tip = self._model_store_var()
+            store.set(self.video_model_pick_var.get())
         except Exception:                            # noqa: BLE001
             pass
 
@@ -1296,7 +1348,7 @@ class SettingsTab(ttk.Frame):
         self.video_model_var.set(self._video_model_label(vid))
         self.video_engine_var.set(self._video_engine_label(vid))
         self.video_esrgan_model_var.set(self._video_esrgan_model_label(vid))
-        self._sync_esrgan_model_state()
+        self._sync_model_choices()      # re-point the shared "Model:" picklist
         _vbs = int(vid.get("batch_size", 0) or 0)
         self.video_batch_var.set("Auto" if _vbs <= 0 else str(_vbs))
         _vov = int(vid.get("temporal_overlap", -1))

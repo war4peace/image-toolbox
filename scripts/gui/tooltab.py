@@ -30,6 +30,7 @@ from gui.common import (
     CREATE_NO_WINDOW, CFG, save_config, load_settings, save_settings,
     get_default_folder, set_default_folder, get_install_mode, mqtt_enabled,
     funds_color, config_funds_floor, fmt_funds, _FUNDS_GREY,
+    RUN_ON_LOCAL, RUN_ON_REMOTE,
 )
 from gui.widgets import (
     sanitize, _fmt_eta, ProgressBar, TelemetryRow, LogPane, LogViewer,
@@ -213,50 +214,78 @@ class ToolTab(ttk.Frame):
         the user switches to the tab. Idempotent: only fills empty fields, never
         overwrites a folder the user is working with. Overridden per tool."""
 
-    # ── Remote-pod row: "Run on remote pod" + live GPU picker ────────────────
+    # ── "Run on" row: Local / Remote selector + GPU picker ───────────────────
     #
-    # The picker queries RunPod for what is ACTUALLY deployable right now (GPU,
-    # live price, stock) in the volume's region, filtered to a usable VRAM floor
-    # and sorted cheapest-first — so the user can't pick a card that only fails at
-    # create time (the static Settings picklists could). The selection overrides
-    # the configured default for this run and seeds a price-ordered fallback
-    # chain. Tabs set self._gpu_min_vram and self._gpu_pref_key before building.
+    # One row, the same shape on every tool tab (the Video Upscaler builds its own
+    # copy of it): "Run on:" picks the local card or a rented RunPod pod, and the
+    # GPU picker next to it lists whatever that choice can actually use.
+    #
+    # Remote: the picker queries RunPod for what is ACTUALLY deployable right now
+    # (GPU, live price, stock) in the volume's region, filtered to a usable VRAM
+    # floor and sorted cheapest-first — so the user can't pick a card that only
+    # fails at create time (the static Settings picklists could). The selection
+    # overrides the configured default for this run. Tabs set self._gpu_min_vram
+    # and self._gpu_pref_key before building.
+    #
+    # Local: the picker lists this machine's NVIDIA cards (nvidia-smi). With one
+    # card it is a readout; with several, the pick is passed to the runner as
+    # CUDA_VISIBLE_DEVICES (see _local_gpu_env).
+    #
+    # remote_var stays the single source of truth for "is this run remote" (the
+    # funds readout, telemetry and every _start read it); the combobox just drives
+    # it, so nothing downstream had to change.
 
     def _build_remote_row(self, row):
-        """A dedicated full-width row so the long checkbox label and the GPU
-        picker both fit (fixes the 'Run on rer' clipping when they shared the
-        button row)."""
+        """A dedicated full-width row so the two pickers and the cost readout all
+        fit (they clipped each other when they shared the button row)."""
         rr = ttk.Frame(self)
         rr.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        self.remote_chk = ttk.Checkbutton(
-            rr, text="Run on remote pod (RunPod)", variable=self.remote_var,
-            command=self._on_remote_toggle)
-        self.remote_chk.pack(side="left")
+        ttk.Label(rr, text="Run on:").pack(side="left", padx=(0, 4))
+        imode = get_install_mode()
+        # A single-mode install can't choose: pin the value and grey the combobox
+        # out (the GPU picker beside it stays live — there is still a card to pick).
+        values = ([RUN_ON_REMOTE] if imode == "remote" else
+                  [RUN_ON_LOCAL] if imode == "local" else
+                  [RUN_ON_LOCAL, RUN_ON_REMOTE])
+        self.run_on_var = tk.StringVar(
+            value=RUN_ON_REMOTE if self.remote_var.get() else RUN_ON_LOCAL)
+        self.run_on_combo = ttk.Combobox(
+            rr, textvariable=self.run_on_var, values=values, width=15,
+            state="disabled" if len(values) == 1 else "readonly")
+        self.run_on_combo.pack(side="left")
+        self.run_on_combo.bind("<<ComboboxSelected>>",
+                               lambda _e: self._on_run_on_change())
         # Kept as an attribute so a tab with a different story (Tag & Rename runs
         # locally and only tunnels the model calls) can RETARGET it via set_text.
         # Adding a second Tooltip would not override this one: Tooltip binds with
         # add="+", so both would pop up, stacked.
         self.remote_tip = Tooltip(
-            self.remote_chk,
-            "Run on a rented RunPod GPU instead of this PC (roadmap #1, "
-            "experimental). Creates a billed pod and terminates it when done. "
-            "Needs a RunPod API key + model volume in Settings.",
+            self.run_on_combo,
+            "Where the AI work happens: this PC's graphics card, or a rented "
+            "RunPod GPU (roadmap #1, experimental). A remote run creates a billed "
+            "pod and terminates it when done; it needs a RunPod API key + model "
+            "volume in Settings.",
             wraplength=Tooltip.WRAP_NARROW)
+        if len(values) == 1:
+            self.remote_tip.set_text(
+                "This is a Remote-only install (no local PyTorch / SeedVR2), so "
+                "every run goes to a rented RunPod GPU." if imode == "remote" else
+                "This is a Local-only install (no RunPod remote stack), so every "
+                "run uses this PC's graphics card.")
         ttk.Label(rr, text="GPU:").pack(side="left", padx=(16, 4))
         self.gpu_pick_var = tk.StringVar(value="")
         self.gpu_combo = ttk.Combobox(
-            rr, textvariable=self.gpu_pick_var, state="disabled", width=44)
+            rr, textvariable=self.gpu_pick_var, state="readonly", width=44)
         self.gpu_combo.pack(side="left")
-        Tooltip(self.gpu_combo,
-                "GPUs that can be rented in your volume's region right now, "
-                "cheapest first. Live availability and price from RunPod. The run "
-                "uses exactly the card you pick, with no automatic substitution: if "
-                "it has sold out by the time the pod deploys, the run stops cleanly "
-                "and you press ↻ to refresh stock and pick another.")
+        self.gpu_tip = Tooltip(self.gpu_combo, self.GPU_TIP_REMOTE,
+                               wraplength=Tooltip.WRAP_NARROW)
         self.gpu_refresh_btn = ttk.Button(
-            rr, text="↻", width=3, state="disabled", command=self._refresh_gpus)
+            rr, text="↻", width=3, command=self._refresh_gpus)
         self.gpu_refresh_btn.pack(side="left", padx=(4, 0))
-        Tooltip(self.gpu_refresh_btn, "Re-check availability and pricing.")
+        Tooltip(self.gpu_refresh_btn,
+                "Re-check the list: rented cards for availability and price, this "
+                "PC's cards for one plugged in since the app started.",
+                wraplength=Tooltip.WRAP_NARROW)
         # Estimated $ / 100 images (0.3.9). Benchmark-derived before a run; switches
         # to a live figure once 100 images are processed. Hidden on local runs.
         self.cost100_var = tk.StringVar(value="")
@@ -268,26 +297,106 @@ class ToolTab(ttk.Frame):
         self.gpu_combo.bind("<<ComboboxSelected>>",
                             lambda _e: self._update_cost100_estimate(), add="+")
         self._gpu_choices = []      # parallel to the combobox values (dicts)
-        self._gpu_loaded  = False   # True after a successful fetch
-        # A Remote-only install defaults the toggle on — load the list up front.
-        if self.remote_var.get():
-            self.after(300, self._on_remote_toggle)
+        self._gpu_loaded  = False   # True after a successful REMOTE fetch
+        self._remote_gpus = None    # cached live RunPod list (None = never fetched)
+        self._remote_dc   = None    # data center the cached list was read in
+        self._local_gpus  = None    # cached nvidia-smi list (None = not detected yet)
+        # Fill the picker for whichever mode we start in, just after the window is
+        # up (both paths block: nvidia-smi spawns, the RunPod list is a network call).
+        self.after(300, self._on_run_on_change)
 
-    def _on_remote_toggle(self):
-        on = bool(self.remote_var.get())
-        self.gpu_combo.configure(state="readonly" if on else "disabled")
-        self.gpu_refresh_btn.configure(state="normal" if on else "disabled")
-        # The $/100 readout is meaningful only for a billed remote run.
-        if on:
-            self._update_cost100_estimate()
-        elif self.cost100_var is not None:
+    GPU_TIP_REMOTE = (
+        "GPUs that can be rented in your volume's region right now, cheapest "
+        "first. Live availability and price from RunPod. The run uses exactly the "
+        "card you pick, with no automatic substitution: if it has sold out by the "
+        "time the pod deploys, the run stops cleanly and you press ↻ to refresh "
+        "stock and pick another.")
+    GPU_TIP_LOCAL = (
+        "The graphics card in this PC that does the work. With more than one "
+        "NVIDIA card, the run is pinned to the one you pick here, leaving the "
+        "others free.")
+
+    def _on_run_on_change(self):
+        """The 'Run on' selector changed (or the tab just came up): mirror it into
+        remote_var, then show the GPU list that belongs to the new mode. Each list
+        is cached, so flipping back and forth costs no extra RunPod call."""
+        remote = self.run_on_var.get() == RUN_ON_REMOTE
+        self.remote_var.set(remote)
+        self.gpu_tip.set_text(self.GPU_TIP_REMOTE if remote else self.GPU_TIP_LOCAL)
+        self._gpu_choices = []
+        self.gpu_combo.configure(values=[])
+        self.gpu_pick_var.set("")
+        if remote:
+            if self._remote_gpus is None:
+                self._refresh_gpus()
+            else:
+                self._populate_gpus(self._remote_gpus, self._remote_dc)
+        else:
+            # The $/100 readout is meaningful only for a billed remote run.
             self.cost100_var.set("")
-        if on and not self._gpu_loaded:
-            self._refresh_gpus()
-        # Enable/disable the bottom-bar funds readout to match the remote toggle.
+            if self._local_gpus is None:
+                self._refresh_local_gpus()
+            else:
+                self._populate_local_gpus(self._local_gpus)
+        # Enable/disable the bottom-bar funds readout to match the mode.
         self.app.refresh_funds_readout()
 
+    # ── Local GPU picker ─────────────────────────────────────────────────────
+
+    def _refresh_local_gpus(self):
+        """Enumerate this machine's NVIDIA cards off the UI thread (nvidia-smi
+        spawns a process). Fail-safe: no card found just says so."""
+        self.gpu_refresh_btn.configure(state="disabled")
+        self.gpu_pick_var.set("detecting local GPUs …")
+
+        def work():
+            try:
+                import system_telemetry as st
+                gpus = st.list_gpus()
+            except Exception:                            # noqa: BLE001 (UI thread)
+                gpus = []
+            self.after(0, lambda: self._populate_local_gpus(gpus))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_local_gpus(self, gpus):
+        self.gpu_refresh_btn.configure(state="normal")
+        prev = self.gpu_pick_var.get()
+        self._local_gpus  = list(gpus or [])
+        # Shaped like a remote GPU dict (id/name/memory_gb/price/stock) so
+        # _selected_gpu and the run-start path read both lists the same way;
+        # price=None marks it free. id = the nvidia-smi name, the key the local
+        # runners record their measured timing under.
+        self._gpu_choices = [{"id": g["name"], "name": g["name"],
+                              "memory_gb": g["memory_gb"], "price": None,
+                              "stock": "local", "index": g["index"]}
+                             for g in self._local_gpus]
+        if not self._gpu_choices:
+            self.gpu_combo.configure(values=[])
+            self.gpu_pick_var.set("no NVIDIA GPU detected")
+            return
+        labels = [f"{g['name']}, {g['memory_gb']} GB" for g in self._gpu_choices]
+        self.gpu_combo.configure(values=labels)
+        # Keep the card the user had picked when ↻ re-detects the same machine.
+        self.gpu_combo.current(labels.index(prev) if prev in labels else 0)
+
+    def _local_gpu_env(self):
+        """Extra env pinning a LOCAL run to the picked card, or None. Only sent on a
+        multi-GPU machine: with a single card there is nothing to choose and pinning
+        it would just add a way to get it wrong."""
+        if len(self._gpu_choices) < 2:
+            return None
+        g = self._selected_gpu()
+        idx = g.get("index") if g else None
+        return {"CUDA_VISIBLE_DEVICES": str(idx)} if idx is not None else None
+
+    # ── Remote GPU picker ────────────────────────────────────────────────────
+
     def _refresh_gpus(self):
+        """The ↻ button (and the first fill): re-read whichever list the current
+        mode shows."""
+        if not self.remote_var.get():
+            return self._refresh_local_gpus()
         rp_cfg = CFG.get("runpod", {})
         if not rp_cfg.get("api_key"):
             self.gpu_pick_var.set("(set a RunPod API key in Settings)")
@@ -322,6 +431,8 @@ class ToolTab(ttk.Frame):
         self.gpu_refresh_btn.configure(state="normal")
         self._gpu_choices = gpus
         self._gpu_loaded  = True
+        self._remote_gpus = gpus            # cached: a mode flip needn't re-fetch
+        self._remote_dc   = dc
         if not gpus:
             region = dc or "this region"
             self.gpu_combo.configure(values=[])

@@ -976,9 +976,9 @@ as the other tools); it adds no pipeline logic.
 
 ### 15.1 Resolved decisions (the contract)
 
-- **Remote OR local as built (0.5.0).** The tab has a **"Run on:" selector**
-  (Remote (RunPod) / Local GPU), gated by the install mode: Remote-only disables Local,
-  Local-only disables Remote, Both remembers the last choice. Local runs SeedVR2 on this
+- **Remote OR local as built (0.5.0).** The tab has a **"Run on:" combobox**
+  ("Local GPU" / "Remote: RunPod"), gated by the install mode: a single-mode install pins
+  and greys it out, Both offers the pair and remembers the last choice. Local runs SeedVR2 on this
   machine's GPU with the predictive VRAM sizer + mid-segment thrash watchdog and no pod.
   Designed + as-built in `docs/local-video-upscaler.md` (sections 10, 15, 17, 18).
 - **A persistent, DB-backed QUEUE is the core object.** "Prepare" adds a

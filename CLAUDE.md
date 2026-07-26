@@ -286,6 +286,30 @@ their **recommended value**, pinned to the runner's coded default by
 fallback it describes. Texts wrap at `Tooltip.WRAP_NARROW` (250 px) so a short
 hint is a compact block, not one wide strip.
 
+**One "Run on" row everywhere** (0.5.8) — the three GPU tabs (Batch Upscaler, Tag
+& Rename, Video Upscaler) present the same control pair on one row: a **"Run on:"
+combobox** ("Local GPU" / "Remote: RunPod", the shared `gui.common.RUN_ON_LOCAL` /
+`RUN_ON_REMOTE` labels) followed by a **GPU picker + ↻** that lists whatever that
+choice can actually use. Remote lists the live RunPod catalog as before; **Local
+lists this machine's NVIDIA cards** (`system_telemetry.list_gpus`, the enumerating
+sibling of the first-card-only `sample_gpu`), and on a **multi-GPU** machine the
+picked card is passed to the runner as `CUDA_VISIBLE_DEVICES` (`ToolTab._local_gpu_env`;
+deliberately NOT sent with one card, where there is nothing to choose). This
+replaced the image tabs' "Run on remote pod (RunPod)" checkbox and the Video tab's
+Local/Remote radio pair. `remote_var` (Upscaler/Tag) and `mode_var` (Video) survive
+unchanged as the "is this run remote" source of truth that the funds readout,
+telemetry and every `_start` read, so the combobox only drives them. A
+**single-mode install** (Local-only / Remote-only) pins the selector to the one
+value it can run and greys it out, with a tooltip saying why, while the GPU picker
+beside it stays live: there is still a card to pick. Each mode's list is cached, so
+flipping back and forth costs no extra RunPod call or `nvidia-smi` spawn. On the
+Video Upscaler the row sits under the folder fields (above "Eligible videos") and
+also carries the **readiness line** and, right-aligned, **Benchmark GPU…** (which
+acts on the card picked on that row); the readiness line no longer repeats the
+card name + VRAM the picker already shows. **Tab order** is Batch Upscaler · Tag &
+Rename · Video Upscaler · Conciliation · Settings · RunPod: the three GPU tools
+sit together, with Conciliation (the post-processing step) after them.
+
 **Settings** — Ollama URL (with reachability check) and model picklist;
 auto-straighten toggle/threshold; Resolution Target and skip-cutoff; SeedVR
 pipeline options; Discord webhook (with Test); default folders per tool. Settings
@@ -352,7 +376,7 @@ a Discord alert, and **auto-stops after the current image** (the resume cache
 continues the queue after a reboot; the rescan pass is skipped via the `degraded`
 stat). Edge-triggered (one notification per episode). Inherent limit: a run that
 is *already* degraded at image #1 has no healthy sample to anchor to (reboot
-first). Toggle + factor/consecutive in Settings → Upscaling; `watchdog_min_samples`
+first). Toggle + factor/consecutive in Settings → Batch Upscaler; `watchdog_min_samples`
 is config-only. Built as a reusable health signal for remote-pod upscaling
 (future #1). See `WATCHDOG_*` and `_trigger_degradation` in `batch_upscale.py`.
 
@@ -462,7 +486,7 @@ needs an elevated, registered source and the app runs non-elevated.) See
 
 **Remote upscaling (RunPod)** (0.3.1, experimental; onboarding 0.3.2) — runs the
 batch on a **rented RunPod GPU** for users without a strong local GPU (or whose
-GPU hit the degradation bug). Tick "Run on remote pod" on the Batch Upscaler tab:
+GPU hit the degradation bug). Set "Run on" to "Remote: RunPod" on the Batch Upscaler tab:
 the app creates a disposable pod, streams **one image at a time** to a resident
 on-pod worker that loads SeedVR2 once, fetches each result back, and tears the pod
 down — the queue, resume-cache, film-strip and watchdog all stay local; the source
@@ -486,7 +510,7 @@ CPU/RAM/VRAM/temp during a run. **0.3.2 made it usable by a non-technical user:*
 "Set up SSH key"), a **Local / Remote / Both install-mode wizard** (Remote-only
 installs skip the ~3 GB local GPU stack), and **one-click model-volume
 provisioning** (Settings → "Provision models…"). **Remote Tag & Rename** (0.3.2)
-works the same way — tick "Run on remote pod" on the Tag & Rename tab: the pod
+works the same way — set "Run on" to "Remote: RunPod" on the Tag & Rename tab: the pod
 runs Ollama (vision model from the volume) **plus** the orientation CNN in a
 lightweight worker "tag mode" (no SeedVR2, so the VRAM is free for Ollama);
 `tag_and_rename.py` still runs locally (reads/writes the files, does EXIF/rename)
@@ -516,7 +540,7 @@ and `DIT_MODEL`/`_dit_model` follow config (`ollama.model` / `upscale.dit_model`
 (`runpod.tag_gpu_type_id` →
 an ordered fallback chain of 16–20 GB cards in `TAG_GPU_TYPES`; the vision model
 needs only ~6.6 GB), not the upscale GPU. **0.3.3 added a live GPU picker** next
-to each tab's "Run on remote pod" toggle: it queries RunPod's **GraphQL** endpoint
+to each tab's "Run on" selector: it queries RunPod's **GraphQL** endpoint
 (`runpod_client.available_gpus`) for the cards **actually deployable right now** in
 the volume's region — with live price and stock — filtered to a VRAM floor (≥32 GB
 upscale, ≥16 GB tag) and **sorted cheapest-first**, so a user can no longer pick a

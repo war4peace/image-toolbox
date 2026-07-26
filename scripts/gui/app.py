@@ -65,7 +65,11 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.minsize(900, 560)
+        # The floor is set by the Video Upscaler's queue list: its 12 visible columns
+        # sum to 1020 px and the window chrome + frame padding eat ~153 px, so
+        # anything under ~1173 clips the last column ("Segments"). 1200 with a little
+        # headroom.
+        self.minsize(1200, 560)
         # App icon for the title bar and taskbar button (app.ico at APP_ROOT, shipped
         # to {app} by the installer). `default=` sets it as the interpreter default, so
         # the root AND every Toplevel created afterwards (Compare, Segments, the log
@@ -101,8 +105,8 @@ class App(tk.Tk):
         self.runpod_tab     = RunPodTab(self.nb, self)
         self.nb.add(self.upscale_tab,    text="  Batch Upscaler  ")
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
-        self.nb.add(self.conciliate_tab, text="  Conciliation  ")
         self.nb.add(self.video_tab,      text="  Video Upscaler  ")
+        self.nb.add(self.conciliate_tab, text="  Conciliation  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.add(self.runpod_tab,     text="  RunPod  ")
         # Tabs whose selection is remembered across restarts (gui_settings.json
@@ -112,8 +116,8 @@ class App(tk.Tk):
         self._savable_tabs = [
             ("upscale",    self.upscale_tab),
             ("tag",        self.tag_tab),
-            ("conciliate", self.conciliate_tab),
             ("video",      self.video_tab),
+            ("conciliate", self.conciliate_tab),
         ]
         # RunPod funds readout state (bottom bar). Cached briefly so switching tabs
         # doesn't hammer the balance API.
@@ -417,7 +421,9 @@ class App(tk.Tk):
 
     def _restore_geometry(self):
         geo = self.settings.get("main_geometry")
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
+        # The fallback starts at the minimum width (see minsize) so a first launch
+        # isn't immediately clamped wider than the size it asked for.
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1200x720")
         if self.settings.get("main_zoomed"):
             try:
                 self.state("zoomed")

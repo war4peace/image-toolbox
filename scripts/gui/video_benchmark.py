@@ -83,10 +83,11 @@ class BenchmarkWindow(tk.Toplevel):
         except Exception:
             pass
         geo = self.app.settings.get("benchmark_geometry") if self.app is not None else None
-        # First-ever open uses the SAME default size as the main window (gui/app.py
-        # _restore_geometry "980x720"); after that the remembered geometry wins.
+        # First-ever open is 980x720; after that the remembered geometry wins. Its own
+        # numbers, sized by the results table (the main window's minimum is set by the
+        # video queue's column count and is deliberately unrelated).
         self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "980x720")
-        self.minsize(900, 480)                             # match the main window's min width
+        self.minsize(900, 480)
         # NOT transient(master): while the benchmark is up we fully HIDE the main window (see
         # _hide_master / _restore_master) so a non-technical user can't reach the tabs behind
         # it and start a conflicting GPU job. A transient child is auto-hidden when its master

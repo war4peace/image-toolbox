@@ -79,8 +79,10 @@ class UpscaleTab(ToolTab):
             self, text="Save as Default", command=lambda: self._save_default("out"))
         self.save_out_btn.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
 
+        # The "Run on" row is gridded above the action buttons (row 2 vs row 3): the
+        # user picks where the run happens, then presses Start.
         btns = ttk.Frame(self)
-        btns.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        btns.grid(row=3, column=0, columnspan=4, sticky="w", pady=(10, 0))
         self.start_btn = ttk.Button(btns, text="Start upscaling", command=self._start)
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._pause_or_cancel, state="disabled")
         self.stop_btn  = ttk.Button(btns, text="Stop after current image", command=self._stop, state="disabled")
@@ -90,7 +92,7 @@ class UpscaleTab(ToolTab):
             b.pack(side="left", padx=(0, 6))
         self._add_tooltips()
 
-        self._build_remote_row(row=3)
+        self._build_remote_row(row=2)
         self._build_output_area(row=4)
 
     # ── Button hints ─────────────────────────────────────────────────────────
@@ -313,13 +315,15 @@ class UpscaleTab(ToolTab):
                     APP_TITLE,
                     "This is a Remote-only install — the local upscaling engine "
                     "(PyTorch + SeedVR2) isn't installed.\n\n"
-                    "Tick 'Run on remote pod (RunPod)' to upscale on a rented GPU, "
+                    "Set 'Run on' to 'Remote: RunPod' to upscale on a rented GPU, "
                     "or reinstall and choose Local or Both to upscale on this PC.")
                 return
             if not self.confirm_gpu_overlap():
                 # Warn about local GPU contention. (No local GPU is used in remote
                 # mode, so that check is skipped above.)
                 return
+            # Multi-GPU machine: pin the run to the card picked next to 'Run on'.
+            extra_env = self._local_gpu_env()
 
         self.progress.set(0)
         self._reset_stream_state()
