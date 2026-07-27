@@ -1,0 +1,238 @@
+# =====================================================================
+# Image Toolbox - notification automations (OPTIONAL)
+# =====================================================================
+# Get a phone / dashboard notification when a run finishes, when it finishes
+# badly, and when the app dies in the middle of one.
+#
+# Where this goes: your Home Assistant `automations.yaml` (Settings > Automations
+# shows them afterwards), or paste one at a time into a new automation's
+# "Edit in YAML" view. Reload from Developer Tools > YAML > "Automations".
+#
+# Needs: the MQTT integration set up and Image Toolbox pointed at the same broker
+# (see this folder's README). Automations 1, 2 and 5 need nothing else; 3 and 4
+# additionally need the sensors from mqtt-sensors.yaml.
+#
+# ---------------------------------------------------------------------
+# WHERE TO SEND IT
+# ---------------------------------------------------------------------
+# Every example below notifies `notify.persistent_notification`, which exists on
+# every Home Assistant install and shows up in the sidebar. To get it on your
+# phone, install the Home Assistant companion app and replace that one line with
+# your device's service, e.g.
+#
+#     action: notify.mobile_app_pixel_9
+#
+# (Developer Tools > Actions > type "notify." to see yours.)
+#
+# ---------------------------------------------------------------------
+# THE ONE TRAP: RETAINED TOPICS RE-FIRE
+# ---------------------------------------------------------------------
+# Image Toolbox publishes its state RETAINED, so the broker hands a subscriber
+# the last value the moment it subscribes - that is what makes a dashboard
+# correct straight after a restart, instead of "unknown" until the next run.
+#
+# The cost: a retained value is delivered again on every Home Assistant restart
+# and every broker reconnect. An automation that triggers on `last_run` therefore
+# announces a run that finished days ago, every time HA restarts.
+#
+# So the app also publishes two NON-retained, one-shot EVENTS:
+#
+#     image-toolbox/event/run_started     {"tool": ..., "started_at": ...}
+#     image-toolbox/event/run_finished    the same object as `last_run`
+#
+# These are delivered live, exactly once, and are never replayed - so an
+# automation triggering on them cannot misfire. **Prefer the event topics for
+# triggers** (automations 1, 2 and 5) and read the retained topics for state.
+#
+# Automation 3 shows the retained route anyway, with the freshness guard it needs,
+# because you may want to trigger off the sensor you already have on a dashboard.
+#
+# ---------------------------------------------------------------------
+# HOME ASSISTANT VERSION
+# ---------------------------------------------------------------------
+# Written in the modern schema (`triggers:` / `conditions:` / `actions:` and
+# `trigger: mqtt`), Home Assistant 2024.10 and newer. On an older version use the
+# singular keys and `platform:` instead: `trigger:` / `condition:` / `action:`,
+# with `- platform: mqtt` and `service:` in place of `action:`.
+# =====================================================================
+
+
+# 1) A run finished cleanly -> tell me what it did.
+#    Covers all four tools (Batch Upscaler, Tag & Rename, Conciliation, Video
+#    Upscaler): they all publish the same summary shape.
+- alias: "Image Toolbox - run finished"
+  id: image_toolbox_run_finished
+  mode: queued
+  max: 5
+  triggers:
+    - trigger: mqtt
+      topic: image-toolbox/event/run_finished
+  conditions:
+    # Only the clean case here; automation 2 handles failures and early stops, and
+    # the two conditions are exact opposites, so a run fires exactly one of them.
+    # (Not every tool reports every key: `stop_reason` comes from Tag & Rename and
+    # the Video Upscaler, `stopped_by_user` / `degraded` from the Batch Upscaler.
+    # The defaults make a missing key mean "nothing went wrong".)
+    - condition: template
+      value_template: >-
+        {{ (trigger.payload_json.failed | default(0) | int) == 0
+           and (trigger.payload_json.stop_reason | default('completed')) == 'completed'
+           and not (trigger.payload_json.stopped_by_user | default(false))
+           and not (trigger.payload_json.degraded | default(false)) }}
+  actions:
+    - action: notify.persistent_notification
+      data:
+        # The `tool` key is a short machine word (upscale / tag / video /
+        # conciliating); this maps it to the tab name you see in the app.
+        title: >-
+          {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
+                        'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+          {%- set tool = trigger.payload_json.tool | default('run') %}
+          Image Toolbox: {{ nice.get(tool, tool) }} finished
+        message: >-
+          {{ trigger.payload_json.processed | default(0) }} processed
+          {%- if trigger.payload_json.skipped is defined %}, {{ trigger.payload_json.skipped }} skipped{% endif %}
+          {%- set secs = trigger.payload_json.elapsed_seconds | default(0) | float %}
+          {%- if secs >= 3600 %} in {{ (secs / 3600) | round(1) }} h
+          {%- elif secs >= 60 %} in {{ (secs / 60) | round(1) }} min
+          {%- elif secs > 0 %} in {{ secs | round | int }} s{% endif %}
+          {%- if trigger.payload_json.cost %} (${{ '%.2f' | format(trigger.payload_json.cost | float) }} of pod time){% endif %}.
+
+
+# 2) A run had failures, or ended early -> same information, louder.
+- alias: "Image Toolbox - run finished with problems"
+  id: image_toolbox_run_problems
+  mode: queued
+  max: 5
+  triggers:
+    - trigger: mqtt
+      topic: image-toolbox/event/run_finished
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ (trigger.payload_json.failed | default(0) | int) > 0
+           or (trigger.payload_json.stop_reason | default('completed')) != 'completed'
+           or (trigger.payload_json.stopped_by_user | default(false))
+           or (trigger.payload_json.degraded | default(false)) }}
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: >-
+          {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
+                        'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+          {%- set tool = trigger.payload_json.tool | default('run') %}
+          Image Toolbox: {{ nice.get(tool, tool) }} needs a look
+        message: >-
+          {{ trigger.payload_json.processed | default(0) }} processed,
+          {{ trigger.payload_json.failed | default(0) }} failed.
+          {%- if trigger.payload_json.degraded | default(false) %}
+          The GPU slowed down badly and the run auto-stopped (reboot, then re-run to continue).
+          {%- elif (trigger.payload_json.stop_reason | default('completed')) != 'completed' %}
+          Stopped early: {{ trigger.payload_json.stop_reason }}.
+          {%- elif trigger.payload_json.stopped_by_user | default(false) %}
+          You stopped it; re-running continues where it left off.
+          {%- endif %}
+        # On the companion app, an Android channel / iOS interruption level can
+        # make this one buzz differently from automation 1:
+        # data:
+        #   push:
+        #     interruption-level: time-sensitive   # iOS
+        #   channel: Image Toolbox alerts          # Android
+
+
+# 3) The SAME alert, built on the retained sensor instead of the event.
+#    Use this one only if you prefer triggering off the dashboard sensor. It needs
+#    BOTH guards below; without them it announces an old run on every HA restart.
+#    Disabled by default so it can't double up with automation 1.
+- alias: "Image Toolbox - run finished (retained-sensor route)"
+  id: image_toolbox_run_finished_retained
+  initial_state: false
+  mode: queued
+  triggers:
+    - trigger: state
+      entity_id: sensor.image_toolbox_last_run_summary
+      # Guard 1: at startup the entity goes unknown/unavailable -> value, which is
+      # a state change like any other. Ignore those.
+      not_from:
+        - unknown
+        - unavailable
+      not_to:
+        - unknown
+        - unavailable
+  conditions:
+    # Guard 2: the retained payload carries the time the run actually ended, with
+    # a UTC offset, so this comparison is correct whatever timezone HA runs in.
+    # Anything older than 10 minutes is a replay, not a run that just finished.
+    - condition: template
+      value_template: >-
+        {% set finished = state_attr('sensor.image_toolbox_last_run_summary', 'finished_at') %}
+        {{ finished is not none
+           and (as_timestamp(now()) - as_timestamp(finished, 0)) | abs < 600 }}
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: >-
+          {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
+                        'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+          {%- set tool = state_attr('sensor.image_toolbox_last_run_summary', 'tool') | default('run') %}
+          Image Toolbox: {{ nice.get(tool, tool) }} finished
+        message: >-
+          {{ state_attr('sensor.image_toolbox_last_run_summary', 'processed') }} processed,
+          {{ state_attr('sensor.image_toolbox_last_run_summary', 'failed') }} failed.
+
+
+# 4) The app died in the middle of a run.
+#    Nothing inside the app can send this: it is the broker publishing the app's
+#    Last Will when the connection drops without a clean goodbye. That makes Home
+#    Assistant the only place a crash (or a machine that rebooted) can be noticed.
+#    The explicit `from: online` is what keeps it quiet at HA restart.
+- alias: "Image Toolbox - app went offline mid-run"
+  id: image_toolbox_offline_midrun
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: sensor.image_toolbox_availability
+      from: "online"
+      to: "offline"
+  conditions:
+    # If it was idle, the app simply exited (or you closed it). Only worth an
+    # alert while it was working on something.
+    - condition: template
+      value_template: >-
+        {{ states('sensor.image_toolbox_task_name') not in ['idle', 'unknown', 'unavailable'] }}
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: "Image Toolbox stopped responding"
+        message: >-
+          The app went offline while {{ states('sensor.image_toolbox_task_name') }}
+          ({{ states('sensor.image_toolbox_task_details') }}).
+          Progress was {{ states('sensor.image_toolbox_task_progress') }}.
+          Runs resume where they stopped, so re-starting it should continue.
+
+
+# 5) OPTIONAL: a run started. Handy if someone else (or a scheduled task) starts
+#    runs on that machine. Disabled by default - enable it in the UI if you want it.
+- alias: "Image Toolbox - run started"
+  id: image_toolbox_run_started
+  initial_state: false
+  mode: queued
+  triggers:
+    - trigger: mqtt
+      topic: image-toolbox/event/run_started
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: >-
+          {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
+                        'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+          {%- set tool = trigger.payload_json.tool | default('a run') %}
+          Image Toolbox: {{ nice.get(tool, tool) }} started
+        message: "Started at {{ trigger.payload_json.started_at }}."
+
+# ---------------------------------------------------------------------
+# NOT here on purpose: a "progress" notification. `task/progress`, `task/eta` and
+# `task/details` update every few seconds during a run, so a notification per
+# change is unusable. Put those on a dashboard instead (dashboard-core.yaml has a
+# card that appears only while a run is active).
+# ---------------------------------------------------------------------

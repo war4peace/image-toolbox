@@ -256,6 +256,7 @@ fmt_duration    = runner_common.fmt_duration
 
 
 _LOG_FH = None        # per-run file sink (logs/video_<hash>.log, append mode)
+_RUN_T0 = time.time()  # run start, for the DONE event's elapsed_seconds (reset in main)
 
 
 def _open_log(source_root):
@@ -330,6 +331,7 @@ def gui_event(kind, payload):
       RTELEM|<json>    – a remote-pod telemetry sample (cpu/ram/gpu)
       POD|<pod id>     – the live remote pod (empty on none); protects it from terminate
       RCOST|<float>    – the pod's real billed $/h, for the live cost readout
+      DONE|<json>      – ONE machine-readable run summary (drives MQTT last_run)
     """
     runner_common.gui_event(kind, json.dumps(payload))
 
@@ -2263,10 +2265,11 @@ def run_queue(engine, conn, root_id, source_root, vcfg, budget,
                # Which jobs this pass tried (18): grouped Start unions these into a session-wide
                # attempted set so a failed job never re-triggers its group's pod on a later pass.
                "attempted": set(attempted)}
-    # The supervisor (#6) sends ONE accumulated summary across all its redeploys, so it
-    # passes notify_summary=False here to suppress a per-pod notification.
+    # The supervisor (#6) and the grouped run (18) send ONE accumulated summary across
+    # all their pods/redeploys, so they pass notify_summary=False here to suppress the
+    # per-pass notification AND its DONE event (exactly one of each reaches the GUI).
     if notify_summary:
-        _notify_summary(notify_settings, summary, source_root)
+        _run_finished(notify_settings, summary, source_root)
     log(f"Summary: {done} done, {failed} failed of {done + failed}"
         + (f", stopped early ({stopped})" if stopped else "") + ".")
     return summary
@@ -2349,6 +2352,52 @@ def _summary_desc(summary):
         lines.append("")
         lines.append("Totals: " + ", ".join(totals))
     return "\n".join(lines)
+
+
+def _done_payload(summary, src_root, elapsed):
+    """The machine-readable end-of-run summary carried by the DONE event (which
+    drives the MQTT `last_run` topic, so a Home Assistant automation can fire when
+    a video queue finishes; the image runners have emitted this for three tools
+    since 0.2.4, the Video Upscaler for none).
+
+    `tool` / `processed` / `failed` / `elapsed_seconds` deliberately reuse the
+    image runners' key names, so ONE automation covers every tool; the rest are
+    video-specific. `summary['attempted']` is a set (not JSON-serialisable) and
+    `summary['files']` is a per-file detail list belonging in the notification,
+    not in a retained MQTT payload: both are reduced here. Pure, so it is
+    unit-tested."""
+    files = summary.get("files") or []
+    stopped = summary.get("stopped") or ""
+    cost = None
+    for f in files:
+        if f.get("cost") is not None:
+            cost = (cost or 0.0) + float(f["cost"])
+    return {
+        "tool":            "video",
+        "processed":       summary.get("done", 0),
+        "failed":          summary.get("failed", 0),
+        "total":           summary.get("total", 0),
+        "files":           len(files),
+        "elapsed_seconds": round(max(0.0, elapsed), 1),
+        "stop_reason":     stopped or "completed",
+        "stopped_by_user": stopped == "stopped by user",
+        "cost":            round(cost, 2) if cost is not None else None,
+        "source":          src_root,
+    }
+
+
+def _run_finished(notify_settings, summary, src_root):
+    """The single end-of-run seam: tell the GUI (DONE -> MQTT last_run), then send
+    the completion notification. Called exactly ONCE per run: the grouped and
+    supervised paths suppress the per-pass notification and call this with their
+    accumulated summary instead, so neither fans out twice. The DONE event is NOT
+    conditional on a notification backend being configured: MQTT is a separate
+    consumer, and Home Assistant may be the user's only one."""
+    try:
+        gui_event("DONE", _done_payload(summary, src_root, time.time() - _RUN_T0))
+    except Exception as exc:                          # noqa: BLE001 (fail-safe)
+        debug_log("batch_video_upscale._run_finished DONE", exc=exc)
+    _notify_summary(notify_settings, summary, src_root)
 
 
 def _notify_summary(notify_settings, summary, src_root):
@@ -2586,10 +2635,11 @@ def _run_supervised(session_factory, run_pass, *, pod_alive, wait_for_stock, is_
     def finish(stopped):
         summary = _final_summary(acc_done, acc_failed, stopped, acc_files)
         summary["attempted"] = set(acc_attempted)
-        # In a grouped run (18) each group is supervised but the ONE end-of-run notification
-        # is sent by run_grouped's caller, so a per-group supervisor suppresses its own.
+        # In a grouped run (18) each group is supervised but the ONE end-of-run summary
+        # (DONE + notification) is sent by run_grouped's caller, so a per-group supervisor
+        # suppresses its own.
         if notify_summary:
-            _notify_summary(notify_settings, summary, source_root)
+            _run_finished(notify_settings, summary, source_root)
         log(f"Summary: {acc_done} done, {acc_failed} failed of {acc_done + acc_failed}"
             + (f", stopped early ({stopped})" if stopped else "") + ".")
         return summary
@@ -2752,6 +2802,9 @@ def main(argv=None):
                         "(e.g. realesr-general-x4v3, RealESRGAN_x4plus). Overrides "
                         "video.fixed_ratio_model.")
     args = p.parse_args(argv)
+
+    global _RUN_T0
+    _RUN_T0 = time.time()             # the run clock the DONE event reports
 
     src_root = os.path.abspath(args.source)
     if not os.path.isdir(src_root):
@@ -2996,10 +3049,10 @@ def main(argv=None):
             summary = run_grouped(lambda: db.get_video_queue(conn, root_id), run_group,
                                   gpu_in_stock=gpu_in_stock, wait_for_stock=wait_for_stock,
                                   is_stopped=_STOP.is_set, on_event=log)
-            _notify_summary(notify_settings,
-                            _final_summary(summary["done"], summary["failed"],
-                                           summary.get("stopped"), summary.get("files")),
-                            src_root)
+            _run_finished(notify_settings,
+                          _final_summary(summary["done"], summary["failed"],
+                                         summary.get("stopped"), summary.get("files")),
+                          src_root)
             log(f"Summary: {summary['done']} done, {summary['failed']} failed of "
                 f"{summary['total']}"
                 + (f", stopped early ({summary['stopped']})" if summary.get("stopped") else "")

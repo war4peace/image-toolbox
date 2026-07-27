@@ -46,6 +46,13 @@ Add the entities first, then a dashboard.
 
    To have both tiers, repeat with a second card. You can also lift any single
    sub-card out of the file into its own card.
+4. **Notification automations** *(optional)* -
+   [`automations.yaml`](automations.yaml): tell me when a run finishes, when it
+   finishes badly, and when the app dies mid-run. Paste into your
+   `automations.yaml` (or one at a time into a new automation's **Edit in YAML**
+   view) and reload from **Developer Tools > YAML > Automations**. See
+   [Notifications](#notifications) below for how they avoid the retained-message
+   trap.
 
 ## HACS cards (custom dashboard only)
 
@@ -60,6 +67,40 @@ Install from **HACS > Frontend**. A minimal set is Mushroom + ApexCharts.
 
 Custom-card versions drift over time; if a card looks off, check its repo for a
 config change (captured here as of 2026-07).
+
+## Notifications
+
+[`automations.yaml`](automations.yaml) has five ready-made ones (run finished, run
+finished badly, the same via the retained sensor, app died mid-run, run started).
+One thing is worth understanding before you write your own.
+
+**Everything in the topic table below is published *retained*.** That is what
+makes a dashboard correct the moment Home Assistant starts, instead of blank until
+the next run: the broker re-sends the last value to every new subscriber. The cost
+is that a retained value arrives again on **every Home Assistant restart and every
+broker reconnect** - so an automation that triggers on `last_run` cheerfully
+announces a run that finished last Tuesday, every time you restart HA.
+
+So the app also publishes two **events**, which are the opposite: not retained,
+delivered live exactly once, never replayed.
+
+| | Retained state | Event |
+|---|---|---|
+| Topics | `last_run`, `task/*`, `system/*`, `version`, `availability` | `event/run_started`, `event/run_finished` |
+| Re-sent when a subscriber connects | yes (that's the point) | no |
+| Use it for | dashboards, templates, "what is true now" | **triggers** |
+
+**Trigger on the event topics.** `event/run_finished` carries the exact same JSON
+object as `last_run`, so any template you write works on either. If you would
+rather trigger off the sensor you already have on a dashboard, automation 3 in the
+sample shows the retained route with the two guards it needs (ignore
+`unknown`/`unavailable` state changes, and check `finished_at` is recent - it
+carries a UTC offset, so that comparison is correct whatever timezone HA runs in).
+
+The one thing only Home Assistant can tell you: **the app died mid-run**. The
+`availability` topic is a Last Will, published by the *broker* when the app's
+connection drops without a clean goodbye, so nothing inside the app could ever
+send that alert about itself (automation 4).
 
 ## What updates when
 
@@ -81,11 +122,19 @@ All under the base topic `image-toolbox/`:
 | `availability` | `online` / `offline` (Last-Will, so HA knows if the app is running) |
 | `last_run` | JSON summary of the last finished run (state = tool @ finished-at; fields as attributes) |
 | `last_used` | timestamp the app last exited cleanly |
-| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` |
+| `event/run_started` | **not retained.** `{tool, started_at}`, one shot, when a run starts |
+| `event/run_finished` | **not retained.** The same object as `last_run`, one shot, when a run ends. Trigger on this, not on `last_run` (see [Notifications](#notifications)) |
+| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` / `video upscaling` |
 | `task/details` | human-readable current phase |
 | `task/progress` / `task/eta` | `X/Y` and estimated time remaining |
 | `task/runtime` | seconds of active-task runtime |
 | `task/average_processing_time` / `task/last_processing_time` | seconds per item |
+
+A **video** run counts in frames, not files: `task/progress` is frames done / frames
+queued across the whole queue, and the two per-item times are seconds per frame (the
+run's running average, and the live measurement from the pod or local GPU). Its
+`last_run` carries `processed` / `failed` / `total` job counts, `files`, `stop_reason`,
+and a `cost` when a rented pod was billed.
 | `system/cpu` | CPU load, % |
 | `system/ram` / `system/ram_total` | RAM used / total, MB |
 | `system/gpu_vram` / `system/gpu_vram_total` | VRAM used / total, MB |

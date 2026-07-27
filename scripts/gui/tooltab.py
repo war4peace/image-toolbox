@@ -6,6 +6,10 @@ tabs. Owns the subprocess plumbing (launch/pump/poll of the runner scripts), the
 @@TBX@@ event-marker parsing, the image-queue preview strip (FilmStrip), the log
 viewer, per-tool telemetry, and the MQTT/taskbar task-state publishing.
 
+MqttTaskState (below) is the task/* + last_run publishing on its own, so the
+Video Upscaler tab - which is not a ToolTab - can mix it in and report the same
+live state.
+
 Sits above gui.common/widgets/comparison/filmstrip in the import order; it talks
 to the App only at runtime via self.app, so it does not import the app module.
 """
@@ -13,7 +17,6 @@ to the App only at runtime via self.app, so it does not import the app module.
 import os
 import json
 import codecs
-import datetime
 import queue
 import threading
 import subprocess
@@ -30,7 +33,7 @@ from gui.common import (
     CREATE_NO_WINDOW, CFG, save_config, load_settings, save_settings,
     get_default_folder, set_default_folder, get_install_mode, mqtt_enabled,
     funds_color, config_funds_floor, fmt_funds, _FUNDS_GREY,
-    RUN_ON_LOCAL, RUN_ON_REMOTE,
+    RUN_ON_LOCAL, RUN_ON_REMOTE, now_stamp,
 )
 from gui.widgets import (
     sanitize, _fmt_eta, ProgressBar, TelemetryRow, LogPane, LogViewer,
@@ -41,10 +44,102 @@ from gui.filmstrip import FilmStrip, CELL_DEFAULT
 
 
 # ─────────────────────────────────────────────
+#  MQTT TASK STATE  (shared by every tool tab)
+# ─────────────────────────────────────────────
+
+class MqttTaskState:
+    """The live `task/*` + `last_run` MQTT publishing a run does.
+
+    Split out of ToolTab (0.5.8) so the **Video Upscaler** gets it too: that tab
+    is not a ToolTab (it carries its own subprocess plumbing), so it used to
+    publish nothing at all - Home Assistant read `idle` right through the
+    longest, most notification-worthy runs the app does, and `last_run` was
+    never written for a video queue.
+
+    Needs only `self.app` (for mqtt_publish) and `self.mqtt_task_name`, and owns
+    no widgets, so a tab mixes it in alongside its ttk.Frame base. Every call is
+    a no-op while no MQTT client exists.
+    """
+
+    mqtt_task_name = "task"      # task/name label; each tab overrides
+    _last_done     = None        # last DONE payload (JSON string) -> last_run
+
+    def mqtt_task_started(self):
+        """A run began: announce the task and clear the previous run's numbers."""
+        self._last_done = None
+        self.app.mqtt_publish({
+            mqtt_publisher.TASK_NAME_TOPIC:     self.mqtt_task_name,
+            mqtt_publisher.TASK_DETAILS_TOPIC:  "starting",
+            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
+            mqtt_publisher.TASK_ETA_TOPIC:      "",
+            mqtt_publisher.TASK_RUNTIME_TOPIC:  "0",
+        })
+        # ...and the one-shot event beside it, so an automation can trigger on a run
+        # starting WITHOUT triggering again every time Home Assistant reconnects and
+        # is re-sent the retained task/name.
+        self.mqtt_event(mqtt_publisher.EVENT_RUN_STARTED_TOPIC,
+                        {"tool": self.mqtt_task_name, "started_at": now_stamp()})
+
+    def mqtt_event(self, topic, payload):
+        """Publish a one-shot event: NON-retained, qos 1. Not remembered for the
+        reconnect replay either, so it is delivered live exactly once and can never
+        re-fire an automation later (see mqtt_publisher's EVENT_* block)."""
+        self.app.mqtt_publish({topic: json.dumps(payload)}, retain=False, qos=1)
+
+    def mqtt_task_update(self, details=None, progress=None, eta=None,
+                         runtime=None, avg=None, last=None):
+        """Publish whichever task/* values this tick actually knows. A None is
+        left ALONE (not blanked), so a tool that can't measure one of them never
+        wipes a value another tick published."""
+        values = {}
+        for value, topic in ((details,  mqtt_publisher.TASK_DETAILS_TOPIC),
+                             (progress, mqtt_publisher.TASK_PROGRESS_TOPIC),
+                             (eta,      mqtt_publisher.TASK_ETA_TOPIC),
+                             (runtime,  mqtt_publisher.TASK_RUNTIME_TOPIC),
+                             (avg,      mqtt_publisher.TASK_AVG_TOPIC),
+                             (last,     mqtt_publisher.TASK_LAST_TOPIC)):
+            if value is not None:
+                values[topic] = str(value)
+        if values:
+            self.app.mqtt_publish(values)
+
+    def mqtt_task_idle(self):
+        """The task ended: go idle and publish a last_run summary (from the
+        runner's DONE event, if it sent one), plus the matching one-shot event.
+
+        The two carry the SAME object: `last_run` is retained state (a dashboard
+        reads it, and is re-sent it after a restart), `event/run_finished` is the
+        trigger. A run with no summary (one that crashed before its runner could
+        report) publishes neither, so an automation is never handed a result the
+        app does not actually have; the availability LWT covers that case."""
+        if getattr(self.app, "mqtt", None) is None:
+            return
+        values = {
+            mqtt_publisher.TASK_NAME_TOPIC:     "idle",
+            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
+            mqtt_publisher.TASK_ETA_TOPIC:      "",
+        }
+        summary = None
+        if self._last_done:
+            try:
+                summary = json.loads(self._last_done)
+            except (ValueError, TypeError):
+                summary = {"raw": self._last_done}
+            if not isinstance(summary, dict):          # a runner sent a bare value
+                summary = {"raw": summary}
+            summary.setdefault("tool", self.mqtt_task_name)
+            summary["finished_at"] = now_stamp()
+            values[mqtt_publisher.LAST_RUN_TOPIC] = json.dumps(summary)
+        self.app.mqtt_publish(values)
+        if summary is not None:
+            self.mqtt_event(mqtt_publisher.EVENT_RUN_FINISHED_TOPIC, summary)
+
+
+# ─────────────────────────────────────────────
 #  TOOL TAB BASE  (subprocess plumbing)
 # ─────────────────────────────────────────────
 
-class ToolTab(ttk.Frame):
+class ToolTab(MqttTaskState, ttk.Frame):
     """
     Shared plumbing for both tool tabs: subprocess management, GUI-event
     marker parsing, the image-queue preview strip and the log viewer.
@@ -631,16 +726,9 @@ class ToolTab(ttk.Frame):
         # If the shared log window is open, make it follow this run's output.
         self.app.rebind_log_if_open(self.console, self._log_title())
         # MQTT: a task is now active — reset timing and announce it.
-        self._last_done = None
         self._mqtt_prev_elapsed   = 0.0
         self._mqtt_prev_processed = 0
-        self.app.mqtt_publish({
-            mqtt_publisher.TASK_NAME_TOPIC:     self.mqtt_task_name,
-            mqtt_publisher.TASK_DETAILS_TOPIC:  "starting",
-            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
-            mqtt_publisher.TASK_ETA_TOPIC:      "",
-            mqtt_publisher.TASK_RUNTIME_TOPIC:  "0",
-        })
+        self.mqtt_task_started()
         self._start_telemetry()
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
@@ -975,26 +1063,7 @@ class ToolTab(ttk.Frame):
         # after the run, rather than waiting for the next idle tick. The proc is
         # already cleared by this point, so this counts as an idle reading.
         self.app.sample_telemetry()
-        self._publish_task_idle()
-
-    def _publish_task_idle(self):
-        """MQTT: the task ended — go idle and publish a last_run summary."""
-        if self.app.mqtt is None:
-            return
-        values = {
-            mqtt_publisher.TASK_NAME_TOPIC:     "idle",
-            mqtt_publisher.TASK_PROGRESS_TOPIC: "",
-            mqtt_publisher.TASK_ETA_TOPIC:      "",
-        }
-        if self._last_done:
-            try:
-                summary = json.loads(self._last_done)
-            except (ValueError, TypeError):
-                summary = {"raw": self._last_done}
-            summary.setdefault("tool", self.mqtt_task_name)
-            summary["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
-            values[mqtt_publisher.LAST_RUN_TOPIC] = json.dumps(summary)
-        self.app.mqtt_publish(values)
+        self.mqtt_task_idle()
 
     # ── System telemetry (Feature #3a) ───────────────────────────────────────
 

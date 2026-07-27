@@ -417,11 +417,58 @@ up for the app's lifetime, verifies connectivity on startup, auto-reconnects,
 and sets an availability **LWT** (`image-toolbox/availability` → online/offline)
 so HA always knows if the app is alive. Retained topics: `version`, `update`,
 `latest_version`, `last_run` (JSON summary), `last_used`, plus live `task/*`
-state (`name` = idle/upscaling/tagging/conciliating, `details`, `runtime`,
-`progress` = X/Y, `eta`, `average_processing_time`, `last_processing_time`).
+state (`name` = idle/upscaling/tagging/conciliating/**video upscaling**,
+`details`, `runtime`, `progress` = X/Y, `eta`, `average_processing_time`,
+`last_processing_time`).
 Settings has host/port/username/password/client-id fields, a "Test" button, and
 a "Publish now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`);
 the import is lazy so older venvs still launch. See `mqtt_publisher.py`.
+**All four tools report** (0.5.8): the Video Upscaler used to publish nothing at
+all: `VideoTab` is not a `ToolTab` and carried its own plumbing, so HA read
+`idle` (and a stale `last_run`) right through the app's longest runs, and an
+"alert me when the queue finishes" automation silently never fired for video. The
+`task/*` + `last_run` publishing is now the widget-free **`MqttTaskState`** mixin
+in `gui/tooltab.py` (`mqtt_task_started` / `mqtt_task_update` / `mqtt_task_idle`),
+mixed into both `ToolTab` and `VideoTab`, and `batch_video_upscale` emits a `DONE`
+event from one end-of-run seam (`_run_finished`, which also sends the completion
+notification; the grouped and Auto-resume paths suppress their per-pass copies, so
+exactly one of each reaches the GUI). A video run's `progress` counts **frames**
+(not files) and its per-item times are **seconds per frame**; `_done_payload`
+reuses the image runners' `tool`/`processed`/`failed`/`elapsed_seconds` key names
+so one HA automation covers every tool, and reduces the runner summary for a
+retained payload (the `attempted` **set** and the per-file list can't go on the
+wire; the billed pod cost is summed). A **remote** video run also keeps sampling
+the local machine on a 30 s keep-alive (`system/*` used to freeze for the whole
+run: `App._any_task_running()` stands the 60 s idle sampler down, and the tab only
+sampled for a local run).
+**Retained state vs one-shot events** (0.5.8): every topic above is retained, which
+is what makes a dashboard correct immediately after an HA restart, but makes it a
+**bad trigger** — the broker re-sends a retained value to every new subscriber, so
+an automation on `last_run` re-announces a days-old run on every HA restart and
+every broker reconnect (and `MqttClient` replays its retained set on reconnect
+too). So a run start/end is ALSO published as a **non-retained, qos-1 one-shot
+event** (`event/run_started` = `{tool, started_at}`, `event/run_finished` = the
+same object as `last_run`), never stored for the replay, so it is delivered live
+exactly once and cannot re-fire. `App.mqtt_publish(values, retain=, qos=)` and
+`MqttClient.publish_many` carry the flags; `MqttTaskState.mqtt_event` is the
+publisher. A run with **no** summary (one that crashed before the runner reported)
+publishes neither `last_run` nor the event, so an automation is never handed a
+result the app doesn't have — the availability LWT covers that case. Every
+timestamp the app publishes goes through **`gui.common.now_stamp()`** (offset-aware
+ISO, e.g. `+03:00`): a naive stamp is read in whatever timezone the HA *process*
+runs in (commonly UTC in a container), which silently breaks the freshness
+condition the retained route depends on by exactly the offset between the two
+machines. Ready-made automations (incl. the retained route WITH both guards, and
+an app-died-mid-run alert off the LWT) ship in
+`samples/home-assistant/automations.yaml`, pinned by `tests/test_ha_samples.py`
+(the sample's topics/entities must exist, its Jinja must compile, and its two
+"finished" automations must PARTITION every runner's real DONE payload: rendered
+against all four, exactly one fires per run). Writing that test surfaced the last
+key mismatch: `conciliate.py`'s DONE predates the shared naming, so it now also
+emits `processed`/`failed`/`elapsed_seconds`/`stopped_by_user` alongside its
+original `done`/`conflicts`/`errors`/`removed_dirs` (both kept, so an existing
+template still works) — otherwise a one-size-fits-all automation reported
+"0 processed" for every conciliation run.
 
 **System telemetry** (Feature #3a) — a compact, read-only status row below the
 image carousel on each tool tab showing **CPU usage, RAM, GPU VRAM, GPU
@@ -602,7 +649,7 @@ widget does NOT override the first: it binds `<Enter>` with `add="+"`, so both
 pop up stacked), and `use_window_button_style()`, the bold label for a button
 that opens a window which is exclusive/modal/persistent AND wants prolonged focus
 (Segments…, Benchmark GPU…, Provision…, the first-start wizard; log windows stay
-plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
+plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **GPU work happens wherever this runs.** |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
@@ -618,7 +665,7 @@ plain by design, the rule is recorded above the style constant)); **`gui/compari
 | `orientation.py` (~170 lines) | Auto-straighten: a small pretrained CNN (`ternaus/check_orientation`) detects sideways photos and losslessly rotates them upright; fails safe (leaves ambiguous/upside-down alone). Heavy imports are lazy. `unload()` (0.5.2) drops the cached CNN and frees its VRAM (~90 MB), reloading lazily on the next `analyse()`; it reads torch from `sys.modules` rather than importing it, so a Remote-only install (no torch) is unaffected. Both pause paths call it: **a pause frees EVERY resident model, with no size-based exceptions** (an exception is one more rule to remember). |
 | `updater.py` (~170 lines) | In-app updater. Queries the GitHub Releases API for the latest tag, compares it to `APP_VERSION`, and downloads/launches `ImageToolboxSetup.exe`. Pure stdlib (`urllib`), network calls meant for a background thread; the GUI (`UpdateDialog`, Settings "Updates" section) owns the UI. |
 | `system_telemetry.py` (~180 lines) | System telemetry sampler (Feature #3a). Stdlib-only, read-only, best-effort: `CpuSampler` reads CPU usage from Windows `GetSystemTimes` (`ctypes`) as a delta between calls; `sample_ram()` reads physical RAM via `GlobalMemoryStatusEx`; `sample_gpu()` shells out to `nvidia-smi` (one call) for VRAM used/total, temperature, **core utilization %, power draw + limit, and core clock** (0.5.3, telemetry graphs #9), returning a **dict** with a per-field safe parse so a card that reports `[N/A]` for a field yields `None` for just that field. `pod/worker._sample_gpu` mirrors the identical query/order. All fail safe to `None`. The GPU query blocks (spawns a process), so the GUI samples from a background thread. Also holds **`TelemetryHistory`** (0.5.3, #9): a GUI-free, per-run in-memory buffer (records only between `start()`/`seal()`, so idle sampling never enters a graph; gap-breaks the line across sample stalls) that feeds `gui/telemetry_graph.py`. |
-| `mqtt_publisher.py` (~290 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
+| `mqtt_publisher.py` (~300 lines) | Optional Home Assistant (MQTT) integration. One-shot helpers (`test_connection`, `publish_state`, `publish_version`) for the Settings "Test"/"Publish now" buttons and the startup snapshot, plus a persistent `MqttClient` that holds the connection for the app's lifetime, sets the availability LWT, replays retained topics on reconnect, and publishes live `task/*` state. Topics split in two (0.5.8): retained **state** (everything historic) and the non-retained one-shot **`EVENT_*`** pair (`event/run_started` / `event/run_finished`), which is deliberately NOT remembered for the reconnect replay — retained state re-fires an automation on every subscribe, events can't. Lazy `paho-mqtt` import; network calls run on background threads (the GUI owns the UI/config). |
 | `notifications.py` (~330 lines) | Shared notification layer (0.3.8). The single source of truth for the queue-complete / error alerts, fanning out to **Discord** (webhook embed), **Telegram** (Bot API HTML message) and **ntfy** (HTTP publish to a topic; public ntfy.sh or self-hosted). `resolve_settings(cfg)` pulls the `notifications` config section (legacy `upscale.discord_webhook_url` fallback, ntfy server default `https://ntfy.sh`); `notify(settings, title, desc, color, fields)` sends to every configured backend, fail-safe; `send_discord`/`send_telegram`/`send_ntfy` are the per-backend senders. GUI helpers: `test_discord`, `test_telegram`, `detect_telegram_chat` (reads the bot's `getUpdates` for the chat ID), `test_ntfy`. Status colour maps to a Telegram emoji and to an ntfy emoji tag + priority (red = priority 5). Stdlib only (`urllib`, `html`); the runners replaced their duplicated `send_discord_notification` with `send_notification` → `notify`. |
 | `net_ssl.py` (~50 lines) | Shared HTTPS trust context (0.5.0). `ssl_context()` hands urllib an explicit CA bundle from **certifi** (bundled in every install mode), cached per-process, with a fail-safe fallback to the stdlib default context if certifi is absent. Fixes a Remote-only-install blocker: a fresh Windows VM's OS root store often can't verify RunPod's cert, and Python's OpenSSL (unlike PowerShell/SChannel, which auto-fetches roots) fails every HTTPS call with "unable to get local issuer certificate" (the RunPod API-key test was the first casualty). Passed as `context=` to the public-TLS `urlopen` calls in `runpod_client` (REST + GraphQL), `updater`, `notifications` and `vlc_setup`; ignored for the ssh-tunnelled localhost calls, so it's safe to pass unconditionally. Stdlib + optional certifi. |
 | `crash_logger.py` (~180 lines) | Last-resort crash diagnostics (0.2.5). `install()` (armed at the top of `toolbox_gui.py`, before the feature imports) hooks `sys.excepthook`, `threading.excepthook` and `tkinter.Tk.report_callback_exception`; on an unhandled crash it writes `logs/crash_<timestamp>.log` (header + full traceback) and pops a native ctypes message box so the crash is visible under `pythonw`. Stdlib only, fail-safe, re-entrancy-guarded. |

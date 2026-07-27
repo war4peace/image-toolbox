@@ -20,7 +20,7 @@ from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MA
 from gui.widgets import (ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip,
                          use_window_button_style)
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
-from gui.tooltab import ToolTab
+from gui.tooltab import ToolTab, MqttTaskState
 
 
 # Where the per-bar-change progress diagnostics go: "window" = the tab's log pane,
@@ -413,7 +413,7 @@ class SegmentsManager(tk.Toplevel):
 #  APP WINDOW
 # ─────────────────────────────────────────────
 
-class VideoTab(ttk.Frame):
+class VideoTab(MqttTaskState, ttk.Frame):
     """The Video Upscaler tab (#2, phase 5). Runs on a rented RunPod pod OR, feature #7,
     on this machine's LOCAL GPU (a "Run on" mode selector, gated by the install mode). A
     two-list setup flow (scan list -> Prepare -> a durable queue), a cheapest-first GPU
@@ -433,6 +433,9 @@ class VideoTab(ttk.Frame):
         self._marker_buf = None
         self.console = ConsoleBuffer()
         self.tool_name = "Video Upscaler"
+        self.mqtt_task_name = "video upscaling"   # task/name while a run is live
+        self._last_done = None                    # runner DONE payload -> MQTT last_run
+        self._mqtt_next = 0.0                     # next allowed task/* publish (throttle)
         self.active_pod_id = None
         self._gpu_choices = []
         self._local_gpu_name = None      # cached nvidia-smi name for the queue's Local GPU label
@@ -458,6 +461,7 @@ class VideoTab(ttk.Frame):
         self._remote_rate = None    # pod's real billed $/h (RCOST); live cost readout
         self._run_tick_job = None
         self._local_telem_job = None   # local-run telemetry sampler (#7, graphs #9)
+        self._local_telem_ms = self.LOCAL_TELEM_MS   # its cadence (slower on a remote run)
         self._build()
         self.after(200, self._check_readiness)
         self.after(300, self._initial_load)
@@ -2849,8 +2853,6 @@ class VideoTab(ttk.Frame):
                         starting_msg="Starting local upscale …")
         self._launch("batch_video_upscale.py",
                      [self._src_root, self._out_root, "--local"], env)
-        if self.proc is not None:            # launch succeeded (else _end_run already ran)
-            self._start_local_telemetry()
 
     def _begin_run(self, total_frames, starting_msg="Starting pod …"):
         self._run_total = total_frames
@@ -2880,6 +2882,11 @@ class VideoTab(ttk.Frame):
         self.status_var.set(starting_msg)
         self.console.clear()
         self.app.taskbar_state("indeterminate")
+        # MQTT (Home Assistant): announce the task. Without this the broker read
+        # "idle" through the app's longest runs (see MqttTaskState).
+        self.mqtt_task_started()
+        self._mqtt_next = 0.0
+        self.mqtt_task_update(details=starting_msg)
         if self._run_tick_job is None:
             self._run_tick_job = self.after(1000, self._run_tick)
 
@@ -2903,6 +2910,14 @@ class VideoTab(ttk.Frame):
         # Exclusivity: lock the other tabs now that proc is live (a local run owns the
         # GPU; _begin_run ran before proc existed, so it can't do this itself).
         self.app.refresh_tab_exclusivity()
+        # Telemetry for the run: dense + a usage graph locally, a slow keep-alive on a
+        # remote run (see _start_local_telemetry: the app's idle sampler is standing
+        # down for the whole run, so nothing else refreshes the row or system/* MQTT).
+        if self.mode_var.get() == "local":
+            self._start_local_telemetry()
+        else:
+            self._start_local_telemetry(history=False,
+                                        interval_ms=self.REMOTE_TELEM_MS)
         threading.Thread(target=self._pump, daemon=True).start()
         self.after(50, self._poll)
 
@@ -3026,6 +3041,9 @@ class VideoTab(ttk.Frame):
                                 f"→ {data.get('target')} "
                                 f"[{data.get('index')}/{data.get('total')}]")
             self.status_var.set(self._cur_status)
+            # A new file is the interesting transition: publish it now instead of
+            # waiting out the tick throttle.
+            self.mqtt_task_update(details=self._cur_status)
         elif kind == "SEGMENT" and data:
             seg_frames = data.get("seg_frames") or 0
             fp = data.get("frames_processed")
@@ -3078,6 +3096,11 @@ class VideoTab(ttk.Frame):
             self._load_queue()                           # done/failed leaves the queue
         elif kind == "RTELEM" and data:
             self.app.apply_remote_telemetry(self, data)
+        elif kind == "DONE":
+            # The runner's one machine-readable run summary; published to MQTT as
+            # last_run when the run ends (_end_run -> mqtt_task_idle). Kept as the
+            # RAW json string, which is what MqttTaskState expects.
+            self._last_done = payload
 
     def _paint_bar(self, src="tick"):
         """Single owner of the progress bar. Computes a frames-done estimate (real
@@ -3186,23 +3209,56 @@ class VideoTab(ttk.Frame):
             tail += f" · ${spent:.2f} so far"
         if base:
             self.status_var.set(base + tail)
+        self._publish_task_state(now, elapsed, done_now)
         # NOTE: the per-minute "Processing" heartbeat now lives in the RUNNER
         # (batch_video_upscale._progress), so it reaches BOTH the console and the
         # on-disk log file. It used to be fed here (console only), which left a long
         # segment with no on-disk trace. See that runner code.
         self._run_tick_job = self.after(1000, self._run_tick)
 
-    # ── local-run telemetry (#7 local GPU; usage graphs #9) ──────────────────
-    LOCAL_TELEM_MS = 5000     # sampling cadence while a LOCAL run works the GPU
+    # MQTT is a status feed, not a progress bar: publish the run's task/* state on a
+    # slow cadence rather than on every 1 s tick, so a multi-hour run doesn't push
+    # thousands of retained messages at a broker for numbers a human reads occasionally.
+    MQTT_PUBLISH_S = 10
 
-    def _start_local_telemetry(self):
-        """Sample this machine while a LOCAL run works the GPU, so the Local Unit
-        row stays live and the run feeds a per-run usage graph (#9). A remote run
-        uses the pod's own remote row/history instead, and the app's 60 s idle
-        sampler pauses while any run is active, so a local run must drive its own
-        (denser) sampling here."""
-        self.app.telemetry_history_start("local",
-                                         title=f"Local system - {self.tool_name}")
+    def _publish_task_state(self, now, elapsed, done_now):
+        """Mirror the running view to MQTT (Home Assistant), throttled. `details` is the
+        BASE status line without the ETA tail (the tail's parts have their own topics),
+        `progress` counts FRAMES (the unit a video run measures in, where the image tools
+        count files), and avg/last carry the seconds-per-frame pair: the run's running
+        average and the pod's live measurement."""
+        if now < self._mqtt_next:
+            return
+        self._mqtt_next = now + self.MQTT_PUBLISH_S
+        import video_estimate as ve
+        eta = None
+        if self._eta_finish is not None and done_now > 0:
+            eta = ve.fmt_duration(max(0.0, self._eta_finish - now))
+        self.mqtt_task_update(
+            details=getattr(self, "_cur_status", "") or "starting",
+            progress=f"{int(done_now)}/{self._run_total}" if self._run_total > 0 else "",
+            eta=eta,
+            runtime=int(max(0.0, elapsed)),
+            avg=f"{self._rate:.1f}" if self._rate else None,
+            last=f"{self._live_spf:.1f}" if self._live_spf else None)
+
+    # ── local-run telemetry (#7 local GPU; usage graphs #9) ──────────────────
+    LOCAL_TELEM_MS  = 5000     # sampling cadence while a LOCAL run works the GPU
+    REMOTE_TELEM_MS = 30000    # slow keep-alive while the work is on a pod
+
+    def _start_local_telemetry(self, history=True, interval_ms=None):
+        """Sample this machine for the duration of the run, so the Local Unit row and
+        the MQTT `system/*` topics stay live: the app's 60 s idle sampler stands down
+        while ANY task is running, so a tab that doesn't sample itself leaves both
+        frozen for the length of the run (hours, for video).
+
+        A LOCAL run samples densely and feeds a per-run usage graph (#9). A REMOTE run
+        keeps a slow keep-alive only, and opens NO local history: its GPU work is on the
+        pod, whose own remote row/history covers it (matching ToolTab._start_telemetry)."""
+        if history:
+            self.app.telemetry_history_start("local",
+                                             title=f"Local system - {self.tool_name}")
+        self._local_telem_ms = interval_ms or self.LOCAL_TELEM_MS
         self._local_telem_tick()
 
     def _local_telem_tick(self):
@@ -3210,7 +3266,7 @@ class VideoTab(ttk.Frame):
             self._local_telem_job = None
             return
         self.app.sample_telemetry()
-        self._local_telem_job = self.after(self.LOCAL_TELEM_MS,
+        self._local_telem_job = self.after(self._local_telem_ms,
                                            self._local_telem_tick)
 
     def _stop_local_telemetry(self):
@@ -3266,6 +3322,8 @@ class VideoTab(ttk.Frame):
         # The remote-pod telemetry row only makes sense during a remote run; hide it and
         # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.
         self.app.clear_remote_telemetry(self)
+        # MQTT: back to idle, and publish this run's last_run summary (from DONE).
+        self.mqtt_task_idle()
 
     def _view_log(self):
         self.app.show_log(self.console, f"{APP_TITLE} — Video Upscaler output")

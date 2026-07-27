@@ -67,6 +67,19 @@ TASK_ETA_TOPIC      = f"{BASE_TOPIC}/task/eta"         # estimated time remainin
 TASK_AVG_TOPIC      = f"{BASE_TOPIC}/task/average_processing_time"   # seconds/image
 TASK_LAST_TOPIC     = f"{BASE_TOPIC}/task/last_processing_time"      # seconds for last image
 
+# ── Events (0.5.8): NOT retained, unlike every topic above ───────────────────
+# Everything else here is retained STATE ("what is true now"), which a subscriber
+# is re-sent the moment it subscribes: the whole point, so a dashboard is correct
+# after a restart. That makes retained state a **bad trigger**: an automation on
+# "last_run changed" fires again on every Home Assistant restart and every broker
+# reconnect, re-announcing a run that finished days ago. These two are the other
+# half of the pattern: one-shot EVENTS, published non-retained (and never stored
+# for the reconnect replay), so they are delivered live exactly once and cannot be
+# replayed. Trigger on these; read the retained topics for state. Payload is the
+# same JSON object as `last_run` (run_finished) / `{tool, started_at}` (run_started).
+EVENT_RUN_STARTED_TOPIC  = f"{BASE_TOPIC}/event/run_started"
+EVENT_RUN_FINISHED_TOPIC = f"{BASE_TOPIC}/event/run_finished"
+
 ONLINE  = "online"
 OFFLINE = "offline"
 
@@ -303,9 +316,14 @@ class MqttClient:
                 self._publish_broken = True
                 debug_log("MqttClient.publish (silenced until recovery)", exc=exc)
 
-    def publish_many(self, values, retain=True):
+    def publish_many(self, values, retain=True, qos=0):
+        """Publish a {topic: payload} mapping. `retain=False` marks the batch as
+        one-shot EVENTS: they are neither retained by the broker nor remembered for
+        the reconnect replay, so no subscriber can ever be handed them twice (see
+        the EVENT_* topics). Events go out at qos=1 by default at the call site,
+        since there is no retained copy to fall back on."""
         for topic, payload in values.items():
-            self.publish(topic, payload, retain=retain)
+            self.publish(topic, payload, retain=retain, qos=qos)
 
     def stop(self, last_used=None):
         """Publish a clean 'offline' (and optional last_used), then disconnect.

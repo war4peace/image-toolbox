@@ -613,9 +613,17 @@ def main():
     log.tee(f"Done in {elapsed:.1f}s — {done} replaced, "
             f"{conflicts} skipped (conflict), {errors} error(s)"
             + (f", {removed_dirs} empty folder(s) removed." if removed_dirs else "."))
+    # GUI: machine-readable run summary (drives the MQTT last_run topic + the
+    # run-finished event). `processed`/`failed`/`elapsed_seconds` mirror the other
+    # three runners' key names so ONE Home Assistant automation covers every tool
+    # (this runner predates that convention); the original four keys stay, so a
+    # template already reading them is unaffected.
     _gui_event("DONE", json.dumps(
         {"done": done, "conflicts": conflicts, "errors": errors,
-         "removed_dirs": removed_dirs}))
+         "removed_dirs": removed_dirs,
+         "processed": done, "failed": errors,
+         "elapsed_seconds": round(elapsed, 1),
+         "stopped_by_user": _quit_evt.is_set()}))
     _gui_event("STATUS", f"Done — {done} file(s) replaced.")
 
     # Notify: conciliation used to finish silently (item 9). Colour by outcome,

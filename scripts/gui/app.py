@@ -42,6 +42,7 @@ from gui.common import (
     update_auto_check_enabled, update_skipped_version, report_issue, open_donate,
     _FUNDS_GREY, funds_color, config_funds_floor, fmt_funds,
     mqtt_config, mqtt_enabled, load_settings, save_settings, _geometry_on_screen,
+    now_stamp,
 )
 from gui.widgets import Tooltip, LogViewer
 from gui.comparison import ComparisonWindow
@@ -781,13 +782,17 @@ class App(tk.Tk):
         if tb is not None:
             tb.clear()
 
-    def mqtt_publish(self, values):
+    def mqtt_publish(self, values, retain=True, qos=0):
         """Publish a {topic: payload} mapping if the client is running (no-op
         otherwise). Called from the tool tabs as task state changes. Uses getattr
-        because the tabs are constructed before self.mqtt is assigned."""
+        because the tabs are constructed before self.mqtt is assigned.
+
+        `retain=False` is for the one-shot event topics (0.5.8): retained state is
+        re-delivered on every subscribe/reconnect, which makes it fire an automation
+        that triggers on it long after the fact."""
         client = getattr(self, "mqtt", None)
         if client is not None:
-            client.publish_many(values)
+            client.publish_many(values, retain=retain, qos=qos)
 
     # ── System telemetry (Feature #3a) ───────────────────────────────────────
 
@@ -1082,7 +1087,7 @@ class App(tk.Tk):
                 pass
         mark("save-geometry")
         # Record last-used time and announce going offline before we exit.
-        self.stop_mqtt(last_used=datetime.datetime.now().isoformat(timespec="seconds"))
+        self.stop_mqtt(last_used=now_stamp())     # offset-aware: HA reads it as a time
         mark("stop-mqtt")
         self._log_close_timing(marks)
         self.destroy()

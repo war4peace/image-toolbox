@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import shutil
+import datetime
 import platform
 import webbrowser
 import urllib.parse
@@ -320,6 +321,21 @@ def mqtt_enabled():
     """MQTT is active whenever a broker host is configured — no separate toggle.
     Clear the host in Settings to disable publishing."""
     return bool((mqtt_config().get("host") or "").strip())
+
+
+def now_stamp():
+    """Now, as an ISO-8601 string WITH the machine's UTC offset
+    ('2026-07-27T18:04:11+03:00'). Every timestamp the app publishes (`last_run`'s
+    `finished_at`, the run events, `last_used`) goes through here.
+
+    The offset is not cosmetic: Home Assistant's freshness condition on a retained
+    payload is `as_timestamp(now()) - as_timestamp(finished_at)`, and a NAIVE
+    timestamp is read in whatever timezone the HA process runs in (commonly UTC in
+    a container). A Windows box two hours off HA would then look either two hours
+    stale (the guard suppresses every alert) or two hours in the future - a silent,
+    hard-to-diagnose failure of exactly the guard the retained topics need. With an
+    offset the comparison is correct from any timezone."""
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 # ─────────────────────────────────────────────

@@ -20,6 +20,58 @@ Releases page.
 
 ## 0.5.8
 
+### The Video Upscaler now reports to Home Assistant
+Video runs were invisible to the MQTT integration: while a queue was upscaling, Home
+Assistant still read **idle**, the progress/ETA/runtime values sat frozen at whatever the
+last image run left behind, and the "last run" summary was never written. So an
+automation like "tell me when a run finishes" never fired for the longest, most worth-
+notifying runs the app does.
+
+A video run now publishes the same live state the other three tools do:
+
+- **Current task** reads *video upscaling* while a queue is running, and goes back to
+  *idle* when it ends.
+- **Progress, ETA and runtime** update as the run goes. Progress counts **frames**
+  (across the whole queue), since that is what a video run measures in, and the two
+  per-item times are **seconds per frame**: the run's running average, and the live
+  figure measured on the pod or on your own GPU.
+- **Last run** gets a summary when the queue ends: jobs done and failed, how many files,
+  how long it took, why it stopped (finished, your Stop, a per-run cap …) and, for a
+  rented pod, what it cost.
+- **This machine's CPU/RAM/GPU readings keep updating during a remote run.** They used
+  to freeze for the whole run, since the app pauses its idle sampling while any task is
+  running and a remote video run had nothing sampling in its place.
+
+Nothing to configure: if MQTT is set up, video runs simply start appearing.
+
+### Home Assistant: ready-made notification automations, and no more phantom alerts
+There is now a [`samples/home-assistant/automations.yaml`](../samples/home-assistant/automations.yaml)
+to paste in: **a run finished**, **a run finished badly** (failures, an early stop, a
+degraded GPU), **the app died mid-run**, and an optional **a run started**. Plus a
+Notifications section in that folder's README explaining the one trap in the whole
+setup.
+
+That trap, and what changed in the app because of it: the values Image Toolbox
+publishes are *retained*, which is why your dashboard is correct the instant Home
+Assistant restarts instead of blank until the next run. The flip side is that a
+retained value is re-delivered on every Home Assistant restart and every reconnect,
+so the obvious automation ("when the last-run summary changes, notify me") announces
+a run that finished days ago, every single time you restart HA.
+
+So the app now publishes a run's start and end **twice**: as retained state, as
+before, and as a one-shot **event** that is not retained and never replayed. Trigger
+your automations on `image-toolbox/event/run_finished` (it carries exactly the same
+summary as `last_run`) and it can only ever fire when a run really finishes. The
+sample also shows the retained route with the guards it needs, if you prefer it.
+
+Timestamps the app publishes now carry their UTC offset, so a "did this just happen?"
+condition is right even when Home Assistant runs in a different timezone than the PC
+(a container defaulting to UTC would previously have made that check silently wrong by
+hours, in either direction). And a **Conciliation** run's summary now reports the same
+"processed / failed / how long" fields the other three tools do (its own
+replaced/conflicts/errors counts are still there), so one automation genuinely covers
+all four tools instead of reading "0 processed" for that one.
+
 ### A "Buy me a coffee" link
 The bottom status bar now carries an optional support link next to **Report an issue**.
 It is a link and nothing more: clicking it opens buymeacoffee.com in your browser, the
