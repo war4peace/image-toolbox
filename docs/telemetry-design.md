@@ -1,5 +1,10 @@
 # Telemetry design (in-app graphs #9 + Home Assistant foundation)
 
+> Scope note: this covers the **`system/*` telemetry topics** and the in-app graphs.
+> The MQTT integration as a whole (every topic, retained state vs one-shot events,
+> the run lifecycle, the `last_run` contract) is
+> [`mqtt-integration.md`](mqtt-integration.md).
+>
 > Planning deliverable for future-features **#9 (telemetry usage graphs)** and the
 > telemetry half of **#10 (Home Assistant dashboard samples)**. Written 2026-07-22.
 > This is the design of record; it becomes the work-order once green-lit.

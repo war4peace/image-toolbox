@@ -415,60 +415,25 @@ enable toggle: MQTT activates whenever a broker **host** is configured in
 Settings (clear the host to disable). A persistent client keeps the connection
 up for the app's lifetime, verifies connectivity on startup, auto-reconnects,
 and sets an availability **LWT** (`image-toolbox/availability` → online/offline)
-so HA always knows if the app is alive. Retained topics: `version`, `update`,
-`latest_version`, `last_run` (JSON summary), `last_used`, plus live `task/*`
-state (`name` = idle/upscaling/tagging/conciliating/**video upscaling**,
-`details`, `runtime`, `progress` = X/Y, `eta`, `average_processing_time`,
-`last_processing_time`).
-Settings has host/port/username/password/client-id fields, a "Test" button, and
-a "Publish now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`);
-the import is lazy so older venvs still launch. See `mqtt_publisher.py`.
-**All four tools report** (0.5.8): the Video Upscaler used to publish nothing at
-all: `VideoTab` is not a `ToolTab` and carried its own plumbing, so HA read
-`idle` (and a stale `last_run`) right through the app's longest runs, and an
-"alert me when the queue finishes" automation silently never fired for video. The
-`task/*` + `last_run` publishing is now the widget-free **`MqttTaskState`** mixin
-in `gui/tooltab.py` (`mqtt_task_started` / `mqtt_task_update` / `mqtt_task_idle`),
-mixed into both `ToolTab` and `VideoTab`, and `batch_video_upscale` emits a `DONE`
-event from one end-of-run seam (`_run_finished`, which also sends the completion
-notification; the grouped and Auto-resume paths suppress their per-pass copies, so
-exactly one of each reaches the GUI). A video run's `progress` counts **frames**
-(not files) and its per-item times are **seconds per frame**; `_done_payload`
-reuses the image runners' `tool`/`processed`/`failed`/`elapsed_seconds` key names
-so one HA automation covers every tool, and reduces the runner summary for a
-retained payload (the `attempted` **set** and the per-file list can't go on the
-wire; the billed pod cost is summed). A **remote** video run also keeps sampling
-the local machine on a 30 s keep-alive (`system/*` used to freeze for the whole
-run: `App._any_task_running()` stands the 60 s idle sampler down, and the tab only
-sampled for a local run).
-**Retained state vs one-shot events** (0.5.8): every topic above is retained, which
-is what makes a dashboard correct immediately after an HA restart, but makes it a
-**bad trigger** — the broker re-sends a retained value to every new subscriber, so
-an automation on `last_run` re-announces a days-old run on every HA restart and
-every broker reconnect (and `MqttClient` replays its retained set on reconnect
-too). So a run start/end is ALSO published as a **non-retained, qos-1 one-shot
-event** (`event/run_started` = `{tool, started_at}`, `event/run_finished` = the
-same object as `last_run`), never stored for the replay, so it is delivered live
-exactly once and cannot re-fire. `App.mqtt_publish(values, retain=, qos=)` and
-`MqttClient.publish_many` carry the flags; `MqttTaskState.mqtt_event` is the
-publisher. A run with **no** summary (one that crashed before the runner reported)
-publishes neither `last_run` nor the event, so an automation is never handed a
-result the app doesn't have — the availability LWT covers that case. Every
-timestamp the app publishes goes through **`gui.common.now_stamp()`** (offset-aware
-ISO, e.g. `+03:00`): a naive stamp is read in whatever timezone the HA *process*
-runs in (commonly UTC in a container), which silently breaks the freshness
-condition the retained route depends on by exactly the offset between the two
-machines. Ready-made automations (incl. the retained route WITH both guards, and
-an app-died-mid-run alert off the LWT) ship in
-`samples/home-assistant/automations.yaml`, pinned by `tests/test_ha_samples.py`
-(the sample's topics/entities must exist, its Jinja must compile, and its two
-"finished" automations must PARTITION every runner's real DONE payload: rendered
-against all four, exactly one fires per run). Writing that test surfaced the last
-key mismatch: `conciliate.py`'s DONE predates the shared naming, so it now also
-emits `processed`/`failed`/`elapsed_seconds`/`stopped_by_user` alongside its
-original `done`/`conflicts`/`errors`/`removed_dirs` (both kept, so an existing
-template still works) — otherwise a one-size-fits-all automation reported
-"0 processed" for every conciliation run.
+so HA always knows if the app is alive. Retained **state** topics: `version`,
+`update`, `latest_version`, `last_run` (JSON summary), `last_used`, `system/*`
+telemetry, plus live `task/*` state (`name` =
+idle/upscaling/tagging/conciliating/video upscaling, `details`, `runtime`,
+`progress` = X/Y, `eta`, `average_processing_time`, `last_processing_time`) —
+**all four tools report** since 0.5.8, the Video Upscaler included (its
+`progress` counts frames, not files). Plus two **non-retained one-shot events**
+(`event/run_started` / `event/run_finished`): retained state is re-sent to every
+new subscriber, so it re-fires an automation on every HA restart, and the events
+are what a trigger should use. The publishing lives in the widget-free
+**`MqttTaskState`** mixin (`gui/tooltab.py`), shared by `ToolTab` and `VideoTab`;
+every published timestamp goes through **`gui.common.now_stamp()`**
+(offset-aware, so HA's freshness checks work from any timezone). Settings has
+host/port/username/password/client-id fields, a "Test" button, and a "Publish
+now" button. Depends on `paho-mqtt` (installed by `bootstrap.ps1`); the import is
+lazy so older venvs still launch. Ready-made HA automations ship in
+`samples/home-assistant/`. **The full contract, the payload keys per tool, the
+design decisions and what was rejected are in `docs/mqtt-integration.md`** — read
+it before touching a topic, a payload key or a retain flag.
 
 **System telemetry** (Feature #3a) — a compact, read-only status row below the
 image carousel on each tool tab showing **CPU usage, RAM, GPU VRAM, GPU
@@ -747,7 +712,11 @@ Engine, packaging & CI:
   and the local GPU path #7), `benchmark-sharing.md` (as-built notes for the
   crowdsourced benchmark corpus, #8), `tag-and-rename.md` (vision-model design +
   as-built notes for Tag & Rename: the model tiers + the `ollama_num_ctx` cap, with
-  `tag-rename-benchmarks.csv` the raw 100-image measurements), `CHANGELOG.md` (working
+  `tag-rename-benchmarks.csv` the raw 100-image measurements), `mqtt-integration.md`
+  (the MQTT/Home Assistant contract: every topic, the retained-state vs one-shot-event
+  split, the per-tool `last_run` keys, and what was rejected — the single source for
+  anything MQTT), `telemetry-design.md` (the `system/*` topics + the in-app usage
+  graphs, #9/#10), `CHANGELOG.md` (working
   draft of per-version release notes), `image-benchmarks.csv` (author benchmark data,
   read by `benchmarks.py`).
 

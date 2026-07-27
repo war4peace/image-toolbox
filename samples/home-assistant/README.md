@@ -102,6 +102,10 @@ The one thing only Home Assistant can tell you: **the app died mid-run**. The
 connection drops without a clean goodbye, so nothing inside the app could ever
 send that alert about itself (automation 4).
 
+Writing your own? [`docs/mqtt-integration.md`](../../docs/mqtt-integration.md) is the
+full contract: every topic, the exact `last_run` keys each tool reports, and why the
+design is the way it is.
+
 ## What updates when
 
 - **`system/*`** (this machine) updates only **while a task runs**, plus a slow

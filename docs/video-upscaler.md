@@ -1359,27 +1359,26 @@ clamped below the batch on the pod.
 
 #### MQTT / Home Assistant reporting (0.5.8)
 
-The running view is also published to MQTT, which it was not until 0.5.8: `VideoTab` is
-not a `ToolTab`, so it inherited none of the `task/*` publishing and a video run left
-Home Assistant reading `idle` with a stale `last_run` for hours. The publishing now lives
-in **`MqttTaskState`** (`gui/tooltab.py`), a widget-free mixin both `ToolTab` and
-`VideoTab` use, so there is one implementation.
+The running view is also published to MQTT, which it was not until 0.5.8. **The contract,
+the design and the as-built record live in [`mqtt-integration.md`](mqtt-integration.md)**;
+only what is specific to this tab is repeated here:
 
-- `task/name` = `video upscaling` from `_begin_run`, back to `idle` in `_end_run`.
-- `_publish_task_state` (from the 1 s `_run_tick`, **throttled to 10 s** - a multi-hour
-  run should not push thousands of retained messages for numbers a human reads
-  occasionally) sends `details` (the base status line, without the volatile ETA tail:
-  its parts have their own topics), `progress` in **frames**, `eta`, `runtime`, and the
-  s/frame pair as `average_processing_time` (the run's running average) /
-  `last_processing_time` (the live measurement). A new file's `details` is published
-  immediately on the `VIDEO` event rather than waiting out the throttle.
-- `last_run` comes from a new **`DONE`** event, emitted by `batch_video_upscale`'s single
+- `task/name` = `video upscaling` from `_begin_run`, back to `idle` in `_end_run`. The
+  publishing itself is the shared `MqttTaskState` mixin (`gui/tooltab.py`), not a copy.
+- `_publish_task_state` runs from the 1 s `_run_tick` but is **throttled to 10 s**: a
+  multi-hour run should not push thousands of retained messages for numbers a human reads
+  occasionally. It sends `details` (the base status line **without** the volatile ETA
+  tail, whose parts have their own topics), `progress` in **frames** (where the image
+  tools count files), `eta`, `runtime`, and the s/frame pair as
+  `average_processing_time` (the run's running average) / `last_processing_time` (the
+  pod's or GPU's live measurement). A new file's `details` is published immediately on
+  the `VIDEO` event rather than waiting out the throttle, because that transition is the
+  interesting one.
+- `last_run` comes from the **`DONE`** event, emitted by `batch_video_upscale`'s single
   end-of-run seam `_run_finished` (which also sends the completion notification, so the
-  grouped/Auto-resume paths suppress exactly one pair). `_done_payload` is pure: it
-  reuses the image runners' `tool`/`processed`/`failed`/`elapsed_seconds` key names (one
-  HA automation covers every tool) and reduces the summary for a retained payload - the
-  `attempted` **set** is not JSON-serialisable and the per-file list belongs in the
-  notification, so both become counts, and a billed pod's per-file costs are summed.
+  grouped/Auto-resume paths suppress exactly one pair). `_done_payload` is pure and
+  reduces the run summary for a retained payload; keys and rationale in
+  [`mqtt-integration.md`](mqtt-integration.md#last_run-and-eventrun_finished-payloads).
 - A **remote** run keeps sampling the local machine on a 30 s keep-alive (`_launch`).
   `App._any_task_running()` stands the app's 60 s idle sampler down for the whole run,
   and the tab previously only sampled for a *local* run, so `system/*` froze for hours.
