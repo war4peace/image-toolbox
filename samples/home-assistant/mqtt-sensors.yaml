@@ -37,7 +37,7 @@
 #     image-toolbox/event/run_finished
 #
 # They are one-shot and NOT retained, meant as automation TRIGGERS (see
-# automations.yaml). As a sensor, each would sit at a value that never changes
+# automations-ui.yaml). As a sensor, each would sit at a value that never changes
 # back, which is what the retained `last_run` sensor below is already for.
 # =====================================================================
 
@@ -121,7 +121,7 @@
 # 0.5.8: the Video Upscaler publishes here too, adding `cost` (dollars of pod
 # time, when a rented pod was billed) and `files` to the usual processed/failed.
 # `finished_at` now carries a UTC offset, which is what makes a "did this run
-# just finish?" template correct in any timezone (see automations.yaml, #3).
+# just finish?" template correct in any timezone (see automations-ui.yaml, block 3).
 
   - name: "Image Toolbox Last Run Summary"
     state_topic: image-toolbox/last_run

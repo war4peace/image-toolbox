@@ -43,24 +43,19 @@ def _load(name):
 
 
 def _load_all(name):
-    """The UI-paste sample is a stream of one-automation documents."""
+    """The automations sample is a stream of one-automation documents."""
     with open(os.path.join(SAMPLES, name), encoding="utf-8") as fh:
         return [d for d in yaml.safe_load_all(fh) if d]
 
 
 @pytest.fixture(scope="module")
 def automations():
-    return _load("automations.yaml")
+    return _load_all("automations-ui.yaml")
 
 
 @pytest.fixture(scope="module")
 def sensors():
     return _load("mqtt-sensors.yaml")
-
-
-@pytest.fixture(scope="module")
-def ui_automations():
-    return _load_all("automations-ui.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -93,14 +88,20 @@ def _entity_id(sensor_name):
 
 # ── it parses, and it is what it claims to be ────────────────────────────────
 
-def test_automations_are_a_list_of_uniquely_identified_automations(automations):
-    assert isinstance(automations, list) and automations
-    ids = [a["id"] for a in automations]
-    aliases = [a["alias"] for a in automations]
-    assert len(set(ids)) == len(ids)              # a duplicate id silently overwrites
-    assert len(set(aliases)) == len(aliases)
+def test_each_automation_is_one_standalone_document(automations):
+    """The sample is pasted into the UI's "Edit in YAML" editor, which holds ONE
+    automation and rejects anything else with "extra keys not allowed @ data['0']".
+    So each document must be a bare mapping (never a list), with no `id` (the UI
+    assigns its own) and no `initial_state` (file-only; the ones that should start
+    off say to switch them off after saving)."""
+    assert automations, "no automation documents parsed: are the `---` separators intact?"
     for a in automations:
-        assert a["triggers"] and a["actions"]
+        assert isinstance(a, dict), f"{a!r} is not a single automation mapping"
+        assert "id" not in a, f"{a['alias']}: `id` is assigned by the UI"
+        assert "initial_state" not in a, f"{a['alias']}: `initial_state` is file-only"
+        assert a["alias"] and a["triggers"] and a["actions"]
+    aliases = [a["alias"] for a in automations]
+    assert len(set(aliases)) == len(aliases)      # the alias is how the user tells them apart
 
 
 def test_every_jinja_template_compiles(automations, sensors):
@@ -200,67 +201,53 @@ def test_the_progress_percent_template_renders(template_sensors, progress, expec
     assert rendered == expected, rendered
 
 
-# ── the UI-paste copy is the same automations, differently shaped ────────────
-#
-# automations.yaml is a LIST (for the user's own automations.yaml file);
-# automations-ui.yaml is one MAPPING per document (for the UI's YAML editor,
-# which rejects a list with "extra keys not allowed @ data['0']"). Shipping the
-# same content twice is a drift risk, so the two are pinned equal here: edit
-# either one and this fails until the other matches.
-
-_UI_DROPS = ("id", "initial_state")     # the UI owns both; they are not pasted
-
-
-def test_the_ui_paste_copy_matches_automations_one_for_one(automations, ui_automations):
-    assert len(ui_automations) == len(automations)
-    for src, ui in zip(automations, ui_automations):
-        expected = {k: v for k, v in src.items() if k not in _UI_DROPS}
-        assert ui == expected, (
-            f"{src['alias']}: automations-ui.yaml has drifted from automations.yaml. "
-            f"Re-derive it: drop the leading '- ', de-indent by 2, drop {_UI_DROPS}.")
-
-
-def test_the_ui_paste_copy_carries_no_key_the_editor_rejects(ui_automations):
-    """`id` is assigned by the UI and `initial_state` is the file-only way to ship
-    an automation disabled; either one pasted into the editor is a key it did not
-    ask for. The disabled ones say "switch it off after saving" instead."""
-    for ui in ui_automations:
-        assert isinstance(ui, dict), "a document is still a list -> the pasted form fails"
-        for key in _UI_DROPS:
-            assert key not in ui, f"{ui['alias']}: {key} must not be in the UI copy"
-
-
 # ── finding F2: the retained-topic guards ────────────────────────────────────
 
-def _by_id(automations, wanted):
-    return next(a for a in automations if a["id"] == wanted)
+RUN_FINISHED = "Image Toolbox - run finished"
+RUN_PROBLEMS = "Image Toolbox - run finished with problems"
+RETAINED_ROUTE = "Image Toolbox - run finished (retained-sensor route)"
+OFFLINE_MIDRUN = "Image Toolbox - app went offline mid-run"
+
+
+def _by_alias(automations, wanted):
+    return next(a for a in automations if a["alias"] == wanted)
 
 
 def test_the_recommended_route_triggers_on_the_non_retained_event(automations):
-    """The default-on "run finished" automation must use the event topic. A
-    retained topic would re-announce an old run on every HA restart."""
-    a = _by_id(automations, "image_toolbox_run_finished")
-    assert a.get("initial_state") is not False            # this one ships enabled
+    """The "run finished" automation must use the event topic. A retained topic
+    would re-announce an old run on every HA restart."""
+    a = _by_alias(automations, RUN_FINISHED)
     assert [t["topic"] for t in a["triggers"]] == [mp.EVENT_RUN_FINISHED_TOPIC]
 
 
 def test_the_retained_route_carries_both_guards(automations):
     """The alternative route triggers on retained state, so it needs the startup
     guard (unknown/unavailable) AND the freshness guard on `finished_at`, or it
-    fires on every restart. It also ships disabled so it can't double up."""
-    a = _by_id(automations, "image_toolbox_run_finished_retained")
-    assert a["initial_state"] is False
+    fires on every restart."""
+    a = _by_alias(automations, RETAINED_ROUTE)
     trig = a["triggers"][0]
     assert "unknown" in trig["not_from"] and "unavailable" in trig["not_from"]
     guard = a["conditions"][0]["value_template"]
     assert "finished_at" in guard and "as_timestamp" in guard
 
 
+def test_the_retained_route_warns_against_adding_it_as_well():
+    """It duplicates the "run finished" alert, so with both in place every
+    notification arrives twice. A file-pasted automation could ship disabled
+    (`initial_state: false`); one built in the UI cannot, so this warning in its
+    banner is the only thing standing between the user and double alerts. Checked
+    in the raw text because it lives in a comment."""
+    with open(os.path.join(SAMPLES, "automations-ui.yaml"), encoding="utf-8") as fh:
+        src = fh.read()
+    banner = src.split(RETAINED_ROUTE)[0].rsplit("# ===", 2)[-2]
+    assert "ONLY INSTEAD OF BLOCK 1" in banner, banner
+
+
 def test_the_last_will_automation_only_fires_on_a_real_transition(automations):
     """`from: online` is the guard: at HA startup the sensor goes
     unknown -> offline, which would otherwise alert on every restart while the
     app happens to be closed."""
-    trig = _by_id(automations, "image_toolbox_offline_midrun")["triggers"][0]
+    trig = _by_alias(automations, OFFLINE_MIDRUN)["triggers"][0]
     assert trig["from"] == "online" and trig["to"] == "offline"
 
 
@@ -322,8 +309,8 @@ def _render(template, payload):
 def test_the_two_finished_automations_partition_every_runners_payload(automations):
     """Both listen to the same event, so exactly ONE must accept each run: a run
     that satisfies neither is silent, a run that satisfies both notifies twice."""
-    clean = _by_id(automations, "image_toolbox_run_finished")["conditions"][0]
-    problem = _by_id(automations, "image_toolbox_run_problems")["conditions"][0]
+    clean = _by_alias(automations, RUN_FINISHED)["conditions"][0]
+    problem = _by_alias(automations, RUN_PROBLEMS)["conditions"][0]
     for name, payload in _PAYLOADS.items():
         got_clean = _render(clean["value_template"], payload) == "True"
         got_problem = _render(problem["value_template"], payload) == "True"
@@ -335,7 +322,7 @@ def test_the_finished_message_reads_correctly_for_every_tool(automations):
     """The `default(...)` fallbacks have to hold across four runners that emit
     different keys — a stray 'None' or a raised UndefinedError lands in the user's
     notification."""
-    a = _by_id(automations, "image_toolbox_run_finished")
+    a = _by_alias(automations, RUN_FINISHED)
     title = a["actions"][0]["data"]["title"]
     message = a["actions"][0]["data"]["message"]
     for name in _CLEAN:
@@ -349,7 +336,7 @@ def test_the_finished_message_reads_correctly_for_every_tool(automations):
 
 
 def test_the_problem_message_names_the_reason(automations):
-    message = _by_id(automations, "image_toolbox_run_problems")["actions"][0]["data"]["message"]
+    message = _by_alias(automations, RUN_PROBLEMS)["actions"][0]["data"]["message"]
     assert "GPU slowed down" in _render(message, _PAYLOADS["upscale-degraded"])
     assert "per-run cap" in _render(message, _PAYLOADS["video-capped"])
     assert "You stopped it" in _render(message, _PAYLOADS["upscale-user-stop"])

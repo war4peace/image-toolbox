@@ -1,62 +1,92 @@
 # =====================================================================
-# Image Toolbox - notification automations, UI-PASTE VERSION
+# Image Toolbox - notification automations (OPTIONAL)
 # =====================================================================
-# The SAME five automations as automations.yaml, already converted for Home
-# Assistant's automation editor. Use whichever file matches how you add them:
+# Get a phone / dashboard notification when a run finishes, when it finishes
+# badly, and when the app dies in the middle of one.
 #
-#   automations.yaml     -> your own `automations.yaml` file (a LIST: every
-#                           automation starts with `- alias:`).
-#   automations-ui.yaml  -> THIS file: the UI, one automation at a time.
-#
-# They are kept identical by a test (tests/test_ha_samples.py), so neither can
-# quietly drift from the other. Nothing is lost by picking either one.
+# Needs: the MQTT integration set up and Image Toolbox pointed at the same broker
+# (see this folder's README). Blocks 1, 2 and 5 need nothing else; 3 and 4
+# additionally need the sensors from mqtt-sensors.yaml.
 #
 # ---------------------------------------------------------------------
-# WHY A SECOND FILE
+# HOW TO ADD ONE
 # ---------------------------------------------------------------------
-# The UI's YAML editor holds ONE automation, so it wants a plain mapping. Pasting
-# the list form from automations.yaml into it fails with:
+# Everything happens in the Home Assistant UI; you never edit a file. For each
+# automation you want:
 #
-#     Message malformed: extra keys not allowed @ data['0']
-#
-# ('0' is the first item of the list.) The conversion is mechanical but fiddly to
-# do by hand five times, and a slip corrupts the automation, so it is done here:
-# no leading `- `, de-indented, and no `id:` (the UI assigns its own).
-#
-# ---------------------------------------------------------------------
-# HOW TO USE THIS FILE
-# ---------------------------------------------------------------------
-# For each automation you want:
 #   1. Settings > Automations & scenes > + CREATE AUTOMATION >
 #      "Create new automation".
 #   2. Top-right three-dot menu > "Edit in YAML".
-#   3. Select all in that editor (it starts with a placeholder) and paste ONE
+#   3. Select all in that editor (it opens with a placeholder) and paste ONE
 #      block from below: from its `alias:` line down to the next banner.
-#   4. Save. Home Assistant names it from the `alias:` line.
+#   4. Save. Home Assistant names the automation from the `alias:` line.
 #
-# Copy one block at a time. Pasting two would put you back at the error above.
+# ONE BLOCK AT A TIME. That editor holds a single automation, so pasting two (or
+# pasting a `- `-prefixed list, the shape Home Assistant's own automations.yaml
+# file uses) fails with:
+#
+#     Message malformed: extra keys not allowed @ data['0']
+#
+# Each block below is therefore a complete, standalone automation: no leading
+# `- `, and no `id:` (the UI assigns its own).
 #
 # ---------------------------------------------------------------------
 # WHERE THE NOTIFICATION GOES
 # ---------------------------------------------------------------------
 # Every block notifies `notify.persistent_notification`, which exists on every
-# Home Assistant install and shows in the sidebar. For your phone, install the
-# companion app and replace that one line with your device's service, e.g.
+# Home Assistant install and shows up in the sidebar. To get it on your phone,
+# install the Home Assistant companion app and replace that one line with your
+# device's service, e.g.
 #
 #     action: notify.mobile_app_pixel_9
 #
 # (Developer Tools > Actions > type "notify." to see yours.)
 #
-# The design notes (why triggers use the non-retained event topics, what each
-# guard is for) are in automations.yaml and this folder's README; only the
-# formatting differs here.
+# ---------------------------------------------------------------------
+# THE ONE TRAP: RETAINED TOPICS RE-FIRE
+# ---------------------------------------------------------------------
+# Image Toolbox publishes its state RETAINED, so the broker hands a subscriber
+# the last value the moment it subscribes: that is what makes a dashboard correct
+# straight after a restart, instead of "unknown" until the next run.
 #
-# Needs: the MQTT integration set up and Image Toolbox pointed at the same
-# broker. Blocks 1, 2 and 5 need nothing else; 3 and 4 additionally need the
-# sensors from mqtt-sensors.yaml.
+# The cost: a retained value is delivered again on every Home Assistant restart
+# and every broker reconnect. An automation that triggers on `last_run` therefore
+# announces a run that finished days ago, every time Home Assistant restarts.
 #
+# So the app also publishes two NON-retained, one-shot EVENTS:
+#
+#     image-toolbox/event/run_started     {"tool": ..., "started_at": ...}
+#     image-toolbox/event/run_finished    the same object as `last_run`
+#
+# These are delivered live, exactly once, and are never replayed, so an
+# automation triggering on them cannot misfire. **Prefer the event topics for
+# triggers** (blocks 1, 2 and 5) and read the retained topics for state.
+#
+# Block 3 shows the retained route anyway, with the freshness guard it needs,
+# because you may want to trigger off the sensor you already have on a dashboard.
+#
+# ---------------------------------------------------------------------
+# UPGRADING: HOW TO COPY ONLY WHAT IS NEW
+# ---------------------------------------------------------------------
+# Each block is tagged with the app version that introduced or changed it:
+#
+#   # NEW: version 0.5.8        a new automation. Add it as above.
+#   # CHANGED: version X.Y.Z    an existing one whose YAML changed. Open yours,
+#                               "Edit in YAML", select all, and paste the new
+#                               block over it; that is safer than editing in
+#                               place, and keeps your name and enabled state.
+#
+# EVERY BLOCK IS NEW IN 0.5.8, this being the first version to ship them, so on a
+# first install just take the ones you want. Later versions will tag only what
+# actually changed.
+#
+# ---------------------------------------------------------------------
+# HOME ASSISTANT VERSION
+# ---------------------------------------------------------------------
 # Written in the modern schema (`triggers:` / `conditions:` / `actions:` and
-# `trigger: mqtt`), Home Assistant 2024.10 and newer.
+# `trigger: mqtt`), Home Assistant 2024.10 and newer. On an older version use the
+# singular keys and `platform:` instead: `trigger:` / `condition:` / `action:`,
+# with `- platform: mqtt` and `service:` in place of `action:`.
 # =====================================================================
 
 
@@ -159,9 +189,9 @@ actions:
 # the event. It needs BOTH guards below; without them it announces an old run on
 # every Home Assistant restart.
 #
-# AFTER SAVING, SWITCH THIS ONE OFF in Settings > Automations & scenes (the
-# toggle on its row), unless you are using it INSTEAD of block 1. Left on
-# alongside block 1, you get every notification twice.
+# ADD THIS ONE ONLY INSTEAD OF BLOCK 1, never alongside it: the two alert on the
+# same thing, so with both in place every notification arrives twice. (If you
+# already added both, switch one off in Settings > Automations & scenes.)
 # =====================================================================
 ---
 alias: "Image Toolbox - run finished (retained-sensor route)"

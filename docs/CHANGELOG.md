@@ -61,11 +61,14 @@ value in a runner, so the two palettes cannot drift apart again. New
 setup steps and what each alert contains.
 
 ### Home Assistant: ready-made notification automations, and no more phantom alerts
-There is now a [`samples/home-assistant/automations.yaml`](../samples/home-assistant/automations.yaml)
-to paste in: **a run finished**, **a run finished badly** (failures, an early stop, a
-degraded GPU), **the app died mid-run**, and an optional **a run started**. Plus a
-Notifications section in that folder's README explaining the one trap in the whole
-setup.
+There is now a [`samples/home-assistant/automations-ui.yaml`](../samples/home-assistant/automations-ui.yaml)
+with five ready-made automations: **a run finished**, **a run finished badly**
+(failures, an early stop, a degraded GPU), **the app died mid-run**, an optional **a
+run started**, and an alternative form of the first one. Each is a self-contained
+block you paste into Home Assistant's own automation editor (**Edit in YAML**), so
+you never touch a configuration file: no leading dash, no `id`, nothing to reload.
+Plus a Notifications section in that folder's README explaining the one trap in the
+whole setup.
 
 That trap, and what changed in the app because of it: the values Image Toolbox
 publishes are *retained*, which is why your dashboard is correct the instant Home
@@ -87,19 +90,6 @@ hours, in either direction). And a **Conciliation** run's summary now reports th
 "processed / failed / how long" fields the other three tools do (its own
 replaced/conflicts/errors counts are still there), so one automation genuinely covers
 all four tools instead of reading "0 processed" for that one.
-
-### Home Assistant: the automations, ready to paste into the UI
-Home Assistant accepts automations in two shapes, and it does not accept the wrong
-one: your `automations.yaml` file wants a **list** (each automation starting with
-`- `), while the automation editor's **Edit in YAML** view holds a single automation
-and rejects a list with `Message malformed: extra keys not allowed @ data['0']`.
-
-The sample was only ever the list form, with a note saying you could also paste it
-into the UI, which was wrong. There is now a second file,
-[`automations-ui.yaml`](../samples/home-assistant/automations-ui.yaml), holding the
-same five automations already converted for that editor: one paste-ready block each,
-no leading dash, no `id:` (the UI assigns its own). A test keeps the two files
-identical, so neither can drift and there is no "which one is newer" to work out.
 
 ### Home Assistant samples: version markers, and a progress bar
 The files in `samples/home-assistant/` are pasted into your own Home Assistant

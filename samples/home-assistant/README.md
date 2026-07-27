@@ -48,20 +48,18 @@ Add the entities first, then a dashboard.
    To have both tiers, repeat with a second card. You can also lift any single
    sub-card out of the file into its own card.
 4. **Notification automations** *(optional)* -
-   [`automations.yaml`](automations.yaml): tell me when a run finishes, when it
-   finishes badly, and when the app dies mid-run. Append the ones you want to
-   your own `automations.yaml`, keeping the leading `- `, and reload from
-   **Developer Tools > YAML > Automations**. See [Notifications](#notifications)
-   below for how they avoid the retained-message trap.
+   [`automations-ui.yaml`](automations-ui.yaml): tell me when a run finishes,
+   when it finishes badly, and when the app dies mid-run. Five ready-made ones,
+   each a self-contained block you paste into the automation editor:
+   1. **Settings > Automations & scenes > + CREATE AUTOMATION > Create new
+      automation**.
+   2. Top-right three-dot menu > **Edit in YAML**.
+   3. Select all in that editor and paste **one** block from the file (from its
+      `alias:` line down to the next banner). **Save**.
 
-   **Prefer to add them in the UI?** Use
-   [`automations-ui.yaml`](automations-ui.yaml) instead: the same five
-   automations, already converted for the automation editor's **Edit in YAML**
-   view, one paste-ready block each. That editor holds *one* automation and
-   rejects the list form with `Message malformed: extra keys not allowed @
-   data['0']`, so the conversion (no leading `- `, de-indented, no `id:`) is done
-   for you rather than left as five chances to slip. A test keeps the two files
-   identical.
+   Repeat for each one you want. No file editing, and nothing to reload. See
+   [Notifications](#notifications) below for how they avoid the retained-message
+   trap.
 
 ## Upgrading these files
 
@@ -74,7 +72,7 @@ kind of file is upgraded differently:
 | `mqtt-sensors.yaml` | `# --- Added in 0.5.3 ---`, `# --- Changed in 0.5.3 ---` | Copy only the blocks newer than the version you first pasted. A *Changed* block replaces your copy of that one sensor. |
 | `template-sensors.yaml` | `# --- Added in 0.5.8 ---` | Same: copy only the newer sensors. |
 | `dashboard-core.yaml` / `dashboard-custom.yaml` | `UPDATED IN 0.5.8` header, `# NEW in 0.5.8` inline | Re-paste the **whole** file over the card. It is one card, so replacing it is easier than patching it, and you lose nothing (the card holds no state). |
-| `automations.yaml`, `automations-ui.yaml` | `# NEW: version 0.5.8`, `# CHANGED: version X.Y.Z` | Paste in the *NEW* ones. For a *CHANGED* one, delete your copy and re-paste that whole automation. The two files hold the same automations in the two shapes Home Assistant accepts; use whichever matches how you add them. |
+| `automations-ui.yaml` | `# NEW: version 0.5.8`, `# CHANGED: version X.Y.Z` | Add the *NEW* ones as above. For a *CHANGED* one, open yours, **Edit in YAML**, select all and paste the new block over it: that keeps its name and enabled state, and is safer than editing in place. |
 
 Lines that begin `# 0.5.8:` are notes about something that already exists and
 whose **meaning** widened. They are not a change to copy.
@@ -92,8 +90,8 @@ video run left the app looking idle for hours.
   turns that `X/Y` text into a percentage a gauge can show.
 - **Both dashboards: re-paste.** They gain a progress arc (needs the sensor
   above) and last-run detail rows: processed, failed, and what the pod cost.
-- **`automations.yaml` is new in 0.5.8** and needs the two new event topics, so
-  it wants app 0.5.8 or later.
+- **`automations-ui.yaml` is new in 0.5.8** and triggers on the two new event
+  topics, so it wants app 0.5.8 or later.
 
 ## HACS cards (custom dashboard only)
 
@@ -111,9 +109,9 @@ config change (captured here as of 2026-07).
 
 ## Notifications
 
-[`automations.yaml`](automations.yaml) has five ready-made ones (run finished, run
-finished badly, the same via the retained sensor, app died mid-run, run started).
-One thing is worth understanding before you write your own.
+[`automations-ui.yaml`](automations-ui.yaml) has five ready-made ones (run finished,
+run finished badly, the same via the retained sensor, app died mid-run, run
+started). One thing is worth understanding before you write your own.
 
 **Everything in the topic table below is published *retained*.** That is what
 makes a dashboard correct the moment Home Assistant starts, instead of blank until
@@ -133,7 +131,7 @@ delivered live exactly once, never replayed.
 
 **Trigger on the event topics.** `event/run_finished` carries the exact same JSON
 object as `last_run`, so any template you write works on either. If you would
-rather trigger off the sensor you already have on a dashboard, automation 3 in the
+rather trigger off the sensor you already have on a dashboard, block 3 in the
 sample shows the retained route with the two guards it needs (ignore
 `unknown`/`unavailable` state changes, and check `finished_at` is recent - it
 carries a UTC offset, so that comparison is correct whatever timezone HA runs in).
@@ -141,7 +139,7 @@ carries a UTC offset, so that comparison is correct whatever timezone HA runs in
 The one thing only Home Assistant can tell you: **the app died mid-run**. The
 `availability` topic is a Last Will, published by the *broker* when the app's
 connection drops without a clean goodbye, so nothing inside the app could ever
-send that alert about itself (automation 4).
+send that alert about itself (block 4).
 
 Writing your own? [`docs/mqtt-integration.md`](../../docs/mqtt-integration.md) is the
 full contract: every topic, the exact `last_run` keys each tool reports, and why the
