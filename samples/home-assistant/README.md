@@ -54,12 +54,14 @@ Add the entities first, then a dashboard.
    **Developer Tools > YAML > Automations**. See [Notifications](#notifications)
    below for how they avoid the retained-message trap.
 
-   **Pasting into the UI instead?** The file is a *list*; the UI's **Edit in
-   YAML** editor holds *one* automation and rejects a list with `Message
-   malformed: extra keys not allowed @ data['0']`. Convert as you paste: drop the
-   leading `- `, de-indent by 2 spaces, and delete the `id:` line (the UI assigns
-   its own). If the automation ships disabled, drop `initial_state: false` too
-   and just leave it switched off in the automations list.
+   **Prefer to add them in the UI?** Use
+   [`automations-ui.yaml`](automations-ui.yaml) instead: the same five
+   automations, already converted for the automation editor's **Edit in YAML**
+   view, one paste-ready block each. That editor holds *one* automation and
+   rejects the list form with `Message malformed: extra keys not allowed @
+   data['0']`, so the conversion (no leading `- `, de-indented, no `id:`) is done
+   for you rather than left as five chances to slip. A test keeps the two files
+   identical.
 
 ## Upgrading these files
 
@@ -72,7 +74,7 @@ kind of file is upgraded differently:
 | `mqtt-sensors.yaml` | `# --- Added in 0.5.3 ---`, `# --- Changed in 0.5.3 ---` | Copy only the blocks newer than the version you first pasted. A *Changed* block replaces your copy of that one sensor. |
 | `template-sensors.yaml` | `# --- Added in 0.5.8 ---` | Same: copy only the newer sensors. |
 | `dashboard-core.yaml` / `dashboard-custom.yaml` | `UPDATED IN 0.5.8` header, `# NEW in 0.5.8` inline | Re-paste the **whole** file over the card. It is one card, so replacing it is easier than patching it, and you lose nothing (the card holds no state). |
-| `automations.yaml` | `# NEW: version 0.5.8`, `# CHANGED: version X.Y.Z` | Paste in the *NEW* ones. For a *CHANGED* one, delete your copy and re-paste that whole automation. |
+| `automations.yaml`, `automations-ui.yaml` | `# NEW: version 0.5.8`, `# CHANGED: version X.Y.Z` | Paste in the *NEW* ones. For a *CHANGED* one, delete your copy and re-paste that whole automation. The two files hold the same automations in the two shapes Home Assistant accepts; use whichever matches how you add them. |
 
 Lines that begin `# 0.5.8:` are notes about something that already exists and
 whose **meaning** widened. They are not a change to copy.

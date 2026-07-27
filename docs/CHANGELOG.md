@@ -88,6 +88,19 @@ hours, in either direction). And a **Conciliation** run's summary now reports th
 replaced/conflicts/errors counts are still there), so one automation genuinely covers
 all four tools instead of reading "0 processed" for that one.
 
+### Home Assistant: the automations, ready to paste into the UI
+Home Assistant accepts automations in two shapes, and it does not accept the wrong
+one: your `automations.yaml` file wants a **list** (each automation starting with
+`- `), while the automation editor's **Edit in YAML** view holds a single automation
+and rejects a list with `Message malformed: extra keys not allowed @ data['0']`.
+
+The sample was only ever the list form, with a note saying you could also paste it
+into the UI, which was wrong. There is now a second file,
+[`automations-ui.yaml`](../samples/home-assistant/automations-ui.yaml), holding the
+same five automations already converted for that editor: one paste-ready block each,
+no leading dash, no `id:` (the UI assigns its own). A test keeps the two files
+identical, so neither can drift and there is no "which one is newer" to work out.
+
 ### Home Assistant samples: version markers, and a progress bar
 The files in `samples/home-assistant/` are pasted into your own Home Assistant
 configuration, so a new version of the app cannot update them for you. They now carry

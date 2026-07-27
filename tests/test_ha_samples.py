@@ -42,6 +42,12 @@ def _load(name):
         return yaml.safe_load(fh)
 
 
+def _load_all(name):
+    """The UI-paste sample is a stream of one-automation documents."""
+    with open(os.path.join(SAMPLES, name), encoding="utf-8") as fh:
+        return [d for d in yaml.safe_load_all(fh) if d]
+
+
 @pytest.fixture(scope="module")
 def automations():
     return _load("automations.yaml")
@@ -50,6 +56,11 @@ def automations():
 @pytest.fixture(scope="module")
 def sensors():
     return _load("mqtt-sensors.yaml")
+
+
+@pytest.fixture(scope="module")
+def ui_automations():
+    return _load_all("automations-ui.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -187,6 +198,36 @@ def test_the_progress_percent_template_renders(template_sensors, progress, expec
     env = jinja2.Environment()
     rendered = env.from_string(src).render(states=lambda _: progress).strip()
     assert rendered == expected, rendered
+
+
+# ── the UI-paste copy is the same automations, differently shaped ────────────
+#
+# automations.yaml is a LIST (for the user's own automations.yaml file);
+# automations-ui.yaml is one MAPPING per document (for the UI's YAML editor,
+# which rejects a list with "extra keys not allowed @ data['0']"). Shipping the
+# same content twice is a drift risk, so the two are pinned equal here: edit
+# either one and this fails until the other matches.
+
+_UI_DROPS = ("id", "initial_state")     # the UI owns both; they are not pasted
+
+
+def test_the_ui_paste_copy_matches_automations_one_for_one(automations, ui_automations):
+    assert len(ui_automations) == len(automations)
+    for src, ui in zip(automations, ui_automations):
+        expected = {k: v for k, v in src.items() if k not in _UI_DROPS}
+        assert ui == expected, (
+            f"{src['alias']}: automations-ui.yaml has drifted from automations.yaml. "
+            f"Re-derive it: drop the leading '- ', de-indent by 2, drop {_UI_DROPS}.")
+
+
+def test_the_ui_paste_copy_carries_no_key_the_editor_rejects(ui_automations):
+    """`id` is assigned by the UI and `initial_state` is the file-only way to ship
+    an automation disabled; either one pasted into the editor is a key it did not
+    ask for. The disabled ones say "switch it off after saving" instead."""
+    for ui in ui_automations:
+        assert isinstance(ui, dict), "a document is still a list -> the pasted form fails"
+        for key in _UI_DROPS:
+            assert key not in ui, f"{ui['alias']}: {key} must not be in the UI copy"
 
 
 # ── finding F2: the retained-topic guards ────────────────────────────────────
