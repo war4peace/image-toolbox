@@ -43,23 +43,67 @@ from net_ssl import ssl_context
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _DEFAULT_NTFY_SERVER = "https://ntfy.sh"
 
-# Telegram has no embed colours, so a known Discord embed colour becomes a leading
-# status emoji. Unknown colours fall back to no emoji (still a valid message).
-_COLOR_EMOJI = {
-    3066993:  "\U0001F7E2",  # green  - success
-    15105570: "\U0001F7E0",  # orange - warning / degraded
-    16776960: "\U0001F7E1",  # yellow - caution
-    15548997: "\U0001F534",  # red    - error
+# ─────────────────────────────────────────────────────────────
+#  SEVERITY  (the one table every backend renders from)
+# ─────────────────────────────────────────────────────────────
+# The alert's severity travels as a Discord embed colour, because Discord was the
+# first backend. The other backends have no colours, so each derives its own
+# rendering from that int: Telegram a leading emoji, ntfy an emoji tag + a
+# priority (so an error buzzes louder than a normal completion).
+#
+# USE THESE CONSTANTS, never a raw int. Until 0.5.8 the runners each wrote their
+# own literal, and the Video Upscaler's palette was a different one: its red
+# (0xE74C3C) and amber (0xF1C40F) matched no entry here, so a FAILED video run -
+# the expensive, most worth-shouting-about case - went out at ntfy's default
+# priority 3 with no tag and no Telegram emoji, silently the quietest alert the
+# app can send. Named constants + the completeness test make that unrepresentable.
+
+COLOR_GREEN  = 3066993     # 0x2ECC71  success: finished cleanly
+COLOR_ORANGE = 15105570    # 0xE67E22  warning: degraded / interrupted, needs attention
+COLOR_YELLOW = 16776960    # 0xFFFF00  caution: finished with issues, stopped early
+COLOR_RED    = 15548997    # 0xED4245  error:   failed, or could not start
+
+# colour -> (level, telegram emoji, ntfy tag, ntfy priority 1..5)
+_SEVERITY = {
+    COLOR_GREEN:  ("success", "\U0001F7E2", "green_circle",  3),
+    COLOR_ORANGE: ("warning", "\U0001F7E0", "orange_circle", 4),
+    COLOR_YELLOW: ("caution", "\U0001F7E1", "yellow_circle", 4),
+    COLOR_RED:    ("error",   "\U0001F534", "red_circle",    5),
 }
 
-# ntfy carries the status via an emoji "tag" (X-Tags, an emoji short code) plus a
-# priority (X-Priority 1..5) so errors buzz louder than a normal completion.
-_COLOR_NTFY = {
-    3066993:  ("green_circle",  3),  # green  - success (default priority)
-    15105570: ("orange_circle", 4),  # orange - warning / degraded (high)
-    16776960: ("yellow_circle", 4),  # yellow - caution (high)
-    15548997: ("red_circle",    5),  # red    - error (max/urgent)
+# The flat-UI palette the Video Upscaler used before 0.5.8, mapped onto the
+# canonical four. The runners now emit the constants above, so nothing in-tree
+# needs these; they are kept so an equivalent colour from anywhere (an older
+# runner, a caller written from the Discord docs) still renders as itself instead
+# of silently degrading to "info".
+_COLOR_ALIASES = {
+    0x2ECC71: COLOR_GREEN,
+    0xE67E22: COLOR_ORANGE,
+    0xF1C40F: COLOR_YELLOW,
+    0xE74C3C: COLOR_RED,
+    0xFFFF00: COLOR_YELLOW,
+    0xED4245: COLOR_RED,
 }
+
+# Anything unrecognised: no emoji, no tag, normal priority. A notification that
+# renders plainly beats one that raises or is dropped.
+_SEVERITY_UNKNOWN = ("info", "", "", 3)
+
+
+def _severity(color):
+    """(level, emoji, ntfy_tag, ntfy_priority) for an embed colour. Never raises."""
+    try:
+        color = int(color)
+    except (TypeError, ValueError):
+        return _SEVERITY_UNKNOWN
+    return _SEVERITY.get(_COLOR_ALIASES.get(color, color), _SEVERITY_UNKNOWN)
+
+
+def level_for(color):
+    """The severity as a word: success / warning / caution / error (info if the
+    colour is unknown). For a consumer that has no notion of colour, e.g. a
+    JSON-webhook backend or a template branching on how bad the news is."""
+    return _severity(color)[0]
 
 _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
@@ -141,7 +185,7 @@ def send_discord(webhook_url, title, description, color, fields=None,
 
 def _telegram_text(title, description, color, fields=None):
     """Build an HTML message body mirroring the Discord embed."""
-    emoji = _COLOR_EMOJI.get(color, "")
+    emoji = _severity(color)[1]
     head = f"{emoji} " if emoji else ""
     lines = [f"{head}<b>{html.escape(title or '')}</b>"]
     if description:
@@ -203,7 +247,7 @@ def send_ntfy(server, topic, title, description, color, fields=None, token=None,
     if not topic:
         return
     server = (server or _DEFAULT_NTFY_SERVER).strip().rstrip("/")
-    tag, priority = _COLOR_NTFY.get(color, ("", 3))
+    _level, _emoji, tag, priority = _severity(color)
     headers = {
         "Title":     (title or "Image Toolbox").encode("ascii", "replace").decode("ascii"),
         "Priority":  str(priority),
@@ -235,7 +279,8 @@ def notify(settings, title, description, color, fields=None, username="Image Too
     Send the same alert to every configured backend. `settings` is the dict from
     resolve_settings(). Each backend is independent and fail-safe: one being
     misconfigured never blocks the other, and neither ever raises into the run.
-    color: Discord embed integer (15548997=red, 15105570=orange, 3066993=green).
+    `color` is the severity: pass one of COLOR_GREEN / COLOR_ORANGE / COLOR_YELLOW
+    / COLOR_RED, never a raw int (see the SEVERITY block at the top).
     """
     settings = settings or {}
     send_discord(settings.get("discord_webhook_url", ""),

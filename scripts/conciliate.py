@@ -103,7 +103,7 @@ NOTIFY = notifications.resolve_settings(config_store.load(APP_ROOT) or {})
 def send_notification(title, description, color, fields=None):
     """Fan out an alert to every configured backend; no-op for any that isn't
     configured, and fail-safe. Mirrors the other runners' wrapper.
-    color: integer (15548997 = red, 16776960 = yellow, 3066993 = green)."""
+    color: a notifications.COLOR_* severity constant (never a raw int)."""
     notifications.notify(NOTIFY, title, description, color, fields,
                          username="Conciliate Bot")
 
@@ -112,12 +112,12 @@ def _completion_notice(done, conflicts, errors, stopped):
     """Pick (title, color) for the end-of-run notification from the outcome
     (item 9). Green when the run finished clean; yellow when the user stopped it
     or it finished with conflicts/errors. Pure, so it is unit-tested.
-    color: 16776960 = yellow, 3066993 = green."""
+    Colours are notifications.COLOR_* constants, never raw ints."""
     if stopped:
-        return "Conciliation -- Stopped by User", 16776960
+        return "Conciliation -- Stopped by User", notifications.COLOR_YELLOW
     if errors > 0 or conflicts > 0:
-        return "Conciliation -- Finished with Issues", 16776960
-    return "Conciliation -- Finished", 3066993
+        return "Conciliation -- Finished with Issues", notifications.COLOR_YELLOW
+    return "Conciliation -- Finished", notifications.COLOR_GREEN
 
 
 def _norm(p):

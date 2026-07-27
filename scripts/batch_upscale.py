@@ -219,7 +219,7 @@ def send_notification(title, description, color, fields=None):
     """
     Fan out an alert to every configured backend (Discord webhook, Telegram bot).
     No-op for any backend that isn't configured; fail-safe.
-    color: integer (e.g. 15548997 = red, 16776960 = yellow, 3066993 = green).
+    color: a notifications.COLOR_* severity constant (never a raw int).
     fields: list of {"name": str, "value": str} dicts, or None.
     """
     notifications.notify(NOTIFY, title, description, color, fields, username="Upscale Bot")
@@ -1054,7 +1054,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         send_notification(
             title       = "Upscale Script -- Performance Degradation Detected",
             description = reason,
-            color       = 15105570,        # orange
+            color       = notifications.COLOR_ORANGE,
             fields      = [
                 {"name": "Last image",    "value": image},
                 {"name": "Progress",      "value": f"{idx}/{total}"},
@@ -1305,7 +1305,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                                    "or max-runtime), or the pod was stopped. The run "
                                    "ended cleanly — the resume cache continues the "
                                    "queue on the next run."),
-                    color       = 15105570,   # amber
+                    color       = notifications.COLOR_ORANGE,
                     fields      = [
                         {"name": "Progress",      "value": f"{idx}/{total}"},
                         {"name": "Total elapsed", "value": fmt_hhmmss(grand_elapsed)},
@@ -1328,7 +1328,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 send_notification(
                     title       = "Upscale Script -- Repeated Failures Detected",
                     description = outage_msg,
-                    color       = 15548997,
+                    color       = notifications.COLOR_RED,
                     fields      = [
                         {"name": "Last failed image", "value": local_path},
                         {"name": "Progress",          "value": f"{idx}/{total}"},
@@ -1347,7 +1347,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
                 send_notification(
                     title       = "Upscale Script -- Resumed",
                     description = "Script resumed after outage pause.",
-                    color       = 3066993,
+                    color       = notifications.COLOR_GREEN,
                     fields      = [
                         {"name": "Progress",      "value": f"{idx}/{total}"},
                         {"name": "Total elapsed", "value": fmt_hhmmss(time.time() - grand_start - pause.paused_seconds)},
@@ -1541,7 +1541,7 @@ def main():
         send_notification(
             title       = "Upscale Script -- Engine Failed to Start",
             description = f"Could not initialize the {where}.\n{e}",
-            color       = 15548997,   # red
+            color       = notifications.COLOR_RED,
             fields      = [{"name": "Machine", "value": os.environ.get("COMPUTERNAME", "unknown")}],
         )
         sys.exit(1)
@@ -1930,15 +1930,20 @@ def main():
     # it first or the run would be mislabelled "Finished with Failures". A remote
     # pod stop is next (its last image also counts as a failure).
     if degraded:
-        notif_title, notif_color = "Upscale Queue -- Auto-Stopped (GPU Degraded)", 15105570  # orange
+        notif_title, notif_color = ("Upscale Queue -- Auto-Stopped (GPU Degraded)",
+                                    notifications.COLOR_ORANGE)
     elif remote_stopped:
-        notif_title, notif_color = "Upscale Queue -- Remote Pod Stopped (resume to continue)", 15105570  # orange
+        notif_title, notif_color = ("Upscale Queue -- Remote Pod Stopped (resume to continue)",
+                                    notifications.COLOR_ORANGE)
     elif total_failed > 0:
-        notif_title, notif_color = "Upscale Queue -- Finished with Failures", 16776960   # yellow
+        notif_title, notif_color = ("Upscale Queue -- Finished with Failures",
+                                    notifications.COLOR_YELLOW)
     elif user_quit:
-        notif_title, notif_color = "Upscale Queue -- Stopped by User", 16776960          # yellow
+        notif_title, notif_color = ("Upscale Queue -- Stopped by User",
+                                    notifications.COLOR_YELLOW)
     else:
-        notif_title, notif_color = "Upscale Queue -- Finished", 3066993                  # green
+        notif_title, notif_color = ("Upscale Queue -- Finished",
+                                    notifications.COLOR_GREEN)
     send_notification(
         title       = notif_title,
         description = ", ".join(parts),

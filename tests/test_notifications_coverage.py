@@ -9,6 +9,7 @@ delegation; they are stdlib-only (no torch/PIL/tkinter), so they run everywhere.
 """
 
 import conciliate
+import notifications
 import batch_video_upscale as bv
 
 
@@ -17,21 +18,21 @@ import batch_video_upscale as bv
 def test_conciliate_notice_clean_is_green():
     title, color = conciliate._completion_notice(done=10, conflicts=0, errors=0,
                                                   stopped=False)
-    assert color == 3066993                     # green
+    assert color == notifications.COLOR_GREEN
     assert "Finished" in title and "Issues" not in title
 
 
 def test_conciliate_notice_conflicts_is_yellow():
     title, color = conciliate._completion_notice(5, conflicts=2, errors=0,
                                                   stopped=False)
-    assert color == 16776960                    # yellow
+    assert color == notifications.COLOR_YELLOW
     assert "Issues" in title
 
 
 def test_conciliate_notice_errors_is_yellow():
     title, color = conciliate._completion_notice(5, conflicts=0, errors=1,
                                                   stopped=False)
-    assert color == 16776960
+    assert color == notifications.COLOR_YELLOW
     assert "Issues" in title
 
 
@@ -39,7 +40,7 @@ def test_conciliate_notice_stopped_wins_over_clean():
     # A user stop is reported as such even when nothing errored.
     title, color = conciliate._completion_notice(3, conflicts=0, errors=0,
                                                   stopped=True)
-    assert color == 16776960
+    assert color == notifications.COLOR_YELLOW
     assert "Stopped by User" in title
 
 
@@ -51,9 +52,9 @@ def test_conciliate_send_notification_delegates(monkeypatch):
                         lambda settings, title, desc, color, fields=None, username="x":
                         seen.update(title=title, color=color, username=username,
                                     settings=settings))
-    conciliate.send_notification("T", "D", 3066993, fields=[{"name": "a", "value": "b"}])
+    conciliate.send_notification("T", "D", notifications.COLOR_GREEN, fields=[{"name": "a", "value": "b"}])
     assert seen["title"] == "T"
-    assert seen["color"] == 3066993
+    assert seen["color"] == notifications.COLOR_GREEN
     assert seen["username"] == "Conciliate Bot"
     assert seen["settings"] is conciliate.NOTIFY     # uses the module-level settings
 
@@ -65,7 +66,7 @@ def test_conciliate_send_notification_is_failsafe_when_unconfigured(monkeypatch)
     # real Discord webhook (the module-level NOTIFY is resolved from live config).
     monkeypatch.setattr(conciliate, "NOTIFY",
                         conciliate.notifications.resolve_settings({}))
-    conciliate.send_notification("T", "D", 3066993)   # must not raise
+    conciliate.send_notification("T", "D", notifications.COLOR_GREEN)  # must not raise
 
 
 # ── video runner: startup-vs-midrun failure notice ───────────────────────────
@@ -89,7 +90,7 @@ def test_video_failure_notice_midrun_is_distinct():
 def test_stop_notice_per_run_cap():
     title, color, resume = bv._stop_notice("per-run cap of 30 min reached")
     assert title == "Video upscale paused (per-run cap)"
-    assert color == 0xF1C40F and resume is True
+    assert color == notifications.COLOR_YELLOW and resume is True
 
 
 def test_stop_notice_per_run_cost_cap():
@@ -112,7 +113,7 @@ def test_stop_notice_work_root_refusal_did_not_start():
               "(X:\\stage): the scanner would re-read its own segments")
     title, color, resume = bv._stop_notice(reason)
     assert title == "Video upscale did not start"
-    assert color == 0xE74C3C and resume is False
+    assert color == notifications.COLOR_RED and resume is False
 
 
 def test_stop_notice_unknown_reason_is_not_mislabeled_a_cap():

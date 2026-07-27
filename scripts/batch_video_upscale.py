@@ -1870,7 +1870,8 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
                     log(f"    WATCHDOG: {msg}")
                     try:
                         notifications.notify(
-                            notify_settings, "Video upscale: slow segment", msg, 0xF1C40F,
+                            notify_settings, "Video upscale: slow segment", msg,
+                            notifications.COLOR_YELLOW,
                             fields=[{"name": "Source", "value": rel}])
                     except Exception:                  # noqa: BLE001
                         pass
@@ -2296,14 +2297,14 @@ def _stop_notice(stopped):
     and re-running continues it; False = nothing was staged (the startup refusal)."""
     reason = (stopped or "").lower()
     if reason.startswith("per-run "):                 # covers cap AND cost-cap messages
-        return "Video upscale paused (per-run cap)", 0xF1C40F, True
+        return "Video upscale paused (per-run cap)", notifications.COLOR_YELLOW, True
     if "staging work folder" in reason:               # work_root_conflict refusal
-        return "Video upscale did not start", 0xE74C3C, False
+        return "Video upscale did not start", notifications.COLOR_RED, False
     if "thrash" in reason:                            # local GPU degradation (#7)
-        return "Video upscale stopped (GPU thrashing)", 0xE74C3C, True
+        return "Video upscale stopped (GPU thrashing)", notifications.COLOR_RED, True
     if reason == "stopped by user":
-        return "Video upscale stopped", 0xF1C40F, True
-    return "Video upscale stopped early", 0xF1C40F, True   # unknown reason: report plainly
+        return "Video upscale stopped", notifications.COLOR_YELLOW, True
+    return "Video upscale stopped early", notifications.COLOR_YELLOW, True   # unknown reason
 
 
 _NOTIFY_FILE_CAP = 20          # list at most this many files; the rest fold into "and N more"
@@ -2407,13 +2408,13 @@ def _notify_summary(notify_settings, summary, src_root):
         stopped = summary["stopped"]
         resume_hint = False
         if summary["failed"]:                         # errors outrank an early stop
-            color, title = 0xE74C3C, "Video upscale finished with errors"
+            color, title = notifications.COLOR_RED, "Video upscale finished with errors"
             if stopped:
                 resume_hint = _stop_notice(stopped)[2]
         elif stopped:
             title, color, resume_hint = _stop_notice(stopped)
         else:
-            color, title = 0x2ECC71, "Video upscale complete"
+            color, title = notifications.COLOR_GREEN, "Video upscale complete"
         desc = _summary_desc(summary)
         if stopped:
             desc += f"\n\n{stopped}" + (", re-run to continue." if resume_hint else ".")
@@ -2462,12 +2463,12 @@ def _notify_stock(notify_settings, source_root, label, *, recovered, waited=0.0)
             title = "Video upscale resuming"
             desc = (f"{label} is back in stock after {fmt_hhmmss(waited)}; "
                     f"redeploying the same card and continuing.")
-            color = 0x2ECC71                            # green
+            color = notifications.COLOR_GREEN
         else:
             title = "Video upscale waiting for GPU"
             desc = (f"{label} is out of stock. Auto-resume is waiting for it to return "
                     f"(no time cap, $0 billed while waiting).")
-            color = 0xF1C40F                            # amber
+            color = notifications.COLOR_YELLOW
         notifications.notify(notify_settings, title, desc, color,
                              fields=[{"name": "Source", "value": source_root}])
     except Exception:
@@ -3098,7 +3099,7 @@ def main(argv=None):
         title, desc = _failure_notice(engine is not None or started["v"], exc)
         try:
             notifications.notify(
-                notify_settings, title, desc, 0xE74C3C,   # red
+                notify_settings, title, desc, notifications.COLOR_RED,
                 fields=[{"name": "Source",  "value": src_root},
                         {"name": "Machine", "value": os.environ.get("COMPUTERNAME", "unknown")}],
             )

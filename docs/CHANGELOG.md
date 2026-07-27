@@ -44,6 +44,22 @@ A video run now publishes the same live state the other three tools do:
 
 Nothing to configure: if MQTT is set up, video runs simply start appearing.
 
+### A failed video run now alerts as loudly as it should
+Alerts carry a severity: green finished cleanly, orange/yellow needs a look, red failed.
+On ntfy that severity sets the notification's **priority**, and on Telegram it puts a
+status emoji in front of the message.
+
+The Video Upscaler was using a different set of colour values than the other tools, which
+the notification layer did not recognise, so its alerts fell through to "no severity
+known": a **failed** video run went out at normal priority with no tag and no emoji. In
+other words the one alert most worth noticing, from the tool whose failures cost money,
+was the quietest one the app could send. It now arrives red, at maximum priority.
+
+The colours are named constants shared by every tool, and a test refuses any raw colour
+value in a runner, so the two palettes cannot drift apart again. New
+[`docs/notifications.md`](notifications.md) covers the three backends, which to pick, the
+setup steps and what each alert contains.
+
 ### Home Assistant: ready-made notification automations, and no more phantom alerts
 There is now a [`samples/home-assistant/automations.yaml`](../samples/home-assistant/automations.yaml)
 to paste in: **a run finished**, **a run finished badly** (failures, an early stop, a

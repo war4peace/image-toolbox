@@ -396,7 +396,7 @@ def send_notification(title, description, color, fields=None):
     """
     Fan out an alert to every configured backend (Discord webhook, Telegram bot).
     No-op for any backend that isn't configured; fail-safe.
-    color: integer (e.g. 15548997 = red, 16776960 = yellow, 3066993 = green).
+    color: a notifications.COLOR_* severity constant (never a raw int).
     """
     notifications.notify(NOTIFY, title, description, color, fields, username="Tag & Rename Bot")
 
@@ -2136,7 +2136,7 @@ def main():
                     description = ("The remote pod's dead-man's switch fired (idle or "
                                    "max-runtime), or the pod was stopped. The run ended "
                                    "cleanly — re-run to continue; tagged files are skipped."),
-                    color       = 15105570,   # amber
+                    color       = notifications.COLOR_ORANGE,
                     fields      = [
                         {"name": "Progress", "value": f"{idx}/{total}"},
                         {"name": "Machine",  "value": os.environ.get("COMPUTERNAME", "unknown")},
@@ -2153,7 +2153,7 @@ def main():
                     description = (f"{consecutive_fails} consecutive image(s) failed. "
                                    f"Ollama may be unreachable or the model unloaded.\n"
                                    f"Last error: {type(e).__name__}: {e}"),
-                    color       = 15548997,   # red
+                    color       = notifications.COLOR_RED,
                     fields      = [
                         {"name": "Last failed image", "value": path},
                         {"name": "Progress",          "value": f"{idx}/{total}"},
@@ -2255,15 +2255,20 @@ def main():
 
     # ── Discord: queue finished / stopped ────────────────────────────────────
     if stop_reason == "remote":
-        notif_title, notif_color = "Tag & Rename -- Remote Pod Stopped (re-run to continue)", 15105570  # amber
+        notif_title, notif_color = ("Tag & Rename -- Remote Pod Stopped (re-run to continue)",
+                                    notifications.COLOR_ORANGE)
     elif stop_reason == "ollama":
-        notif_title, notif_color = "Tag & Rename -- Stopped (Ollama Unreachable)", 15548997   # red
+        notif_title, notif_color = ("Tag & Rename -- Stopped (Ollama Unreachable)",
+                                    notifications.COLOR_RED)
     elif total_failed > 0:
-        notif_title, notif_color = "Tag & Rename -- Finished with Failures", 16776960          # yellow
+        notif_title, notif_color = ("Tag & Rename -- Finished with Failures",
+                                    notifications.COLOR_YELLOW)
     elif stop_reason == "user":
-        notif_title, notif_color = "Tag & Rename -- Stopped by User", 16776960                 # yellow
+        notif_title, notif_color = ("Tag & Rename -- Stopped by User",
+                                    notifications.COLOR_YELLOW)
     else:
-        notif_title, notif_color = "Tag & Rename -- Finished", 3066993                         # green
+        notif_title, notif_color = ("Tag & Rename -- Finished",
+                                    notifications.COLOR_GREEN)
     send_notification(
         title       = notif_title,
         description = f"{total_processed} processed, {total_rotated} rotated, {total_skipped} already tagged, {total_failed} failed",

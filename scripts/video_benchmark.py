@@ -1010,9 +1010,9 @@ def _notify_benchmark(notify_settings, gpu_id, model_tag, remote, results, stopp
         fitted = sum(1 for _n, _c, s in results if s)
         total = len(results)
         if stopped:
-            color, title = 0xE67E22, "Video benchmark stopped"      # orange: incomplete
+            color, title = notifications.COLOR_ORANGE, "Video benchmark stopped"
         else:
-            color, title = 0x2ECC71, "Video benchmark complete"     # green: all done
+            color, title = notifications.COLOR_GREEN, "Video benchmark complete"
         where = "remote pod" if remote else "local card"
         desc = (f"{gpu_id} ({model_tag}) on the {where}: {fitted}/{total} target(s) "
                 f"measured in {fmt_hhmmss(elapsed)}.")
@@ -1607,7 +1607,8 @@ def run_esrgan_benchmark(ratios, tiers, remote=False, seconds=DEFAULT_ESR_SECOND
     try:
         if notify_settings:
             fitted = sum(1 for _n, s in results if s)
-            color = 0xE67E22 if stopped else 0x2ECC71
+            color = (notifications.COLOR_ORANGE if stopped
+                     else notifications.COLOR_GREEN)
             title = "Real-ESRGAN benchmark " + ("stopped" if stopped else "complete")
             desc = (f"{gpu_id} (Real-ESRGAN {tiers_label}) on the "
                     f"{'remote pod' if remote else 'local card'}: {fitted}/{len(plan)} cell(s) "

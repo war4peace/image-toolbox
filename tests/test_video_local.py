@@ -261,7 +261,8 @@ def test_local_seedvr2_paths_honours_config_and_expands_env(monkeypatch):
 def test_stop_notice_gpu_thrash_is_red_and_resumable():
     title, color, resume = bv._stop_notice("gpu thrash")
     assert "thrash" in title.lower()
-    assert color == 0xE74C3C                             # red (a degradation, not a plain pause)
+    import notifications
+    assert color == notifications.COLOR_RED       # red: a degradation, not a plain pause
     assert resume is True                                # the queue resumes after a reboot
 
 

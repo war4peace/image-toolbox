@@ -242,7 +242,9 @@ Get a message when a queue finishes (for both the Upscaler and Tag & Rename) and
 - **Telegram**: create a bot with **@BotFather**, paste its **bot token**, open the bot and press **Start**, then click **Detect** to fill in your chat ID.
 - **ntfy**: make up a **topic** name, subscribe to it in the [ntfy](https://ntfy.sh) app, and enter it here (the **server** defaults to the public `https://ntfy.sh`; point it at your own server if you self-host). On the public server anyone who knows the topic can read it, so pick an unguessable name.
 
-Each has a **Test** button. Whatever you configure (any combination, or none) receives the same alerts.
+Each has a **Test** button. Whatever you configure (any combination, or none) receives the same alerts, tagged with a severity: green finished cleanly, orange/yellow needs a look, red failed. On ntfy that severity also sets the notification's **priority**, so a failed run buzzes harder than a completed one.
+
+Which to pick, the full setup steps, and what each alert contains: [`docs/notifications.md`](/docs/notifications.md).
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
