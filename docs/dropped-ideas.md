@@ -20,6 +20,8 @@ Sources: `docs/future-features.md` (open roadmap) and
 - [Pause for the Video Upscaler](#pause-for-the-video-upscaler-2026-07-21)
 - [Region pre-seed at first-run bootstrap](#region-pre-seed-at-first-run-bootstrap)
 - [Automatic run-telemetry reporting](#automatic-run-telemetry-reporting-coarse-idea-4-phase-2)
+- [Everything around the donation link](#everything-around-the-donation-link-2026-07-27)
+- [Verifying the Home Assistant webhook](#verifying-the-home-assistant-webhook-2026-07-27)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -136,6 +138,54 @@ Dropped from the original plan:
 
 The curated CSV plus the curation script suffice for the foreseeable future. See
 `docs/benchmark-sharing.md`.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Everything around the donation link (2026-07-27)
+
+The "Buy me a coffee" link shipped in 0.5.8 as **one label in the bottom status
+bar**, and that placement is the whole design. Rejected, so it is not
+re-proposed: a Settings "Support" section, a first-start-wizard step, an
+installer post-install checkbox, a README badge or Support section, and **any
+form of click counting** (the app never contacts that site by itself).
+
+The reasoning is the project's own premise: it is a free personal tool, and the
+difference between a link someone can choose to notice and a thing that asks is
+the difference between the two kinds of software this is not trying to be. One
+place, no telemetry, no prompt after a run.
+
+Still available if ever wanted: a repo-page **Sponsor** button is
+`.github/FUNDING.yml` with `buy_me_a_coffee: <username>`, a two-line file that
+touches no app code. Noted so the option is not lost; it was not part of the
+work.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Verifying the Home Assistant webhook (2026-07-27)
+
+The webhook notification backend (0.5.8) **cannot confirm its own delivery**, and
+three ways of trying were rejected. Home Assistant answers `200 OK` to a webhook
+id it has never heard of, on purpose ("Always respond successfully to not give
+away if a hook exists or not"), and also to a request its `local_only` refused.
+So there is no positive signal to read, and the Test button says exactly that.
+
+Rejected:
+
+- **Checking through HA's REST API with a long-lived access token.** A second
+  credential and a different auth model, and it still would not prove the id maps
+  to an automation.
+- **Probing `/api/config` to at least confirm "this is Home Assistant".** Proves
+  the host, never the hook, and invites precisely the false confidence the honest
+  wording exists to avoid.
+- **Any round-trip where HA calls back into the app.** That needs the app to
+  listen on a port, which it does not and should not do.
+- **A "skip certificate check" toggle** for a self-signed HTTPS Home Assistant: a
+  permanent hole in every HTTPS call the app makes, to avoid one config change on
+  a LAN where plain HTTP already works.
+
+The verification is the **user's**, on the HA side (the automation's Traces, or a
+temporary `persistent_notification.create` action), and takes under a minute. See
+`docs/notifications.md`.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
