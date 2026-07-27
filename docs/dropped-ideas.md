@@ -22,6 +22,7 @@ Sources: `docs/future-features.md` (open roadmap) and
 - [Automatic run-telemetry reporting](#automatic-run-telemetry-reporting-coarse-idea-4-phase-2)
 - [Everything around the donation link](#everything-around-the-donation-link-2026-07-27)
 - [Verifying the Home Assistant webhook](#verifying-the-home-assistant-webhook-2026-07-27)
+- [UI localization / multi-language interface](#ui-localization--multi-language-interface-2026-07-27)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -186,6 +187,95 @@ Rejected:
 The verification is the **user's**, on the HA side (the automation's Traces, or a
 temporary `persistent_notification.create` action), and takes under a minute. See
 `docs/notifications.md`.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## UI localization / multi-language interface (2026-07-27)
+
+Prompted by [`upscayl-vs-image-toolbox.md`](upscayl-vs-image-toolbox.md) section 3.7,
+where "Localised UI (many languages)" is one of the few rows Upscayl wins outright.
+Researched against the code, then **dropped**.
+
+**The decision, in the author's words:** Image Toolbox is a single-developer project, a
+passion-born side job. Multi-language is too much work for too little reward for the
+foreseeable future.
+
+**Revisit only if** the app matures to hundreds or thousands of users, at which point the
+reach it buys might justify the ongoing cost. Not before.
+
+### Why the cost is higher than it looks
+
+- **The surface is ~2,130 candidate user-visible strings in `scripts/gui/` alone**
+  (AST-counted: 4+ chars, contains letters, not an identifier/path/URL/format key, so an
+  upper bound with maybe 20-30% noise). Worst offenders: `tab_video.py` 492,
+  `video_benchmark.py` 250, `tab_settings.py` 220, `tab_runpod.py` 198. The runners and
+  backend add ~4,120 more.
+- **Upscayl's entire `en.json` is a few hundred keys**, for one screen plus a settings
+  panel. This app has six tabs, a wizard, a benchmark window, a segment picker, two
+  comparison windows and ~160 deliberately wordy tooltips. The comparison row is real but
+  the two jobs are not the same size, and that asymmetry is the finding.
+- **The ongoing cost is the problem, not the mechanical work.** Wrapping the strings,
+  building a catalog and adding a picker is days of focused work. Keeping ~2,130 strings
+  translated across releases, on a one-maintainer project, is forever.
+- **A machine-translated catalog nobody proofreads would be worse than English here.**
+  The tooltips carry money and data-loss warnings ("Delete is not undoable", "a pod bills
+  by the second"). Getting one subtly wrong in a language the author cannot read is a
+  hazard, not a cosmetic risk.
+
+### What the research found, for whoever picks this up later
+
+Kept because it is the expensive part to rediscover:
+
+- **Scope line:** GUI chrome only (~2,130 strings, one process, no protocol impact).
+  **Logs should stay English permanently**, and be documented as a deliberate support
+  decision: a user pasting a translated log into a GitHub issue hands the author text he
+  cannot read.
+- **Machine-readable strings must never be translated.** Some strings that look like UI
+  text are a wire format: MQTT `task/details` is literally the status label's text
+  (`tab_conciliate.py` publishes `self.status_lbl.cget("text")`), `task/name` values are
+  matched by the shipped Home Assistant automations, and the `@@TBX@@` events and
+  `last_run` payload keys are parsed, not read. The boundary is **the presentation layer
+  translates, the integration layer never does**, and where a string is currently both
+  (the `task/details` case) it has to be split into an English state value plus a
+  translated display string. That is a refactor, not a search-and-replace.
+- **Layout will break, and it cannot be machine-translated away.** tkinter does not
+  reflow; the GUI has 97 hard-coded `width=N` values and a fixed tooltip wrap width.
+  Romanian, German and French run 20-35% longer than English. The 0.5.8 rows are the most
+  exposed, having deliberately optimised for tightness (the SeedVR strip is commented
+  "fit every SeedVR control on ONE row even at the app's minimum width"). Expect a
+  per-language layout pass, and some labels shortened in *English* to leave headroom.
+- **Technology:** a JSON catalog plus a `t(key)` helper, falling back per key to English.
+  Stdlib only, hand-editable by a non-programmer translator, no compile step, no installer
+  change, and it is what Upscayl does. `gettext` also works but adds an `msgfmt` build step
+  and binary catalogs; `babel` fails the dependency rule outright.
+- **Pilot, if it ever proceeds:** one second language, **Romanian**, GUI chrome only. The
+  author is a native speaker and can proofread it, which removes the hazard above, and it
+  produces an honest per-language cost figure before any promise of "many languages".
+- **Test coupling:** `tests/test_settings_recommended_values.py` asserts literal English
+  substrings in the module source to pin a tooltip's advice to the runner's coded default.
+  A catalog needs its own equivalent guard, or that drift protection is lost per language.
+- **Also confused with this, deliberately:** Tag & Rename's **description language**
+  (`resolve_language`) sets the language the vision model *writes photo descriptions in*.
+  That is output data, not interface. If a UI language setting is ever added the two sit
+  next to each other in Settings and must be labelled "Interface language" vs "Description
+  language".
+
+### One piece worth doing anyway, independently of this
+
+The research turned up two places where **logic reads a widget's displayed text**. Both
+work only because the UI is monolingual, and both are worth fixing on their own merits:
+
+1. `tab_upscale.py`: `self.PAUSE_TIPS.get(self.pause_btn.cget("text"))` looks a tooltip up
+   by the button's displayed English label. Under any relabelling this silently returns
+   `None` and the tooltip disappears.
+2. `tooltab.py`: `remote = self.run_on_var.get() == RUN_ON_REMOTE` derives the run mode
+   from a combobox's *display* value. It survives today only because both sides come from
+   one constant, which is fragile by construction: the moment the label and the comparison
+   diverge, the app runs local jobs remotely or vice versa. That is a money bug.
+
+The correct pattern is a stable internal key plus a separate display string. An audit for
+"logic keyed on displayed text" is small, self-contained, and improves correctness whether
+or not localization ever happens.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

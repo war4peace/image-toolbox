@@ -260,7 +260,11 @@ is useless.
   display"), and this tool answers the second on purpose. It is a real limitation
   for anyone who wants the first; it is not an incidental gap.
 - **Smaller, riskier project.** One non-professional author, several features
-  flagged experimental, no localisation.
+  flagged experimental, no localisation (English only, and
+  [deliberately so](dropped-ideas.md#ui-localization--multi-language-interface-2026-07-27):
+  the interface is roughly ten times the text Upscayl translates, on a project with one
+  maintainer, and tooltips that carry money and data-loss warnings are the worst possible
+  thing to machine-translate unreviewed).
 - **No drag-and-drop, no theming.** tkinter buys dependency-lightness at the cost
   of polish.
 
