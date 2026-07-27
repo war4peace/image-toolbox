@@ -4,8 +4,8 @@ A feature-by-feature comparison between [Upscayl](https://github.com/upscayl/ups
 and **Image Toolbox** (this project).
 
 Written 2026-07-27 against Upscayl's public repository / website and Image Toolbox
-0.5.8-experimental. Upscayl moves fast and is a much larger, better-known project;
-if something below looks stale, check their repo first.
+0.5.8-experimental. Check their repo before relying on their column: this is a
+snapshot of one day's reading, and their side can change without this file noticing.
 
 **This is not a competitive pitch.** The two tools are not chasing the same users,
 so there is nothing to win by overstating one or understating the other. The point
@@ -59,8 +59,23 @@ Rules of thumb:
 | **UI toolkit** | Electron (React) | Python standard-library tkinter |
 | **Install size** | Small (app + model files) | Modest for a remote-only install; large for a local one (GPU stack + model weights) |
 | **License** | AGPL-3.0 (backend AGPLv3) | Personal project, source public |
-| **Maturity / audience** | Large, mainstream, heavily used | Small personal project, "vibecoded", experimental features |
+| **Maturity / audience** | Large, mainstream, heavily used (47.6k stars) | Small personal project, "vibecoded", experimental features |
+| **Development activity** *(measured 2026-07-27)* | Last release **2024-12-25**; last commit to `main` **2026-03-27**; **10 commits** in the previous 12 months; 55 open issues, the oldest from **April 2023** | Last release **2026-07-26**; ~400 commits in the previous 12 months |
 | **Paid tier** | None (a "Upscayl Cloud" waitlist exists in-app) | None. Optional rented RunPod GPU, paid to RunPod, not to the author |
+
+**On that activity row, fairly:** a low commit count is not automatically a fault.
+Upscayl is a focused tool that largely does what it set out to do, and finished
+software does not need commits; 47.6k users are not using something broken. But it
+is decision-relevant, so it belongs in the table: at this cadence, expect no new
+models, no new platform or GPU support, and no fix for a bug you hit. The oldest
+open issue dating to April 2023 is the practical version of that. Read it as
+"stable and quiet", not as "dead", and weigh it against the fact that Image
+Toolbox's high commit rate is one hobbyist's spare time and could stop the day he
+loses interest. Neither project offers a support guarantee.
+
+(One data caveat: GitHub reports `pushed_at` for the Upscayl repo as 2026-07-21,
+which looks current, but that field counts a push to **any** ref. The `main`
+history is the honest signal and it ends 2026-03-27.)
 
 ---
 
