@@ -23,6 +23,7 @@ Sources: `docs/future-features.md` (open roadmap) and
 - [Everything around the donation link](#everything-around-the-donation-link-2026-07-27)
 - [Verifying the Home Assistant webhook](#verifying-the-home-assistant-webhook-2026-07-27)
 - [UI localization / multi-language interface](#ui-localization--multi-language-interface-2026-07-27)
+- [Light/dark theme](#lightdark-theme-2026-07-28)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -285,6 +286,111 @@ One instance was left alone deliberately: `tab_conciliate` publishes its status 
 text to MQTT `task/details`. There the published value **is** the human status line by
 design (that is what the topic is), so reading it back off the widget is merely
 inelegant, not wrong. With localization dropped it is not a hazard either.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Light/dark theme (2026-07-28)
+
+Prompted by [`upscayl-vs-image-toolbox.md`](upscayl-vs-image-toolbox.md) section 3.7,
+where a themed UI is one of the few rows Upscayl wins outright. Researched against the
+code and probed against the real Tk build (8.6.15), then **dropped**, for the same shape
+of reason as [UI localization](#ui-localization--multi-language-interface-2026-07-27).
+
+**The decision, in the author's words:** currently too expensive from a development
+standpoint. And the usage pattern argues against it: **the UI is an enabler for
+long-duration jobs, during which the user does not need to look at it** (which is what
+every notification feature exists for). Using the app is minutes of UI work and many hours
+of waiting for an upscale or a Tag & Rename run to finish. That makes theming a genuine
+"nice to have, at some point", not something to spend the current budget on.
+
+**Revisit if** the balance shifts: if the app grows work that keeps a user *in front of*
+the window, or if the effort drops sharply (a vendored theme that turns out to be a drop-in
+on this widget set).
+
+### The blocking fact, measured
+
+This is the part worth keeping, because it is not obvious from the source and it is what
+makes the idea expensive.
+
+The app calls `ttk.Style(self).theme_use("vista")`
+([app.py:85](../scripts/gui/app.py#L85)). **`vista`, `xpnative` and `winnative` are
+native-drawn themes**: the widget pixels come from the Windows UxTheme engine, not from Tk,
+and they **cannot be recoloured**. Probed on this machine:
+
+| Theme | `TButton` layout root | Meaning |
+|---|---|---|
+| `vista` (current) | `Button.button` | ONE native element paints the whole button. Colour options are ignored. |
+| `clam` | `Button.border` | Tk-drawn border + padding + label, each independently styleable. |
+
+So **dark mode is not "add colours to the existing UI". It requires abandoning the native
+Windows theme** and moving the whole app to `clam` (or `alt`/`default`), which also changes
+how the app looks in **light** mode. The decision hiding behind this idea was never
+technical: it is whether losing the native Windows look is acceptable.
+
+**A trap that will waste an afternoon if it is not written down:**
+`Style.configure("X.TButton", background="#ff0000")` **succeeds silently** under `vista`,
+and `Style.lookup(...)` dutifully reads `#ff0000` back, while the rendered button is
+unchanged. The configured value is stored; the native element engine just never consults
+it. So theming cannot be verified by `lookup` or by any unit test, only by looking at the
+screen. Available themes on this build, for reference: `winnative, clam, alt, default,
+classic, vista, xpnative`.
+
+### The surface it would have to convert
+
+| Thing | Count | Note |
+|---|---:|---|
+| Hard-coded hex colours in `gui/` | **160** literals, **36** unique, across 16 modules | Worst: `tab_runpod.py` 48, `tab_settings.py` 23, `widgets.py` 13, `comparison.py` 13. |
+| Classic (non-ttk) widgets | 19 `tk.Label`, 16 `tk.Toplevel`, 7 `tk.Canvas`, 3 `tk.Text`, 3 `tk.Menu`, 2 `tk.Button`, 1 `tk.Listbox` | These **never** follow a ttk theme. Each needs explicit `bg`/`fg`/`insertbackground`/`selectbackground`, in both themes. |
+| matplotlib figure | [telemetry_graph.py](../scripts/gui/telemetry_graph.py) | Its own hard-coded palette (`grid color="#e6e9ef"`, `mec="white"` markers, `#3a4250` labels). Needs a second palette plus figure/axes facecolors, or it renders a white slab inside a dark window. |
+| Window title bar | n/a | Stays light unless explicitly told otherwise (see below). |
+
+The 36 colours are **already semantic**, which was the one genuinely good finding:
+`funds_color` ([common.py:275](../scripts/gui/common.py#L275)), the telemetry load bands
+`TelemetryRow._band` ([widgets.py:249](../scripts/gui/widgets.py#L249): blue `#3a86ff`
+<=25, green `#1a9e4b` <=65, dark yellow `#b58900` <=85, red `#d11a2a`), the film-strip
+green/red outcome frames, the link blue `#3a86ff` with `#1a5fd0` hover. So the conversion
+would be "route ~36 named roles through a `PALETTE[theme][role]` table in
+`gui/common.py`", not "invent a design system".
+
+**They cannot be inverted programmatically.** These were picked to read on a light
+background; `#1a7f37` green (used 30 times) is close to unreadable on dark. Every one needs
+a hand-picked dark counterpart checked for contrast. That is eyeballing, not an algorithm,
+and it is the part that has no clear finish line.
+
+### The other findings, kept so they are not re-derived
+
+- **The title bar needs ctypes.** Windows draws it, and it stays light unless the app opts
+  in: `DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE = 20, BOOL(1), 4)`
+  (attribute 19 on pre-1903 builds). One small call, in exactly the style the app already
+  uses ([taskbar_progress.py](../scripts/taskbar_progress.py), `single_instance.py`,
+  `crash_logger.py`). Without it a dark window with a white title bar looks broken rather
+  than themed, and there are **16 `tk.Toplevel`s**, so it wants a helper.
+- **Detection is free.** Windows exposes the preference at
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`
+  (`0` = dark), readable with stdlib `winreg`. Checked on the author's machine during this
+  research: **`AppsUseLightTheme = 0`** (the OS is already dark and Image Toolbox is the
+  light outlier, which is why the idea came up). If it ever ships, offer **Auto / Light /
+  Dark**, not Auto alone: a user who wants the app light while their OS is dark is not an
+  edge case, and the extra cost is a three-value combobox.
+- **Live switching is roughly double the work.** Re-theming a running tkinter app means
+  walking every existing widget and reapplying colours, because classic widgets keep
+  whatever they were given at construction. An honest v1 applies the theme at startup and
+  says so.
+- **Vendoring a modern ttk theme** (Sun Valley / Azure style `.tcl` + assets) buys a
+  Win11-ish light+dark look largely for free, but costs a third-party asset bundle to ship
+  and maintain, PNG elements that soften at non-100% DPI, and it lands on the same
+  "not native" outcome anyway.
+- **"Dark-ish without leaving `vista`" is not achievable.** Recorded explicitly so it is
+  not attempted: you would get dark backgrounds behind light-grey native buttons.
+- **Verification is manual, entirely.** No test can see a colour here. Every tab, both
+  comparison windows, the wizard, the benchmark window, the segment picker, the log viewer
+  and every dialog would have to be opened and looked at, twice.
+
+### If it is ever revisited, start here
+
+The first step is not code. **A throwaway branch that flips one tab to `clam` and
+screenshots it next to the current `vista` UI** answers the only question that matters, in
+a minute, and everything else is downstream of that answer.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

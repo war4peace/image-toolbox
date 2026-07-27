@@ -191,7 +191,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | First-start hardware-aware setup wizard | ❌ | ✅ | Detects the GPU and recommends the model tiers that fit its VRAM. |
 | Anonymous usage telemetry (opt-out) | ✅ | ❌ | Image Toolbox collects nothing, ever. |
 | Localised UI (many languages) | ✅ | ❌ | Image Toolbox's UI is English only (the *descriptions it writes* are multilingual). |
-| Light/dark theme | ✅ | ❌ | tkinter default look. |
+| Light/dark theme | ✅ | ❌ | Native Windows (`vista`) look, light only. Investigated and dropped: the native `ttk` themes cannot be recoloured, so dark mode means leaving the native look in *both* modes. See [`dropped-ideas.md`](dropped-ideas.md#lightdark-theme-2026-07-28). |
 | Tooltips on every control | ⚠️ | ✅ | ~160 plain-language tooltips; money- and data-affecting ones lead with the consequence. |
 
 ### 3.8 Formats
