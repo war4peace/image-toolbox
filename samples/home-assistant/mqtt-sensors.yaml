@@ -1,6 +1,48 @@
-# ================================================
-# Image Toolbox MQTT
-# ================================================
+# =====================================================================
+# Image Toolbox - MQTT sensors
+# =====================================================================
+# Where this goes: your Home Assistant `configuration.yaml`, under the MQTT
+# integration's `sensor:` block (or a file you already `!include` there), then
+# restart Home Assistant.
+#
+#   mqtt:
+#     sensor: !include mqtt-sensors.yaml     # (this file, list included as-is)
+#
+# ---------------------------------------------------------------------
+# UPGRADING: HOW TO COPY ONLY WHAT IS NEW
+# ---------------------------------------------------------------------
+# Every block below is tagged with the app version that added it:
+#
+#   # --- Added in 0.5.3 ---   a NEW sensor. Copy the block if you set this up
+#                              on an older version.
+#   # --- Changed in 0.5.3 --- an EXISTING sensor whose YAML changed. REPLACE
+#                              your copy of it.
+#   # 0.5.8: ...               a note about what a sensor now reports. No YAML
+#                              change, nothing to re-copy.
+#
+# So on an upgrade you only need the blocks newer than the version you first
+# pasted this in, instead of diffing the whole file.
+#
+# ---------------------------------------------------------------------
+# 0.5.8 AT A GLANCE: NO NEW SENSORS
+# ---------------------------------------------------------------------
+# 0.5.8 makes the Video Upscaler report to MQTT like the other three tools, so
+# the `task/*` and `last_run` sensors you already have simply start filling in
+# during a video run. Nothing here needs re-copying: see the `# 0.5.8:` notes
+# for what those sensors now mean during a video run.
+#
+# 0.5.8 also adds two topics that are deliberately NOT sensors:
+#
+#     image-toolbox/event/run_started
+#     image-toolbox/event/run_finished
+#
+# They are one-shot and NOT retained, meant as automation TRIGGERS (see
+# automations.yaml). As a sensor, each would sit at a value that never changes
+# back, which is what the retained `last_run` sensor below is already for.
+# =====================================================================
+
+
+# --- Added in 0.5.0: app state ---------------------------------------
 
   - name: "Image Toolbox Version"
     state_topic: image-toolbox/version
@@ -14,14 +56,25 @@
     state_topic: image-toolbox/latest_version
     unique_id: image_toolbox_latest_version
 
+  # Last-Will topic: the BROKER publishes "offline" here if the app's connection
+  # drops without a clean goodbye, so this is the only way a crash can be noticed.
   - name: "Image Toolbox Availability"
     state_topic: image-toolbox/availability
     unique_id: image_toolbox_availability
+
+  - name: "Image Toolbox Last Exit Timestamp"
+    state_topic: image-toolbox/last_used
+    unique_id: image_toolbox_last_exit_timestamp
+
+
+# --- Added in 0.5.0: the running task --------------------------------
 
   - name: "Image Toolbox Task Details"
     state_topic: image-toolbox/task/details
     unique_id: image_toolbox_task_details
 
+  # 0.5.8: also reports "video upscaling" (the Video Upscaler was silent before).
+  # Values: idle / upscaling / tagging / conciliating / video upscaling.
   - name: "Image Toolbox Task Name"
     state_topic: image-toolbox/task/name
     unique_id: image_toolbox_task_name
@@ -31,14 +84,8 @@
     unique_id: image_toolbox_task_runtime
     unit_of_measurement: "s"
 
-  - name: "Image Toolbox Task Progress"
-    state_topic: image-toolbox/task/progress
-    unique_id: image_toolbox_task_progress
-
-  - name: "Image Toolbox Task ETA"
-    state_topic: image-toolbox/task/eta
-    unique_id: image_toolbox_task_eta
-
+  # 0.5.8: during a VIDEO run these are seconds per FRAME (the run's average, and
+  # the live figure from the pod or local GPU), not seconds per file.
   - name: "Image Toolbox Average Processing Time"
     state_topic: image-toolbox/task/average_processing_time
     unique_id: image_toolbox_average_processing_time
@@ -49,10 +96,33 @@
     unique_id: image_toolbox_last_processing_time
     unit_of_measurement: "s"
 
-  # last_run is a JSON OBJECT (runner summary + tool + finished_at), not a scalar.
-  # Bound as a plain state_topic it would exceed HA's 255-char state limit and show
-  # truncated, so the state is a short template and the full object is exposed as
-  # attributes (read individual fields with {{ state_attr('sensor.image_toolbox_last_run_summary','<key>') }}).
+
+# --- Added in 0.5.3: the running task (progress + ETA) ---------------
+
+  # "X/Y" as text. template-sensors.yaml turns it into a percentage.
+  # 0.5.8: a VIDEO run counts FRAMES here (frames done / frames queued across the
+  # whole queue), not files, so expect much larger numbers than an image run.
+  - name: "Image Toolbox Task Progress"
+    state_topic: image-toolbox/task/progress
+    unique_id: image_toolbox_task_progress
+
+  - name: "Image Toolbox Task ETA"
+    state_topic: image-toolbox/task/eta
+    unique_id: image_toolbox_task_eta
+
+
+# --- Changed in 0.5.3: last-run summary (REPLACE your 0.5.0 copy) ----
+#
+# last_run is a JSON OBJECT (runner summary + tool + finished_at), not a scalar.
+# Bound as a plain state_topic it would exceed HA's 255-char state limit and show
+# truncated, so the state is a short template and the full object is exposed as
+# attributes (read individual fields with {{ state_attr('sensor.image_toolbox_last_run_summary','<key>') }}).
+#
+# 0.5.8: the Video Upscaler publishes here too, adding `cost` (dollars of pod
+# time, when a rented pod was billed) and `files` to the usual processed/failed.
+# `finished_at` now carries a UTC offset, which is what makes a "did this run
+# just finish?" template correct in any timezone (see automations.yaml, #3).
+
   - name: "Image Toolbox Last Run Summary"
     state_topic: image-toolbox/last_run
     unique_id: image_toolbox_last_run_summary
@@ -60,9 +130,8 @@
       {{ value_json.tool | default('unknown') }} @ {{ value_json.finished_at | default('') }}
     json_attributes_topic: image-toolbox/last_run
 
-  - name: "Image Toolbox Last Exit Timestamp"
-    state_topic: image-toolbox/last_used
-    unique_id: image_toolbox_last_exit_timestamp
+
+# --- Added in 0.5.0: this machine's telemetry ------------------------
 
   - name: "Image Toolbox CPU Usage"
     state_topic: image-toolbox/system/cpu
@@ -94,6 +163,9 @@
     unique_id: image_toolbox_gpu_temperature
     unit_of_measurement: "°C"
 
+
+# --- Added in 0.5.3: this machine's telemetry (widened) --------------
+
   - name: "Image Toolbox GPU Utilization"
     state_topic: image-toolbox/system/gpu_util
     unique_id: image_toolbox_gpu_utilization
@@ -114,7 +186,12 @@
     unique_id: image_toolbox_gpu_clock
     unit_of_measurement: "MHz"
 
-# === Image Toolbox REMOTE Pod sensors ===
+
+# --- Added in 0.5.0: the rented pod ----------------------------------
+#
+# These exist only DURING a remote-pod run and are zeroed when the pod is torn
+# down, so gaps and zeros between runs are normal.
+# 0.5.8: a remote VIDEO run reports here too (before, only the image tools did).
 
   - name: "Image Toolbox Remote CPU Usage"
     state_topic: image-toolbox/system/remote/cpu
@@ -145,6 +222,9 @@
     state_topic: image-toolbox/system/remote/gpu_temp
     unique_id: image_toolbox_remote_gpu_temperature
     unit_of_measurement: "°C"
+
+
+# --- Added in 0.5.3: the rented pod (widened) ------------------------
 
   - name: "Image Toolbox Remote GPU Utilization"
     state_topic: image-toolbox/system/remote/gpu_util

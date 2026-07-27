@@ -29,10 +29,11 @@ Add the entities first, then a dashboard.
    under the MQTT `sensor:` block in your `configuration.yaml` (or a file you
    already `!include`), then restart Home Assistant.
 2. **Derived percentages** - [`template-sensors.yaml`](template-sensors.yaml):
-   the app publishes RAM and VRAM as raw **MB** on purpose, so these template
-   sensors compute `used / total * 100` for the gauges. Add under a top-level
-   `template:` key and reload template entities (or restart). *Only needed for the
-   dashboards' RAM/VRAM gauges; CPU and GPU utilization are already percentages.*
+   the app publishes raw values on purpose (RAM and VRAM as **MB**, progress as
+   `X/Y` text), so these template sensors compute the percentages the gauges
+   want. Add under a top-level `template:` key and reload template entities (or
+   restart). *Only needed for the dashboards' RAM/VRAM/progress gauges; CPU and
+   GPU utilization are already percentages.*
 3. **A dashboard card** - each dashboard file is **one card** (a vertical stack),
    pasted into a single card's code editor. This is deliberate: editing the whole
    dashboard's raw YAML is risky, so you never touch it.
@@ -53,6 +54,38 @@ Add the entities first, then a dashboard.
    view) and reload from **Developer Tools > YAML > Automations**. See
    [Notifications](#notifications) below for how they avoid the retained-message
    trap.
+
+## Upgrading these files
+
+You pasted these into your own configuration, so a new app version cannot update
+them for you. To make that cheap, every file carries version markers, and each
+kind of file is upgraded differently:
+
+| File | Marker | What to do |
+|------|--------|------------|
+| `mqtt-sensors.yaml` | `# --- Added in 0.5.3 ---`, `# --- Changed in 0.5.3 ---` | Copy only the blocks newer than the version you first pasted. A *Changed* block replaces your copy of that one sensor. |
+| `template-sensors.yaml` | `# --- Added in 0.5.8 ---` | Same: copy only the newer sensors. |
+| `dashboard-core.yaml` / `dashboard-custom.yaml` | `UPDATED IN 0.5.8` header, `# NEW in 0.5.8` inline | Re-paste the **whole** file over the card. It is one card, so replacing it is easier than patching it, and you lose nothing (the card holds no state). |
+| `automations.yaml` | `# NEW: version 0.5.8`, `# CHANGED: version X.Y.Z` | Paste in the *NEW* ones. For a *CHANGED* one, delete your copy and re-paste that whole automation. |
+
+Lines that begin `# 0.5.8:` are notes about something that already exists and
+whose **meaning** widened. They are not a change to copy.
+
+### What changed in 0.5.8
+
+The Video Upscaler now reports to MQTT like the other three tools; before, a
+video run left the app looking idle for hours.
+
+- **`mqtt-sensors.yaml`: nothing to re-copy.** The `task/*` and `last_run`
+  sensors you already have simply fill in during a video run. Note that a video
+  run counts **frames**, so `task/progress` reads e.g. `8412/95160` and the
+  per-item times are seconds per frame.
+- **`template-sensors.yaml`: one new sensor**, *Task Progress Percent*, which
+  turns that `X/Y` text into a percentage a gauge can show.
+- **Both dashboards: re-paste.** They gain a progress arc (needs the sensor
+  above) and last-run detail rows: processed, failed, and what the pod cost.
+- **`automations.yaml` is new in 0.5.8** and needs the two new event topics, so
+  it wants app 0.5.8 or later.
 
 ## HACS cards (custom dashboard only)
 
@@ -133,12 +166,6 @@ All under the base topic `image-toolbox/`:
 | `task/progress` / `task/eta` | `X/Y` and estimated time remaining |
 | `task/runtime` | seconds of active-task runtime |
 | `task/average_processing_time` / `task/last_processing_time` | seconds per item |
-
-A **video** run counts in frames, not files: `task/progress` is frames done / frames
-queued across the whole queue, and the two per-item times are seconds per frame (the
-run's running average, and the live measurement from the pod or local GPU). Its
-`last_run` carries `processed` / `failed` / `total` job counts, `files`, `stop_reason`,
-and a `cost` when a rented pod was billed.
 | `system/cpu` | CPU load, % |
 | `system/ram` / `system/ram_total` | RAM used / total, MB |
 | `system/gpu_vram` / `system/gpu_vram_total` | VRAM used / total, MB |
@@ -147,6 +174,12 @@ and a `cost` when a rented pod was billed.
 | `system/gpu_power` / `system/gpu_power_limit` | GPU power draw / cap, W |
 | `system/gpu_clock` | GPU core clock, MHz |
 | `system/remote/*` | the same telemetry group for the rented pod (during a remote run) |
+
+A **video** run counts in frames, not files: `task/progress` is frames done / frames
+queued across the whole queue, and the two per-item times are seconds per frame (the
+run's running average, and the live measurement from the pod or local GPU). Its
+`last_run` carries `processed` / `failed` / `total` job counts, `files`, `stop_reason`,
+and a `cost` when a rented pod was billed.
 
 ## Screenshots
 

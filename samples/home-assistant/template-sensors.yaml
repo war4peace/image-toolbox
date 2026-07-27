@@ -1,11 +1,10 @@
 # =====================================================================
-# Image Toolbox - derived percentage sensors (OPTIONAL)
+# Image Toolbox - derived sensors (OPTIONAL)
 # =====================================================================
-# The app publishes RAM and VRAM as raw MB (used + total) on purpose, so
-# the gauge cards in dashboard-core.yaml need a percentage to show. These
-# template sensors derive "used / total * 100" for you. CPU and GPU
-# utilization are already published as a percentage, so they need nothing
-# here.
+# The app publishes raw values on purpose (RAM/VRAM as MB, progress as "X/Y"),
+# so these template sensors derive the percentages the dashboard cards want.
+# CPU and GPU utilization are already published as a percentage and need
+# nothing here.
 #
 # Where this goes: your Home Assistant `configuration.yaml` under a
 # top-level `template:` key (or a file you already `!include` there). This
@@ -16,9 +15,23 @@
 #
 # ...or paste the whole `template:` block straight into configuration.yaml.
 # Reload from Developer Tools > YAML > "Template entities" (or restart HA).
+#
+# ---------------------------------------------------------------------
+# UPGRADING: HOW TO COPY ONLY WHAT IS NEW
+# ---------------------------------------------------------------------
+# Each sensor is tagged with the app version that added it (`# Added in 0.5.3`),
+# so on an upgrade you only copy the ones newer than the version you first
+# pasted this in.
+#
+# 0.5.8 adds ONE sensor: "Task Progress Percent". It exists because the Video
+# Upscaler now reports progress too, and a video run counts FRAMES, so the raw
+# `task/progress` text reads "8412/95160" - true, but not something you can put
+# in a progress bar. Both dashboards use it.
+# =====================================================================
 
 template:
   - sensor:
+      # --- Added in 0.5.3 ---
       - name: "Image Toolbox VRAM Percent"
         unique_id: image_toolbox_vram_percent
         unit_of_measurement: "%"
@@ -27,6 +40,7 @@ template:
           {% set total = states('sensor.image_toolbox_gpu_vram_total') | float(0) %}
           {{ (100 * used / total) | round(0) if total > 0 else 0 }}
 
+      # --- Added in 0.5.3 ---
       - name: "Image Toolbox RAM Percent"
         unique_id: image_toolbox_ram_percent
         unit_of_measurement: "%"
@@ -35,7 +49,21 @@ template:
           {% set total = states('sensor.image_toolbox_ram_total') | float(0) %}
           {{ (100 * used / total) | round(0) if total > 0 else 0 }}
 
-      # --- Remote pod (only meaningful during a remote-pod run) ---
+      # --- Added in 0.5.8 ---
+      # "X/Y" -> a percentage, so a run can be shown as a bar or a gauge.
+      # Works for every tool: images/videos done for the image tools, FRAMES done
+      # for the Video Upscaler. Reads 0 while idle or when the text is not "X/Y".
+      - name: "Image Toolbox Task Progress Percent"
+        unique_id: image_toolbox_task_progress_percent
+        unit_of_measurement: "%"
+        state: >-
+          {% set raw = states('sensor.image_toolbox_task_progress') %}
+          {% set parts = raw.split('/') if '/' in raw else [] %}
+          {% set done = parts[0] | trim | float(0) if parts else 0 %}
+          {% set total = parts[1] | trim | float(0) if parts | count > 1 else 0 %}
+          {{ (100 * done / total) | round | int if total > 0 else 0 }}
+
+      # --- Added in 0.5.3: remote pod (only meaningful during a remote run) ---
       - name: "Image Toolbox Remote VRAM Percent"
         unique_id: image_toolbox_remote_vram_percent
         unit_of_measurement: "%"
@@ -44,6 +72,7 @@ template:
           {% set total = states('sensor.image_toolbox_remote_gpu_vram_total') | float(0) %}
           {{ (100 * used / total) | round(0) if total > 0 else 0 }}
 
+      # --- Added in 0.5.3 ---
       - name: "Image Toolbox Remote RAM Percent"
         unique_id: image_toolbox_remote_ram_percent
         unit_of_measurement: "%"

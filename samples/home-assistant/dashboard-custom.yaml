@@ -13,6 +13,17 @@
 # A minimal set is Mushroom + ApexCharts (the tiles + graphs). card-mod and
 # auto-entities are only used by the optional extras noted inline.
 #
+# UPDATED IN 0.5.8 - if you already have this card, the simplest upgrade is to
+# open it, "Show code editor", select all and paste this file over it. What is
+# new (each marked `# NEW in 0.5.8` inline):
+#   * a progress arc on the live-task card, from the new "Task Progress Percent"
+#     template sensor (re-copy template-sensors.yaml first, or that card will
+#     show as an unknown entity);
+#   * a last-run tile: what the last run did, how long it took and what the pod
+#     cost, read from the `last_run` attributes;
+#   * wording, now that the Video Upscaler reports here too: a video run counts
+#     FRAMES in progress and per-item times, not files.
+#
 # This is ONE card (a vertical stack of sub-cards), pasted into a single
 # card's code editor - NOT the whole-dashboard raw editor. Steps:
 #   1. Add the entities first (mqtt-sensors.yaml + template-sensors.yaml) and
@@ -60,14 +71,54 @@ cards:
       - entity: sensor.image_toolbox_task_name
         state_not: unavailable
     card:
-      type: custom:mushroom-template-card
-      primary: "{{ states('sensor.image_toolbox_task_name') | title }}"
-      secondary: >-
-        {{ states('sensor.image_toolbox_task_details') }} -
-        {{ states('sensor.image_toolbox_task_progress') }} -
-        ETA {{ states('sensor.image_toolbox_task_eta') }}
-      icon: mdi:cog-play
-      icon_color: green
+      type: vertical-stack
+      cards:
+        - type: custom:mushroom-template-card
+          primary: "{{ states('sensor.image_toolbox_task_name') | title }}"
+          # A video run counts FRAMES here, an image run counts files.
+          secondary: >-
+            {{ states('sensor.image_toolbox_task_details') }} -
+            {{ states('sensor.image_toolbox_task_progress') }} -
+            ETA {{ states('sensor.image_toolbox_task_eta') }}
+          icon: mdi:cog-play
+          icon_color: green
+        # NEW in 0.5.8: the same progress as an arc. Needs the "Task Progress
+        # Percent" sensor from template-sensors.yaml.
+        # This one is a CORE gauge on purpose: Mushroom has no bar card, and its
+        # number card only accepts a settable `number` entity, not a sensor. Core
+        # and custom cards mix freely. For a true horizontal bar, install
+        # bar-card (https://github.com/custom-cards/bar-card) and swap in:
+        #   type: custom:bar-card
+        #   entity: sensor.image_toolbox_task_progress_percent
+        #   max: 100
+        - type: gauge
+          name: Progress
+          entity: sensor.image_toolbox_task_progress_percent
+          min: 0
+          max: 100
+          needle: false
+
+  # ---- NEW in 0.5.8: what the last run did ------------------------
+  # Read from the `last_run` JSON attributes, so it covers all four tools.
+  # `cost` is filled in only by a run on a rented pod, and is left out otherwise.
+  - type: custom:mushroom-template-card
+    entity: sensor.image_toolbox_last_run_summary
+    icon: mdi:history
+    icon_color: blue
+    primary: >-
+      {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+      {%- set tool = state_attr('sensor.image_toolbox_last_run_summary', 'tool') | default('Last run') %}
+      Last run: {{ nice.get(tool, tool) }}
+    secondary: >-
+      {%- set a = 'sensor.image_toolbox_last_run_summary' %}
+      {{ state_attr(a, 'processed') | default(0) }} processed,
+      {{ state_attr(a, 'failed') | default(0) }} failed
+      {%- set secs = state_attr(a, 'elapsed_seconds') | default(0) | float %}
+      {%- if secs >= 3600 %} in {{ (secs / 3600) | round(1) }} h
+      {%- elif secs >= 60 %} in {{ (secs / 60) | round(1) }} min
+      {%- elif secs > 0 %} in {{ secs | round | int }} s{% endif %}
+      {%- if state_attr(a, 'cost') %} - ${{ '%.2f' | format(state_attr(a, 'cost') | float) }} of pod time{% endif %}
 
   # ---- band-coloured metric tiles --------------------------------
   - type: grid
@@ -153,6 +204,7 @@ cards:
         unit: W
 
   # ---- remote pod (only during a remote-pod run) -----------------
+  # 0.5.8: a remote VIDEO run lights this panel up too, not just the image tools.
   - type: conditional
     conditions:
       - entity: sensor.image_toolbox_remote_gpu_vram_total

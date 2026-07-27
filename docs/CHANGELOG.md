@@ -88,6 +88,22 @@ hours, in either direction). And a **Conciliation** run's summary now reports th
 replaced/conflicts/errors counts are still there), so one automation genuinely covers
 all four tools instead of reading "0 processed" for that one.
 
+### Home Assistant samples: version markers, and a progress bar
+The files in `samples/home-assistant/` are pasted into your own Home Assistant
+configuration, so a new version of the app cannot update them for you. They now carry
+**version markers**, so an upgrade means copying a marked block rather than diffing the
+whole file against yours: `# --- Added in 0.5.3 ---` on a new sensor,
+`# --- Changed in 0.5.3 ---` on one whose YAML must be replaced, `# NEW: version 0.5.8`
+on an automation, and `# 0.5.8:` on something that already exists and only gained a
+meaning (nothing to re-copy). The folder README has an *Upgrading* table saying which
+files are patched and which are simply re-pasted.
+
+For 0.5.8 itself: the sensors need **no** change (the `task/*` ones you already have
+just start filling in during a video run, counting frames rather than files). There is
+one new derived sensor, **Task Progress Percent**, which turns the `8412/95160` a video
+run reports into something a gauge can show, and both dashboards gained a progress arc
+that uses it plus last-run detail rows (processed, failed, and what the pod cost).
+
 ### A "Buy me a coffee" link
 The bottom status bar now carries an optional support link next to **Report an issue**.
 It is a link and nothing more: clicking it opens buymeacoffee.com in your browser, the

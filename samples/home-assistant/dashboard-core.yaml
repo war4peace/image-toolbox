@@ -4,11 +4,22 @@
 # Built only from Home Assistant's built-in Lovelace cards, so it works on
 # a stock install with nothing extra to download.
 #
+# UPDATED IN 0.5.8 - if you already have this card, the simplest upgrade is to
+# open it, "Show code editor", select all and paste this file over it. What is
+# new (each marked `# NEW in 0.5.8` inline):
+#   * a progress arc on the live-task card, from the new "Task Progress Percent"
+#     template sensor (re-copy template-sensors.yaml first, or that gauge will
+#     show as an unknown entity);
+#   * last-run detail rows (processed / failed / pod cost) read from the
+#     `last_run` attributes;
+#   * wording, now that the Video Upscaler reports here too: a video run counts
+#     FRAMES in progress and per-item times, not files.
+#
 # This is ONE card (a vertical stack of sub-cards), meant to be pasted into
 # a single card's code editor - NOT the whole-dashboard raw editor (which is
 # risky). Steps:
 #   1. Add the entities first: paste mqtt-sensors.yaml (MQTT sensors) and
-#      template-sensors.yaml (the RAM%/VRAM% used by the gauges) into your
+#      template-sensors.yaml (the RAM%/VRAM%/progress% the gauges use) into your
 #      configuration, then reload/restart Home Assistant.
 #   2. Edit your dashboard > "+ ADD SECTION" > add any card (e.g. a Heading).
 #   3. On that card, click "Show code editor", select all, and paste
@@ -37,6 +48,21 @@ cards:
         name: Latest version
       - entity: sensor.image_toolbox_last_run_summary
         name: Last run
+      # NEW in 0.5.8: the last run's numbers, read from the `last_run` JSON
+      # attributes. `Pod cost` is filled in only by a run on a rented pod
+      # (a local run has nothing to bill), so it reads "-" otherwise.
+      - type: attribute
+        entity: sensor.image_toolbox_last_run_summary
+        attribute: processed
+        name: "Last run: processed"
+      - type: attribute
+        entity: sensor.image_toolbox_last_run_summary
+        attribute: failed
+        name: "Last run: failed"
+      - type: attribute
+        entity: sensor.image_toolbox_last_run_summary
+        attribute: cost
+        name: "Last run: pod cost"
       - entity: sensor.image_toolbox_last_exit_timestamp
         name: Last used
 
@@ -48,24 +74,35 @@ cards:
       - entity: sensor.image_toolbox_task_name
         state_not: unavailable
     card:
-      type: entities
-      title: Current task
-      show_header_toggle: false
-      entities:
-        - entity: sensor.image_toolbox_task_name
-          name: Task
-        - entity: sensor.image_toolbox_task_details
-          name: Phase
-        - entity: sensor.image_toolbox_task_progress
+      type: vertical-stack
+      cards:
+        - type: entities
+          title: Current task
+          show_header_toggle: false
+          entities:
+            - entity: sensor.image_toolbox_task_name
+              name: Task
+            - entity: sensor.image_toolbox_task_details
+              name: Phase
+            # A video run counts FRAMES here, an image run counts files.
+            - entity: sensor.image_toolbox_task_progress
+              name: Progress
+            - entity: sensor.image_toolbox_task_eta
+              name: ETA
+            - entity: sensor.image_toolbox_task_runtime
+              name: Runtime
+            - entity: sensor.image_toolbox_average_processing_time
+              name: Avg per item
+            - entity: sensor.image_toolbox_last_processing_time
+              name: Last item
+        # NEW in 0.5.8: the same progress as an arc. Needs the "Task Progress
+        # Percent" sensor from template-sensors.yaml.
+        - type: gauge
           name: Progress
-        - entity: sensor.image_toolbox_task_eta
-          name: ETA
-        - entity: sensor.image_toolbox_task_runtime
-          name: Runtime
-        - entity: sensor.image_toolbox_average_processing_time
-          name: Avg per item
-        - entity: sensor.image_toolbox_last_processing_time
-          name: Last item
+          entity: sensor.image_toolbox_task_progress_percent
+          min: 0
+          max: 100
+          needle: false
 
   # ---- local machine gauges --------------------------------------
   - type: grid
@@ -130,6 +167,7 @@ cards:
         name: GPU temp
 
   # ---- remote pod (only during a remote-pod run) -----------------
+  # 0.5.8: a remote VIDEO run lights this panel up too, not just the image tools.
   - type: conditional
     conditions:
       - entity: sensor.image_toolbox_remote_gpu_vram_total
@@ -176,4 +214,4 @@ cards:
             - entity: sensor.image_toolbox_remote_vram_percent
               name: Pod VRAM
             - entity: sensor.image_toolbox_remote_gpu_temperature
-              name: Pod GPU temp
+              name: Pod temp

@@ -13,6 +13,20 @@
 # additionally need the sensors from mqtt-sensors.yaml.
 #
 # ---------------------------------------------------------------------
+# UPGRADING: HOW TO COPY ONLY WHAT IS NEW
+# ---------------------------------------------------------------------
+# Each automation is tagged with the app version that introduced or changed it:
+#
+#   # NEW: version 0.5.8        a new automation. Paste it in.
+#   # CHANGED: version X.Y.Z    an existing one whose YAML changed. DELETE your
+#                               copy and re-paste this whole automation; editing
+#                               it in place is more error-prone than replacing it.
+#
+# THIS WHOLE FILE IS NEW IN 0.5.8 - every automation below is tagged NEW, so on a
+# first install just take the ones you want. (Two of the five ship disabled; see
+# their notes.) Later versions will only tag what actually changed.
+#
+# ---------------------------------------------------------------------
 # WHERE TO SEND IT
 # ---------------------------------------------------------------------
 # Every example below notifies `notify.persistent_notification`, which exists on
@@ -57,9 +71,12 @@
 # =====================================================================
 
 
-# 1) A run finished cleanly -> tell me what it did.
+# 1) NEW: version 0.5.8
+#    A run finished cleanly -> tell me what it did.
 #    Covers all four tools (Batch Upscaler, Tag & Rename, Conciliation, Video
-#    Upscaler): they all publish the same summary shape.
+#    Upscaler): they all publish the same summary shape. The Video Upscaler was
+#    silent on MQTT before 0.5.8, so on an older app version this fires for the
+#    other three only.
 - alias: "Image Toolbox - run finished"
   id: image_toolbox_run_finished
   mode: queued
@@ -99,7 +116,8 @@
           {%- if trigger.payload_json.cost %} (${{ '%.2f' | format(trigger.payload_json.cost | float) }} of pod time){% endif %}.
 
 
-# 2) A run had failures, or ended early -> same information, louder.
+# 2) NEW: version 0.5.8
+#    A run had failures, or ended early -> same information, louder.
 - alias: "Image Toolbox - run finished with problems"
   id: image_toolbox_run_problems
   mode: queued
@@ -140,7 +158,8 @@
         #   channel: Image Toolbox alerts          # Android
 
 
-# 3) The SAME alert, built on the retained sensor instead of the event.
+# 3) NEW: version 0.5.8
+#    The SAME alert, built on the retained sensor instead of the event.
 #    Use this one only if you prefer triggering off the dashboard sensor. It needs
 #    BOTH guards below; without them it announces an old run on every HA restart.
 #    Disabled by default so it can't double up with automation 1.
@@ -181,7 +200,8 @@
           {{ state_attr('sensor.image_toolbox_last_run_summary', 'failed') }} failed.
 
 
-# 4) The app died in the middle of a run.
+# 4) NEW: version 0.5.8
+#    The app died in the middle of a run.
 #    Nothing inside the app can send this: it is the broker publishing the app's
 #    Last Will when the connection drops without a clean goodbye. That makes Home
 #    Assistant the only place a crash (or a machine that rebooted) can be noticed.
@@ -211,7 +231,8 @@
           Runs resume where they stopped, so re-starting it should continue.
 
 
-# 5) OPTIONAL: a run started. Handy if someone else (or a scheduled task) starts
+# 5) NEW: version 0.5.8
+#    OPTIONAL: a run started. Handy if someone else (or a scheduled task) starts
 #    runs on that machine. Disabled by default - enable it in the UI if you want it.
 - alias: "Image Toolbox - run started"
   id: image_toolbox_run_started

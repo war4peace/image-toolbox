@@ -7,12 +7,14 @@ whether they made the mistake or we shipped it. Nothing else in the repo reads
 these files, so nothing else would ever notice.
 
 What is checked:
-  * `automations.yaml` and `mqtt-sensors.yaml` parse, and every Jinja template in
-    them compiles.
+  * Every sample parses, and every Jinja template in them compiles.
   * The MQTT topics the samples subscribe to are the ones the app actually
     publishes (they are constants in mqtt_publisher, so a rename is caught here
     instead of silently killing an automation).
-  * Every entity the automations reference is one mqtt-sensors.yaml defines.
+  * Every entity the automations and the two dashboards reference is one the
+    sensor samples define (mqtt-sensors.yaml or template-sensors.yaml). A
+    dashboard naming an entity nobody defines renders as an "Entity not
+    available" card, which looks like the user's mistake.
   * The F2 guards are present: the automation that triggers on RETAINED state has
     both its startup guard and its freshness guard, and the Last-Will automation
     triggers only on a real online -> offline transition.
@@ -48,6 +50,16 @@ def automations():
 @pytest.fixture(scope="module")
 def sensors():
     return _load("mqtt-sensors.yaml")
+
+
+@pytest.fixture(scope="module")
+def template_sensors():
+    return _load("template-sensors.yaml")["template"][0]["sensor"]
+
+
+@pytest.fixture(scope="module", params=["dashboard-core.yaml", "dashboard-custom.yaml"])
+def dashboard(request):
+    return request.param, _load(request.param)
 
 
 def _walk(node):
@@ -110,16 +122,71 @@ def test_sensor_topics_are_topics_the_app_publishes(sensors):
         assert s["state_topic"] in published, s["state_topic"]
 
 
-def test_every_referenced_entity_is_defined_by_the_sensor_sample(automations, sensors):
-    defined = {_entity_id(s["name"]) for s in sensors}
+def _referenced_entities(doc):
     used = set()
-    for path, value in _walk(automations):
-        if path.endswith(".entity_id"):
+    for path, value in _walk(doc):
+        if path.endswith(".entity_id") or path.endswith(".entity"):
             used.add(value)
         elif isinstance(value, str):
             used |= set(re.findall(r"sensor\.image_toolbox_[a-z0-9_]+", value))
+    return {e for e in used if isinstance(e, str) and e.startswith("sensor.image_toolbox")}
+
+
+def test_every_referenced_entity_is_defined_by_the_sensor_sample(automations, sensors):
+    defined = {_entity_id(s["name"]) for s in sensors}
+    used = _referenced_entities(automations)
     assert used, "the automations reference no entities at all?"
     assert used <= defined, f"undefined entities: {sorted(used - defined)}"
+
+
+def test_dashboards_parse_and_reference_only_defined_entities(
+        dashboard, sensors, template_sensors):
+    """A dashboard card is pasted verbatim, so a typo'd entity shows the user an
+    'Entity not available' box that looks like their own mistake. Both sample
+    files must resolve entirely against the two sensor samples."""
+    name, doc = dashboard
+    assert doc["type"] == "vertical-stack" and doc["cards"], name
+    defined = {_entity_id(s["name"]) for s in sensors}
+    defined |= {_entity_id(s["name"]) for s in template_sensors}
+    used = _referenced_entities(doc)
+    assert used, f"{name} references no entities at all?"
+    assert used <= defined, f"{name}: undefined entities: {sorted(used - defined)}"
+
+
+def test_dashboard_templates_compile(dashboard):
+    name, doc = dashboard
+    env = jinja2.Environment()
+    for path, value in _walk(doc):
+        if isinstance(value, str) and ("{{" in value or "{%" in value):
+            env.parse(value)                      # raises on a typo
+
+
+def test_the_progress_percent_sensor_exists_for_the_dashboards(template_sensors):
+    """0.5.8: both dashboards gained a progress gauge that reads it. It is a
+    derived sensor, so nothing in the app would notice if it were dropped."""
+    by_id = {s["unique_id"]: s for s in template_sensors}
+    sensor = by_id["image_toolbox_task_progress_percent"]
+    assert sensor["unit_of_measurement"] == "%"
+    assert "sensor.image_toolbox_task_progress" in sensor["state"]
+
+
+@pytest.mark.parametrize("progress,expected", [
+    ("37/100", "37"),
+    ("8412/95160", "9"),          # a video run: frames, so the raw text is unreadable
+    ("0/0", "0"),                 # a run that found nothing: no division by zero
+    ("unknown", "0"),             # idle / before the first publish
+    ("", "0"),
+    ("12", "0"),                  # not "X/Y" at all
+])
+def test_the_progress_percent_template_renders(template_sensors, progress, expected):
+    """Rendered against the real states, because the failure mode is a template
+    error in the user's log plus a sensor stuck at `unavailable` -- with no hint
+    that the sample, not their setup, is at fault."""
+    src = next(s for s in template_sensors
+               if s["unique_id"] == "image_toolbox_task_progress_percent")["state"]
+    env = jinja2.Environment()
+    rendered = env.from_string(src).render(states=lambda _: progress).strip()
+    assert rendered == expected, rendered
 
 
 # ── finding F2: the retained-topic guards ────────────────────────────────────
