@@ -8,6 +8,7 @@ every configured backend:
   - Discord  (webhook, rich embed)
   - Telegram (Bot API, HTML message)
   - ntfy     (HTTP publish to a topic; public ntfy.sh or a self-hosted server)
+  - Home Assistant webhook (JSON POST to an automation's webhook trigger, 0.5.8)
 
 Previously each runner (batch_upscale.py, tag_and_rename.py) carried its own copy
 of send_discord_notification(); that drifted and made adding a second backend a
@@ -24,7 +25,9 @@ Config (config.json "notifications" section):
         "telegram_chat_id":    "",
         "ntfy_server":         "https://ntfy.sh",
         "ntfy_topic":          "",
-        "ntfy_token":          ""
+        "ntfy_token":          "",
+        "ha_url":              "",
+        "ha_webhook_id":       ""
     }
 
 Back-compat: the Discord webhook historically lived at upscale.discord_webhook_url.
@@ -42,6 +45,7 @@ from net_ssl import ssl_context
 
 _TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 _DEFAULT_NTFY_SERVER = "https://ntfy.sh"
+_HA_WEBHOOK_PATH = "/api/webhook/"
 
 # ─────────────────────────────────────────────────────────────
 #  SEVERITY  (the one table every backend renders from)
@@ -113,6 +117,35 @@ _BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 #  CONFIG RESOLUTION
 # ─────────────────────────────────────────────────────────────
 
+def split_ha_webhook(base_url, webhook_id):
+    """
+    Normalise the two Home Assistant fields into (base_url, webhook_id).
+
+    Users paste the whole endpoint ("http://ha.local:8123/api/webhook/abc123")
+    into whichever box they read first, so accept it in EITHER field and split it
+    rather than silently building ".../api/webhook//api/webhook/abc123". Also
+    tolerates a leading "/api/webhook/" typed into the id box. Never raises.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    wid = (webhook_id or "").strip().strip("/")
+
+    # A full endpoint pasted into the ID box: the tail is the id, and the head is
+    # the base unless one was typed on purpose.
+    if _HA_WEBHOOK_PATH in wid or wid.startswith(_HA_WEBHOOK_PATH.strip("/")):
+        head, _, tail = wid.partition(_HA_WEBHOOK_PATH.strip("/"))
+        if tail.strip("/"):
+            base = base or head.strip().rstrip("/")
+            wid = tail.strip("/")
+
+    # ...or pasted into the URL box, which then also carries the id.
+    if _HA_WEBHOOK_PATH.strip("/") in base:
+        head, _, tail = base.partition(_HA_WEBHOOK_PATH.strip("/"))
+        base = head.strip().rstrip("/")
+        wid = wid or tail.strip("/")
+
+    return base, wid
+
+
 def resolve_settings(cfg):
     """
     Pull the notification settings out of a full config.json dict.
@@ -122,6 +155,7 @@ def resolve_settings(cfg):
     """
     notif = (cfg or {}).get("notifications", {}) or {}
     legacy_discord = (cfg or {}).get("upscale", {}).get("discord_webhook_url", "")
+    ha_url, ha_webhook_id = split_ha_webhook(notif.get("ha_url"), notif.get("ha_webhook_id"))
     return {
         "discord_webhook_url": (notif.get("discord_webhook_url") or legacy_discord or "").strip(),
         "telegram_bot_token":  (notif.get("telegram_bot_token")  or "").strip(),
@@ -129,6 +163,8 @@ def resolve_settings(cfg):
         "ntfy_server":         (notif.get("ntfy_server") or _DEFAULT_NTFY_SERVER).strip().rstrip("/"),
         "ntfy_topic":          (notif.get("ntfy_topic") or "").strip(),
         "ntfy_token":          (notif.get("ntfy_token") or "").strip(),
+        "ha_url":              ha_url,
+        "ha_webhook_id":       ha_webhook_id,
     }
 
 
@@ -271,6 +307,63 @@ def send_ntfy(server, topic, title, description, color, fields=None, token=None,
 
 
 # ─────────────────────────────────────────────────────────────
+#  HOME ASSISTANT WEBHOOK  (0.5.8)
+# ─────────────────────────────────────────────────────────────
+# For a Home Assistant user with no MQTT broker: POST the alert as JSON to an
+# automation's webhook trigger, and let their automation decide what to do with
+# it. Deliberately NOT a second MQTT path (see docs/mqtt-integration.md for that
+# route, which is richer: live task state, telemetry, and a Last-Will crash
+# alert this cannot give).
+#
+# WRITE-ONLY BY DESIGN. Home Assistant answers 200 to a webhook id it has never
+# heard of ("Always respond successfully to not give away if a hook exists or
+# not"), and also to a request its `local_only` refuses. So no response can ever
+# confirm delivery, nothing here treats one as proof, and the Test helper says so
+# in as many words. The user verifies on the HA side; see docs/notifications.md.
+
+def ha_webhook_url(base_url, webhook_id):
+    """The endpoint, or "" if either half is missing."""
+    base, wid = split_ha_webhook(base_url, webhook_id)
+    return f"{base}{_HA_WEBHOOK_PATH}{wid}" if base and wid else ""
+
+
+def ha_payload(title, description, color, fields=None, source="Image Toolbox"):
+    """
+    The JSON body. Shaped for Jinja, not for a machine: `message` is already
+    rendered (the same body ntfy gets), so the whole HA action can be
+    `message: "{{ trigger.json.message }}"` instead of twenty lines of template.
+    `level` is the severity as a word, which is what an automation branches on.
+    """
+    return {
+        "app":     "Image Toolbox",
+        "source":  source,
+        "title":   title or "Image Toolbox",
+        "message": _ntfy_body(description, fields),
+        "level":   level_for(color),
+        "color":   color,
+        "fields":  [{"name": f.get("name", ""), "value": f.get("value", "")}
+                    for f in (fields or [])],
+    }
+
+
+def send_ha_webhook(base_url, webhook_id, title, description, color, fields=None,
+                    source="Image Toolbox", timeout=10):
+    """
+    POST the alert to a Home Assistant webhook trigger. No-op unless BOTH the base
+    URL and the webhook id are set. Fail-safe: prints a tagged line, never raises.
+    """
+    url = ha_webhook_url(base_url, webhook_id)
+    if not url:
+        return
+    try:
+        _post_json(url, ha_payload(title, description, color, fields, source), timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        print(f"  [HA] Failed to send notification: HTTP {exc.code} {exc.reason}")
+    except Exception as exc:
+        print(f"  [HA] Failed to send notification: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────
 #  UNIFIED FAN-OUT  (what the runners call)
 # ─────────────────────────────────────────────────────────────
 
@@ -292,6 +385,9 @@ def notify(settings, title, description, color, fields=None, username="Image Too
               settings.get("ntfy_topic", ""),
               title, description, color, fields,
               token=settings.get("ntfy_token", ""))
+    send_ha_webhook(settings.get("ha_url", ""),
+                    settings.get("ha_webhook_id", ""),
+                    title, description, color, fields, source=username)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -422,3 +518,44 @@ def test_ntfy(server, topic, token="", timeout=10):
         return False, f"Send failed: HTTP {exc.code} {exc.reason}"
     except Exception as exc:
         return False, f"Could not reach the ntfy server: {exc}"
+
+
+# What a successful Home Assistant webhook POST is allowed to claim. HA answers
+# 200 both to a webhook id it has never heard of and to a request `local_only`
+# refused, so success here proves only that SOME HA server answered. Saying more
+# would be the one thing worse than no Test button: false confidence, followed by
+# a user wondering for a week why no alert arrives. Wording is fixed (finding F3);
+# tests/test_notifications_ha.py pins it.
+HA_TEST_OK = ("Home Assistant answered (200). That is all this can tell you: it answers "
+              "the same way for a webhook ID it has never heard of. Check your automation "
+              "actually ran (see the setup guide).")
+
+
+def test_ha_webhook(base_url, webhook_id, timeout=10):
+    """
+    POST a sample alert to the Home Assistant webhook. Returns (ok, message).
+
+    A failure IS meaningful (wrong host, no route, timeout, TLS, a proxy 404), so
+    it is reported plainly. A success is not; see HA_TEST_OK.
+    """
+    base, wid = split_ha_webhook(base_url, webhook_id)
+    if not base:
+        return False, "No Home Assistant URL entered."
+    if not wid:
+        return False, "No webhook ID entered."
+    payload = ha_payload("Image Toolbox", "Home Assistant webhook notifications are working.",
+                         COLOR_GREEN, [{"name": "Test", "value": "Sent from Settings"}])
+    try:
+        _post_json(f"{base}{_HA_WEBHOOK_PATH}{wid}", payload, timeout=timeout)
+        return True, HA_TEST_OK
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False, ("Not found (404). Home Assistant answers 200 even for an unknown "
+                           "webhook ID, so a 404 means the URL is not reaching it (check the "
+                           "address and port, or a reverse proxy in front of it).")
+        if exc.code in (401, 403):
+            return False, (f"Refused (HTTP {exc.code}). Something in front of Home Assistant "
+                           "wants authentication; a webhook itself needs none.")
+        return False, f"Send failed: HTTP {exc.code} {exc.reason}"
+    except Exception as exc:
+        return False, f"Could not reach Home Assistant: {exc}"

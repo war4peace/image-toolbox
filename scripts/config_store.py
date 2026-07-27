@@ -39,7 +39,10 @@ OVERLAY_NAME = "config.local.json"
 SECRET_FIELDS = {
     "runpod":        ("api_key",),
     "mqtt":          ("password",),
-    "notifications": ("discord_webhook_url", "telegram_bot_token", "ntfy_token"),
+    # ha_webhook_id: a webhook has no other credential, so the id IS the password
+    # (anyone who has it can fire the automation). The HA base URL is not secret.
+    "notifications": ("discord_webhook_url", "telegram_bot_token", "ntfy_token",
+                      "ha_webhook_id"),
     "upscale":       ("discord_webhook_url",),   # legacy (moved to notifications 0.3.8)
 }
 

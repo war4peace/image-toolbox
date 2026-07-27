@@ -201,6 +201,72 @@ def test_the_progress_percent_template_renders(template_sensors, progress, expec
     assert rendered == expected, rendered
 
 
+# ── the webhook receiver (the no-broker route, 0.5.8) ────────────────────────
+
+@pytest.fixture(scope="module")
+def webhook_automation():
+    return _load("automation-webhook.yaml")
+
+
+def test_the_webhook_sample_is_one_pasteable_automation(webhook_automation):
+    a = webhook_automation
+    assert isinstance(a, dict) and "id" not in a and "initial_state" not in a
+    assert a["alias"] and a["actions"]
+
+
+def test_the_webhook_trigger_is_locked_to_the_local_network(webhook_automation):
+    """The webhook id is the endpoint's ONLY credential, so `local_only` is what
+    keeps a guessed id from being fired from the internet. It is also HA's default,
+    and stated explicitly here so the sample cannot silently lose it."""
+    trig = webhook_automation["triggers"][0]
+    assert trig["trigger"] == "webhook"
+    assert trig["local_only"] is True
+    assert trig["allowed_methods"] == ["POST"]      # what the app sends
+
+
+def test_the_webhook_sample_tells_the_user_to_change_the_id(webhook_automation):
+    """Shipping a usable default id would mean every install on a LAN shares one
+    guessable endpoint."""
+    assert "CHANGE_ME" in webhook_automation["triggers"][0]["webhook_id"]
+
+
+def test_the_webhook_sample_renders_against_the_real_payload():
+    """The sample reads `trigger.json.*`; the app builds that dict in
+    notifications.ha_payload. Renaming a key there would leave every user's
+    automation quietly filling in blanks, and nothing else would notice."""
+    import notifications
+
+    payload = notifications.ha_payload(
+        "Upscale finished", "37 processed, 2 skipped", notifications.COLOR_GREEN,
+        [{"name": "Source", "value": "X:\\Poze"}], source="Upscale Bot")
+    doc = _load("automation-webhook.yaml")
+    env = jinja2.Environment()
+    trigger = type("T", (), {"json": payload})
+    rendered = {k: env.from_string(v).render(trigger=trigger)
+                for k, v in doc["actions"][0]["data"].items()}
+    assert rendered["title"] == "Upscale finished"
+    assert "37 processed" in rendered["message"]
+    assert "Source: X:\\Poze" in rendered["message"]     # the pre-rendered body
+    for value in rendered.values():
+        assert "no details" not in value                 # the default() fallbacks
+        assert "Undefined" not in value
+
+
+def test_the_documented_field_lookup_works_on_the_real_payload():
+    """The "pick one detail" recipe in the sample's comments. Field names contain
+    spaces, so it is a selectattr rather than an attribute access; if that recipe
+    is wrong the user gets an empty string and no error."""
+    import notifications
+
+    payload = notifications.ha_payload(
+        "T", "D", notifications.COLOR_GREEN,
+        [{"name": "Source", "value": "X:\\Poze"}, {"name": "Machine", "value": "DESKTOP"}])
+    tmpl = ("{{ trigger.json.fields | selectattr('name', 'eq', 'Machine') "
+            "| map(attribute='value') | first | default('') }}")
+    trigger = type("T", (), {"json": payload})
+    assert jinja2.Environment().from_string(tmpl).render(trigger=trigger) == "DESKTOP"
+
+
 # ── finding F2: the retained-topic guards ────────────────────────────────────
 
 RUN_FINISHED = "Image Toolbox - run finished"

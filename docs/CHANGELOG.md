@@ -60,6 +60,31 @@ value in a runner, so the two palettes cannot drift apart again. New
 [`docs/notifications.md`](notifications.md) covers the three backends, which to pick, the
 setup steps and what each alert contains.
 
+### Home Assistant alerts without an MQTT broker
+A fourth notification backend: Image Toolbox can now POST each alert straight to a
+**Home Assistant webhook**, so a Home Assistant user who does not run an MQTT broker
+still gets told when a run finishes or fails. Nothing leaves your network, there is no
+account and no token, and your automation decides what to do with it: the payload
+carries a ready-written `message` (so the automation is one line) and a `level` of
+success / caution / warning / error, which is what makes "only buzz me for bad news" a
+one-line condition. A paste-ready automation ships in
+[`samples/home-assistant/automation-webhook.yaml`](../samples/home-assistant/automation-webhook.yaml).
+
+Set it up in **Settings > Notifications**: your Home Assistant address, and a webhook ID
+you invent. **Create the automation in Home Assistant first**, then fill those in. That
+order matters, and the honest reason is worth stating: Home Assistant deliberately
+answers "200 OK" to a webhook ID it has never heard of, so pressing Test before the
+automation exists looks exactly like success. The Test button therefore says only what it
+can prove: that Home Assistant answered. It never claims the alert was delivered, and no
+"verified" tick is stored anywhere. [`docs/notifications.md`](notifications.md) has the
+walkthrough, the payload, and a one-minute way to confirm it really works from the Home
+Assistant side.
+
+**If you already run a broker, prefer the MQTT integration.** It is a superset: live
+progress, telemetry, dashboards, and the one thing a webhook can never do, telling you
+the app **crashed** mid-run (that alert comes from the broker, and a crashed app cannot
+send anything itself).
+
 ### Home Assistant: ready-made notification automations, and no more phantom alerts
 There is now a [`samples/home-assistant/automations-ui.yaml`](../samples/home-assistant/automations-ui.yaml)
 with five ready-made automations: **a run finished**, **a run finished badly**

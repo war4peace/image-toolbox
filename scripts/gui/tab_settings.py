@@ -659,6 +659,36 @@ class SettingsTab(ttk.Frame):
         self.ntfy_status = ttk.Label(sec, text="", foreground="#666")
         self.ntfy_status.grid(row=7, column=1, columnspan=2, sticky="w", padx=6)
 
+        ttk.Label(sec, text="Home Assistant URL:").grid(row=8, column=0, sticky="w", pady=3)
+        self.ha_url_var = tk.StringVar(value=notif.get("ha_url", ""))
+        ha_url_entry = ttk.Entry(sec, textvariable=self.ha_url_var)
+        ha_url_entry.grid(row=8, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(ha_url_entry,
+                "The address you open Home Assistant at on your own network, for "
+                "example http://homeassistant.local:8123. Leave empty to disable "
+                "Home Assistant alerts. (Only needed if you do NOT use the MQTT "
+                "integration below, which reports far more.)")
+
+        ttk.Label(sec, text="HA webhook ID:").grid(row=9, column=0, sticky="w", pady=3)
+        self.ha_webhook_var = tk.StringVar(value=notif.get("ha_webhook_id", ""))
+        ha_webhook_entry = ttk.Entry(sec, textvariable=self.ha_webhook_var)
+        ha_webhook_entry.grid(row=9, column=1, sticky="ew", padx=6, pady=3)
+        Tooltip(ha_webhook_entry,
+                "An ID you make up, and give to a Home Assistant automation that "
+                "starts with a Webhook trigger. Build that automation FIRST; this "
+                "only sends, it cannot create it. The ID is the only thing "
+                "protecting it, so make it long and unguessable, and leave the "
+                "automation's \"Only accessible from the local network\" on.")
+        ha_test = ttk.Button(sec, text="Test", command=self._test_ha_webhook)
+        ha_test.grid(row=9, column=2, pady=3)
+        Tooltip(ha_test,
+                "Send a sample alert to this webhook. It can only tell you Home "
+                "Assistant answered: it answers the same way for an ID it has never "
+                "heard of, so check the automation actually ran on the Home "
+                "Assistant side.", wraplength=W)
+        self.ha_status = ttk.Label(sec, text="", foreground="#666", wraplength=460, justify="left")
+        self.ha_status.grid(row=10, column=1, columnspan=2, sticky="w", padx=6)
+
         # ── Home Assistant (MQTT) ───────────────────────────────────────────────
         mqtt = CFG.get("mqtt", {})
         sec = self._section(body, "Home Assistant (MQTT)")
@@ -885,6 +915,18 @@ class SettingsTab(ttk.Frame):
         ok, msg = notifications.test_ntfy(
             self.ntfy_server_var.get(), self.ntfy_topic_var.get(), token)
         self.ntfy_status.configure(text=msg, foreground="#1a7f37" if ok else "#b3261e")
+
+    def _test_ha_webhook(self):
+        """POST a sample alert to the Home Assistant webhook. Both fields are on the
+        form, so nothing is read from CFG. A success is reported in muted grey, not
+        green: Home Assistant answers 200 to an unknown webhook ID too, so this
+        proves only that it answered (finding F3). A failure IS meaningful and is
+        shown in red."""
+        self.ha_status.configure(text="Testing…", foreground="#666")
+        self.ha_status.update_idletasks()
+        ok, msg = notifications.test_ha_webhook(
+            self.ha_url_var.get(), self.ha_webhook_var.get())
+        self.ha_status.configure(text=msg, foreground="#666" if ok else "#b3261e")
 
     def _rerun_wizard(self):
         """Open the first-start Wizard on demand. Re-running is always allowed (the
@@ -1176,6 +1218,11 @@ class SettingsTab(ttk.Frame):
         except (ValueError, tk.TclError):
             up_conf = 0.9
         ups["straighten_min_confidence"] = min(1.0, max(0.5, up_conf))
+        # Normalise the HA webhook pair at collect time, so a full endpoint pasted
+        # into either box is stored (and shown after Save) already split.
+        ha_url, ha_webhook_id = notifications.split_ha_webhook(
+            self.ha_url_var.get(), self.ha_webhook_var.get())
+
         ups["watchdog_enabled"] = bool(self.watchdog_var.get())
         try:
             wd_factor = round(float(self.watchdog_factor_var.get()), 1)
@@ -1226,6 +1273,8 @@ class SettingsTab(ttk.Frame):
                 "telegram_chat_id":    self.tg_chat_var.get().strip(),
                 "ntfy_server":         self.ntfy_server_var.get().strip(),
                 "ntfy_topic":          self.ntfy_topic_var.get().strip(),
+                "ha_url":              ha_url,
+                "ha_webhook_id":       ha_webhook_id,
             },
         }
         return sections, errors
@@ -1340,6 +1389,8 @@ class SettingsTab(ttk.Frame):
         self.tg_chat_var.set(notif.get("telegram_chat_id", ""))
         self.ntfy_server_var.set(notif.get("ntfy_server", "https://ntfy.sh"))
         self.ntfy_topic_var.set(notif.get("ntfy_topic", ""))
+        self.ha_url_var.set(notif.get("ha_url", ""))
+        self.ha_webhook_var.set(notif.get("ha_webhook_id", ""))
         vid = CFG.get("video", {})
         self.video_target_var.set(vid.get("target", "1080p"))
         self.video_outsub_var.set(vid.get("output_subdir", "__upscaled__"))

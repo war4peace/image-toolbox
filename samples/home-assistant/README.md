@@ -5,6 +5,14 @@ Image Toolbox. The app already publishes its state to MQTT (see the main README'
 **Home Assistant (MQTT)** section); these files turn those topics into sensors and
 two ready-to-paste dashboards.
 
+> **No MQTT broker?** There is a second, much smaller route: the app can POST each
+> alert straight to a Home Assistant automation, with no broker and no sensors.
+> You get the notifications only (no dashboard, no live progress, and nothing if
+> the app crashes). One file here serves it,
+> [`automation-webhook.yaml`](automation-webhook.yaml), and the setup is documented
+> in [`docs/notifications.md`](../../docs/notifications.md#the-home-assistant-webhook-route).
+> Everything else on this page is the MQTT route.
+
 Two tiers:
 
 - **`dashboard-core.yaml`** - built only from Home Assistant's **built-in**
@@ -92,6 +100,31 @@ video run left the app looking idle for hours.
   above) and last-run detail rows: processed, failed, and what the pod cost.
 - **`automations-ui.yaml` is new in 0.5.8** and triggers on the two new event
   topics, so it wants app 0.5.8 or later.
+
+## The other route: a webhook, without a broker
+
+Everything above needs an MQTT broker. If you do not have one and do not want one,
+Image Toolbox can POST its alerts directly to a Home Assistant automation instead:
+paste [`automation-webhook.yaml`](automation-webhook.yaml) in (same steps as step 4
+above), invent a webhook ID, and put that ID plus your Home Assistant address into
+**Settings > Notifications** in the app.
+
+| | MQTT (this page) | Webhook |
+|---|---|---|
+| Needs | a broker | nothing |
+| Gives you | live task state, telemetry, dashboards, run events, **and an alert if the app crashes mid-run** | the finish / failure notifications only |
+| Setup | sensors in `configuration.yaml` + automations | one automation + two fields |
+
+MQTT is the superset, and the only route that can tell you the app **died** (that
+alert is the broker publishing the app's Last Will; a crashed app cannot POST
+anything to say so). The webhook exists for people who will not run a broker.
+
+**The full walkthrough, the payload your automation receives, and how to confirm it
+actually works, are in
+[`docs/notifications.md`](../../docs/notifications.md#the-home-assistant-webhook-route).**
+One thing worth knowing before you start: create the automation **first**, then fill
+in the app. Home Assistant answers 200 to a webhook ID it has never heard of, so
+testing it in the other order looks like success and proves nothing.
 
 ## HACS cards (custom dashboard only)
 

@@ -20,11 +20,13 @@ SECRET_CFG = {
         "ntfy_server":         "https://ntfy.sh",  # not a secret
         "ntfy_topic":          "mytopic",          # not a secret
         "ntfy_token":          "ntfy-SECRET",
+        "ha_url":              "http://ha.local:8123",   # not a secret
+        "ha_webhook_id":       "ha-SECRET",              # the endpoint's only credential
     },
 }
 
 # Every literal we consider a secret, for the leak assertion.
-_SECRET_VALUES = ["rp-SECRET", "pw-SECRET", "tg-SECRET", "ntfy-SECRET",
+_SECRET_VALUES = ["rp-SECRET", "pw-SECRET", "tg-SECRET", "ntfy-SECRET", "ha-SECRET",
                   "https://disc/hook", "https://legacy/hook"]
 
 
@@ -77,9 +79,13 @@ def test_split_blanks_base_and_collects_overlay():
     assert base["upscale"]["resolution"] == 2160
     assert base["mqtt"]["username"] == "user"
     assert base["notifications"]["telegram_chat_id"] == "12345"
+    assert base["notifications"]["ha_url"] == "http://ha.local:8123"
+    # a webhook id is the endpoint's only credential, so it is a secret
+    assert base["notifications"]["ha_webhook_id"] == ""
     # overlay holds the real values
     assert overlay["runpod"]["api_key"] == "rp-SECRET"
     assert overlay["notifications"]["ntfy_token"] == "ntfy-SECRET"
+    assert overlay["notifications"]["ha_webhook_id"] == "ha-SECRET"
 
 
 def test_split_omits_empty_secrets_from_overlay():
@@ -113,6 +119,7 @@ def test_save_removes_empty_overlay(tmp_path):
     cleared["notifications"]["discord_webhook_url"] = ""
     cleared["notifications"]["telegram_bot_token"] = ""
     cleared["notifications"]["ntfy_token"] = ""
+    cleared["notifications"]["ha_webhook_id"] = ""
     cleared["upscale"]["discord_webhook_url"] = ""
     cs.save(cleared, str(tmp_path))
     assert not os.path.exists(cs.overlay_path(str(tmp_path)))

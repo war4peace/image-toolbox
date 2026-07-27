@@ -28,15 +28,19 @@ for _p in (SCRIPTS_DIR, APP_ROOT):
 @pytest.fixture(autouse=True)
 def _block_real_notifications(monkeypatch):
     """Safety net: the test suite must NEVER contact a real Discord/Telegram/ntfy
-    endpoint. The runners resolve their notification settings from the developer's
-    live config.json at import (a real webhook), so a test that calls send/notify
-    with those settings would fire an actual message. Stub the three per-backend
-    senders (which notify() dispatches to by module-global name) to no-ops, for
-    every test. Tests that assert on notify()/gui behaviour monkeypatch at a higher
-    level and still work (their patch wins). Fail-safe if notifications is absent."""
+    endpoint, or the developer's own Home Assistant. The runners resolve their
+    notification settings from the developer's live config.json at import (a real
+    webhook), so a test that calls send/notify with those settings would fire an
+    actual message. Stub every per-backend sender (which notify() dispatches to by
+    module-global name) to a no-op, for every test. Tests that assert on
+    notify()/gui behaviour monkeypatch at a higher level and still work (their
+    patch wins). Fail-safe if notifications is absent.
+
+    ADD A NEW BACKEND'S SENDER HERE the moment it exists: this list is the only
+    thing standing between the suite and a real endpoint."""
     try:
         import notifications
     except Exception:
         return
-    for _name in ("send_discord", "send_telegram", "send_ntfy"):
+    for _name in ("send_discord", "send_telegram", "send_ntfy", "send_ha_webhook"):
         monkeypatch.setattr(notifications, _name, lambda *a, **k: None, raising=False)

@@ -1,0 +1,110 @@
+# =====================================================================
+# Image Toolbox - the WEBHOOK receiver automation (no MQTT broker needed)
+# =====================================================================
+# ONE automation, for the other way of getting Image Toolbox alerts into Home
+# Assistant: the app POSTs each alert straight to this automation. Nothing else in
+# this folder is needed for it: no broker, no MQTT integration, no sensors.
+#
+# Which route do you want?
+#
+#   MQTT (automations-ui.yaml + mqtt-sensors.yaml)
+#     Needs a broker. Gives you live task state, telemetry, dashboards, and an
+#     alert when the app CRASHES mid-run. Pick this if you already run a broker.
+#
+#   Webhook (THIS file)
+#     Needs nothing. Gives you the finish/failure alerts only: no dashboard, no
+#     live progress, and nothing at all if the app dies (it can only send while
+#     it is alive). Pick this if you do not run a broker and do not want one.
+#
+# Running both just means two notifications for the same event.
+#
+# ---------------------------------------------------------------------
+# SETUP ORDER MATTERS: THIS AUTOMATION FIRST
+# ---------------------------------------------------------------------
+#   1. Invent a webhook ID. It is the ONLY thing protecting this endpoint, so
+#      make it long and unguessable, e.g. `imgtbx_7f3a9c21b8` (not `imgtbx`).
+#      Replace it in the trigger below.
+#   2. Add this automation: Settings > Automations & scenes > + CREATE AUTOMATION
+#      > Create new automation > three-dot menu > "Edit in YAML", select all,
+#      paste everything from `alias:` down. Save.
+#   3. THEN, in Image Toolbox: Settings > Notifications > Home Assistant URL +
+#      HA webhook ID > Save. Press Test.
+#
+# Do it in that order. Home Assistant answers 200 even for a webhook ID it has
+# never heard of, so pressing Test before this automation exists looks like it
+# worked and proves nothing.
+#
+# See docs/notifications.md ("Did it work?") for how to actually confirm it.
+# =====================================================================
+
+
+# =====================================================================
+# NEW: version 0.5.8   |   Image Toolbox alert -> a notification.
+# ---------------------------------------------------------------------
+# `local_only: true` means Home Assistant will only accept this from your own
+# network, which is what you want: the ID is the only credential. It is also HA's
+# default, but it is spelled out here so it is obvious what to change if you ever
+# need to (you would also then want a much longer ID).
+#
+# `allowed_methods: [POST]` matches what the app sends.
+# =====================================================================
+alias: "Image Toolbox - alert (webhook)"
+mode: queued
+max: 10
+triggers:
+  - trigger: webhook
+    # CHANGE THIS, and paste the same value into Image Toolbox's Settings.
+    webhook_id: "imgtbx_CHANGE_ME_to_something_long"
+    allowed_methods:
+      - POST
+    local_only: true
+actions:
+  - action: notify.persistent_notification
+    data:
+      # `message` arrives already written out (the summary plus one line per
+      # detail), which is why this is one line instead of a template that walks
+      # the payload. See docs/notifications.md for every key you can use.
+      title: "{{ trigger.json.title | default('Image Toolbox') }}"
+      message: "{{ trigger.json.message | default('(no details)') }}"
+
+# ---------------------------------------------------------------------
+# WANT IT ON YOUR PHONE, LOUDER WHEN SOMETHING FAILED?
+# ---------------------------------------------------------------------
+# Replace the action above with the block below. `trigger.json.level` is one of
+# success / caution / warning / error (plus `info` if the app ever sends a
+# severity this version does not know), which is what makes "only buzz me for
+# bad news" a one-line condition.
+#
+#   - action: notify.mobile_app_YOUR_PHONE
+#     data:
+#       title: "{{ trigger.json.title }}"
+#       message: "{{ trigger.json.message }}"
+#       data:
+#         push:
+#           # iOS: break through a Focus mode only when it went wrong.
+#           interruption-level: >-
+#             {{ 'time-sensitive' if trigger.json.level in ['error', 'warning']
+#                else 'passive' }}
+#         # Android: route the bad news to its own channel.
+#         channel: >-
+#           {{ 'Image Toolbox alerts' if trigger.json.level == 'error'
+#              else 'Image Toolbox' }}
+#
+# To notify ONLY on failures, add a condition instead:
+#
+#   conditions:
+#     - condition: template
+#       value_template: "{{ trigger.json.level in ['error', 'warning'] }}"
+#
+# ---------------------------------------------------------------------
+# A SINGLE DETAIL OUT OF THE ALERT
+# ---------------------------------------------------------------------
+# `fields` is the detail list, kept intact. Field names contain spaces, so pick
+# one by name rather than by position:
+#
+#   {{ trigger.json.fields | selectattr('name', 'eq', 'Source')
+#      | map(attribute='value') | first | default('') }}
+#
+# `trigger.json.source` tells you which tool sent it (the Batch Upscaler, Tag &
+# Rename, the Video Upscaler, Conciliation).
+# ---------------------------------------------------------------------

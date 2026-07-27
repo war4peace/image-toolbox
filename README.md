@@ -127,7 +127,7 @@ Windows GUI (mostly Python standard-library tkinter) with six tabs.
 - **Live feedback:** two-row status (current + previous file), a progress bar, and an estimated time remaining that refreshes after each image. The Windows taskbar button mirrors the progress and flashes for attention when a run finishes or a problem is detected, so an unattended run still catches your eye.
 - **Live preview**: Batches of 100 images are loaded into a "preview" pane, allowing you to open images, perform a live comparison (upscaled images), context menu (right-click images) with common actions.
 - **Resizable thumbnails** in the film strip area.
-- **Notification support**: Currently supports *Discord*, *Telegram* and *ntfy.sh*.
+- **Notification support**: Currently supports *Discord*, *Telegram*, *ntfy.sh* and a *Home Assistant webhook*.
 - **MQTT integration** (e.g. for Home Assistant, see **Home Assistant (MQTT)** section below).
 
 ![In-app per-run telemetry graph](screenshots/image-toolbox-telemetry-graph.png)
@@ -236,11 +236,13 @@ Remote (RunPod) settings - the API key, region/data center, model volume, GPU pr
 
 ### Notifications
 
-Get a message when a queue finishes (for both the Upscaler and Tag & Rename) and on errors (repeated failures, an engine that fails to start, Ollama going unreachable). Three backends, configured in Settings → Notifications, all optional and independent:
+Get a message when a queue finishes (for both the Upscaler and Tag & Rename) and on errors (repeated failures, an engine that fails to start, Ollama going unreachable). Four backends, configured in Settings → Notifications, all optional and independent:
 
 - **Discord**: paste a channel **webhook** URL.
 - **Telegram**: create a bot with **@BotFather**, paste its **bot token**, open the bot and press **Start**, then click **Detect** to fill in your chat ID.
 - **ntfy**: make up a **topic** name, subscribe to it in the [ntfy](https://ntfy.sh) app, and enter it here (the **server** defaults to the public `https://ntfy.sh`; point it at your own server if you self-host). On the public server anyone who knows the topic can read it, so pick an unguessable name.
+
+- **Home Assistant webhook** (0.5.8): for a Home Assistant user with **no MQTT broker**. Add an automation with a **Webhook** trigger, invent a webhook ID, and enter that ID plus your Home Assistant address here; each alert arrives as JSON your automation can do anything with. If you *do* run a broker, prefer the MQTT integration below: it reports far more, including if the app crashes mid-run.
 
 Each has a **Test** button. Whatever you configure (any combination, or none) receives the same alerts, tagged with a severity: green finished cleanly, orange/yellow needs a look, red failed. On ntfy that severity also sets the notification's **priority**, so a failed run buzzes harder than a completed one.
 
@@ -275,7 +277,7 @@ Settings live in `config.json` next to the app, with these sections:
 | `updates`  | In-app update-checker preferences.                                   |
 | `runpod`   | Remote-pod settings: GPU/region/volume prefs and pod-management limits. |
 | `video`    | Video Upscaler deliverable codec/quality and SeedVR tuning knobs.    |
-| `notifications` | Discord webhook, Telegram bot token/chat ID, ntfy server/topic. |
+| `notifications` | Discord webhook, Telegram bot token/chat ID, ntfy server/topic, Home Assistant URL + webhook ID. |
 
 You normally never edit this file by hand; use the **Settings** tab. The installer never overwrites your `config.json` on upgrade, and removes it only on a full uninstall.
 
