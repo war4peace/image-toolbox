@@ -4,9 +4,32 @@
 # Get a phone / dashboard notification when a run finishes, when it finishes
 # badly, and when the app dies in the middle of one.
 #
-# Where this goes: your Home Assistant `automations.yaml` (Settings > Automations
-# shows them afterwards), or paste one at a time into a new automation's
-# "Edit in YAML" view. Reload from Developer Tools > YAML > "Automations".
+# ---------------------------------------------------------------------
+# WHERE THIS GOES: TWO ROUTES, AND THEY WANT DIFFERENT YAML
+# ---------------------------------------------------------------------
+# This file is a LIST: every automation starts with `- alias:`. That is what
+# `automations.yaml` expects, and NOT what the UI's YAML editor expects.
+#
+# ROUTE A - your `automations.yaml` file (recommended: paste as-is).
+#   Append the automations you want, keeping the leading `- `, then reload from
+#   Developer Tools > YAML > "Automations". They then appear in
+#   Settings > Automations like any other.
+#
+# ROUTE B - the UI, one automation at a time (Settings > Automations >
+#   + CREATE AUTOMATION > Create new automation > top-right menu > "Edit in YAML").
+#   That editor holds ONE automation, so it wants a plain mapping, not a list.
+#   Pasting a list there fails with:
+#
+#       Message malformed: extra keys not allowed @ data['0']
+#
+#   ('0' is the first list item.) Three mechanical changes fix it:
+#     1. delete the leading `- ` on the `alias:` line;
+#     2. de-indent the whole automation by 2 spaces;
+#     3. delete the `id:` line (the UI assigns its own id).
+#   For an automation that ships disabled, also delete its `initial_state: false`
+#   line and just leave the automation switched off in Settings > Automations.
+#
+# Either route gives the same working automation. Route A is less fiddly.
 #
 # Needs: the MQTT integration set up and Image Toolbox pointed at the same broker
 # (see this folder's README). Automations 1, 2 and 5 need nothing else; 3 and 4

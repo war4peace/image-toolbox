@@ -49,11 +49,17 @@ Add the entities first, then a dashboard.
    sub-card out of the file into its own card.
 4. **Notification automations** *(optional)* -
    [`automations.yaml`](automations.yaml): tell me when a run finishes, when it
-   finishes badly, and when the app dies mid-run. Paste into your
-   `automations.yaml` (or one at a time into a new automation's **Edit in YAML**
-   view) and reload from **Developer Tools > YAML > Automations**. See
-   [Notifications](#notifications) below for how they avoid the retained-message
-   trap.
+   finishes badly, and when the app dies mid-run. Append the ones you want to
+   your own `automations.yaml`, keeping the leading `- `, and reload from
+   **Developer Tools > YAML > Automations**. See [Notifications](#notifications)
+   below for how they avoid the retained-message trap.
+
+   **Pasting into the UI instead?** The file is a *list*; the UI's **Edit in
+   YAML** editor holds *one* automation and rejects a list with `Message
+   malformed: extra keys not allowed @ data['0']`. Convert as you paste: drop the
+   leading `- `, de-indent by 2 spaces, and delete the `id:` line (the UI assigns
+   its own). If the automation ships disabled, drop `initial_state: false` too
+   and just leave it switched off in the automations list.
 
 ## Upgrading these files
 
