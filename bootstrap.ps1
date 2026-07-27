@@ -13,9 +13,8 @@
 #      and ffmpeg (GitHub build with a curl.exe progress bar - Video Upscaler)
 #   5. Installs PyTorch with CUDA and the remaining Python packages
 #
-# Internet connection required. Downloads roughly 3 GB of components.
-# (The AI model weights, ~16 GB, are downloaded separately by the app
-# the first time an upscale is started.)
+# Internet connection required. (The AI model weights are downloaded
+# separately by the app the first time an upscale is started.)
 #
 # NOTE: this file must stay ASCII-only - PowerShell 5.1 misparses
 # BOM-less UTF-8 and turns smart dashes/quotes into syntax errors.
@@ -155,7 +154,7 @@ function Install-Ffmpeg($appRoot) {
     # 1) Primary: BtbN's GitHub build (fast github.com CDN; no hash sidecar, so
     #    integrity is HTTPS + the functional version check below).
     try {
-        Write-Host "  Downloading ffmpeg ($FFMPEG_LABEL) from GitHub (~160 MB) ..."
+        Write-Host "  Downloading ffmpeg ($FFMPEG_LABEL) from GitHub ..."
         Get-Download $FFMPEG_BTBN_URL $zip
     } catch {
         # 2) Fallback: gyan.dev's release-essentials build, verified against its
@@ -221,7 +220,7 @@ function Install-LibVlc($appRoot) {
     }
     $zip = Join-Path $env:TEMP "libvlc-imgtbx.zip"
     Remove-Item $zip -ErrorAction SilentlyContinue
-    Write-Host "  Downloading libVLC ($LIBVLC_LABEL) from videolan.org (~40 MB) ..."
+    Write-Host "  Downloading libVLC ($LIBVLC_LABEL) from videolan.org ..."
     Get-Download $LIBVLC_URL $zip
     # Integrity gate: a fixed, immutable artifact, so verify against the baked-in SHA-256
     # (mirrors the Python + gyan.dev ffmpeg checks). A mismatch = corrupt/tampered -> stop
@@ -295,7 +294,7 @@ try {
     if ($remoteOnly) {
         Write-Host "  Remote mode: a small one-time setup (no local GPU stack)."
     } else {
-        Write-Host "  This one-time setup downloads about 3 GB of components."
+        Write-Host "  This one-time setup downloads the components the app needs."
     }
     Write-Host "  Please keep this window open until it finishes."
 
@@ -318,7 +317,7 @@ try {
     if ($python) {
         Write-Host "  Found: $python"
     } else {
-        Write-Host "  Not found - downloading Python $PYTHON_VERSION (~25 MB) ..."
+        Write-Host "  Not found - downloading Python $PYTHON_VERSION ..."
         $tmp = Join-Path $env:TEMP "python-$PYTHON_VERSION-amd64.exe"
         Get-Download $PYTHON_URL $tmp
         $actual = (Get-FileHash -Path $tmp -Algorithm SHA256).Hash.ToLower()
@@ -405,7 +404,7 @@ try {
         # (Local/Both already get it via seedvr2's requirements).
         Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi", "matplotlib")
     } else {
-        Step "Installing PyTorch with CUDA support (~3 GB - this is the long part)"
+        Step "Installing PyTorch with CUDA support (this is the long part)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
         Invoke-Pip @("install", "torch", "torchvision", "--index-url", $TORCH_INDEX)
 
@@ -444,7 +443,7 @@ try {
     } else {
         Write-Host "  Ollama is not installed. It is OPTIONAL - only the"
         Write-Host "  Tag & Rename feature needs it; upscaling works without it."
-        if (Confirm-Yes "  Install Ollama now (~1 GB download)?") {
+        if (Confirm-Yes "  Install Ollama now?") {
             $tmp = Join-Path $env:TEMP "OllamaSetup.exe"
             Write-Host "  Downloading Ollama ..."
             Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $tmp -UseBasicParsing
@@ -490,7 +489,8 @@ try {
     Set-Content -Path ".setup_complete" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Encoding utf8
     Step "Setup complete - launching Image Toolbox"
     Write-Host "  Note: the first upscale you run will download the AI model"
-    Write-Host "  weights (~16 GB). The app shows progress while this happens."
+    Write-Host "  weights (a large one-time download). The app shows progress"
+    Write-Host "  while this happens."
     Start-Process (Join-Path $root ".venv\Scripts\pythonw.exe") -ArgumentList "`"$(Join-Path $root 'scripts\toolbox_gui.py')`""
     Write-Host ""
     Write-Host "  A full copy of this output was saved to bootstrap.log"

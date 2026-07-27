@@ -164,5 +164,9 @@ The curated CSV plus the curation script suffice for the foreseeable future. See
   largest lift. Vet any future provider against this checklist before writing
   code: (a) free/cheap ingress+egress, (b) cheap region-wide persistent storage
   that mounts on disposable instances, (c) reliable SSH with key injection.
+  **Note: this rejected vast.ai, not multi-provider support.** A second provider
+  is planned via **packet.ai**, which clears the checklist on advertised
+  behaviour: roadmap **#15** in `docs/future-features.md`, evaluation in
+  `docs/packet-ai-secondary-gpu.md`.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>

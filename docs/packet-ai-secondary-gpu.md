@@ -1,9 +1,16 @@
-# packet.ai as a secondary remote GPU source (reference-only)
+# packet.ai as a secondary remote GPU source
 
-**Status: reference / keep-in-mind. Not planned, not scoped for a release.**
+**Status: planned, blocked on funds.** packet.ai is intended as the second
+remote-pod backend alongside RunPod. The work is scoped on the roadmap as
+**#15** in `docs/future-features.md`; what holds it up is not the design but
+money: the three open questions below can only be answered by signing up and
+running a real deploy/terminate cycle, and any benchmarking of the cards costs
+billed GPU time. Until that spend happens this note stays an evaluation, not an
+as-built record.
+
 This note records what was found while evaluating [packet.ai](https://packet.ai/)
-as a second remote-pod backend alongside RunPod, so the evaluation doesn't have to
-be redone from scratch later. Nothing here is committed to.
+as a second remote-pod backend, so the evaluation doesn't have to be redone from
+scratch later.
 
 ## Contents
 
@@ -28,7 +35,7 @@ REST API**; packet.ai wraps it in a CLI plus a `PACKET_API_KEY`. Practical
 consequence: it is a younger, thinner layer than RunPod, and the deploy path is one
 vendor deep (packet.ai on top of hosted.ai).
 
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>
 
 ## Fit against our remote-pod contract
 
@@ -41,7 +48,7 @@ needs three things from any backend. packet.ai's status on each:
 | **Easy programmatic deploy** (own SSH key, create/terminate, JSON) | GraphQL `podFindAndDeployOnDemand`, `PUBLIC_KEY` injection | **SSH:** full root with *your own* key, auto-injected (`ssh root@…packet.ai`). **CLI:** `packet login \| gpus \| launch --gpu <t> --setup <preset> \| ps \| ssh <id> \| terminate <id>`, `--json` output, `PACKET_API_KEY` env, explicit CI support. Maps cleanly onto our `ssh_setup` key model. |
 | **Live GPU catalog / stock / price query** (our `available_gpus`) | GraphQL live list, per-region stock + price | **`packet gpus` / `--json`** returns types + real-time pricing. **No GraphQL.** Per-region stock granularity unconfirmed. |
 
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>
 
 ## The one real integration risk
 
@@ -54,7 +61,7 @@ sibling to `runpod_client.py` is plausible, but might have to shell out to the
 `packet` CLI (a subprocess seam) rather than talk HTTP directly, depending on what
 the customer REST surface actually exposes.
 
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>
 
 ## GPU catalog
 
@@ -64,7 +71,7 @@ B200, H200, A100, H100, L40S, **RTX 6000 Pro 96 GB (Blackwell)**, RTX 4090, RTX
 7B model, 4K infeasible); the 4090/5090 (24/32 GB) are cheap tag-mode candidates. Sample pricing seen: RTX 4090 ~$0.39/h, L40S
 ~$0.92/h, A100 80 GB ~$1.43/h, B200 from ~$3.75/h.
 
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>
 
 ## Before any real work, verify (none answerable from public pages)
 
@@ -76,17 +83,22 @@ B200, H200, A100, H100, L40S, **RTX 6000 Pro 96 GB (Blackwell)**, RTX 4090, RTX
    availability may be thinner than RunPod's Secure Cloud.
 
 A free account + one `packet gpus --json` and one `packet launch` / `terminate`
-cycle (~15 min) answers all three and is the cheapest way to de-risk.
+cycle (~15 min) answers all three and is the cheapest way to de-risk. **This is
+the gate on #15**: no provider-abstraction code should be written before these
+three answers exist, because each one can change the shape of the interface (a
+CLI-only provider needs a subprocess seam, and a provider with no region-locked
+reattachable volume cannot host the model cache at all).
 
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>
 
 ## Sources
 
 - packet.ai: main / features / cli pages, `dash.packet.ai/docs` (login-gated)
 - hosted·ai platform page (the underlying stack)
 - `hosted-ai/packet-oss` on GitHub (dashboard + CLI; shows the hosted.ai API dependency)
-
-<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source-reference-only">↑ Back to top</a></div>
 - getdeploying.com/packet-ai (pricing / storage tiers)
 
-_Evaluated 2026-07-14 against RunPod as the primary backend._
+_Evaluated 2026-07-14 against RunPod as the primary backend. Promoted from
+reference-only to planned (#15) on 2026-07-27._
+
+<div align="right"><a href="#packetai-as-a-secondary-remote-gpu-source">↑ Back to top</a></div>

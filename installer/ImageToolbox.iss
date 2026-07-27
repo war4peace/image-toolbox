@@ -4,8 +4,9 @@
 ;
 ; The installer itself is small: it ships only the toolbox scripts and the
 ; bootstrap. The first launch of the app downloads the heavy components
-; (Python, PyTorch CUDA, the SeedVR2 engine — about 3 GB) via bootstrap.ps1,
-; and the AI model weights (~16 GB) are fetched by the app on first upscale.
+; (Python, PyTorch CUDA, the SeedVR2 engine) via bootstrap.ps1, and the AI
+; model weights are fetched by the app on first upscale. Deliberately no size
+; figures anywhere in the install path: they drift with every dependency bump.
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -103,7 +104,7 @@ Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your
 Filename: "{#RunPodReferral}"; Description: "Create a RunPod account (opens your browser) - needed to rent a remote GPU"; Flags: postinstall shellexec nowait skipifsilent unchecked; Check: OfferRunPodUnchecked
 ; Launch the app when the wizard finishes - checked by default on BOTH a first
 ; install and an upgrade (so no `unchecked` flag).
-Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (first launch downloads ~3 GB of components)"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\Image Toolbox.cmd"; Description: "Launch Image Toolbox now (the first launch downloads the components it needs)"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 ; Remove what the bootstrap and the app created inside the install folder.
@@ -132,7 +133,7 @@ Type: files; Name: "{app}\install_mode.txt"
 { Install-mode wizard page (#1 remote onboarding): lets the user pick whether the
   app upscales locally, on a rented RunPod pod, or both. The choice is written to
   install_mode.txt, which bootstrap.ps1 reads to decide what to download — Remote
-  skips the ~3 GB local GPU stack (PyTorch CUDA + SeedVR2 + Ollama). }
+  skips the local GPU stack (PyTorch CUDA + SeedVR2 + Ollama). }
 var
   InstallModePage: TInputOptionWizardPage;
   gIsUpgrade: Boolean;      { set once in InitializeSetup, read by the Check funcs }
@@ -160,7 +161,7 @@ begin
     + 'you. You can change this later by re-running the installer.',
     True,   { Exclusive: radio buttons }
     False);
-  InstallModePage.Add('Local - upscale on this PC''s NVIDIA GPU (downloads ~3 GB now, AI weights ~16 GB on first run)');
+  InstallModePage.Add('Local - upscale on this PC''s NVIDIA GPU (large one-time downloads: the GPU stack now, the AI weights on first run)');
   InstallModePage.Add('Remote - upscale on a rented RunPod GPU (lightweight; no local GPU or large downloads needed)');
   InstallModePage.Add('Both - local and remote (full install)');
   InstallModePage.SelectedValueIndex := 0;

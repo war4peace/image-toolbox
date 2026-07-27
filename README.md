@@ -48,7 +48,7 @@ No Git, no Python knowledge required:
 
 The installer offers options to use it locally (taking advantage of your local, powerful GPU) or on a remote machine using RunPod.io infrastructure. ***Note:** I have no business relationship with runpod.io. The only (mutual) "advantage" (in a manner of speaking) is: when you create an account on RunPod from the application, my referral link is used. This gives both me and you an extra credit of 5 USD when you add at least 10 USD to your runpod account.*
 
-The first launch opens a setup window that downloads the required components: Python, PyTorch with CUDA, the SeedVR2 engine (about 150 MB for remote-only, or about 3 GB, if you also picked the option to locally upscale images or videos), a GPL ffmpeg build (~160 MB, used by the Video Upscaler), a bundled libVLC (~40 MB, for in-app video playback with sound) and then starts the app. It also offers to install [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (~6 GB; optional. Local upscaling works without it, and you can decline). The first upscale process you run additionally downloads the AI upscaling model weights (~16 GB) automatically. Everything the setup prints is saved to `bootstrap.log` in the application folder (useful for troubleshooting).
+The first launch opens a setup window that downloads the required components: Python, PyTorch with CUDA and the SeedVR2 engine (a remote-only install skips the local GPU stack, so it downloads far less), a GPL ffmpeg build (used by the Video Upscaler), a bundled libVLC (for in-app video playback with sound) and then starts the app. It also offers to install [Ollama](https://ollama.com) and the vision model used by **Tag & Rename** (optional. Local upscaling works without it, and you can decline). The first upscale process you run additionally downloads the AI upscaling model weights automatically. Everything the setup prints is saved to `bootstrap.log` in the application folder (useful for troubleshooting).
 
 > **Windows SmartScreen note:** because the installer is a new, unsigned download, Windows may show *"Windows protected your PC: Unknown publisher"*. Click **More info → Run anyway**. The installer is built automatically from the public source in this repository by GitHub Actions; you can verify the build on the repository's **Actions** tab.
 
@@ -58,12 +58,12 @@ The first launch opens a setup window that downloads the required components: Py
 * Windows 10/11 (64-bit)
 * An NVIDIA GPU with current drivers (16 GB VRAM minimum)
 * An internet connection
-* ~25 GB of free disk space (plus ~6 GB if you install the tagging model). (PyTorch ships its own CUDA runtime, so a separate CUDA Toolkit install is **not** required).
+* Free disk space for the local GPU stack and the model weights, which are large (the tagging model, if you install it, is extra). (PyTorch ships its own CUDA runtime, so a separate CUDA Toolkit install is **not** required).
 
 ***Remote* Upscaling / Tagging:**
 * Windows 10/11 (64-bit)
 * An internet connection
-* ~3 GB of free disk space (Python infrastructure for application functionality)
+* Modest free disk space (the Python runtime and the app's infrastructure; no local GPU stack, no model weights)
 * A runpod.io account (which you can create via a link from the installer, or separately)
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
@@ -87,7 +87,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 .venv\Scripts\python.exe -m pip install -r seedvr2\requirements.txt pillow piexif timm paho-mqtt python-vlc
 
-# 3. Launch the GUI (model weights ~16 GB download automatically on first use).
+# 3. Launch the GUI (the model weights download automatically on first use).
 #    (In-app video playback also needs a libVLC 3.0.x build in a "vlc\" folder next
 #     to the app; the GUI offers a one-click "Install libVLC now" if it's missing.)
 .venv\Scripts\pythonw.exe scripts\toolbox_gui.py
