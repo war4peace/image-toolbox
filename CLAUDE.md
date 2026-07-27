@@ -298,7 +298,15 @@ deliberately NOT sent with one card, where there is nothing to choose). This
 replaced the image tabs' "Run on remote pod (RunPod)" checkbox and the Video tab's
 Local/Remote radio pair. `remote_var` (Upscaler/Tag) and `mode_var` (Video) survive
 unchanged as the "is this run remote" source of truth that the funds readout,
-telemetry and every `_start` read, so the combobox only drives them. A
+telemetry and every `_start` read, so the combobox only drives them. **The displayed
+label is never the state**: each tab maps label -> mode through a table
+(`ToolTab._run_on_modes`, `VideoTab._mode_tokens`) whose fallback is the CURRENT
+mode, because comparing the display string to a constant (`run_on_var.get() ==
+RUN_ON_REMOTE`, pre-0.5.8) reads an unrecognised label as "not remote" and would
+silently run a pod-bound job on the local GPU. Same rule for the Upscaler's
+phase-changing pause button: `PAUSE_PHASES` + `_set_pause_phase` emit the label and
+its tooltip together instead of looking the hint up by the button's own text
+(`tests/test_display_text_is_not_state.py`). A
 **single-mode install** (Local-only / Remote-only) pins the selector to the one
 value it can run and greys it out, with a tooltip saying why, while the GPU picker
 beside it stays live: there is still a card to pick. Each mode's list is cached, so

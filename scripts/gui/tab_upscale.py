@@ -97,16 +97,25 @@ class UpscaleTab(ToolTab):
 
     # ── Button hints ─────────────────────────────────────────────────────────
 
-    # The middle button changes label with the run phase, so its hint follows
-    # (see _sync_pause_tip). Keyed by the label the button is currently showing.
-    PAUSE_TIPS = {
-        "Cancel": ("Cancel the run before the per-image work starts. The current "
+    # The middle button changes with the run phase. ONE table, keyed by the phase
+    # itself: label and hint come out together, so they cannot disagree and neither
+    # is derived from the other.
+    #
+    # It used to look the hint up by the button's DISPLAYED text, which made the
+    # label the state. A label the table did not know returned None and the button
+    # silently kept the previous phase's hint, and every relabel needed a matching
+    # _sync call to be remembered by hand. `_set_pause_phase` does both or neither.
+    PAUSE_PHASES = {
+        "cancel": ("Cancel",
+                   "Cancel the run before the per-image work starts. The current "
                    "step (scanning, cache check) is finished cleanly and what was "
                    "scanned so far is kept."),
-        "Pause":  ("Pause after the current image and unload the AI models, "
+        "pause":  ("Pause",
+                   "Pause after the current image and unload the AI models, "
                    "giving the graphics card back to you for other work. The "
                    "queue is kept, so Resume continues without re-scanning."),
-        "Resume": ("Continue the paused run. The AI models reload first, so the "
+        "resume": ("Resume",
+                   "Continue the paused run. The AI models reload first, so the "
                    "next image takes longer than the rest."),
     }
 
@@ -129,7 +138,7 @@ class UpscaleTab(ToolTab):
                 "Scan the photo folder and upscale every image that is below the "
                 "Resolution Target. Your originals are never modified: the "
                 "results are written to the output folder.", wraplength=W)
-        self.pause_tip = Tooltip(self.pause_btn, self.PAUSE_TIPS["Pause"],
+        self.pause_tip = Tooltip(self.pause_btn, self.PAUSE_PHASES["pause"][1],
                                  wraplength=W)
         Tooltip(self.stop_btn,
                 "End the run once the current image is finished. Whatever is "
@@ -142,9 +151,13 @@ class UpscaleTab(ToolTab):
                 "Open the log window with this run's full output. Available once "
                 "a run has started.", wraplength=W)
 
-    def _sync_pause_tip(self):
-        tip = self.PAUSE_TIPS.get(self.pause_btn.cget("text"))
-        if tip:
+    def _set_pause_phase(self, phase):
+        """Put the middle button into a phase: cancel / pause / resume. The label
+        and the hint are set from the one table, never read back off the widget."""
+        self._pause_phase = phase
+        label, tip = self.PAUSE_PHASES[phase]
+        self.pause_btn.configure(text=label)
+        if getattr(self, "pause_tip", None) is not None:
             self.pause_tip.set_text(tip)
 
     # ── GUI events specific to the upscaler ─────────────────────────────────
@@ -161,9 +174,7 @@ class UpscaleTab(ToolTab):
                 if processing:                 # entering a processing pass
                     self.eta_var.set("calculating…")
                 if self.running and not self._cancelled:
-                    self.pause_btn.configure(
-                        text="Pause" if processing else "Cancel")
-                    self._sync_pause_tip()
+                    self._set_pause_phase("pause" if processing else "cancel")
         elif kind == "PROG":
             cur, _, tot = payload.partition("|")
             try:
@@ -340,8 +351,7 @@ class UpscaleTab(ToolTab):
             self._phase      = ""
             self._set_running(True)
             # Until per-image processing starts, this button cancels the run
-            self.pause_btn.configure(text="Cancel")
-            self._sync_pause_tip()
+            self._set_pause_phase("cancel")
 
     def _pause_or_cancel(self):
         """
@@ -358,8 +368,7 @@ class UpscaleTab(ToolTab):
             return
         self.send("p")
         self._paused = not self._paused
-        self.pause_btn.configure(text="Resume" if self._paused else "Pause")
-        self._sync_pause_tip()
+        self._set_pause_phase("resume" if self._paused else "pause")
         if self._paused:
             # A local run releases the GPU once the current image is done; a
             # remote one has nothing local to release (the models are on the pod).
@@ -403,8 +412,7 @@ class UpscaleTab(ToolTab):
     def on_exit(self, code):
         self._set_running(False)
         self._paused = False
-        self.pause_btn.configure(text="Pause")
-        self._sync_pause_tip()
+        self._set_pause_phase("pause")
         self.eta_var.set("—")
         # The remote-pod telemetry row only makes sense during a remote run; hide it and
         # zero the MQTT system/remote/* topics so a terminated pod leaves no stale values.

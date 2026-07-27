@@ -260,22 +260,31 @@ Kept because it is the expensive part to rediscover:
   next to each other in Settings and must be labelled "Interface language" vs "Description
   language".
 
-### One piece worth doing anyway, independently of this
+### One piece worth doing anyway: DONE (0.5.8)
 
-The research turned up two places where **logic reads a widget's displayed text**. Both
-work only because the UI is monolingual, and both are worth fixing on their own merits:
+The research turned up two places where **logic read a widget's displayed text**, both
+working only because the UI is monolingual. They were worth fixing on their own merits and
+**were fixed** when this idea was dropped:
 
-1. `tab_upscale.py`: `self.PAUSE_TIPS.get(self.pause_btn.cget("text"))` looks a tooltip up
-   by the button's displayed English label. Under any relabelling this silently returns
-   `None` and the tooltip disappears.
-2. `tooltab.py`: `remote = self.run_on_var.get() == RUN_ON_REMOTE` derives the run mode
-   from a combobox's *display* value. It survives today only because both sides come from
-   one constant, which is fragile by construction: the moment the label and the comparison
-   diverge, the app runs local jobs remotely or vice versa. That is a money bug.
+1. `tab_upscale.py` looked its pause-button tooltip up by the button's own label
+   (`PAUSE_TIPS.get(self.pause_btn.cget("text"))`). Now one `PAUSE_PHASES` table keyed by
+   the phase, set through `_set_pause_phase`, so the label and the hint come out together
+   and neither is derived from the other.
+2. `tooltab.py` derived the run mode from the "Run on" combobox's *display* value
+   (`run_on_var.get() == RUN_ON_REMOTE`). That was a money bug in waiting: an unrecognised
+   label reads as "not remote", so a run aimed at a rented pod would have executed on the
+   local GPU. Now a `_run_on_modes` label-to-mode table whose fallback is **the current
+   mode**, never an implicit local. `tab_video` already did it this way (`mode_var` token +
+   `mode_pick_var` label), so this only brought `ToolTab` in line.
 
-The correct pattern is a stable internal key plus a separate display string. An audit for
-"logic keyed on displayed text" is small, self-contained, and improves correctness whether
-or not localization ever happens.
+`tests/test_display_text_is_not_state.py` pins both, including the unrecognised-label case
+that no manual click-through would produce, plus a structural check that nothing in
+`tab_upscale` reads a widget's text again.
+
+One instance was left alone deliberately: `tab_conciliate` publishes its status label's
+text to MQTT `task/details`. There the published value **is** the human status line by
+design (that is what the topic is), so reading it back off the widget is merely
+inelegant, not wrong. With localization dropped it is not a hazard either.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

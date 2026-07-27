@@ -342,6 +342,14 @@ class ToolTab(MqttTaskState, ttk.Frame):
         values = ([RUN_ON_REMOTE] if imode == "remote" else
                   [RUN_ON_LOCAL] if imode == "local" else
                   [RUN_ON_LOCAL, RUN_ON_REMOTE])
+        # Display label -> the mode it MEANS. `run_on_var` holds what the user sees;
+        # this is what the code asks. Comparing the displayed string to a constant
+        # worked only while both happened to be the same literal, and the failure is
+        # silent AND expensive: an unrecognised label reads as "not remote", so a run
+        # the user sent to a rented pod would quietly execute on the local GPU (or,
+        # on a Remote-only install, not at all). VideoTab already splits the two this
+        # way (`mode_var` token + `mode_pick_var` label); this brings ToolTab in line.
+        self._run_on_modes = {RUN_ON_LOCAL: False, RUN_ON_REMOTE: True}
         self.run_on_var = tk.StringVar(
             value=RUN_ON_REMOTE if self.remote_var.get() else RUN_ON_LOCAL)
         self.run_on_combo = ttk.Combobox(
@@ -415,7 +423,9 @@ class ToolTab(MqttTaskState, ttk.Frame):
         """The 'Run on' selector changed (or the tab just came up): mirror it into
         remote_var, then show the GPU list that belongs to the new mode. Each list
         is cached, so flipping back and forth costs no extra RunPod call."""
-        remote = self.run_on_var.get() == RUN_ON_REMOTE
+        # Fall back to the CURRENT mode, never to "local": an unknown label must not
+        # silently move a run off the pod the user picked.
+        remote = self._run_on_modes.get(self.run_on_var.get(), bool(self.remote_var.get()))
         self.remote_var.set(remote)
         self.gpu_tip.set_text(self.GPU_TIP_REMOTE if remote else self.GPU_TIP_LOCAL)
         self._gpu_choices = []
