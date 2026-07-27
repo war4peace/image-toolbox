@@ -58,43 +58,77 @@ triggers:
     allowed_methods:
       - POST
     local_only: true
+
+# Read the alert once, so every action below says the same thing and there is only
+# one place to edit. `message` arrives already written out (the summary plus one
+# line per detail), which is why nothing here has to walk the payload.
+# See docs/notifications.md for every key you can use.
+variables:
+  alert_title: "{{ trigger.json.title | default('Image Toolbox') }}"
+  alert_message: "{{ trigger.json.message | default('(no details)') }}"
+  alert_level: "{{ trigger.json.level | default('info') }}"
+
 actions:
+  # 1) The Home Assistant sidebar. Works on every install, nothing to configure.
   - action: notify.persistent_notification
     data:
-      # `message` arrives already written out (the summary plus one line per
-      # detail), which is why this is one line instead of a template that walks
-      # the payload. See docs/notifications.md for every key you can use.
-      title: "{{ trigger.json.title | default('Image Toolbox') }}"
-      message: "{{ trigger.json.message | default('(no details)') }}"
+      title: "{{ alert_title }}"
+      message: "{{ alert_message }}"
+
+  # 2) YOUR PHONE. Delete the leading "# " from the six lines at the end of this
+  #    block, and put your own device in place of notify.CHANGE_ME_your_phone.
+  #
+  #    To find its name: Developer Tools > States, filter on "notify." and look for
+  #    your phone (the Home Assistant companion app creates one entity per device).
+  #    Or in the automation's visual editor: Add action > "Send a notification
+  #    message", and pick the device from the list.
+  #
+  # - action: notify.send_message
+  #   target:
+  #     entity_id: notify.CHANGE_ME_your_phone
+  #   data:
+  #     title: "{{ alert_title }}"
+  #     message: "{{ alert_message }}"
 
 # ---------------------------------------------------------------------
-# WANT IT ON YOUR PHONE, LOUDER WHEN SOMETHING FAILED?
+# ONLY THE BAD NEWS
 # ---------------------------------------------------------------------
-# Replace the action above with the block below. `trigger.json.level` is one of
-# success / caution / warning / error (plus `info` if the app ever sends a
-# severity this version does not know), which is what makes "only buzz me for
-# bad news" a one-line condition.
+# `alert_level` is one of success / caution / warning / error (plus `info` if the
+# app ever sends a severity this version does not know). To be notified only when
+# something needs you, add a condition between `variables:` and `actions:`:
 #
-#   - action: notify.mobile_app_YOUR_PHONE
+#   conditions:
+#     - condition: template
+#       value_template: "{{ alert_level in ['error', 'warning', 'caution'] }}"
+#
+# Or keep both: leave the sidebar action unconditional and give the phone action
+# its own `if` (visual editor: Add building block > If-then).
+#
+# ---------------------------------------------------------------------
+# MAKING A FAILURE BUZZ HARDER THAN A COMPLETION
+# ---------------------------------------------------------------------
+# `notify.send_message` above is the modern, tidy way to reach a device, but it
+# carries ONLY a title and a message. The companion app's extras (an Android
+# channel, an iOS interruption level, a sound) need the older per-device action,
+# which takes a nested `data:`. Use this INSTEAD of action 2 if you want that:
+#
+#   - action: notify.mobile_app_YOUR_PHONE      # same device, older syntax
 #     data:
-#       title: "{{ trigger.json.title }}"
-#       message: "{{ trigger.json.message }}"
+#       title: "{{ alert_title }}"
+#       message: "{{ alert_message }}"
 #       data:
 #         push:
 #           # iOS: break through a Focus mode only when it went wrong.
 #           interruption-level: >-
-#             {{ 'time-sensitive' if trigger.json.level in ['error', 'warning']
+#             {{ 'time-sensitive' if alert_level in ['error', 'warning']
 #                else 'passive' }}
 #         # Android: route the bad news to its own channel.
 #         channel: >-
-#           {{ 'Image Toolbox alerts' if trigger.json.level == 'error'
+#           {{ 'Image Toolbox alerts' if alert_level == 'error'
 #              else 'Image Toolbox' }}
 #
-# To notify ONLY on failures, add a condition instead:
-#
-#   conditions:
-#     - condition: template
-#       value_template: "{{ trigger.json.level in ['error', 'warning'] }}"
+# (Both forms reach the same phone. Start with the simple one; switch only if you
+# want the extras.)
 #
 # ---------------------------------------------------------------------
 # A SINGLE DETAIL OUT OF THE ALERT

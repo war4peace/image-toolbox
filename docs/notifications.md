@@ -206,7 +206,45 @@ If Test says 200 and neither shows anything, in order of likelihood:
 | `color` | the Discord colour int, passed through for completeness |
 | `app` | always `Image Toolbox`, so one automation can serve several senders |
 
-The sample automation shows a phone notification that escalates on `level`.
+### Getting it onto your phone
+
+The sample writes to the Home Assistant sidebar, which works everywhere with nothing to
+configure. To also (or instead) push it to a phone running the Home Assistant companion
+app, uncomment the second action in the sample and put your device's entity in it:
+
+```yaml
+  - action: notify.send_message
+    target:
+      entity_id: notify.your_phone      # Developer Tools > States, filter "notify."
+    data:
+      title: "{{ alert_title }}"
+      message: "{{ alert_message }}"
+```
+
+The sample reads the alert once into `variables:` (`alert_title`, `alert_message`,
+`alert_level`), so every action says the same thing and there is one place to edit.
+
+`notify.send_message` is the current, tidy form, and the device is pickable from a list in
+the visual editor. It carries **only** a title and a message, though. The companion app's
+extras (an Android channel, an iOS interruption level, a custom sound) need the older
+per-device action, which takes a nested `data:`:
+
+```yaml
+  - action: notify.mobile_app_your_phone
+    data:
+      title: "{{ alert_title }}"
+      message: "{{ alert_message }}"
+      data:
+        push:
+          interruption-level: >-
+            {{ 'time-sensitive' if alert_level in ['error', 'warning'] else 'passive' }}
+        channel: >-
+          {{ 'Image Toolbox alerts' if alert_level == 'error' else 'Image Toolbox' }}
+```
+
+Both reach the same phone. Start with the simple one; switch only if you want a failed run
+to arrive louder than a completed one. To be notified *only* when something needs you, add
+a condition on `alert_level` instead: the sample shows that too.
 
 ### HTTPS and self-signed certificates
 

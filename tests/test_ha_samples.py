@@ -230,6 +230,19 @@ def test_the_webhook_sample_tells_the_user_to_change_the_id(webhook_automation):
     assert "CHANGE_ME" in webhook_automation["triggers"][0]["webhook_id"]
 
 
+def _render_webhook_sample(payload):
+    """Home Assistant's two stages: `variables:` are rendered against the trigger,
+    then the actions are rendered with those variables in scope. Mirrored here so
+    the test exercises what HA actually does with the file."""
+    doc = _load("automation-webhook.yaml")
+    env = jinja2.Environment()
+    trigger = type("T", (), {"json": payload})
+    variables = {k: env.from_string(v).render(trigger=trigger)
+                 for k, v in doc["variables"].items()}
+    return {k: env.from_string(v).render(trigger=trigger, **variables)
+            for k, v in doc["actions"][0]["data"].items()}
+
+
 def test_the_webhook_sample_renders_against_the_real_payload():
     """The sample reads `trigger.json.*`; the app builds that dict in
     notifications.ha_payload. Renaming a key there would leave every user's
@@ -239,17 +252,46 @@ def test_the_webhook_sample_renders_against_the_real_payload():
     payload = notifications.ha_payload(
         "Upscale finished", "37 processed, 2 skipped", notifications.COLOR_GREEN,
         [{"name": "Source", "value": "X:\\Poze"}], source="Upscale Bot")
-    doc = _load("automation-webhook.yaml")
-    env = jinja2.Environment()
-    trigger = type("T", (), {"json": payload})
-    rendered = {k: env.from_string(v).render(trigger=trigger)
-                for k, v in doc["actions"][0]["data"].items()}
+    rendered = _render_webhook_sample(payload)
     assert rendered["title"] == "Upscale finished"
     assert "37 processed" in rendered["message"]
     assert "Source: X:\\Poze" in rendered["message"]     # the pre-rendered body
     for value in rendered.values():
         assert "no details" not in value                 # the default() fallbacks
         assert "Undefined" not in value
+
+
+def test_the_webhook_sample_survives_a_payload_it_does_not_recognise():
+    """The `default(...)` fallbacks are not decoration: a future version could add
+    a sender, and an automation that renders "None" or raises is worse than one
+    that says less."""
+    rendered = _render_webhook_sample({})
+    assert rendered["title"] == "Image Toolbox"
+    assert rendered["message"] == "(no details)"
+
+
+def test_the_sample_reads_the_alert_once_into_variables():
+    """Title/message/level are read in `variables:` so every action (including any
+    the user adds, e.g. their phone) says the same thing, and there is one place to
+    edit rather than one per action."""
+    doc = _load("automation-webhook.yaml")
+    assert set(doc["variables"]) == {"alert_title", "alert_message", "alert_level"}
+    for action in doc["actions"]:
+        for value in action.get("data", {}).values():
+            assert "trigger.json" not in value, "actions should read the variables"
+
+
+def test_the_sample_works_the_moment_it_is_pasted():
+    """Its one live action is the sidebar notification, which exists on every
+    install. The phone action is commented out on purpose: shipping it live would
+    need an entity id nobody else has, and every alert would log a failed action."""
+    doc = _load("automation-webhook.yaml")
+    assert len(doc["actions"]) == 1
+    assert doc["actions"][0]["action"] == "notify.persistent_notification"
+    with open(os.path.join(SAMPLES, "automation-webhook.yaml"), encoding="utf-8") as fh:
+        src = fh.read()
+    assert "# - action: notify.send_message" in src        # the phone recipe is there
+    assert "notify.CHANGE_ME_your_phone" in src            # ...with a placeholder
 
 
 def test_the_documented_field_lookup_works_on_the_real_payload():
