@@ -168,7 +168,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | Runs on NVIDIA | ✅ | ✅ | |
 | Runs on integrated GPUs | ⚠️ | ❌ | Upscayl: "many iGPUs do not work", but it can. |
 | GPU selection on multi-GPU machines | ✅ | ✅ | Upscayl: GPU ID setting. Image Toolbox: a per-tab "Run on" + GPU picker (0.5.8). |
-| Rent a cloud GPU by the second | ❌ | ✅ | RunPod, with live catalog, stock and price; ~$0.19 per 100 images on an A40. **More remote GPU providers planned** (packet.ai evaluated, see `docs/packet-ai-secondary-gpu.md`). |
+| Rent a cloud GPU by the second | ❌ | ✅ | RunPod, with live catalog, stock and price; ~0.19 USD per 100 images on an A40. **More remote GPU providers planned** (packet.ai evaluated, see `docs/packet-ai-secondary-gpu.md`). |
 | Cost estimate before renting | ❌ | ✅ | Shown before any pod is created. |
 | Spending guard (balance floor, session cap) | ❌ | ✅ | `funds_guard.py`. |
 | Per-card benchmark tool | ❌ | ✅ | Measures the real batch ceiling and s/frame per target; calibrates estimates. |

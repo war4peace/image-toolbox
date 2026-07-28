@@ -33,7 +33,7 @@ Batch Upscaler runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upsc
 - [Remote GPU cost (RunPod)](#remote-gpu-cost-runpod)
   - [Remote Upscaling (Batch Upscaler)](#remote-upscaling-batch-upscaler)
   - [Remote Tag & Rename](#remote-tag--rename)
-- [How it compares to Upscayl](#how-it-compares-to-upscayl)
+- [How it compares to other tools](#how-it-compares-to-other-tools)
 - [Samples](#samples)
 - [Notes](#notes)
 
@@ -339,7 +339,9 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 
 ---
 
-## How it compares to Upscayl
+## How it compares to other tools
+
+### Upscayl
 
 [Upscayl](https://github.com/upscayl/upscayl) is the best-known free AI image upscaler, and it is a good tool. If you want to upscale a handful of images, on a Mac / on AMD / on Linux, right now, with minimum ceremony, **use Upscayl**: it runs Real-ESRGAN class models through ncnn + Vulkan, so it works on any Vulkan-capable GPU on Windows, macOS and Linux, and it has a large model library, custom-model import and a CLI.
 
@@ -348,6 +350,14 @@ Image Toolbox is a different shape of tool. It is NVIDIA-only and Windows-only, 
 So: 40,000 family photos and a shelf of old camcorder footage, unattended and restartable, is the job this was built for.
 
 **[Full feature-by-feature comparison: `docs/upscayl-vs-image-toolbox.md`](/docs/upscayl-vs-image-toolbox.md)**, including a section on where Image Toolbox is honestly the weaker tool, and one on using both together (Image Toolbox for the pipeline, Upscayl for the one-off).
+
+### Topaz Gigapixel and Topaz Video
+
+The commercial reference products are worth comparing against too, and the honest summary is that they offer far more control and far more scope. **[Topaz Gigapixel](https://www.topazlabs.com/topaz-gigapixel)** has nine model families, face recovery, corrective sliders for noise / blur / compression, automatic per-image model choice, RAW input, Photoshop and Lightroom plugins, and it runs on AMD, Intel and Apple GPUs at a 6 GB VRAM floor. **[Topaz Video](https://www.topazlabs.com/topaz-video)** does eight things Image Toolbox does not do at all (denoise, sharpen, stabilise, frame interpolation, slow motion, motion deblur, grain, SDR to HDR), exports ProRes and FFV1, goes past 4K, and scales across multiple GPUs. Which tool upscales a given photo or clip more attractively is a separate question that these comparisons deliberately do not answer: no side-by-side test was run, and the answer varies by source and by taste. Try both on your own files.
+
+What Image Toolbox adds is the collection layer and the cost layer: a recursive tree walk with a mirrored output, segment-level resume so a multi-day queue is banked minute by minute, renting a specific cloud GPU by the second with an estimate and a spending cap, surviving the loss of that GPU mid-run, tagging and renaming, and conciliating the results back over the originals. It is also free, needs no account, and both Topaz products are subscription-only since October 2025.
+
+**Full comparisons: [`docs/topaz-gigapixel-vs-image-toolbox.md`](/docs/topaz-gigapixel-vs-image-toolbox.md)** and **[`docs/topaz-video-vs-image-toolbox.md`](/docs/topaz-video-vs-image-toolbox.md)**, each with the same honest-weaknesses and use-them-together sections.
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
