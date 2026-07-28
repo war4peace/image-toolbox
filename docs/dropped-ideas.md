@@ -24,6 +24,7 @@ Sources: `docs/future-features.md` (open roadmap) and
 - [Verifying the Home Assistant webhook](#verifying-the-home-assistant-webhook-2026-07-27)
 - [UI localization / multi-language interface](#ui-localization--multi-language-interface-2026-07-27)
 - [Light/dark theme](#lightdark-theme-2026-07-28)
+- [Background removal for images and video](#background-removal-for-images-and-video-2026-07-28)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -391,6 +392,126 @@ and it is the part that has no clear finish line.
 The first step is not code. **A throwaway branch that flips one tab to `clam` and
 screenshots it next to the current `vista` UI** answers the only question that matters, in
 a minute, and everything else is downstream of that answer.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Background removal for images and video (2026-07-28)
+
+> Research background remover functionality for images
+> (<https://huggingface.co/briaai/RMBG-2.0>), as well as video
+> (<https://bria.ai/video-background-removal>), using API only (users provide their API
+> key).
+
+Asked for by **someone on social media**, not by the author. Researched 2026-07-27 against
+BRIA's public docs and pricing pages, then **dropped**. Nothing was built.
+
+**The decision, in the author's words:** Image Toolbox is not the right tool for this,
+because **background removal exceeds the scope of the application**. If it were trivial to
+implement it might have been worth a go anyway; it is not.
+
+**Revisit if** there is *enough demand*: not one request, but a repeated ask from several
+users. A second trigger would be the effort collapsing, which is plausible (see the licence
+finding: the MIT model below runs on the stack Local/Both installs already have). Even then
+the scope objection stands on its own and has to be answered first.
+
+### Why "exceeds the scope" is the right call, not just a preference
+
+This app revives **old family photo collections**: it upscales them, describes and renames
+them, and puts the results back. Background removal is a product-photo / avatar / thumbnail
+tool. It is a different job for a different person, and it would be the first feature here
+that does not serve "make my parents' photos look good again".
+
+It is also only half a feature. If the point is "cut the subject out and put it on a new
+background", the second half is **compositing**, which the app has no UI for and no reason
+to grow one.
+
+### The API, as measured (re-check before any work: two BRIA pages already disagreed)
+
+| | Image | Video |
+|---|---|---|
+| Endpoint | `POST https://engine.prod.bria-api.com/v2/image/edit/remove_background` | `POST .../v2/video/edit/remove_background` |
+| Auth | `api_token: <key>` header | same |
+| Input | JSON `{"image": "<base64 or public URL>"}` | video URL or file |
+| Synchronous? | **No.** `202` + `request_id` + `status_url`, poll until terminal | no |
+| Output | `result.image_url`, a link to download the PNG (alpha) | same shape |
+| Extras | input **and** output content moderation, either can block the call | four endpoints incl. a 24 fps WebSocket streaming one |
+| Price | **~$0.018/image** on the RMBG-2.0 tier; a self-service page said **$0.08/image** | **$0.14 per video second** |
+| Free tier | ~100 trial calls | same account |
+
+Base64 input matters: a desktop app can send a local file with no "host your photo publicly
+first" step. The **result** is a URL to download, so every processed image round-trips
+through BRIA storage.
+
+**The video price kills the video half outright.** Against this repo's own measured figures
+for a 1-minute clip on a rented pod ([video-upscaler.md](video-upscaler.md), section 7):
+
+| 1-minute clip | Cost |
+|---|---|
+| SeedVR2 upscale to 1080p (RTX PRO 6000) | ~$0.77 |
+| SeedVR2 upscale to **4K** | ~$6.90 |
+| **BRIA background removal** | **$8.40** |
+
+A 10-minute home video is **$84**. The app's whole video design exists to make a long job
+affordable (per-run minute and cost caps, installments, a cheapest-card estimator), and a
+fixed per-second cloud price defeats every one of those levers at once: there is no cheaper
+card to pick and nothing to tune. If this is ever revived, **images only**.
+
+### The licence finding, which is the genuinely useful one
+
+`briaai/RMBG-2.0` on Hugging Face is **CC BY-NC 4.0** ("Commercial use is subject to a
+commercial agreement with BRIA"), so the weights cannot be bundled. The API price includes
+the commercial licence, which is exactly why the original idea said "API only". But:
+
+1. **RMBG-2.0 is BiRefNet.** BRIA's own model card describes it as the **BiRefNet
+   architecture** plus their proprietary dataset and training. `ZhengPeng7/BiRefNet` is
+   **MIT**, 0.2B parameters, and runs on the torch + Pillow stack this app already ships on
+   Local/Both installs. So "a local background remover" is **not blocked by licensing at
+   all**; only *BRIA's* weights are. Quality is not the deciding factor either way: BRIA's
+   own claim is that RMBG-2.0 beats stock BiRefNet because of their **training data**, on
+   the same architecture. A refinement, not a category difference, and nobody here is
+   compositing for print.
+2. **"Non-commercial" may not be as simple as it looks.** The app is free, but the installer
+   carries a RunPod **affiliate** referral link
+   ([ImageToolbox.iss:17](../installer/ImageToolbox.iss#L17)) and the status bar a donation
+   link. Whether that colours a CC BY-NC bundle is a question for BRIA or a lawyer.
+   Recorded so nobody bundles the weights assuming "it is a free app" settles it.
+
+So the cheap path, if demand ever justifies one, is **local MIT BiRefNet**, not the API: no
+key, no account, no per-image cost, no moderation, nothing leaves the machine, works
+offline. The trade is a ~1 GB model download, a second thing to keep loaded, and
+Remote-only installs needing a pod path (small next to SeedVR2's 16 GB, so the pod worker
+could serve it).
+
+### The objections that would still apply on the API path
+
+- **It breaks the "everything runs on your machine" promise** stated at the top of
+  `CLAUDE.md` and in the README. Every other remote thing here rents *the user's own* GPU on
+  demand and sends images to a pod the user controls and destroys. This would send them to a
+  company, which stores the result at least long enough to serve a download URL. A different
+  bargain, and one that should be made explicitly rather than discovered in a checkbox.
+- **Content moderation can refuse a photo.** The endpoint moderates input and output. In an
+  app built for family photos (beach photos, children, old prints) a false positive is not
+  hypothetical, and there is nothing the app could do but report the picture as rejected.
+- **The output is a PNG cutout, and it must never reach Conciliation.** Conciliation
+  replaces originals with their processed counterparts, matching by content-hash lineage
+  first and mirrored **name** second for images. A `photo.jpg` whose "processed" counterpart
+  is a transparent `photo.png` cutout is precisely the case where a successful match is a
+  disaster. Anything built here must **not** record lineage for cutouts, and the name
+  fallback must not see them. The Video Upscaler already had to make this same call
+  (lineage-only matching, no name guess; see `conciliate.py`).
+
+### What it would have cost
+
+The API client (submit / poll / fetch, stdlib + `net_ssl`), the Settings key + Test, the
+secrets split (`bria.api_key` into `config_store.SECRET_FIELDS`) and the Conciliation
+carve-out are each small. The runner + tab is medium, and mostly inherited: `ToolTab`
+already provides the subprocess runner, the `@@TBX@@` event protocol, the film strip, the
+progress bar and ETA, the taskbar progress, MQTT `task/*` publishing and the notification
+fan-out. Local BiRefNet instead of the API is medium plus a model download.
+
+That is the trap in this idea, and worth naming: it **fits the existing seams almost too
+well**, which makes it look cheap. Fitting the plumbing is not the same as belonging in the
+product.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
