@@ -12,6 +12,11 @@ Related, deliberately not duplicated here:
 | Why the `system/*` telemetry looks the way it does (+ the in-app graphs) | [`telemetry-design.md`](telemetry-design.md) |
 | The Video Upscaler itself | [`video-upscaler.md`](video-upscaler.md) |
 
+**Verified against a live Home Assistant install on 2026-07-28**: the MQTT topics, the
+webhook backend, and the sample sensors, templates and automations all work as
+documented. The only adjustment needed was the indentation of the template YAML, which
+depends on how a given install splits its configuration files.
+
 MQTT is **optional and opt-in**: it activates when a broker **host** is set in
 Settings > MQTT and stops when the host is cleared. There is no separate enable toggle,
 because a second switch that can disagree with the host field is one more thing to get

@@ -32,6 +32,14 @@ Two tiers:
 
 Add the entities first, then a dashboard.
 
+> **Expect to re-indent the two YAML snippets.** They are written at the nesting
+> level of a top-level key in `configuration.yaml`. If your config splits sensors
+> and templates into `!include`d files (a very common layout, and every install
+> differs a little), the same lines belong at a different indentation. YAML cares,
+> Home Assistant will tell you it does, and it is the one adjustment to expect.
+> The automations and the dashboard cards paste as-is, since they go into the UI
+> editors rather than a config file.
+
 1. **MQTT sensors** - [`mqtt-sensors.yaml`](mqtt-sensors.yaml): every published
    topic as a Home Assistant MQTT sensor (local machine and remote pod). Add it
    under the MQTT `sensor:` block in your `configuration.yaml` (or a file you

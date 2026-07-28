@@ -33,6 +33,7 @@ Batch Upscaler runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upsc
 - [Remote GPU cost (RunPod)](#remote-gpu-cost-runpod)
   - [Remote Upscaling (Batch Upscaler)](#remote-upscaling-batch-upscaler)
   - [Remote Tag & Rename](#remote-tag--rename)
+- [How it compares to Upscayl](#how-it-compares-to-upscayl)
 - [Samples](#samples)
 - [Notes](#notes)
 
@@ -332,6 +333,20 @@ The figures below come from benchmarking a 100-image sample of typical digital-c
 **Findings.** Tagging is light: the vision model needs only ~6.6 GB, so the big datacenter cards are wildly overprovisioned and barely faster. The fastest card (H100, 2.4 sec/img) is only about 13% quicker than the RTX A4500 yet costs 13 times as much per hour. Pick a cheap card: an **RTX A4500** or **RTX 2000 Ada** tags 10,000 photos for around $2.50. (Tag & Rename also runs on a local GPU at no GPU cost: a local RTX 3090 tagged 100 photos in under six minutes.)
 
 > **Caveats:** prices are point-in-time and vary by availability and region (the in-app GPU picker shows live prices). The estimates exclude the billed pod boot/teardown (~2 to 3 minutes) and the image upload/download time, so real bills run a little higher, most noticeably on very small runs. Source data: [`docs/image-benchmarks.csv`](/docs/image-benchmarks.csv).
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
+---
+
+## How it compares to Upscayl
+
+[Upscayl](https://github.com/upscayl/upscayl) is the best-known free AI image upscaler, and it is a good tool. If you want to upscale a handful of images, on a Mac / on AMD / on Linux, right now, with minimum ceremony, **use Upscayl**: it runs Real-ESRGAN class models through ncnn + Vulkan, so it works on any Vulkan-capable GPU on Windows, macOS and Linux, and it has a large model library, custom-model import and a CLI.
+
+Image Toolbox is a different shape of tool. It is NVIDIA-only and Windows-only, and upscaling is one of four tools rather than the product. What it adds is everything around a *collection*: video upscaling, vision-model tagging and renaming, replacing the originals with the processed results, resumable multi-thousand-file runs, renting a cloud GPU by the second when the local one is not enough, and home-automation / notification integration. It also runs **SeedVR2**, a diffusion upscaler, alongside Real-ESRGAN.
+
+So: 40,000 family photos and a shelf of old camcorder footage, unattended and restartable, is the job this was built for.
+
+**[Full feature-by-feature comparison: `docs/upscayl-vs-image-toolbox.md`](/docs/upscayl-vs-image-toolbox.md)**, including a section on where Image Toolbox is honestly the weaker tool, and one on using both together (Image Toolbox for the pipeline, Upscayl for the one-off).
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 
