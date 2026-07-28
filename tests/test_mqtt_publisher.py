@@ -1,6 +1,6 @@
 """
-Tests for mqtt_publisher's retained-vs-event publishing (finding F2 of
-docs/coarse-ideas-plan.md).
+Tests for mqtt_publisher's retained-vs-event publishing (the contract is
+docs/mqtt-integration.md).
 
 The trap: every state topic is published **retained**, and `MqttClient` also
 replays its retained set on each (re)connect. A Home Assistant automation that

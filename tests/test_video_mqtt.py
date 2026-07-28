@@ -1,6 +1,6 @@
 """
-Tests for the Video Upscaler's MQTT / Home Assistant reporting (finding F1 of
-docs/coarse-ideas-plan.md).
+Tests for the Video Upscaler's MQTT / Home Assistant reporting (the contract is
+docs/mqtt-integration.md).
 
 The gap: `VideoTab` is not a `ToolTab`, so it published NO task state at all and
 `batch_video_upscale` emitted no `DONE` event. Home Assistant read `task/name =

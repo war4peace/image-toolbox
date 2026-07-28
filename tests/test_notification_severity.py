@@ -1,5 +1,5 @@
 """
-Tests for the notification SEVERITY contract (finding F4 of docs/coarse-ideas-plan.md).
+Tests for the notification SEVERITY contract (docs/notifications.md).
 
 The bug: an alert's severity travels as a Discord embed colour int, and until
 0.5.8 every runner wrote its own literal. The Video Upscaler used a different

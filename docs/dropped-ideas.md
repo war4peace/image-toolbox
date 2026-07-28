@@ -8,18 +8,17 @@ gets re-investigated from scratch.
 Nothing here is scheduled. If one is revisited, the trigger is named in its
 entry ("revisit only if ...").
 
-Sources: `docs/future-features.md` (open roadmap) and
-`docs/coarse-ideas-plan.md` (the 2026-07 coarse-idea investigation).
+Source for the open roadmap: `docs/future-features.md`.
 
 ---
 
 ## Contents
 
-- [Deferred local-engine install (coarse idea #2)](#deferred-local-engine-install-coarse-idea-2-2026-07-21)
-- [Parallel jobs: an image tool + the Video Upscaler (coarse idea #3)](#parallel-jobs-an-image-tool--the-video-upscaler-coarse-idea-3-2026-07-21)
+- [Deferred local-engine install](#deferred-local-engine-install-2026-07-21)
+- [Parallel jobs: an image tool + the Video Upscaler](#parallel-jobs-an-image-tool--the-video-upscaler-2026-07-21)
 - [Pause for the Video Upscaler](#pause-for-the-video-upscaler-2026-07-21)
 - [Region pre-seed at first-run bootstrap](#region-pre-seed-at-first-run-bootstrap)
-- [Automatic run-telemetry reporting](#automatic-run-telemetry-reporting-coarse-idea-4-phase-2)
+- [Automatic run-telemetry reporting](#automatic-run-telemetry-reporting-phase-2)
 - [Everything around the donation link](#everything-around-the-donation-link-2026-07-27)
 - [Verifying the Home Assistant webhook](#verifying-the-home-assistant-webhook-2026-07-27)
 - [UI localization / multi-language interface](#ui-localization--multi-language-interface-2026-07-27)
@@ -29,7 +28,7 @@ Sources: `docs/future-features.md` (open roadmap) and
 
 ---
 
-## Deferred local-engine install (coarse idea #2, 2026-07-21)
+## Deferred local-engine install (2026-07-21)
 
 **The idea.** Stop shipping the ~5 GB GPU stack up front: install torch CUDA +
 seedvr2 on demand, the first time the user starts a LOCAL run, so a "Both"
@@ -59,7 +58,7 @@ install under ~300 MB").
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
-## Parallel jobs: an image tool + the Video Upscaler (coarse idea #3, 2026-07-21)
+## Parallel jobs: an image tool + the Video Upscaler (2026-07-21)
 
 **The idea.** Let one image-side tool and the Video Upscaler run at the same
 time, behind a GUI-enforced compatibility matrix.
@@ -116,7 +115,7 @@ them.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
-## Automatic run-telemetry reporting (coarse idea #4, phase 2)
+## Automatic run-telemetry reporting (phase 2)
 
 The community-database idea shipped as roadmap **#8, Benchmark sharing** (0.5.1),
 but only its zero-infrastructure half: a curated CSV in the repo, auto-downloaded

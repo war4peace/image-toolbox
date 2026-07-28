@@ -436,8 +436,9 @@ The numbers survive only because code and other docs cite the roadmap by them
 ## Decided against / constraints
 
 Moved to **`docs/dropped-ideas.md`**: the Video Upscaler pause, the region
-pre-seed, coarse idea #2 (deferred local-engine install), coarse idea #3
-(parallel jobs), coarse idea #4's automatic-telemetry half, and the standing
-constraints (AMD/ROCm, vast.ai as a second provider).
+pre-seed, the deferred local-engine install, parallel jobs (an image tool
+alongside the Video Upscaler), the automatic-telemetry half of benchmark
+sharing, UI localization, a light/dark theme, background removal, and the
+standing constraints (AMD/ROCm, vast.ai as a second provider).
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
