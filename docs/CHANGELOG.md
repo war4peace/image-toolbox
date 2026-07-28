@@ -20,6 +20,35 @@ Releases page.
 
 ## 0.5.8
 
+### One "Run on" row on every GPU tab
+The three tools that use a GPU (Batch Upscaler, Tag & Rename, Video Upscaler) now ask
+the same question in the same place, in the same way: a **Run on** picklist (*Local GPU*
+or *Remote: RunPod*) with a **GPU picker** beside it. It replaces the image tabs'
+"Run on remote pod (RunPod)" checkbox and the Video Upscaler's Local/Remote radio
+buttons.
+
+The picker is now useful in **both** modes. Remote lists the live RunPod catalog as
+before (prices, stock, cheapest first). Local lists **your own NVIDIA cards**, which is
+new: on a machine with two cards you can send a run to a specific one and leave the
+other free for something else. With a single card there is nothing to choose and nothing
+changes.
+
+If your install is Local-only or Remote-only, the picklist shows the one mode you can
+run and explains why it is fixed. The GPU picker next to it stays live, because there is
+still a card to pick.
+
+- **Tab order** is now Batch Upscaler, Tag & Rename, Video Upscaler, Conciliation,
+  Settings, RunPod: the three GPU tools sit together, and Conciliation (which runs after
+  them) follows.
+- **The window's minimum width went from 900 to 1200 px.** The video queue's columns
+  need it; below that the *Segments* column was clipped.
+- **Settings** got a layout pass around the same controls: the *Upscaling* section is
+  now *Batch Upscaler*, its value boxes line up, and the Video Upscaler section is laid
+  out three-across. The stray SeedVR2 *Model* row is gone: there is one **Model**
+  picklist under **Method** that follows the method and lists SeedVR2 weights or
+  Real-ESRGAN models. Your two choices are stored separately, so switching method never
+  loses the other engine's model.
+
 ### The Video Upscaler now reports to Home Assistant
 Video runs were invisible to the MQTT integration: while a queue was upscaling, Home
 Assistant still read **idle**, the progress/ETA/runtime values sat frozen at whatever the
