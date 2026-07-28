@@ -39,3 +39,8 @@ submissions/
 # Unstructured personal dev notes / brain-dumps (not release docs; the structured
 # notes in docs/*.md are tracked). Too loose to version.
 docs/coarse*
+
+# Personal task list: the work items that need the MAINTAINER to do something by hand
+# (download sample files, produce comparison sets, look at results and judge). Not a design
+# doc and not shared: the decisions it feeds go to docs/future-features.md.
+docs/manual-todos.md

@@ -24,6 +24,8 @@ Source for the open roadmap: `docs/future-features.md`.
 - [UI localization / multi-language interface](#ui-localization--multi-language-interface-2026-07-27)
 - [Light/dark theme](#lightdark-theme-2026-07-28)
 - [Background removal for images and video](#background-removal-for-images-and-video-2026-07-28)
+- [Archival / intermediate codec output](#archival--intermediate-codec-output-2026-07-28)
+- [Processing alpha, multi-page and high-bit-depth images](#processing-alpha-multi-page-and-high-bit-depth-images-2026-07-29)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -511,6 +513,146 @@ fan-out. Local BiRefNet instead of the API is medium plus a model download.
 That is the trap in this idea, and worth naming: it **fits the existing seams almost too
 well**, which makes it look cheap. Fitting the plumbing is not the same as belonging in the
 product.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Archival / intermediate codec output (2026-07-28)
+
+> Batch Upscaler: extend input image processing to RAW and DNG files, as well as
+> Archival / intermediate codecs (ProRes, FFV1)
+
+Half of this idea turned out to be **already shipped**: ProRes, FFV1 and DNxHR *input*
+works end to end and losslessly today, verified by measurement. That half is documented
+in [`video-upscaler.md`](video-upscaler.md) section 6.5 and is not repeated here.
+
+What was **dropped** is producing an archival or intermediate codec as the **output**, plus
+adding `.mxf` to `VIDEO_EXTS`.
+
+### Why
+
+**The deliverable exists to play natively on a monitor or a TV.** That is the app's stated
+purpose, and it is the same sentence that settled the RAW output-format question the same
+day (`.jpg`, not 16-bit TIFF). No television plays FFV1, and ProRes playback outside the
+Apple ecosystem is unreliable. An archival or intermediate output is therefore not the
+deliverable at all: it is a second, optional artifact for a user who is going to do further
+work to it in a video editor. That is a different job for a different person, which is the
+same scope objection that closed background removal.
+
+**The wording bundles two audiences who want opposite things**, and separating them is what
+made it decidable:
+
+| | **Intermediate** (ProRes, DNxHR) | **Archival** (FFV1) |
+|---|---|---|
+| The ask | "something my editor can scrub and grade" | "a lossless preservation master" |
+| Lossless? | No (high-bitrate DCT) | Yes, bit-exact |
+| 1 h of 4K output | ~155 GB | ~220 GB |
+| Honest from this pipeline? | Yes, the claim is "easy to edit" | Weakly: the model input is 8-bit RGB and the existing encode is already visually transparent |
+
+**Storage is the whole cost**, and it is the number that decides it. Measured on 5 s of
+1080p25 (real content, RTX 3090), scaled to an hour:
+
+| 1 hour of output | HEVC (today) | ProRes HQ | FFV1 lossless |
+|---|---:|---:|---:|
+| 1080p | ~4 GB | ~39 GB | ~55 GB |
+| 4K | ~16 GB | ~155 GB | ~220 GB |
+
+### The finding worth keeping: encode time is NOT the objection
+
+The instinct that "CPU archival encoding will be slow" is **wrong at this scale**, and
+measured to be wrong. Every archival encoder is intra-only and cheap, and all of them beat
+the `libx265 -crf 12` the app already uses by default:
+
+| Encoder (5 s of 1080p25) | Time | vs realtime | Size | Bitrate |
+|---|---:|---:|---:|---:|
+| `hevc_nvenc -cq 19` 8-bit | 0.8 s | 6.3x | 5.6 MB | 9 Mbps |
+| `libx265 -crf 12` 10-bit (in use today) | 5.2 s | 1.0x | 4.5 MB | 7 Mbps |
+| `prores_ks` standard | 0.9 s | 5.7x | 45.2 MB | 72 Mbps |
+| `prores_ks` HQ | 0.9 s | 5.3x | 54.4 MB | 87 Mbps |
+| `prores_ks` 4444 | 1.2 s | 4.1x | 68.2 MB | 109 Mbps |
+| `ffv1` L3 10-bit 4:2:2 | 0.6 s | 8.4x | 76.7 MB | 123 Mbps |
+| `utvideo` | 0.5 s | 10.1x | 111.2 MB | 178 Mbps |
+
+Against SeedVR2 at seconds-to-minutes **per frame**, all of these disappear into the noise.
+So if this is ever revisited, do not spend time on encoder performance: it is solved. Spend
+it on the storage warning and on the path bookkeeping below.
+
+### The implementation cost, for whoever revisits it
+
+Not the encoding. The **bookkeeping**, because `_output_path` hard-codes `.mp4`:
+
+- The precedent is good: `_engine_tag` already appends `_realesrgan` for a non-default
+  engine and leaves the default engine's paths byte-for-byte unchanged, so a format suffix
+  plus a format-dependent extension follows a tested pattern.
+- The cost lands in `reconcile_outputs_from_disk` (cross-install "already upscaled"
+  adoption), which loops `for target in ve.ALL_TARGETS` and calls
+  `_output_path(output_root, rel, target)` **with no engine argument**. So it only ever
+  adopts default-engine, default-format outputs. A format dimension **compounds an existing
+  gap rather than creating a new one**: Real-ESRGAN outputs are already invisible to
+  cross-install adoption today. Either that loop becomes a product of
+  (target x engine x format), or the gap gets documented as deliberate.
+- Conciliation matches videos by content-hash lineage only, so a format change does not
+  break matching there.
+
+### `.mxf`
+
+Skipped for a simpler reason: it is a broadcast container, and a home user reviving family
+footage is unlikely to have one. Nearly free to add (`.mxf` demuxes fine and its ProRes/DNxHD
+payload stream-copies into the `.mkv` segments like the others), so it costs one line
+whenever someone actually turns up with one.
+
+**Revisit if** users ask for an editable master, i.e. people are upscaling footage in order
+to *edit* it rather than to watch it. That is a change in what the app is for, and it would
+be visible in the asking. If it happens, build **ProRes only** (the intermediate half): it
+serves the real request, and FFV1's "nothing was lost" claim cannot be made honestly while
+the model path is 8-bit RGB.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Processing alpha, multi-page and high-bit-depth images (2026-07-29)
+
+**Actually supporting** the image variants the pipeline currently mangles: preserving
+transparency through an upscale, handling every page of a multi-page TIFF, and writing 16-bit
+output for a 16-bit source.
+
+**What ships instead:** roadmap **#17**, which treats these files as **not images** and
+leaves them untouched, the same way non-media files are already left untouched. That is a
+deliberate holding position, not a verdict on the formats, which is why this entry exists.
+
+**The decision, in the author's words:** at this stage of development it is safer to skip
+these file types than for the author to decide on an aspect he knows too little about. The
+app already ignores non-image files during Conciliation, so the mechanism is there.
+
+That is the right instinct and it is worth writing down why: the failure being avoided is
+**silent**. Today a transparent PNG is upscaled to an opaque one with the *same name and
+extension*, so Conciliation's mirrored-name fallback matches it with full confidence and
+reports an ordinary "replaced". A wrong guess about how to handle alpha would not look like a
+bug; it would look like a completed run.
+
+### What each one would actually require
+
+Kept because each is a different problem, and lumping them together is what makes the work
+look small:
+
+| | The real question | Not just plumbing because |
+|---|---|---|
+| **Alpha (RGBA/LA PNG, WebP)** | Does SeedVR2 upscale the alpha channel, or is alpha upscaled separately and recomposited? | The model takes 3-channel RGB. Upscaling alpha separately (bicubic, or a second pass) gives a matte that no longer matches the generated colour edges, and a generative model *invents* edge detail, so the mismatch is worst exactly where alpha matters. The premultiplied-vs-straight distinction also has to be got right or edges fringe |
+| **Multi-page TIFF** | Is a page a separate image, or a document? | `_load_image` takes `tensor[0]` today. Scanned documents, bracketed exposures and layer stacks are three different intents behind the same container, and the right output (N files? one multi-page TIFF? page 0 only?) differs for each |
+| **16-bit TIFF / `I;16`** | Is there anything to preserve? | The model path is **8-bit internally** (`_load_image` normalises to float from 8-bit; the video engines feed 8-bit RGB). Writing a 16-bit output from an 8-bit-sourced result is a container claim, not extra information. Honest 16-bit support means changing the model I/O path, which is a much larger job than the file format |
+
+### The cheap half that is real, if this is revisited
+
+**Alpha is the only one with a genuine consumer use case** for this app (a logo or a cut-out
+someone wants enlarged), and the *pragmatic* version is much smaller than the correct one:
+upscale RGB through the model, upscale the alpha channel separately with plain Lanczos, and
+recomposite. It is wrong at the edges by construction, which is precisely why it should not
+be the silent default, but as an explicit, labelled option it would serve the case.
+
+**Revisit if** users actually ask, i.e. someone reports skipped PNGs as a problem rather than
+as the expected message #17 will print. A second trigger would be the model I/O path moving
+past 8-bit for some other reason, which would make the 16-bit row worth revisiting on its own.
+
+Until then the skip is correct and, importantly, **reversible**: nothing is written, nothing
+is lost, and the skip reason is printed per file so the affected users are self-identifying.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

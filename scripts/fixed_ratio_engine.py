@@ -66,6 +66,30 @@ _DEFAULT_TILE = 512
 _TILE_OVERLAP = 32
 _TILE_FLOOR = 128                                    # smallest tile the OOM retry will drop to
 
+# 10-bit delivery pixel format per encoder. This engine's segments ARE the deliverable, so
+# they should match what the SeedVR2 path already writes (libx265 crf 12, yuv420p10le) rather
+# than inherit pick_encoder()'s 8-bit yuv420p, which was chosen for the split's throwaway
+# INTERMEDIATE. Both engines feed the encoder 8-bit RGB, so the win is not extra source
+# information: it is the encoder's own precision, i.e. less banding on gradients.
+#
+# It has to be per-codec, and the two omissions are deliberate, not oversights:
+#   * h264_nvenc has NO 10-bit encode path at all. Measured: `-pix_fmt p010le` dies with
+#     "No capable devices found" before a frame is written, so a blanket 10-bit would break
+#     the fallback for an old card whose NVENC lacks HEVC.
+#   * libx264 CAN encode 10-bit, but that is H.264 High10, which most TVs and set-top boxes
+#     cannot hardware-decode. This app's deliverable exists to play natively on a monitor or
+#     a TV, so 10-bit H.264 trades a visible benefit for an invisible-until-it-fails one.
+# HEVC has neither problem (Main 10 is universally supported), hence the two entries.
+_DELIVERY_PIX_FMT = {"hevc_nvenc": "p010le",         # NVENC's native 10-bit surface format
+                     "libx265":    "yuv420p10le"}
+
+
+def _delivery_pix_fmt(codec):
+    """The pixel format to deliver in for `codec`: 10-bit where the codec supports it AND the
+    result stays widely playable, else the 8-bit yuv420p this engine used before. See
+    _DELIVERY_PIX_FMT for why h264_nvenc and libx264 are not in the table."""
+    return _DELIVERY_PIX_FMT.get(codec, "yuv420p")
+
 
 def _terminate(proc):
     """Best-effort kill of an ffmpeg subprocess on the error/Stop path. Close its pipes
@@ -294,7 +318,7 @@ class FixedRatioVideoEngine:
                    "-r", str(fps), "-i", "-"]
         if (out_w, out_h) != (mw, mh):
             enc_cmd += ["-vf", f"scale={out_w}:{out_h}:flags=lanczos"]
-        enc_cmd += ["-c:v", codec, *enc_args, "-pix_fmt", "yuv420p", dest_path]
+        enc_cmd += ["-c:v", codec, *enc_args, "-pix_fmt", _delivery_pix_fmt(codec), dest_path]
 
         frame_bytes = sw * sh * 3
         t0 = time.time()

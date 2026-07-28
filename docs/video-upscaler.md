@@ -346,12 +346,25 @@ by **local GPU capability, not video size**.
   h264 (auto-detect). Remote-only install (no capable GPU) -> CPU libx265/libx264
   fallback, with a "re-encode pre-pass may be slow on this machine" notice. Quality
   here barely matters (SeedVR2 hallucinates detail), so a fast encode is plenty.
-- **The deliverable's codec is decided on the pod, so there is no local output-codec
+- **The deliverable's codec is decided by the engine, so there is no local output-codec
   choice.** SeedVR2's own `FFMPEGVideoWriter` encodes each upscaled segment (x264, or
-  x265 10-bit via `video_backend ffmpeg` + `use_10bit`). Local **reassembly is
-  `-c copy` concat + `-c copy` audio mux** with no re-encode of the result, so all
-  segments share identical codec params (same worker settings) and concat stays
-  lossless.
+  x265 10-bit via `video_backend ffmpeg` + `use_10bit`, which is the default). Local
+  **reassembly is `-c copy` concat + `-c copy` audio mux** with no re-encode of the
+  result, so all segments share identical codec params (same worker settings) and concat
+  stays lossless.
+- **Real-ESRGAN (#11) writes its own segments, and used to write them at a lower
+  quality than SeedVR2 by accident** (found 2026-07-28). `FixedRatioVideoEngine` encodes
+  through `vp.pick_encoder()`, which was written for the split's throwaway **intermediate**
+  and therefore forces 8-bit `yuv420p`. So the same source delivered through the fast engine
+  came out 8-bit while the SeedVR2 path delivered 10-bit, a quality difference nobody chose.
+  Fixed with a per-codec delivery format (`fixed_ratio_engine._delivery_pix_fmt`):
+  `hevc_nvenc` -> `p010le`, `libx265` -> `yuv420p10le`, everything else unchanged at
+  `yuv420p`. **Both omissions are deliberate:** `h264_nvenc` has no 10-bit encode path at
+  all (measured: `-pix_fmt p010le` dies with "No capable devices found" before a frame is
+  written), and libx264's 10-bit is H.264 **High10**, which most TVs and set-top boxes
+  cannot hardware-decode. HEVC has neither problem, so only the two HEVC encoders go 10-bit.
+  Verified on an RTX 3090: `hevc, Main 10, yuv420p10le`, at unchanged NVENC speed (~6x
+  realtime at 1080p, vs `libx265 -crf 12`'s 1.0x).
 - **Two `-c copy` exceptions found in phase 2 (refines the two bullets above):**
   (a) **Audio may not fit mp4.** Old-camera audio codecs (measured: `Pisici.AVI`
   carries `pcm_mulaw`) cannot `-c copy` into an mp4/mov container, so the **audio
@@ -362,6 +375,44 @@ by **local GPU capability, not video size**.
   `hevc_nvenc` 400s on the source's `yuvj422p` with "YUV422P not supported"), so the
   re-encode forces `-pix_fmt yuv420p` (universal for x264/x265/nvenc; harmless, since
   that intermediate is upscaled downstream by a detail-hallucinating model).
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
+### 6.5 Archival / intermediate codec sources already work (VERIFIED 2026-07-28)
+
+Recorded because it is the kind of capability that gets re-investigated as a feature request
+every few months. **ProRes, FFV1 and DNxHR/DNxHD sources are supported today, end to end,
+losslessly, with no code change.** This was verified by building 120-second 1080p sources in
+each codec and running them through the real `probe` / `detect_interlaced` / `plan_split` /
+`split`:
+
+| Source | probe | plan_split | Result | Segment pix_fmt |
+|---|---|---|---|---|
+| ProRes 422 HQ `.mov` (1305 MB) | `prores yuv422p10le` | **copy** | 4 segments, 1305 MB | `prores, yuv422p10le` |
+| FFV1 level 3 `.mkv` (1842 MB) | `ffv1 yuv422p10le` | **copy** | 4 segments, 1842 MB | `ffv1, yuv422p10le` |
+| DNxHR HQ `.mov` (2625 MB) | `dnxhd yuv422p` | **copy** | 4 segments, 2625 MB | `dnxhd, yuv422p` |
+
+Why it works without anyone designing for it, which is also why it is robust rather than
+lucky:
+
+- `.mov` and `.mkv` are already in `VIDEO_EXTS`, so these files scan as eligible.
+- **`SEGMENT_EXT` is `.mkv`**, and Matroska carries all three codecs. Had segments been
+  `.mp4`, FFV1 would have failed at the muxer (there is no FFV1 mapping for MP4), and this
+  entry would read very differently.
+- All three are **all-intra**: every frame is a keyframe, so `plan_split` measures a 0.04 s
+  keyframe gap and always picks the free lossless `-c copy` split. Byte counts are preserved
+  exactly, and 10-bit 4:2:2 survives the split untouched. The `-pix_fmt yuv420p` normalization
+  in 6.4's exception (b) never fires, because that path only runs when the split re-encodes.
+- OpenCV (SeedVR2's frame reader) decodes all three: verified `cap.read()` on each.
+
+**What this does not mean.** The pipeline is **8-bit RGB internally** in both engines
+(`cv2.VideoCapture` -> BGR -> `/255.0` for SeedVR2, ffmpeg `-pix_fmt rgb24` for Real-ESRGAN),
+so a 10-bit archival source's extra precision reaches the split and stops there. Accepting
+ProRes is real and useful; claiming the pipeline is a 10-bit pipeline would not be.
+
+**Archival OUTPUT was considered at the same time and deliberately not built**, as was
+adding `.mxf` to `VIDEO_EXTS`. The reasoning, the measured encoder costs and the storage
+figures are in [`dropped-ideas.md`](dropped-ideas.md#archival--intermediate-codec-output-2026-07-28).
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
 
