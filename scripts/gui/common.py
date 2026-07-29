@@ -495,6 +495,14 @@ def mark_wizard_completed():
     save_settings(s)
 
 
+# The size a main-window-sized window opens at when nothing has been remembered
+# yet. Starts at the main window's minsize width (see App.minsize) so a first
+# launch isn't immediately clamped wider than the size it asked for.
+#
+# Shared, not copied: the upscaled-image browser (#22) is a full-window view of
+# the same content and opens at the same size, so the two must not drift apart.
+DEFAULT_WINDOW_GEOMETRY = "1200x720"
+
 _GEOMETRY_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
 
 

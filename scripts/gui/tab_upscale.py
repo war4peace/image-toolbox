@@ -12,7 +12,7 @@ import ssh_setup
 import taskbar_progress
 from gui.common import APP_TITLE, CFG, get_default_folder, set_default_folder, get_install_mode
 from gui.tooltab import ToolTab
-from gui.widgets import Tooltip
+from gui.widgets import Tooltip, use_window_button_style
 
 
 class UpscaleTab(ToolTab):
@@ -87,9 +87,14 @@ class UpscaleTab(ToolTab):
         self.pause_btn = ttk.Button(btns, text="Pause", command=self._pause_or_cancel, state="disabled")
         self.stop_btn  = ttk.Button(btns, text="Stop after current image", command=self._stop, state="disabled")
         self.open_btn  = ttk.Button(btns, text="Open output folder", command=self._open_out)
+        self.browse_btn = ttk.Button(btns, text="Browse upscaled…", command=self._browse_upscaled)
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
-        for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
+        for b in (self.start_btn, self.pause_btn, self.stop_btn, self.open_btn,
+                  self.browse_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
+        # Bold: its window hides the main one and is a place the user settles into
+        # to look at pictures, which is the documented rule for this style.
+        use_window_button_style(self.browse_btn)
         self._add_tooltips()
 
         self._build_remote_row(row=2)
@@ -147,6 +152,10 @@ class UpscaleTab(ToolTab):
         Tooltip(self.open_btn,
                 "Open the folder holding the upscaled copies in Windows Explorer.",
                 wraplength=W)
+        Tooltip(self.browse_btn,
+                "Look through photos you upscaled earlier and compare any of them "
+                "with the original, even from a run finished long ago. The main "
+                "window is hidden while you browse.", wraplength=W)
         Tooltip(self.viewlog_btn,
                 "Open the log window with this run's full output. Available once "
                 "a run has started.", wraplength=W)
@@ -219,9 +228,12 @@ class UpscaleTab(ToolTab):
     def _refresh_save_buttons(self):
         self.save_src_btn.configure(state="normal" if self._src_valid() else "disabled")
         self.save_out_btn.configure(state="normal" if self._out_valid() else "disabled")
-        # "Open output folder" is meaningless with no output path entered.
-        self.open_btn.configure(
-            state="normal" if self.out_var.get().strip() else "disabled")
+        # "Open output folder" and "Browse upscaled…" are meaningless with no
+        # output path entered (and stay locked for the duration of a run).
+        has_out = bool(self.out_var.get().strip())
+        self.open_btn.configure(state="normal" if has_out else "disabled")
+        if not self.running:
+            self.browse_btn.configure(state="normal" if has_out else "disabled")
         # No source folder, nothing to upscale — but never re-enable mid-run.
         if not self.running:
             self.start_btn.configure(
@@ -267,6 +279,26 @@ class UpscaleTab(ToolTab):
             os.startfile(out)
         else:
             messagebox.showinfo(APP_TITLE, "The output folder does not exist yet.")
+
+    def _browse_upscaled(self):
+        """Open the upscaled-image browser (#22) on the folders this tab points
+        at. The source folder is what the pairing derives originals from, so a
+        missing one is worth saying out loud: the browser still works, but every
+        image comes out unpaired and nothing can be compared."""
+        out = self.out_var.get().strip()
+        if not out or not os.path.isdir(out):
+            messagebox.showinfo(APP_TITLE, "The output folder does not exist yet.")
+            return
+        src = self.src_var.get().strip()
+        if src and not os.path.isdir(src):
+            src = ""
+        if not src and not messagebox.askyesno(
+                APP_TITLE,
+                "No photo folder is set, so the originals can't be found and "
+                "nothing can be compared — you'll see the upscaled images only.\n\n"
+                "Browse anyway?"):
+            return
+        self.app.show_browser(src, out)
 
     def _start(self):
         src = self.src_var.get().strip()
@@ -403,6 +435,11 @@ class UpscaleTab(ToolTab):
             state="normal" if (not running and has_src) else "disabled")
         self.pause_btn.configure(state="normal"   if running else "disabled")
         self.stop_btn.configure(state="normal"    if running else "disabled")
+        # The browser hides the main window, so it must not be opened over a live
+        # run whose progress and Stop button would go with it. (A product call,
+        # not a safety one: outputs are written atomically, so reading the tree
+        # mid-run was never unsafe.)
+        self.browse_btn.configure(state="disabled" if running else "normal")
         # VRAM is fully committed during an upscale run — lock out the other tool
         self.app.set_tag_tab_enabled(not running)
         self.app.refresh_conciliate_lock()

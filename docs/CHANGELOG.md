@@ -55,6 +55,39 @@ one thing you just did.
 It works the same way on the video comparison window, on whichever frame you have
 stopped at.
 
+### Look through photos you upscaled earlier
+Until now, comparing a photo with its original only worked **while the run that made it
+was still on screen**. Close the app, or start another batch, and the thumbnails went
+away with it, even though both files were still sitting on your disk. So the one view
+that actually shows what the app did for you was also the one you could not go back to.
+
+The Batch Upscaler tab has a new **Browse upscaled…** button. It opens a window over
+your output folder: your folders on the left, a wall of thumbnails on the right, 200 at a
+time (use the arrows to turn the page, and the +/- buttons to make the thumbnails bigger
+or smaller). **Double-click any photo** and the comparison window opens on it, divider
+and lens included, exactly as it does during a run.
+
+It works out which original each upscaled photo came from **on its own**, including
+photos that Tag & Rename has since renamed, and it does that by looking at the folders
+themselves. So it still works on photos upscaled months ago, on a folder upscaled by
+another PC, and even if the app's cache was deleted.
+
+A green frame means the original was found and the photo can be compared. If you have
+**moved or renamed originals** since upscaling them, tick **Match by content** and the
+app will pair the leftovers by reading the files themselves instead of going by name.
+It is a tick-box rather than something that always happens, because reading files takes
+time and most folders do not need it. A photo with no original found is not a problem:
+it simply has no frame, and double-clicking opens it in your usual image viewer.
+
+The bottom of the window tells you what you are looking at ("263 upscaled image(s) in 4
+folder(s)"). The main window steps aside while you browse and comes back when you close
+the browser, and the button is unavailable during a run, so a batch in progress can never
+disappear behind it.
+
+One thing it does not do yet: if you have already **conciliated** a folder (replaced your
+originals with the upscaled copies), the output folder is empty afterwards, so there is
+nothing left there to browse. The window says so rather than looking broken.
+
 ---
 
 ## 0.5.9

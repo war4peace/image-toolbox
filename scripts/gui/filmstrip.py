@@ -45,9 +45,10 @@ class FilmStrip(ttk.Frame):
     not-yet-processed. Outcomes are run-level (kept across batch swaps) and
     follow a file through a rename; the blue current-frame always draws on top.
 
-    Thumbnails are decoded in a background thread, one batch of BATCH_SIZE
-    around the current image at a time (when the current image crosses into
-    the next batch, that batch is loaded), so very large queues stay snappy.
+    Thumbnails are decoded in a background thread, one page at a time (when the
+    current image crosses into the next page, that page is loaded), so very
+    large queues stay snappy. The page size is per-widget (`page_size=`): the
+    tool tabs use BATCH_SIZE, the upscaled-image browser asks for more.
     """
 
     BG          = "#202329"
@@ -59,9 +60,16 @@ class FilmStrip(ttk.Frame):
     OK_FRAME    = "#3fb950"
     FAIL_FRAME  = "#f85149"
 
-    def __init__(self, master, cell=CELL_DEFAULT, on_zoom=None):
+    def __init__(self, master, cell=CELL_DEFAULT, on_zoom=None,
+                 page_size=BATCH_SIZE):
         super().__init__(master)
         self._on_zoom = on_zoom
+        # How many thumbnails one page holds. The tool tabs keep BATCH_SIZE (a
+        # run's strip is a few hundred px tall, so a bigger batch would only
+        # decode images nobody can see); the upscaled-image browser (#22) asks
+        # for more, because a maximised window at 4K fits over 200 cells and a
+        # 100-image page leaves half the wall empty.
+        self._page_size = max(1, int(page_size))
         self.canvas = tk.Canvas(self, highlightthickness=0, bg=self.BG)
         ys = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=ys.set)
@@ -182,17 +190,46 @@ class FilmStrip(ttk.Frame):
         threading.Thread(target=self._load_batch,
                          args=([p], self._gen), daemon=True).start()
 
+    def page_count(self):
+        """How many pages the queue spans (0 when it is empty)."""
+        return (len(self._paths) + self._page_size - 1) // self._page_size
+
+    def current_page(self):
+        """The page on screen, or None before the first one is built."""
+        return self._batch
+
+    def show_page(self, n, first=None):
+        """Display page `n` (0-based, clamped). `first` decodes that image ahead
+        of the rest.
+
+        The visible batch used to be a pure side effect of set_current (the batch
+        was derived from the current image and _build_cells was reachable from
+        nowhere else), so a caller with pages but no "current" image — the
+        upscaled-image browser (#22) — had to fake one to turn the page. This is
+        the same code, driven directly; set_current calls it too.
+
+        It deliberately does NOT touch the blue current-frame: a page is a
+        viewport, not a statement about what is being processed.
+        """
+        pages = self.page_count()
+        if pages == 0:
+            self._batch = None
+            self._build_cells([])
+            return
+        n = max(0, min(pages - 1, int(n)))
+        if n == self._batch:
+            return
+        self._batch = n
+        sl = self._paths[n * self._page_size:(n + 1) * self._page_size]
+        self._build_cells(sl, first=first)
+        self.canvas.yview_moveto(0)         # new page — start at the top
+
     def set_current(self, path):
         if path not in self._index:     # rescan oddity — still show the image
             self._index[path] = len(self._paths)
             self._paths.append(path)
-        idx   = self._index[path]
-        batch = idx // BATCH_SIZE
-        if batch != self._batch:
-            self._batch = batch
-            sl = self._paths[batch * BATCH_SIZE:(batch + 1) * BATCH_SIZE]
-            self._build_cells(sl, first=path)
-            self.canvas.yview_moveto(0)     # new batch — start at the top
+        idx = self._index[path]
+        self.show_page(idx // self._page_size, first=path)
         # The current image is only marked (highlighted); the view is NOT
         # moved, so scrolling/browsing is never interrupted mid-run.
         self._current = path

@@ -193,6 +193,78 @@ frame is cleared when a run ends (`FilmStrip.clear_current`, called from
 `ToolTab.on_exit`) so the last image shows its own green/red outcome instead of
 staying highlighted.
 
+**Browse upscaled** (0.6.0, future-features #22) — a **Browse upscaled…** window on the
+Batch Upscaler tab: folders-only tree left, paged thumbnail wall right, double-click
+opens the comparison window (wipe + lens) on any pair. It closes a real gap: comparison
+pairing was **in-memory and run-scoped** (`FilmStrip._compare` is filled from `RESULT`
+events and wiped by both `set_queue()` and `clear()`), so the app's most directly
+persuasive view was unreachable the moment a run left the screen, though both files were
+still on disk. The Video Upscaler already had the equivalent, driven from the DB; the
+older and more-used Batch Upscaler had nothing. **Pairing walks the OUTPUT tree and
+derives the source back**, not from the DB: the upscaler mirrors via `os.path.relpath`
+and keeps the source filename with a lowercased extension, so the inverse is one cached
+directory lookup, needs no hashing, and works on a tree produced by another install or
+after `db/cache.db` was deleted (`lineage`'s stored paths are marked "informational only"
+in the schema). It is `resolve_file`, NOT `os.path.isfile`, and the difference is
+load-bearing: Windows stats case-insensitively, so a probe for `a.jpg` finds `a.JPG` and
+then hands back a path that is not the file's own name -- everything still opens, but the
+browser would show, sort and copy a filename that disagrees with Explorer. One cached
+`scandir` per directory answers with the real spelling and is cheaper than the several
+stats it replaced. Resolution order is **inverted tag cache, then mirrored name, then
+nothing**: `conciliate.find_tr_cache` maps original->current, and browsing starts from the
+renamed file on disk, so the useful direction is the reverse (tagging is step 2 of the
+documented workflow, not an edge case). **Content-hash matching is an opt-in checkbox**
+applied to the remainder, and its cheap end goes first: each unpaired output is hashed and
+looked up in `lineage`, and if not one has a recorded source hash the source tree is never
+walked at all. A **pair-less output costs nothing** because the entry is keyed by its
+OUTPUT path (a paired one is keyed by its SOURCE, like the run strip): with no `_compare`
+entry, double-click falls through to `os.startfile`, no status means no green frame, and
+the context menu drops into its plain "Open image" branch, all pointed at the file that
+exists. `FilmStrip` gained an additive **`show_page`/`page_count`** (the visible batch used
+to be a side effect of `set_current`, so paging had to be driven by faking a "current"
+image) and a per-widget **`page_size`**, and is built here with **`on_zoom=None`**:
+`_do_resize` clamps the cell to the viewport and writes the clamped value BACK, so a
+maximised browser near `CELL_HARD_MAX` would have the tabs' few-hundred-px strip re-save
+the smaller value on every close. A browser page holds **200** (`BROWSE_PAGE_SIZE`),
+double the tabs' `BATCH_SIZE`, because a maximised window at 4K fits a little over 200
+default-size cells and 100 left half the wall empty. Measured before changing it (220 real
+4K JPEGs): decode is linear and off-thread, so time to the FIRST thumbnail is unchanged
+(~25-50 ms) and the wall fills progressively; the price is memory (+99 -> +192 MB at cell
+150, +140 -> +276 MB at cell 300, nearly all of it the <=512 px PIL masters, released on
+the next page) plus a slower zoom click, which regenerates every PhotoImage (215 -> 432 ms
+at cell 300). Cheap for a window that is modal and for an app that loads a 16 GB model; the
+tabs keep 100, where a bigger batch would only decode images nobody can see, mid-run. The
+zoom and paging controls sit in a toolbar **above the wall and inside the thumbnail pane**,
+not spanning the window: they act on the thumbnails, and the split is draggable, so a
+window-wide bar would drift away from what it controls. Within that bar the paging group
+(count between the arrows that change it) is **centred on the wall** via a two-column
+`uniform` group, so it is centred on the pane rather than on whatever slack the left-hand
+zoom buttons happened to leave. Each control sits over what it changes: **"Match by content"
+is above the TREE** (it re-pairs images, which moves them between folders and changes the
+counts on those rows; over the wall it read as a filter on the thumbnails on screen, which
+it is not). The **status line is a bottom bar**, with Close on it -- moving status out of
+the top would otherwise have left a header row holding nothing but that button. It is
+written in ONE place (`_set_status_summary`, since the same summary is re-shown after
+content matching and after un-ticking it) and counts **images AND folders** ("263 upscaled
+image(s) in 4 folder(s)"), because the image count alone says nothing about how far the
+tree they are spread over. The folder tree opens with only the ROOT expanded. First-ever
+open uses `gui.common.DEFAULT_WINDOW_GEOMETRY`, the SAME constant as the main window's
+first-run size (this window replaces it on screen, so a different size reads as the app
+having jumped somewhere else); after that its own `browse_geometry` wins.
+**Modality copies `gui/video_benchmark.py` verbatim** -- no `grab_set()` (beyond the
+Windows title-bar problem, a local grab routes events to the grabber AND ITS DESCENDANTS,
+and the shared `ComparisonWindow` is a child of `App`: a grab would make it open and then
+ignore every click), no `transient` (auto-hidden with its master), `withdraw()` not
+`iconify()`, and restore-the-main-window bound to `<Destroy>` as well as
+`WM_DELETE_WINDOW`. That last one is the riskiest line in the feature: everything else
+fails visibly, but it fails by leaving the app running with no visible window at all, and
+`single_instance.py` then blocks a relaunch. The walk uses `DerivedPruner` (a nested
+`__Archive__` is not "upscaled images"), the scan runs off the UI thread, and the roots
+come from the tab as-is -- nothing about them is remembered. **Conciliated trees are
+deferred** (the output folder is empty after a run, so the empty state names conciliation,
+or the deferral reads as a bug). Pairing and paging are pure module-level functions, tested
+without a display. See `gui/browse_upscaled.py` and `tests/test_browse_upscaled.py`.
+
 **Conciliation** (experimental, 0.2.1; videos 0.5.1, future-features #5) — replaces
 original photos **and videos** with their processed (upscaled, optionally tagged &
 renamed) counterparts. Two phases: **Scan/Preview** builds a per-folder plan
@@ -875,13 +947,13 @@ counts give a sense of weight:
 | File (`scripts/`) | Role |
 |------|------|
 | `toolbox_gui.py` (~65 lines) | GUI **entry point / thin shim** (0.4.3). Arms crash logging **before** importing the `gui/` package (so an import-time failure still logs + shows a dialog), then imports `App`/`main` from `gui.app` and re-exports the public API (`App`, `main`, `APP_VERSION`, `GUI_MARKER`, `ToolTab`, `funds_color`, `fmt_funds`, ...) so `import toolbox_gui` callers and the tests are unchanged. `Image Toolbox.cmd` / bootstrap / installer all run this file. |
-| **`gui/` package** (~9k lines across 18 modules, 0.4.3; +video playback 0.4.7) | The tkinter GUI, split out of the former single `toolbox_gui.py`. Built bottom-up so imports never cycle: **`gui/common.py`** (foundation: paths/version, config.json + gui_settings.json helpers incl. the `wizard_done` flag, funds/mqtt/ollama probes incl. `ollama_model_present` + streaming `ollama_pull`, `GUI_MARKER`, `CFG`); **`gui/widgets.py`** (Tooltip, ProgressBar, TelemetryRow, LogPane, ConsoleBuffer, LogViewer, `_ScrollFrame`, sanitize/_fmt_eta/_log_hms; the LogViewer has a **"Collapse repeating progress lines"** toggle, 0.4.8, `gui_settings.log_collapse_processing`, default on: a run of the per-minute video "Processing:" heartbeat collapses to just the latest line via `LogPane.set_collapse`/`COLLAPSE_PROCESSING_RE`, display-only so the on-disk log keeps every line; 0.5.2 adds `Tooltip.set_text()`,
+| **`gui/` package** (~18k lines across 21 modules, 0.4.3; +video playback 0.4.7, +the upscaled-image browser 0.6.0) | The tkinter GUI, split out of the former single `toolbox_gui.py`. Built bottom-up so imports never cycle: **`gui/common.py`** (foundation: paths/version, config.json + gui_settings.json helpers incl. the `wizard_done` flag, funds/mqtt/ollama probes incl. `ollama_model_present` + streaming `ollama_pull`, `GUI_MARKER`, `CFG`); **`gui/widgets.py`** (Tooltip, ProgressBar, TelemetryRow, LogPane, ConsoleBuffer, LogViewer, `_ScrollFrame`, sanitize/_fmt_eta/_log_hms; the LogViewer has a **"Collapse repeating progress lines"** toggle, 0.4.8, `gui_settings.log_collapse_processing`, default on: a run of the per-minute video "Processing:" heartbeat collapses to just the latest line via `LogPane.set_collapse`/`COLLAPSE_PROCESSING_RE`, display-only so the on-disk log keeps every line; 0.5.2 adds `Tooltip.set_text()`,
 which RETARGETS a hint whose button changes label (a second `Tooltip` on one
 widget does NOT override the first: it binds `<Enter>` with `add="+"`, so both
 pop up stacked), and `use_window_button_style()`, the bold label for a button
 that opens a window which is exclusive/modal/persistent AND wants prolonged focus
 (Segments…, Benchmark GPU…, Provision…, the first-start wizard; log windows stay
-plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + the **lens view** on both of them, 0.6.0/#14, whose geometry is three pure display-free functions at module level, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
+plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + the **lens view** on both of them, 0.6.0/#14, whose geometry is three pure display-free functions at module level, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames, + the additive `show_page`/`page_count` #22 needed to drive pages without a "current" image); **`gui/browse_upscaled.py`** (0.6.0/#22, `BrowseUpscaledWindow`: browse an already-upscaled tree and compare any pair long after the run ended — folder tree + paged thumbnail wall, pairing by inverting the upscaler's own mirror, opt-in content matching; its pairing/paging arithmetic is pure module-level functions); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **RGB-only end to end** (`convert("RGB")` in, `arr[..., :3]` out, frame 0 only), which is why alpha / multi-page / >8-bit images are detected and skipped upstream rather than silently flattened here (#17). `_save_image` also carries the SOURCE's metadata onto the output via `exif_copy` (#13a) with a retry-without-metadata fallback, so an odd EXIF block can never cost the image. **GPU work happens wherever this runs** -- which is why the metadata copy lives here and not in `batch_upscale`: on a remote run the pod writes the file. |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
@@ -981,7 +1053,7 @@ Engine, packaging & CI:
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
 - `docs/` — `future-features.md` (roadmap: open milestones #19/#20/#21,
-  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18 kept only as a
+  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#22 kept only as a
   numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai),
   `runpod-notes.md` (remote-pod upscaling notes), `video-upscaler.md` /

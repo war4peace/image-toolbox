@@ -42,9 +42,10 @@ from gui.common import (
     update_auto_check_enabled, update_skipped_version, report_issue, open_donate,
     _FUNDS_GREY, funds_color, config_funds_floor, fmt_funds,
     mqtt_config, mqtt_enabled, load_settings, save_settings, _geometry_on_screen,
-    now_stamp,
+    now_stamp, DEFAULT_WINDOW_GEOMETRY,
 )
 from gui.widgets import Tooltip, LogViewer
+from gui.browse_upscaled import BrowseUpscaledWindow
 from gui.comparison import ComparisonWindow
 from gui.tooltab import ToolTab
 from gui.tab_upscale import UpscaleTab
@@ -90,6 +91,7 @@ class App(tk.Tk):
         self._last_normal_geo = None
         self.log_window = None          # single shared LogViewer for both tools
         self.comparison_window = None   # single shared ComparisonWindow (images)
+        self.browse_window = None       # single BrowseUpscaledWindow (#22)
         self.video_comparison_window = None  # single shared VideoComparisonWindow (frames)
         self.video_playback_window = None    # single shared VideoPlaybackWindow (libVLC)
         self._migrate_default_folders()
@@ -438,9 +440,11 @@ class App(tk.Tk):
 
     def _restore_geometry(self):
         geo = self.settings.get("main_geometry")
-        # The fallback starts at the minimum width (see minsize) so a first launch
-        # isn't immediately clamped wider than the size it asked for.
-        self.geometry(geo if (geo and _geometry_on_screen(self, geo)) else "1200x720")
+        # The fallback (DEFAULT_WINDOW_GEOMETRY) starts at the minimum width, see
+        # minsize, so a first launch isn't immediately clamped wider than the size
+        # it asked for.
+        self.geometry(geo if (geo and _geometry_on_screen(self, geo))
+                      else DEFAULT_WINDOW_GEOMETRY)
         if self.settings.get("main_zoomed"):
             try:
                 self.state("zoomed")
@@ -642,6 +646,22 @@ class App(tk.Tk):
             self.comparison_window.show(source, output)
         else:
             self.comparison_window = ComparisonWindow(self, source, output, app=self)
+
+    # ── Upscaled-image browser (#22) ─────────────────────────────────────────
+
+    def show_browser(self, source_root, output_root):
+        """Open (or focus) the upscaled-image browser for a source/output pair.
+
+        Both roots are taken as-is at open time and nothing about them is
+        remembered: the browser is a view onto whatever the Batch Upscaler tab is
+        currently pointed at, not a second place to configure folders.
+        """
+        if self.browse_window is not None and self.browse_window.winfo_exists():
+            self.browse_window.lift()
+            self.browse_window.focus_set()
+            return
+        self.browse_window = BrowseUpscaledWindow(
+            self, source_root, output_root, app=self)
 
     # ── Updates ──────────────────────────────────────────────────────────────
 
@@ -1066,6 +1086,8 @@ class App(tk.Tk):
             self.log_window.save_geometry()
         if self.comparison_window is not None and self.comparison_window.winfo_exists():
             self.comparison_window.save_geometry()
+        if self.browse_window is not None and self.browse_window.winfo_exists():
+            self.browse_window.save_geometry()
         if self.video_comparison_window is not None and self.video_comparison_window.winfo_exists():
             self.video_comparison_window.save_geometry()
         seg = getattr(self.video_tab, "_segments_win", None)

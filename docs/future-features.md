@@ -6,13 +6,12 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-The remaining open milestones are all medium or larger: two new input/processing
-capabilities (#19 RAW and DNG input, #20 a Video Stabilization
-tab), one measurement-gated one (#21 denoising), a Video Upscaler feature (#12 mixed
-local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second
-GPU provider). Two lower-priority ones each introduce a new process model, networking, or
-packaging (HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a
-numbering legend, after the open work.
+Every open milestone is now medium or larger: two new input/processing capabilities (#19 RAW
+and DNG input, #20 a Video Stabilization tab), one measurement-gated one (#21 denoising), a
+Video Upscaler feature (#12 mixed local+remote queue) and a remote-side one blocked on funds
+rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new
+process model, networking, or packaging (HTTP interface #3, Unraid #4). The **shipped**
+milestones are kept below as a numbering legend, after the open work.
 
 ---
 
@@ -511,12 +510,12 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17 and #18 are complete** (remote
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22 are complete** (remote
   upscaling + funds-floor; RunPod video; video conciliation; self-healing remote runs; local
   video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples;
   Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
-  pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo), so the
-  remaining sequencing is only among the low-priority open milestones below.
+  pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
+  already-upscaled images), so the remaining sequencing is only among the open milestones below.
 - **Open milestones: #19, #20, #21, #12, #15, #3, #4.**
 - **#19 (RAW) inherits #17's superset rule**: an original may only be replaced when the
   processed file is a superset of it. #17 satisfies that rule by never producing a
@@ -568,7 +567,7 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17 and #18** are done and live; they are no
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22** are done and live; they are no
 longer described in full here (their design of record lives in `CLAUDE.md`,
 `docs/runpod-notes.md`, `docs/video-upscaler.md`, `docs/local-video-upscaler.md`,
 `docs/benchmark-sharing.md`, `docs/telemetry-design.md` and `samples/home-assistant/`).
@@ -715,6 +714,36 @@ The numbers survive only because code and other docs cite the roadmap by them
   rare recovery path and can afford the read; a journal failure disables the journal, reports
   itself once, and lets the conciliation finish. See `CLAUDE.md` (Conciliation Undo) and
   `tests/test_conciliate_undo.py`.
+- **#22: Browse already-upscaled images (Batch Upscaler).** Shipped 0.6.0-experimental. A
+  **Browse upscaled…** window: folders-only tree left, paged thumbnail wall right,
+  double-click opens the existing comparison window (wipe + lens) on any pair. It closes a
+  real gap: comparison pairing was in-memory and run-scoped (`FilmStrip._compare` filled from
+  RESULT events, wiped by `set_queue`/`clear`), so the app's most persuasive view was
+  unreachable the moment a run left the screen, though both files were still on disk. The
+  Video Upscaler already had the equivalent. **Pairing walks the OUTPUT tree and derives the
+  source back** rather than reading the DB: the upscaler mirrors via `relpath` + a lowercased
+  extension, so the inverse is a cached directory lookup, and it works on a tree from another
+  install or after `cache.db` was deleted. One decision moved during the build: the plan said
+  `os.path.isfile` probes, but Windows stats case-insensitively and would then hand back
+  `a.jpg` for a file really named `a.JPG` — everything opens, but the browser shows, sorts and
+  copies a name that disagrees with Explorer — so `resolve_file` reads one cached `scandir` per
+  directory instead and answers with the real spelling (also cheaper than the probes it
+  replaced). Tag-&-renamed outputs resolve through the **inverted** tag cache first (step 2 of
+  the documented workflow, not an edge case); content-hash matching is the opt-in remainder and
+  never walks the source tree when no unpaired output has a lineage row. `FilmStrip` gained an
+  additive `show_page`/`page_count` (the visible batch used to be a side effect of
+  `set_current`) plus a per-widget `page_size`, and is built here with `on_zoom=None`, so a
+  maximised browser cannot clamp and re-save the tool tabs' thumbnail size. A browser page
+  holds **200**, not the planned `BATCH_SIZE` of 100: a maximised window at 4K fits a little
+  over 200 default cells, so 100 left half the wall empty. That was measured, not assumed (220
+  real 4K JPEGs) — decode is linear and off-thread so first paint is unchanged, the cost is
+  ~+93 MB of PIL masters at the default cell and a zoom click going 215 ms -> 432 ms at large
+  cells, both cheap for a modal window in an app that loads a 16 GB model. Modality copies
+  `gui/video_benchmark.py` verbatim — no
+  grab (a local grab would capture the shared comparison window's clicks), no transient,
+  `withdraw()` not `iconify()`, and restore-on-`<Destroy>` as well as on close. Conciliated
+  trees are deferred; the empty state names conciliation so the deferral does not read as a
+  bug. See `CLAUDE.md` (Browse upscaled) and `tests/test_browse_upscaled.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

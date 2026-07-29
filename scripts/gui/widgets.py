@@ -46,8 +46,10 @@ COLLAPSE_PROCESSING_RE = re.compile(
 #
 # Bold today: Segments… and Benchmark GPU… (Video), Provision… (RunPod, a long
 # one-time job the user watches), Re-run first-start wizard (Settings, modal via
-# grab_set). Deliberately plain: View log, Browse…, Undo this folder…, and the
-# install/progress dialogs the user only waits on.
+# grab_set), Browse upscaled… (Batch Upscaler, #22: it hides the main window and
+# is a place the user settles into). Deliberately plain: View log, the folder-picker
+# Browse… buttons, Undo this folder…, and the install/progress dialogs the user
+# only waits on.
 WINDOW_BUTTON_STYLE = "Window.TButton"
 _window_button_font = None
 
