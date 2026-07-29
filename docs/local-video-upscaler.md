@@ -337,17 +337,17 @@ source dims. So the generated frame is written at its native size, never resized
 tier (x4 only) offers nothing for a 1080p source (its x4 exceeds the 4K cap, and 4K is only
 2x), so a 1080p source uses the Quality tier's native x2.
 
-### 11.4 Remote Real-ESRGAN (designed, not built)
+### 11.4 Remote Real-ESRGAN (shipped 0.5.6)
 
-The engine above is **local-only** as shipped: the Method combobox offers Real-ESRGAN in Local
-mode only, and the remote pod path stays SeedVR2. A **remote** Real-ESRGAN path is designed but
-not built: a lightweight `pod/worker.py --mode esrgan` that loads `FixedRatioVideoEngine` on a
-cheap, low-VRAM, **no-volume** pod which self-downloads the ~65 MB hash-pinned weight via
-`esrgan_models.ensure_model`. It rides on a general queue change (**per-item GPU binding +
-grouped multi-pod Start**), so one mixed queue can route each item to its own (method, GPU) pod,
-one pod up at a time. The full design (motivation, the GPU-combobox semantic flip, the pendulum
-Auto-resume, the DB/UI ripple, and the build order) lives in `docs/video-upscaler.md` section
-18, since it is fundamentally remote-pod orchestration.
+The engine above began local-only and gained its remote half in the same version, so the
+Method combobox offers Real-ESRGAN in both modes: a lightweight `pod/worker.py --mode esrgan`
+loads `FixedRatioVideoEngine` on a cheap, low-VRAM, **no-volume** pod which self-downloads the
+~65 MB hash-pinned weight via `esrgan_models.ensure_model`. It rides on a general queue change
+(**per-item GPU binding + grouped multi-pod Start**), so one mixed queue routes each item to
+its own (method, GPU) pod, one pod up at a time. The design (motivation, the GPU-combobox
+semantic flip, the pendulum Auto-resume, the DB/UI ripple, the build order) and the as-built
+notes live in `docs/video-upscaler.md` section 18, with 18.8 recording what shipped against
+what was designed, since it is fundamentally remote-pod orchestration.
 
 <div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
 

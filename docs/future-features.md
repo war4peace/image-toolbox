@@ -567,183 +567,73 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22** are done and live; they are no
-longer described in full here (their design of record lives in `CLAUDE.md`,
-`docs/runpod-notes.md`, `docs/video-upscaler.md`, `docs/local-video-upscaler.md`,
-`docs/benchmark-sharing.md`, `docs/telemetry-design.md` and `samples/home-assistant/`).
-The numbers survive only because code and other docs cite the roadmap by them
-(`remote #1`, `Video Upscaler #2`, `local #7`):
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22** are
+done and live. **This section is a pointer list, not a record.** Each entry says what the
+number meant and where the design of record actually lives; nothing is described in full
+here. The numbers survive because code and other docs cite the roadmap by them (`remote
+#1`, `Video Upscaler #2`, `local #7`), so deleting the entries outright would strand those
+references.
 
-- **#1: Remote upscaling (RunPod).** Shipped 0.3.1–0.4.2. See `CLAUDE.md` +
-  `docs/runpod-notes.md`.
-- **#2: Video upscaling (RunPod-only, experimental).** Shipped. See
-  `docs/video-upscaler.md`.
-- **#5: Video conciliation.** Shipped 0.5.1-experimental: Conciliation now
-  matches and replaces VIDEO originals with their upscaled outputs, alongside
-  images, in one scan. Videos match by the content-hash `lineage` the Video
-  Upscaler records on completion (item 10) ONLY: no name fallback, so a partial
-  clip (which records no lineage) can never be mistaken for a whole-video match;
-  a video is acted on only when its output is present in the chosen processed
-  tree. See `CLAUDE.md` (Conciliation) and `conciliate.py`.
-- **#6: Self-healing remote runs (auto-recover a lost pod).** Shipped 0.5.0
-  (video only): an opt-in "Auto-resume" supervisor reconnects a blipped pod, or
-  waits unbounded for the identical card and redeploys it, continuing from the
-  first unfinished segment. Funds guard / user Stop / completed queue are the only
-  non-redeploy stops. See `docs/video-upscaler.md` section 17.
-- **#7: Local video upscaling (free-and-slow alternative to remote).** Shipped
-  0.5.0: the same SeedVR2 video work runs in-process on the user's own GPU via
-  `LocalVideoEngine`, with a predictive VRAM sizer, a one-click per-card benchmark,
-  and optional `torch.compile`. See `docs/local-video-upscaler.md`.
-- **#8: Benchmark sharing (community download / contribute).** Shipped 0.5.1: the
-  per-card video benchmark becomes a crowdsourced corpus, auto-downloaded from GitHub
-  at launch and contributed back via a browser-delegated GitHub issue (multi-GPU,
-  deduped against the published set); a maintainer `--merge` tool curates submissions.
-  See `CLAUDE.md` (Benchmark sharing) and `docs/benchmark-sharing.md`.
-- **#9: Telemetry usage graphs.** Shipped 0.5.3: clicking a telemetry row opens a
-  per-run usage-graph window (embedded matplotlib, four capacity-pinned stacked
-  charts, a dynamic/global range-toggle bar, a blitted crosshair), one shared
-  instance per source (the local machine, or a tab's remote pod). Lazy + fail-safe:
-  absent matplotlib disables only the graph, not the row or MQTT. See `CLAUDE.md`
-  (Telemetry usage graphs) and `docs/telemetry-design.md`.
-- **#10: Home Assistant dashboard samples.** Shipped 0.5.3: ready-made Lovelace
-  dashboards under `samples/home-assistant/` (a no-HACS core dashboard + a
-  Mushroom/ApexCharts one, plus the MQTT sensor + derived-percent template YAML)
-  that render the app's existing `image-toolbox/*` MQTT telemetry live. Docs/samples
-  only, no pipeline change. See `samples/home-assistant/`.
-- **#11: Real-ESRGAN engine (fixed-ratio 2X/4X alternative to SeedVR2).** Shipped
-  0.5.6: a second video upscaling engine (a GAN: fast, VRAM-light, deterministic)
-  dropping into the same engine seam, local (`FixedRatioVideoEngine`) and remote (a
-  volume-free esrgan pod, `pod/worker.py --mode esrgan`, models self-downloaded). Two
-  tiers (Compact / Quality), native-scale only. It required a general Video Upscaler
-  change that mixed-GPU SeedVR2 queues benefit from too: **per-item GPU binding +
-  grouped multi-pod Start** (each job carries its engine + picked card; the queue
-  groups by (engine, GPU) and runs one pod per group, re-grouping mid-run). The
-  Benchmark GPU window + estimator treat ESRGAN as a distinct method (single s/frame
-  + peak-VRAM probe per cell, a separate rate namespace). See `CLAUDE.md` (Real-ESRGAN
-  engine cluster), `docs/local-video-upscaler.md` §23 and `docs/video-upscaler.md` §18.
-- **#13: Copy metadata from the original.** Shipped 0.5.9-experimental, the third
-  correctness fix of that branch. `upscale_engine._save_image` wrote the result with a bare
-  `img.save(...)`, so **every upscaled image lost all metadata**: capture date, camera, lens,
-  exposure, GPS, copyright. After Conciliation replaced the original, the capture date was
-  gone for good. Both halves shipped together. **13a** reads the source's block and writes it
-  onto the output (`exif_copy.exif_for_upscaled`), wherever the file is written - the same
-  engine runs on a rented pod, so `exif_copy.py` is pushed with it. **13b** repairs the
-  already-upscaled backlog inside Conciliation, at the one moment the app holds both files
-  already matched and immediately before the original stops being available; Scan/Preview
-  only counts it. Pillow does the reading and writing for every format (no piexif on the read
-  side); piexif appears only in 13b's JPEG path, because `insert` patches the APP1 segment and
-  leaves the scan data byte-identical. Three corrections are not optional: Orientation is
-  normalised (the pipeline already applied it, so copying it verbatim rotates an upright photo
-  twice), the stale embedded thumbnail is dropped, and a TIFF source's structural tags are
-  stripped before they can describe a strip layout inside a JPEG. One Settings checkbox
-  (`upscale.copy_metadata`, default on) governs both halves. See `CLAUDE.md` (Metadata carried
-  across) and `tests/test_exif_copy.py`.
-- **#14: Hover magnifier ("lens view") in the comparison window.** Shipped
-  0.6.0-experimental. A **Lens** toggle on both comparison windows magnifies the patch
-  under the pointer as original AND upscaled side by side, which is the one thing a
-  before/after wipe cannot do: a wipe shows a patch as *either*, so the eye compares
-  against a memory. The four design questions the entry left open were answered as
-  follows. **Magnification is derived from the real upscale ratio**, not hard-coded like
-  Upscayl's 4x, so the right-hand panel is exactly 1:1 with the file that was produced
-  (and is a plain `crop`, not a resample, so "1:1" is literally true); a same-size pair
-  has no ratio to use and falls back to a fixed 4x, labelled honestly. **The wheel zooms
-  the lens** 1x/2x/4x/8x on top of that ratio (Ctrl+wheel keeps zooming the picture
-  behind), which the first cut lacked and badly needed: on a 320x240 -> 640x480 video in
-  a maximised window the canvas already draws the image at ~2.7x, so a fixed 1:1 panel
-  showed the patch SMALLER than it looked behind the lens, in a fixed 180 px stamp. The
-  panel now follows the window size, a zoom step grows it until the panels would swallow
-  the picture (past that the zoom narrows the patch instead), and `lens_zoom_floor`
-  starts the lens at least as strong as the view it sits on. **It is a mode,
-  not an overlay:** while the lens is on, the divider is put away and the canvas shows
-  the upscaled image full-frame as the context to magnify out of, because the wipe wants
-  the drag and the lens wants the hover. **Transient AND pinnable** — it follows the
-  pointer and vanishes with it, and a click (a press-release that did not move) pins it,
-  for looking at one spot while the hand moves, and for a screenshot. **Video came along
-  whole**: a decoded frame pair is just another (old, new) pair to the renderer, and it
-  does not fight the transport. Zoom and pan keep working and do not change the lens. The
-  sample rect is computed ONCE in normalized coordinates and mapped onto each image,
-  which is what stops the two panels drifting apart at the clamped edges — the one
-  failure a lens must not have, because it would read as a difference between the images.
-  Pointer moves redraw the panels only (the base blit is left alone, tagged items). See
-  `CLAUDE.md` (Comparison) and `tests/test_lens_view.py`.
-- **#16: Derived directories must not be re-scanned as input.** Shipped
-  0.5.9-experimental, a correctness fix rather than a feature. The app writes its outputs
-  inside the tree it scans (`<source>/__upscaled__`, `<source>/__Archive__`), and only
-  Conciliation pruned its own archive: after an archive-mode run the Batch Upscaler found
-  every archived original (the only copies still BELOW the target, therefore all eligible)
-  and re-upscaled them, Tag & Rename re-tagged them, the Video Upscaler re-queued them —
-  billed GPU time on a rented pod. Fixed by a shared **name** rule
-  (`runner_common.DerivedPruner`, `DERIVED_DIRNAMES`) called from all four walkers plus
-  Conciliation's processed-hash index; it is stateless, free per file and **retroactive**
-  (a DB record would not survive a second install, a deleted `cache.db`, or an archive made
-  before the fix). It prunes SUBdirectories only, so pointing a tool AT an `__upscaled__` /
-  `__Archive__` folder as the chosen root still scans it. Nesting itself was deliberately
-  NOT "fixed": a shared sibling output root would collide the moment a second source tree
-  is processed. See `CLAUDE.md` (Derived-directory pruning) and
+When a milestone ships, its rationale moves to the document that owns the feature and the
+entry here shrinks to one of these lines. That rule is the point of the section: a design
+kept in two places drifts, and the stale copy is the one that gets read.
+
+- **#1: Remote upscaling (RunPod).** Shipped 0.3.1-0.4.2. The Batch Upscaler and Tag &
+  Rename on a rented pod: disposable pod, resident streaming worker, dead-man's switch.
+  See `CLAUDE.md` (Remote upscaling) and `docs/runpod-notes.md`.
+- **#2: Video upscaling (experimental).** Shipped 0.4.x. The Video Upscaler:
+  probe / split / stream / reassemble on a rented pod, with segment-level resume.
+  See `CLAUDE.md` (Video Upscaler) and `docs/video-upscaler.md`.
+- **#5: Video conciliation.** Shipped 0.5.1. Conciliation matches and replaces VIDEO
+  originals alongside images, by content-hash lineage only (no name fallback, so a partial
+  clip can never be taken for a whole-video match). See `CLAUDE.md` (Conciliation) and
+  `conciliate.py`.
+- **#6: Self-healing remote runs.** Shipped 0.5.0, video only. An opt-in Auto-resume
+  supervisor survives losing the pod mid-run: reconnect a blip, or wait for the identical
+  card and redeploy. See `CLAUDE.md` (Video Upscaler) and `docs/video-upscaler.md`
+  section 17.
+- **#7: Local video upscaling.** Shipped 0.5.0. The same SeedVR2 video work in-process on
+  the user's own GPU, with a predictive VRAM sizer, a per-card benchmark and optional
+  `torch.compile`. See `docs/local-video-upscaler.md`.
+- **#8: Benchmark sharing.** Shipped 0.5.1. The per-card video benchmark as a crowdsourced
+  corpus: pulled from GitHub at launch, contributed back through a pre-filled issue, curated
+  by a maintainer `--merge` tool. See `CLAUDE.md` (Benchmark sharing) and
+  `docs/benchmark-sharing.md`.
+- **#9: Telemetry usage graphs.** Shipped 0.5.3. A per-run usage-graph window behind each
+  telemetry row, one shared instance per source. See `CLAUDE.md` (Telemetry usage graphs)
+  and `docs/telemetry-design.md`.
+- **#10: Home Assistant dashboard samples.** Shipped 0.5.3. Ready-made Lovelace dashboards
+  over the MQTT topics the app already published; docs and samples only, no pipeline change.
+  See `samples/home-assistant/` and `docs/mqtt-integration.md`.
+- **#11: Real-ESRGAN engine.** Shipped 0.5.6. A second video engine (a fixed-ratio 2X/4X
+  GAN) local and remote, plus the general queue change it rides on: per-item GPU binding +
+  grouped multi-pod Start. See `CLAUDE.md` (Real-ESRGAN engine cluster),
+  `docs/video-upscaler.md` section 18 and `docs/local-video-upscaler.md` section 23.
+- **#13: Copy metadata from the original.** Shipped 0.5.9. 13a writes the source's metadata
+  onto the upscaled file wherever it is written; 13b backfills the already-upscaled backlog
+  inside Conciliation, at the last moment both files exist. See `CLAUDE.md` (Metadata
+  carried across) and `tests/test_exif_copy.py`.
+- **#14: Hover magnifier ("lens view").** Shipped 0.6.0. Both comparison windows magnify
+  the patch under the pointer as original AND upscaled side by side, at the real upscale
+  ratio, with a wheel-zoomed and pinnable lens. See `CLAUDE.md` (Comparison) and
+  `tests/test_lens_view.py`.
+- **#16: Derived directories must not be re-scanned as input.** Shipped 0.5.9. One shared
+  name rule prunes the app's own output folders (`__upscaled__`, `__Archive__`,
+  `.imgtbx_video`) from every input walk. See `CLAUDE.md` (Derived-directory pruning) and
   `tests/test_derived_dirs.py`.
-- **#17: Skip image variants the pipeline cannot round-trip.** Shipped 0.5.9-experimental,
-  the second correctness fix of that branch. The upscale engine is RGB-only end to end
-  (`convert("RGB")` in, `arr[..., :3]` as `mode="RGB"` out, frame 0 only), so a transparent
-  PNG/WebP, a multi-page TIFF and a 16-bit TIFF all came out flattened **under the same name
-  and extension** - after which Conciliation's mirrored-name fallback matched with full
-  confidence and reported an ordinary "replaced", archiving or DELETING the only copy that
-  still had the alpha / pages / bit depth. The decision was to **skip** them, not to support
-  them (that half, with its revisit trigger, is in `dropped-ideas.md`): they are detected
-  from the header (`runner_common.image_variant_reason`, no decode, and not even attempted
-  for JPEG), classified with a specific plain-English reason ("would lose transparency"),
-  counted separately and **named** in the log by both the Batch Upscaler and Conciliation.
-  Conciliation checks the ORIGINAL before either matching path, so it also protects a tree
-  upscaled before the fix. See `CLAUDE.md` (Image variants left as-is) and
+- **#17: Skip image variants the pipeline cannot round-trip.** Shipped 0.5.9. Transparency,
+  several pages and 16-bit depth are detected from the header and skipped with a named
+  reason, in the Batch Upscaler and in Conciliation (which checks the ORIGINAL, so the
+  protection is retroactive). See `CLAUDE.md` (Image variants left as-is) and
   `tests/test_image_variants.py`.
-- **#18: Conciliation Undo.** Shipped 0.5.9-experimental. Conciliation was the app's only
-  destructive tool and the only one with no undo record: the `__Archive__` folder was the
-  sole evidence a run had happened, and a Delete run left not even that. A Run now journals
-  one row per file action (`db.conc_runs` / `conc_actions`) **before** performing it, and an
-  **Undo last run** button on the tab reverses an archive run: each processed file returns to
-  the processed tree, each original comes back out of `__Archive__`. Four decisions carry the
-  feature. **Undo reads the disk, not the row's status**, so an interrupted run (a `pending`
-  row, one of the two moves done) unwinds correctly and a repeated undo is a no-op. **It
-  never overwrites**: both halves of a pair are checked before either moves, so a refusal
-  leaves the pair exactly as it was; a file changed since the run, or a name something else
-  now occupies, is a reported conflict. **A delete run is refused, not attempted** - the
-  bytes are gone and no journal changes that, so the button stays disabled and says why,
-  while the journal is spent on the question a user actually asks after a bad delete run
-  ("what exactly did it remove?"). And **recording is free and fail-safe**: the fingerprint
-  is (size, mtime) plus the content hash only when one is already memoised (`db.cached_hash`,
-  which never reads a file), because recording happens on every run while verifying is the
-  rare recovery path and can afford the read; a journal failure disables the journal, reports
-  itself once, and lets the conciliation finish. See `CLAUDE.md` (Conciliation Undo) and
+- **#18: Conciliation Undo.** Shipped 0.5.9. Every file action is journalled before it
+  happens, and an archive run can be reversed from that journal; a delete run is refused
+  rather than attempted. See `CLAUDE.md` (Conciliation Undo) and
   `tests/test_conciliate_undo.py`.
-- **#22: Browse already-upscaled images (Batch Upscaler).** Shipped 0.6.0-experimental. A
-  **Browse upscaled…** window: folders-only tree left, paged thumbnail wall right,
-  double-click opens the existing comparison window (wipe + lens) on any pair. It closes a
-  real gap: comparison pairing was in-memory and run-scoped (`FilmStrip._compare` filled from
-  RESULT events, wiped by `set_queue`/`clear`), so the app's most persuasive view was
-  unreachable the moment a run left the screen, though both files were still on disk. The
-  Video Upscaler already had the equivalent. **Pairing walks the OUTPUT tree and derives the
-  source back** rather than reading the DB: the upscaler mirrors via `relpath` + a lowercased
-  extension, so the inverse is a cached directory lookup, and it works on a tree from another
-  install or after `cache.db` was deleted. One decision moved during the build: the plan said
-  `os.path.isfile` probes, but Windows stats case-insensitively and would then hand back
-  `a.jpg` for a file really named `a.JPG` — everything opens, but the browser shows, sorts and
-  copies a name that disagrees with Explorer — so `resolve_file` reads one cached `scandir` per
-  directory instead and answers with the real spelling (also cheaper than the probes it
-  replaced). Tag-&-renamed outputs resolve through the **inverted** tag cache first (step 2 of
-  the documented workflow, not an edge case); content-hash matching is the opt-in remainder and
-  never walks the source tree when no unpaired output has a lineage row. `FilmStrip` gained an
-  additive `show_page`/`page_count` (the visible batch used to be a side effect of
-  `set_current`) plus a per-widget `page_size`, and is built here with `on_zoom=None`, so a
-  maximised browser cannot clamp and re-save the tool tabs' thumbnail size. A browser page
-  holds **200**, not the planned `BATCH_SIZE` of 100: a maximised window at 4K fits a little
-  over 200 default cells, so 100 left half the wall empty. That was measured, not assumed (220
-  real 4K JPEGs) — decode is linear and off-thread so first paint is unchanged, the cost is
-  ~+93 MB of PIL masters at the default cell and a zoom click going 215 ms -> 432 ms at large
-  cells, both cheap for a modal window in an app that loads a 16 GB model. Modality copies
-  `gui/video_benchmark.py` verbatim — no
-  grab (a local grab would capture the shared comparison window's clicks), no transient,
-  `withdraw()` not `iconify()`, and restore-on-`<Destroy>` as well as on close. Conciliated
-  trees are deferred; the empty state names conciliation so the deferral does not read as a
-  bug. See `CLAUDE.md` (Browse upscaled) and `tests/test_browse_upscaled.py`.
+- **#22: Browse already-upscaled images.** Shipped 0.6.0. A **Browse upscaled…** window
+  pairs an output tree back to its originals long after the run ended, by inverting the
+  upscaler's own mirror. See `CLAUDE.md` (Browse upscaled) and
+  `tests/test_browse_upscaled.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

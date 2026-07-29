@@ -26,9 +26,10 @@ Upscaler"**.
 > alternative local engine (0.5.6):** a **Real-ESRGAN** fixed-ratio 2x/4x upscaler,
 > deterministic and per-frame (no temporal VAE, mild generative prior), selectable **per
 > video** next to SeedVR2 on a Local/Both install. Fast + low-VRAM; see
-> `docs/local-video-upscaler.md` section 11. A **remote** Real-ESRGAN path (a cheap
-> no-volume pod), together with the queue change it needs (**per-item GPU binding +
-> grouped multi-pod Start**), is **designed but not yet built**: see section 18.
+> `docs/local-video-upscaler.md` section 11. The **remote** Real-ESRGAN path (a cheap
+> no-volume pod), together with the queue change it rides on (**per-item GPU binding +
+> grouped multi-pod Start**), **shipped in 0.5.6**: see section 18, and 18.8 for what
+> was built against what was designed.
 
 ---
 

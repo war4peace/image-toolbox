@@ -456,7 +456,7 @@ its compression) are refused with a named reason rather than silently skipped, a
 videos never reach it (`_is_image_pair`; container metadata is an ffmpeg job).
 `orientation._rotate_file` gained the same treatment on its non-JPEG branch, where a
 bare Pillow re-save had been stripping EXIF from every PNG/WebP/TIFF it straightened.
-See `docs/future-features.md` (#13 in the shipped legend) and `tests/test_exif_copy.py`.
+See `exif_copy.py` and `tests/test_exif_copy.py`.
 
 **Video Upscaler** (experimental, future-features #2) — upscales a folder of
 videos with the same SeedVR2 engine the Batch Upscaler uses for stills, to a
