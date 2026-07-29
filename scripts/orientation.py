@@ -179,7 +179,18 @@ def _rotate_file(path, transpose_const):
         except Exception:
             rotated.save(path, "jpeg", quality=95, subsampling=0)
     else:
-        rotated.save(path)
+        # Non-JPEG: Pillow re-save. Carry the metadata across explicitly (#13) --
+        # a bare save() writes none, so rotating a PNG/WebP/TIFF used to strip its
+        # capture date, camera and GPS. Orientation is normalised for the same
+        # reason as the JPEG branch above: the pixels have just been corrected.
+        try:
+            exif = img.getexif()
+            if not dict(exif):
+                raise ValueError("no metadata to carry")   # plain save below
+            exif[274] = 1
+            rotated.save(path, exif=exif.tobytes())
+        except Exception:
+            rotated.save(path)
 
 
 def straighten(path, degrees):

@@ -179,9 +179,13 @@ class ConciliateTab(ToolTab):
         Tooltip(self.tree,
                 "One row per folder, counting what the scan found.\n"
                 "Replaced: an original that has a processed version and will be "
-                "archived or deleted.\n"
+                "archived or deleted. Before that happens, any metadata the "
+                "processed copy is missing (capture date, camera, GPS) is copied "
+                "back from the original, which is the last moment both exist.\n"
                 "No match (kept): no processed version was found, so the original "
-                "is left alone.\n"
+                "is left alone. This also covers images the upscaler cannot "
+                "reproduce exactly (transparency, several pages, 16-bit), which "
+                "are never replaced. The log names each one.\n"
                 "Non-media (kept): anything that is not a photo or video, never "
                 "touched.", wraplength=W)
         vsb = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
@@ -402,6 +406,9 @@ class ConciliateTab(ToolTab):
             self.progress.set(100)
             removed = r.get("removed_dirs", 0)
             extra = f", {removed} empty folder(s) removed" if removed else ""
+            meta = r.get("metadata_restored", 0)
+            if meta:
+                extra += f", metadata restored into {meta}"
             self.status_lbl.configure(
                 text=f"Done — {r.get('done', 0)} replaced, "
                      f"{r.get('conflicts', 0)} skipped (conflict), "

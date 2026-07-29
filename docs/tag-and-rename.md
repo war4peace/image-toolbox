@@ -6,6 +6,52 @@ defaults. The raw measurements live in
 [`tag-rename-benchmarks.csv`](tag-rename-benchmarks.csv) (updated by hand as new
 models are tested; the `.xlsx` copy was dropped, the CSV is the single source).
 
+## Which folder to point it at (the usage method)
+
+Tag & Rename is normally the **second** step, run on the Batch Upscaler's output,
+not on the original photos:
+
+1. **Batch Upscaler** reads `<source>` and writes `<source>/__upscaled__` (the
+   default). Originals are never modified.
+2. **Tag & Rename** is pointed at **`<source>/__upscaled__`** and describes,
+   EXIF-tags and renames the upscaled copies.
+3. **Conciliation** replaces each original with its tagged, upscaled counterpart.
+
+Step 2 is what Conciliation already expects: it looks for the tag/rename cache
+under the **processed** root (`find_tr_cache(processed_root)` in
+[`conciliate.py`](../scripts/conciliate.py)), so a mirrored-name match can follow an
+upscale through its rename. Tagging the originals instead leaves the upscales
+untitled, and Conciliation then replaces a tagged original with an untagged upscale.
+
+**This changed in 0.5.9.** Before, pointing Tag & Rename at `<source>` happened to
+work: the low-resolution originals fell below the `MIN_WIDTH`/`MIN_HEIGHT` threshold
+(3840/2160) and were skipped, while the 4K files inside `__upscaled__` passed it, so
+the run tagged the upscales by accident. Roadmap #16 stopped every scanner walking
+into the folders the app creates (`__upscaled__`, `__Archive__`), because the same
+descent was re-upscaling and re-tagging archived originals: **billed GPU time on a
+remote run**. Only **subdirectories** are pruned, never the folder you choose, so
+selecting `__upscaled__` yourself is the supported route and always was.
+
+To help, the tab **pre-fills "Photo folder"** with the first of these that has a
+value (`TagTab.restore_defaults_if_empty`), then stops:
+
+1. whatever is already in the field
+2. Settings → Default folders → **Tag & Rename Photo folder**
+3. the Batch Upscaler tab's live **"Save upscaled to"**
+4. Settings → Default folders → **Batch Upscaler Output folder**
+5. otherwise empty
+
+Rules 3 and 4 mean the folder the upscaler is about to write is offered without the
+user retyping it. Rule 2 requires the folder to exist (a photo source that is gone
+is meaningless, so it falls through to something usable); rules 3 and 4 do not,
+because an upscale output folder is created by the first run and so is normally
+offered before it exists. Press **Save as Default** to pin the choice, which then
+wins as rule 2 on every later launch.
+
+**Force Tag / Force Rename** are the escape hatch for the threshold: they process
+every image regardless of resolution, which is what you want when tagging a folder
+of ordinary-sized photos you have no intention of upscaling.
+
 ## What the tool asks the model to do
 
 Tag & Rename sends each photo to Ollama and asks for exactly two lines: a 20-40

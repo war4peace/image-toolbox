@@ -6,10 +6,8 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-The remaining open milestones start with two easy correctness fixes that are costing
-something today (#16 derived-directory re-scan, #17 skipping image variants the pipeline
-silently mangles), then an easy Batch Upscaler gap (copy the original's metadata into the
-upscaled image, #13) and an easy comfort feature deferred to later (a hover magnifier, #14).
+The remaining open milestones start with an easy comfort feature deferred to later (a
+hover magnifier, #14).
 The medium tier is a safety feature for the one destructive tool (#18 Conciliation Undo),
 two new input/processing capabilities (#19 RAW and DNG input, #20 a Video Stabilization
 tab), one measurement-gated one (#21 denoising), a Video Upscaler feature (#12 mixed
@@ -22,9 +20,6 @@ numbering legend, after the open work.
 
 ## Contents
 
-- [16. Derived directories must not be re-scanned as input](#16-derived-directories-must-not-be-re-scanned-as-input-easy-do-this-first)
-- [17. Skip image variants the pipeline cannot round-trip](#17-skip-image-variants-the-pipeline-cannot-round-trip-easy)
-- [13. Copy metadata from the original (Batch Upscaler + Conciliation)](#13-copy-metadata-from-the-original-batch-upscaler--conciliation-easy)
 - [14. Hover magnifier ("lens view") in the comparison window](#14-hover-magnifier-lens-view-in-the-comparison-window-easy-later)
 - [18. Conciliation Undo](#18-conciliation-undo-medium)
 - [19. RAW and DNG input for the Batch Upscaler](#19-raw-and-dng-input-for-the-batch-upscaler-medium)
@@ -37,253 +32,6 @@ numbering legend, after the open work.
 - [Sequencing & dependencies](#sequencing--dependencies)
 - [Shipped milestones (numbering legend)](#shipped-milestones-numbering-legend)
 - [Decided against / constraints](#decided-against--constraints)
-
----
-
-## 16. Derived directories must not be re-scanned as input: Easy (do this first)
-
-A correctness bug that exists **today** and costs real money on a remote run. Found
-2026-07-28 while checking whether a new tool could safely write its output into a subfolder
-of the source.
-
-- **What happens now.** Conciliation in **Archive** mode moves every replaced original into
-  `<source>/__Archive__/<rel>`, which is **inside the tree the other tools scan**. Only
-  Conciliation knows to skip it:
-
-  | Tool | Prunes | Prunes `__Archive__`? |
-  |---|---|---|
-  | `batch_upscale` ([:906](../scripts/batch_upscale.py#L906)) | the current run's output root only | **No** |
-  | `tag_and_rename` ([:1588](../scripts/tag_and_rename.py#L1588)) | **nothing** (no `dirnames[:]` filter at all) | **No** |
-  | `batch_video_upscale` ([:849](../scripts/batch_video_upscale.py#L849)) | `WORK_DIRNAME` + the output subtree | **No** |
-  | `conciliate` ([:329](../scripts/conciliate.py#L329)) | `__Archive__` + the processed tree | Yes (it owns it) |
-
-  So after an archive-mode run, the next Batch Upscaler scan finds every archived original
-  (they are the **pre-upscale** files, so they are below the target and therefore eligible)
-  and upscales them all again into `<output>/__Archive__/...`; Tag & Rename tags and renames
-  them; the Video Upscaler queues the archived videos.
-- **Why it has gone unnoticed:** the *replaced* files in the main tree are above the
-  resolution threshold, so they are correctly skipped. The archive holds the only copies that
-  are still below it. It is precisely the case the threshold does not cover.
-- **Cost:** not data loss (the source promise holds and the archive is intact), but wasted
-  hours, a confusing mirrored output tree, and on a **rented pod it is billed GPU time**
-  spent re-processing files the user already conciliated.
-- **Two adjacent cases the same fix covers**, which pruning "this run's output root" does
-  not: Tag & Rename descends into `__upscaled__` today and tags the originals *and* their
-  upscaled copies; and a second upscale run with a *different* output folder walks into the
-  first run's `__upscaled__` and re-upscales the upscales.
-- **The fix: prune by NAME, in all four walkers.** The app owns its derived directories and
-  already names them with a consistent `__name__` convention (`__upscaled__`, `__Archive__`,
-  and #20/#21's future output folders). One shared helper listing those names, called from
-  each walker, is the whole change.
-- **Why not a database lookup** (considered and rejected 2026-07-28): Conciliation records
-  **nothing** about its own actions today (there is no conciliation table in `db.py`; it only
-  reads `lineage` and writes memoised `file_hashes`), so the record would have to be built
-  first. Even then it is the wrong tool: the `upscale_files` cache is keyed by **relative
-  path** and archiving *changes* the path, so only a **content hash** survives the move,
-  which would mean hashing every candidate file on every scan (the scan reads headers
-  precisely to avoid that). And `db/cache.db` is per-install and regenerable, so a DB rule
-  would silently fail on a second install, a deleted cache, and every archive created before
-  the feature shipped. The name rule is stateless, free per file, and **retroactive**.
-- **Nesting itself is correct and must not be "fixed".** The Batch Upscaler's default output
-  *is* a subfolder of the source (`gui/tab_upscale.py`:
-  `os.path.join(src_now, "__upscaled__")`), and that is the right default: a shared sibling
-  root would collide the moment a second source tree is processed (`D:\Pics` and `D:\Pics2`
-  would both want `D:\__upscaled__`), and a nested folder is where the user will look. The
-  rule is **"a derived directory must be pruned by every scanner that could walk it"**, not
-  "do not nest".
-- **Risks:** very low. It only ever *removes* files from consideration, and only files the
-  app itself created. The one thing to check is that a user who deliberately points a tool
-  **at** an `__upscaled__` or `__Archive__` folder as their chosen root still gets it
-  scanned: prune matching **subdirectories**, never refuse the root itself.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
-
----
-
-## 17. Skip image variants the pipeline cannot round-trip: Easy
-
-Treat images whose distinguishing content the upscaler silently discards as **not images**
-for processing purposes: leave them alone, the way non-media files are already left alone.
-
-- **The problem, found 2026-07-28.** `upscale_engine._load_image` does `img.convert("RGB")`
-  ([:464](../scripts/upscale_engine.py#L464)) and `_save_image` writes `arr[..., :3]` as
-  `mode="RGB"` ([:481](../scripts/upscale_engine.py#L481)). The output therefore always loses
-  anything outside three 8-bit channels of page zero:
-
-  | Original | What comes out | Then Conciliation... |
-  |---|---|---|
-  | PNG / WebP **with alpha** | same name, same extension, **transparency flattened** | mirrored-name match succeeds -> original archived or **deleted** |
-  | Multi-page TIFF | page 0 only (`tensor[0]`) | same, other pages gone |
-  | 16-bit TIFF | 8-bit output | same, bit depth gone |
-
-  The alpha row is the sharp one: name and extension are identical, so Conciliation's
-  mirrored-name fallback matches with full confidence and reports it as an ordinary
-  "replaced". Reachable today with no new feature.
-- **The decision (2026-07-28): skip them, do not fix them.** Handling alpha, multi-page and
-  high-bit-depth images *properly* is a set of design questions about formats this project
-  has not needed to reason about, and guessing at them is how quiet data loss happens.
-  Skipping is the conservative, reversible choice, and the app already has the exact
-  behaviour to copy: non-media files are detected, counted, listed and left untouched.
-- **What "skip" means concretely:**
-  * The Batch Upscaler's eligibility scan classifies them as ineligible with a **specific
-    skip reason** ("has transparency", "multi-page", "16-bit"), not a generic failure, so the
-    log tells the user why and the count is visible rather than mysterious.
-  * Conciliation never matches or replaces them (they were never processed, so they have no
-    counterpart; the important part is that they are not silently *name*-matched to some
-    unrelated file).
-  * Tag & Rename is unaffected: it does not rewrite pixels, so tagging a 16-bit TIFF or a
-    transparent PNG loses nothing.
-- **Detection is cheap and does not need a decode:** Pillow's `Image.open` gives `mode`
-  (`RGBA`/`LA`/`PA`, or `I;16`/`I` for 16-bit) and `n_frames` from the header alone, which is
-  the same lazy-open the dimension reader already falls back to.
-- **Note the relationship to the superset rule** used by #19: "an original may only be
-  replaced when the processed file is a superset of it". Skipping these formats satisfies
-  that rule by never producing a non-superset in the first place, which is simpler than
-  producing one and then carving Conciliation around it.
-- **The other half of this decision** (actually supporting these formats: alpha-preserving
-  upscale, per-page TIFF handling, 16-bit output) is recorded in
-  [`dropped-ideas.md`](dropped-ideas.md#processing-alpha-multi-page-and-high-bit-depth-images-2026-07-29)
-  with its revisit trigger, so the skip is not mistaken for a permanent verdict on the
-  formats.
-- **Risks:** low, and in the safe direction. The worst case is that a user with a
-  transparent PNG they wanted upscaled is told it was skipped and why, instead of getting a
-  silently flattened file.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
-
----
-
-## 13. Copy metadata from the original (Batch Upscaler + Conciliation): Easy
-Carry the source photo's EXIF (and where the format allows, IPTC/XMP) into the
-upscaled output, instead of writing a metadata-free image. Two parts: **13a**
-fixes the upscaler so new output keeps its metadata, and **13b** recovers the
-metadata for images already upscaled before the fix, at conciliation time.
-**13c** is not a third part but a boundary note: what this design assumes about
-the source format, and where a RAW source would break the assumption.
-
-### 13a. Write the metadata at upscale time
-
-- **Today's behaviour:** `upscale_engine._save_image` saves the result tensor
-  with a bare `img.save(...)` (jpeg q95 / webp q95 / PNG), passing no `exif=`,
-  so **every upscaled image loses all metadata**: capture date, camera make and
-  model, lens, exposure, GPS, copyright, any existing description or rating.
-  For a tool whose stated purpose is reviving a personal photo collection, losing
-  DateTimeOriginal is the painful one: the upscaled copy sorts by file date, and
-  after Conciliation replaces the original, the capture date is gone for good.
-  This is a genuine gap against Upscayl, which has a "copy metadata from
-  original" toggle (see `docs/upscayl-vs-image-toolbox.md` section 3.4).
-- **Work needed:** read the source's EXIF once (piexif is already a dependency,
-  used by `tag_and_rename.py`), then write it onto the output in `_save_image`.
-  JPEG and WebP take an `exif=` bytes argument; PNG needs the value stashed as a
-  text chunk or dropped, so the honest scope is "JPEG and WebP fully, PNG
-  best-effort".
-- **The one correctness trap (must not be skipped):** the pipeline **already
-  applied** the orientation. `_load_image` runs `ImageOps.exif_transpose`, and
-  auto-straighten may have rotated a temp copy on top of that, so the output
-  pixels are upright. Copying the source's `Orientation` tag verbatim would make
-  every viewer rotate an already-upright image a second time. The copied block
-  must have **Orientation forced to 1** (and the thumbnail sub-IFD dropped or
-  regenerated, since the embedded thumbnail is stale and still the old size).
-- **Also needs deciding:** whether the pixel-describing tags that are now wrong
-  (`ExifImageWidth` / `ExifImageHeight`, and any `PixelXDimension` equivalents)
-  are corrected to the upscaled size or stripped. Stripping is safer than lying.
-- **Interaction with Tag & Rename:** it writes `ImageDescription` into whatever
-  EXIF the file has. Today it has to create a block from nothing on an upscaled
-  file; once this ships it edits a real one, which is strictly better, but the
-  order of operations (upscale then tag) must keep the description the tagger
-  wrote rather than the source's older one.
-- **Should it be a toggle?** Upscayl makes it optional. Copying metadata is what
-  a user expects by default, so the recommendation is **on by default**, with a
-  Settings checkbox for anyone who deliberately wants scrubbed output (sharing
-  photos without GPS is the real use case for off).
-- **Risks:** low. A malformed or oversized EXIF block from an old camera must not
-  fail the save, so the copy has to be wrapped and fall back to writing the image
-  with no metadata (the current behaviour), matching the app's fail-safe rule.
-
-### 13c. What this cannot assume: RAW sources
-
-Recorded here so #13 is not designed around a premise that only holds for the
-formats the app accepts **today**. If RAW/DNG input is ever added to the Batch
-Upscaler, the "read the source's EXIF with piexif" step above does not survive
-contact with it, and the difference is worth knowing before the code is written
-rather than after.
-
-- **piexif cannot read a proprietary RAW container.** It handles JPEG and TIFF.
-  A CR2/CR3/NEF/ARW is not a file it can open, and `rawpy` (the natural decoder)
-  is a LibRaw *imaging* wrapper that exposes pixels and sizes, not an EXIF
-  library. So on a RAW source there is nothing for 13a to copy **from**, using
-  the tools 13a is built on.
-- **Which makes the decode strategy a metadata decision, not just an imaging
-  one.** If the RAW path renders the file by extracting the camera's **embedded
-  full-size JPEG preview** (the cheaper strategy, and the one that matches what
-  the camera itself would have written), then that preview *is* a JPEG and
-  carries the camera's EXIF intact, so 13a works unchanged: the "source" it
-  reads from is the extracted preview, not the RAW container. If instead the
-  path demosaics the sensor data, the metadata has to come from somewhere else
-  (`exifread`, or piexif against the TIFF IFD of a DNG/CR2, both of which read
-  the common tags). **The first strategy makes 13a free on RAW; the second makes
-  it a second piece of work.**
-- **The orientation trap has a RAW-specific shape.** A RAW does not carry an
-  EXIF `Orientation` tag that `ImageOps.exif_transpose` would consume; it
-  carries LibRaw's own `flip` flag, which `postprocess()` applies by default. The
-  outcome is the same (the output pixels are upright, so the written
-  `Orientation` must be forced to 1) but nothing in today's code path is what
-  makes it upright, so the assertion "the pipeline already applied the
-  orientation" has to be re-established rather than inherited.
-- **13b is unaffected, by construction.** Conciliation is never allowed to
-  archive or delete a RAW original (the rule being: an original may only be
-  replaced when the processed file is a **superset** of it, and a JPEG rendering
-  is not a superset of a raw sensor file). A RAW therefore never becomes a
-  conciliated pair, so the backfill never sees one and needs no carve-out of its
-  own.
-
-### 13b. Retroactive backfill during Conciliation
-
-Fixing the upscaler only helps images upscaled **from then on**. Anyone who has
-already upscaled a large collection but has not conciliated it yet is sitting on
-a pile of metadata-free outputs, and their originals are still on disk, so the
-information is not lost yet. Conciliation is the one moment where the app holds
-**both** files, already matched to each other, immediately before the original
-stops being available. That makes it the right place (and in Delete mode, the
-last possible place) to recover the gap.
-
-- **What it does:** when conciliating an image pair, compare the original's EXIF
-  against the processed file's and copy across every field the processed file is
-  **missing**, leaving every field it already has untouched.
-- **"Copy what is missing, keep what is present" is the whole policy**, and it is
-  deliberately one rule rather than a per-field table. Any field the processed
-  file already carries got there because something downstream set it on purpose:
-  the pipeline's normalised `Orientation` (the pixels are upright, see the trap
-  above), the `ImageDescription` Tag & Rename wrote, corrected or stripped pixel
-  dimensions. Never overwriting means the backfill can never undo the work of the
-  tool that ran before it, and the rule needs no maintenance when a later feature
-  starts writing some new tag.
-- **Still exclude outright:** the source's `Orientation` and its embedded
-  thumbnail sub-IFD. On a metadata-free upscale both are "missing", so the
-  general rule would happily copy them, and both would then be wrong (a second
-  rotation, and a stale thumbnail at the old size).
-- **Where:** `conciliate._move_processed_in` is the seam. Do it while the
-  original is still in place, before the archive move or the delete.
-- **Preview must show it:** Scan/Preview touches nothing today and must keep that
-  promise, so it reports a count (for example "metadata restored: N") alongside
-  the existing replaced / no-match / kept counts, and only **Run** writes.
-- **Idempotent by construction:** re-running Conciliation over already-backfilled
-  files finds nothing missing and does nothing. The same holds once the upscaler
-  side ships: those outputs already carry their metadata, so the backfill quietly
-  becomes a no-op and only the older backlog is touched.
-- **Dependency note:** `conciliate.py` is currently pure file I/O with no Pillow
-  or piexif import, which is part of why it is fast and cheap to run. The backfill
-  changes that, so the import should be guarded and the feature degrade to
-  skipping cleanly if it is unavailable, rather than becoming a hard requirement
-  of the whole tool.
-- **Fail-safe, emphatically:** Conciliation is the one destructive tool in the
-  app. A metadata copy that raises must never abort the move, leave a file in two
-  places, or block the archive/delete. It is a bonus pass: log the failure, carry
-  on with the file operation.
-- **Out of scope:** videos. Container-level metadata is an ffmpeg job with its own
-  rules, and video pairs are lineage-matched only; keep this to images.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -369,8 +117,8 @@ Give Conciliation the same one-click Undo that Tag & Rename has had since early 
   Note that Conciliation currently writes **nothing** to the DB about its own actions (it
   only reads `lineage` and writes memoised `file_hashes`), so this is genuinely new state
   rather than an extension of something.
-- **Interaction with #16:** independent. #16 fixes scanners walking into `__Archive__`; this
-  makes the archive reversible. Neither needs the other.
+- **Interaction with #16:** independent. #16 (shipped) stopped scanners walking into
+  `__Archive__`; this makes the archive reversible. Neither needs the other.
 - **Interaction with #19:** RAW pairs are never replaced (they are folded in alongside), so
   the Undo action for them is simply "remove the added file", the easiest case.
 - **Risks:** medium, and concentrated in one place. An undo that restores the *wrong* file is
@@ -473,9 +221,25 @@ pattern privately. The agreed shape is one chain:
 - **The added file re-enters the app's input space.** It lands in the source tree as a `.jpg`,
   so later scans see it. It will be above target and skipped, and Tag & Rename *should* see
   it (per decision 7, the render is what gets tagged). Both fine, both worth knowing.
-- **Roadmap #13 already carries the metadata consequences** (see 13c): piexif cannot read a
-  proprietary RAW container, so S2 makes 13a free (the preview is a JPEG with EXIF) while S1
-  would make it a second piece of work.
+- **The decode strategy is a METADATA decision, not just an imaging one.** Shipped #13 reads
+  the source's block with Pillow's `getexif()`, which handles JPEG, WebP, PNG and TIFF and
+  **not** a proprietary RAW container; `rawpy` is a LibRaw *imaging* wrapper that exposes
+  pixels and sizes, not an EXIF library. So under **S2** (extract the camera's embedded
+  full-size JPEG preview) #13 works unchanged, because the "source" it reads from is that
+  preview and it carries the camera's EXIF intact. Under **S1** (demosaic the sensor data)
+  there is nothing for it to read from, and the metadata has to come from somewhere else
+  (`exifread`, or piexif against the TIFF IFD of a DNG/CR2). **S2 makes the metadata free;
+  S1 makes it a second piece of work.**
+- **#13's orientation trap has a RAW-specific shape.** #13 forces the written `Orientation`
+  to 1 on the assertion "the pipeline already applied it" (`ImageOps.exif_transpose` in
+  `_load_image`, plus auto-straighten). A RAW carries no EXIF `Orientation` for
+  `exif_transpose` to consume: it carries LibRaw's own `flip` flag, which `postprocess()`
+  applies by default. The outcome is the same (the pixels come out upright, so 1 is still
+  correct) but nothing in today's code path is what makes it so, and the assertion has to be
+  re-established rather than inherited.
+- **#13b needs no RAW carve-out, by construction.** Conciliation may never archive or delete
+  a RAW original (decision 8 above folds the render in ALONGSIDE it), so a RAW never becomes
+  a conciliated pair and the backfill never sees one.
 - **Most modern RAW files will be skipped as already-above-target**, so this feature mainly
   serves **old** RAW: 2003-2010, 6-8 MP early DSLRs. That is the same demographic the app
   already serves, but it is worth saying out loud because it changes who it is for.
@@ -845,20 +609,16 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10 and #11 are complete** (remote upscaling + funds-floor;
-  RunPod video; video conciliation; self-healing remote runs; local video; benchmark
-  sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN engine),
-  so the remaining sequencing is only among the low-priority open milestones below.
-- **Open milestones: #16, #17, #13, #14, #18, #19, #20, #21, #12, #15, #3, #4.**
-- **#16 and #17 come first, and they are not features.** Both are correctness fixes for
-  behaviour that is wrong **today**: #16 has three scanners walking into Conciliation's
-  archive and re-processing it (billed GPU time on a remote run), #17 has the upscaler
-  silently flattening alpha, dropping TIFF pages and truncating 16-bit, after which
-  Conciliation replaces the original with full confidence. Both are small, both are
-  independent of everything else, and both stop an ongoing cost. #16 in particular should
-  land before any further bulk Conciliation runs.
-- **#13 (copy metadata) remains the cheapest actual feature** and has no dependencies: one
-  function in `upscale_engine.py` plus a Settings checkbox, closing a real data-loss gap.
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16 and #17 are complete** (remote upscaling +
+  funds-floor; RunPod video; video conciliation; self-healing remote runs; local video;
+  benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN
+  engine; metadata copy + backfill; derived-directory pruning; skipping image variants the
+  pipeline cannot round-trip), so the remaining sequencing is only among the low-priority
+  open milestones below.
+- **Open milestones: #14, #18, #19, #20, #21, #12, #15, #3, #4.**
+- **#19 (RAW) inherits #17's superset rule**: an original may only be replaced when the
+  processed file is a superset of it. #17 satisfies that rule by never producing a
+  non-superset; #19 has to keep satisfying it for a format the pipeline *does* process.
 - **#19 (RAW) is gated on one measurement**, not on other features: how often a full-size
   embedded preview exists. It shares its prepare-pipeline design with #21, so whichever
   lands first builds the chain and the other slots a stage into it.
@@ -871,24 +631,18 @@ The user installs and runs the application on their Unraid server.
   is the new MQTT `task/name` value, which is a **contract change** requiring
   `docs/mqtt-integration.md` and `samples/home-assistant/` to be updated in the same change.
 - **#18 (Conciliation Undo) is independent of #16**, despite both touching the archive: #16
-  stops scanners walking into it, #18 makes it reversible.
+  (shipped) stops scanners walking into it, #18 makes it reversible.
 - **#12 (mixed local+remote queue)** is a medium, self-contained Video Upscaler feature that
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
   done over MQTT, the old telemetry coupling no longer drives sequencing.
-- **#13 is worth doing before any bulk Conciliation run**, since Conciliation
-  replaces the original with the metadata-free upscale and the capture date is
-  then unrecoverable. Its two halves are independent and can land separately:
-  **13a** (upscaler) protects everything upscaled from then on, **13b**
-  (Conciliation backfill) is what rescues an already-upscaled backlog, and 13b
-  keeps earning its place afterwards for anyone conciliating old output.
 - **#14 is deliberately parked.** It is easy and self-contained (one GUI module,
   view-only, cannot touch a file), but it is comfort rather than capability: the
   comparison window already does the job. It has no dependencies, so it can be
   picked up whenever there is appetite for a small, low-risk piece of work.
 - **#15 is gated by spend, not by other features.** It needs a paid account and
   billed GPU time to answer three questions no public page answers, so its
-  ordering is set by when that spend happens, not by #13/#14/#12. Nothing else
+  ordering is set by when that spend happens, not by #14/#12. Nothing else
   depends on it, and it does not depend on anything else. Note the overlap with
   #12: both add a dimension to "where does this job run", so whichever lands
   second inherits the other's grouping/selector work (a job would then carry
@@ -918,8 +672,8 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9 and #10** are done and live; they are no longer
-described in full here (their design of record lives in `CLAUDE.md`,
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16 and #17** are done and live; they are no
+longer described in full here (their design of record lives in `CLAUDE.md`,
 `docs/runpod-notes.md`, `docs/video-upscaler.md`, `docs/local-video-upscaler.md`,
 `docs/benchmark-sharing.md`, `docs/telemetry-design.md` and `samples/home-assistant/`).
 The numbers survive only because code and other docs cite the roadmap by them
@@ -972,6 +726,52 @@ The numbers survive only because code and other docs cite the roadmap by them
   Benchmark GPU window + estimator treat ESRGAN as a distinct method (single s/frame
   + peak-VRAM probe per cell, a separate rate namespace). See `CLAUDE.md` (Real-ESRGAN
   engine cluster), `docs/local-video-upscaler.md` §23 and `docs/video-upscaler.md` §18.
+- **#13: Copy metadata from the original.** Shipped 0.5.9-experimental, the third
+  correctness fix of that branch. `upscale_engine._save_image` wrote the result with a bare
+  `img.save(...)`, so **every upscaled image lost all metadata**: capture date, camera, lens,
+  exposure, GPS, copyright. After Conciliation replaced the original, the capture date was
+  gone for good. Both halves shipped together. **13a** reads the source's block and writes it
+  onto the output (`exif_copy.exif_for_upscaled`), wherever the file is written - the same
+  engine runs on a rented pod, so `exif_copy.py` is pushed with it. **13b** repairs the
+  already-upscaled backlog inside Conciliation, at the one moment the app holds both files
+  already matched and immediately before the original stops being available; Scan/Preview
+  only counts it. Pillow does the reading and writing for every format (no piexif on the read
+  side); piexif appears only in 13b's JPEG path, because `insert` patches the APP1 segment and
+  leaves the scan data byte-identical. Three corrections are not optional: Orientation is
+  normalised (the pipeline already applied it, so copying it verbatim rotates an upright photo
+  twice), the stale embedded thumbnail is dropped, and a TIFF source's structural tags are
+  stripped before they can describe a strip layout inside a JPEG. One Settings checkbox
+  (`upscale.copy_metadata`, default on) governs both halves. See `CLAUDE.md` (Metadata carried
+  across) and `tests/test_exif_copy.py`.
+- **#16: Derived directories must not be re-scanned as input.** Shipped
+  0.5.9-experimental, a correctness fix rather than a feature. The app writes its outputs
+  inside the tree it scans (`<source>/__upscaled__`, `<source>/__Archive__`), and only
+  Conciliation pruned its own archive: after an archive-mode run the Batch Upscaler found
+  every archived original (the only copies still BELOW the target, therefore all eligible)
+  and re-upscaled them, Tag & Rename re-tagged them, the Video Upscaler re-queued them —
+  billed GPU time on a rented pod. Fixed by a shared **name** rule
+  (`runner_common.DerivedPruner`, `DERIVED_DIRNAMES`) called from all four walkers plus
+  Conciliation's processed-hash index; it is stateless, free per file and **retroactive**
+  (a DB record would not survive a second install, a deleted `cache.db`, or an archive made
+  before the fix). It prunes SUBdirectories only, so pointing a tool AT an `__upscaled__` /
+  `__Archive__` folder as the chosen root still scans it. Nesting itself was deliberately
+  NOT "fixed": a shared sibling output root would collide the moment a second source tree
+  is processed. See `CLAUDE.md` (Derived-directory pruning) and
+  `tests/test_derived_dirs.py`.
+- **#17: Skip image variants the pipeline cannot round-trip.** Shipped 0.5.9-experimental,
+  the second correctness fix of that branch. The upscale engine is RGB-only end to end
+  (`convert("RGB")` in, `arr[..., :3]` as `mode="RGB"` out, frame 0 only), so a transparent
+  PNG/WebP, a multi-page TIFF and a 16-bit TIFF all came out flattened **under the same name
+  and extension** - after which Conciliation's mirrored-name fallback matched with full
+  confidence and reported an ordinary "replaced", archiving or DELETING the only copy that
+  still had the alpha / pages / bit depth. The decision was to **skip** them, not to support
+  them (that half, with its revisit trigger, is in `dropped-ideas.md`): they are detected
+  from the header (`runner_common.image_variant_reason`, no decode, and not even attempted
+  for JPEG), classified with a specific plain-English reason ("would lose transparency"),
+  counted separately and **named** in the log by both the Batch Upscaler and Conciliation.
+  Conciliation checks the ORIGINAL before either matching path, so it also protects a tree
+  upscaled before the fix. See `CLAUDE.md` (Image variants left as-is) and
+  `tests/test_image_variants.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

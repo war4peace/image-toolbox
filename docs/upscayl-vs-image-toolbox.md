@@ -145,7 +145,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | One-click Undo of tags/renames | ❌ | ✅ | Every change recorded before anything is modified. |
 | Auto-straighten sideways photos (CNN) | ❌ | ✅ | Applied before upscaling **and** before tagging; confident calls only. |
 | Replace originals with processed results (Conciliation) | ❌ | ✅ | Archive or delete, content-hash lineage matching, non-destructive preview first. |
-| Metadata copied from original | ✅ | ❌ | A real gap. Upscayl has a copy-metadata toggle; Image Toolbox's upscaled output currently carries **no** EXIF (capture date, camera, GPS are all lost), though Tag & Rename writes its own description block. On the roadmap as **#13** in `docs/future-features.md`. |
+| Metadata copied from original | ✅ | ✅ | Was a real gap; closed by roadmap #13 in 0.5.9. Both have an on-by-default copy-metadata toggle. Image Toolbox additionally normalises Orientation (its pipeline has already applied it) and drops the stale embedded thumbnail, and Conciliation backfills anything upscaled before the fix. |
 
 ### 3.5 Comparison and preview UI
 

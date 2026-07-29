@@ -124,6 +124,11 @@ WATCHDOG_MIN_SAMPLES = int(_U.get("watchdog_min_samples", 3))  # images seen bef
 # source is never touched. Set auto_straighten=false to keep the old behaviour.
 AUTO_STRAIGHTEN       = bool(_U.get("auto_straighten", True))
 STRAIGHTEN_CONFIDENCE = float(_U.get("straighten_min_confidence", 0.9))
+# Carry the source's EXIF onto the upscaled image (#13a). The copy itself happens
+# in upscale_engine (LOCAL or on the pod, wherever the file is written), which
+# reads this same key out of the pushed upscale settings; this copy exists so the
+# run banner can state it once. Conciliation reads it too, for the #13b backfill.
+COPY_METADATA         = bool(_U.get("copy_metadata", True))
 # Cap the orientation-model load. Normally ~3 s (or a one-time ~82 MB download);
 # but a stuck local CUDA init (a degraded/contended GPU) could hang forever and
 # block the whole run — especially in remote mode where the GPU work is on the
@@ -467,6 +472,11 @@ class EligibilityCache:
 # Header-based image-size reader lives in runner_common (shared with the other
 # runners; superset with a Pillow fallback for the formats the fast path misses).
 get_image_dimensions = runner_common.get_image_dimensions
+
+# Images the engine cannot round-trip (alpha, multi-page, >8-bit): detected and
+# left alone rather than silently flattened (#17). See runner_common.
+image_variant_reason = runner_common.image_variant_reason
+is_variant_reason    = runner_common.is_variant_reason
 
 
 def _skip_for_dims(w, h, cutoff_pct):
@@ -894,6 +904,11 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None,
     items = []
     folder_count = 0
     output_root_norm = os.path.normcase(os.path.normpath(output_root))
+    # Never walk into folders this app produced (#16). Pruning THIS run's output
+    # root by path is not enough: an earlier run with a different output folder,
+    # and Conciliation's __Archive__ (which holds the only copies still below the
+    # target, so they all look eligible), are both inside the source tree.
+    pruner = runner_common.DerivedPruner(_CFG)
 
     _tw = _terminal_width()
     _last_status = 0.0          # throttle GUI status updates to a few per second
@@ -912,6 +927,7 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None,
             if os.path.normcase(os.path.normpath(os.path.join(dirpath, d)))
             != output_root_norm
         ]
+        pruner.prune(dirnames)          # …and any other derived folder (#16)
 
         folder_count += 1
 
@@ -947,6 +963,10 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None,
     sys.stdout.flush()
     _emit_status()                       # final exact totals
 
+    _pruned = pruner.summary()
+    if _pruned:
+        print(f"  {_pruned}")
+
     return items, folder_count
 
 
@@ -963,11 +983,13 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
     large   = folder_stats[dirpath]["skipped_size"]
     missing = folder_stats[dirpath]["skipped_missing"]
     corrupt = folder_stats[dirpath]["skipped_corrupt"]
-    if done == 0 and large == 0 and missing == 0 and corrupt == 0:
+    variant = folder_stats[dirpath]["skipped_variant"]
+    if done == 0 and large == 0 and missing == 0 and corrupt == 0 and variant == 0:
         return
     parts = []
     if done    > 0: parts.append(f"{done} already done")
     if large   > 0: parts.append(f"{large} too large")
+    if variant > 0: parts.append(f"{variant} left as-is (would lose data)")
     if missing > 0: parts.append(f"{missing} no longer exist")
     if corrupt > 0: parts.append(f"{corrupt} corrupted/unreadable")
     summary = ", ".join(parts)
@@ -983,7 +1005,8 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
 # down the whole end-of-run summary (table + DONE event + MQTT + notification) on
 # any run that had a rescan second pass. See item 4.
 _FOLDER_STAT_KEYS = ("processed", "skipped_done", "skipped_size",
-                     "skipped_missing", "skipped_corrupt", "failed")
+                     "skipped_variant", "skipped_missing", "skipped_corrupt",
+                     "failed")
 
 
 def _new_folder_stats():
@@ -1007,16 +1030,18 @@ def _merge_pass_stats(s1, s2):
     for d, v in s2["folder_stats"].items():
         for k in v:
             merged[d][k] += v[k]
-    return {
-        "folder_stats":          merged,
-        "total_processed":       s1["total_processed"]       + s2["total_processed"],
-        "total_skipped_done":    s1["total_skipped_done"]    + s2["total_skipped_done"],
-        "total_skipped_size":    s1["total_skipped_size"]    + s2["total_skipped_size"],
-        "total_skipped_missing": s1["total_skipped_missing"] + s2["total_skipped_missing"],
-        "total_skipped_corrupt": s1["total_skipped_corrupt"] + s2["total_skipped_corrupt"],
-        "total_failed":          s1["total_failed"]          + s2["total_failed"],
-        "corrupt_files":         s1.get("corrupt_files", []) + s2.get("corrupt_files", []),
-    }
+    # Totals are summed through .get(): adding a counter (#17's
+    # total_skipped_variant was the first) must never be able to KeyError the
+    # whole end-of-run summary again, which is the failure this function's
+    # _FOLDER_STAT_KEYS factory was written to stop.
+    out = {"folder_stats": merged}
+    for key in ("total_processed", "total_skipped_done", "total_skipped_size",
+                "total_skipped_variant", "total_skipped_missing",
+                "total_skipped_corrupt", "total_failed"):
+        out[key] = s1.get(key, 0) + s2.get(key, 0)
+    for key in ("corrupt_files", "variant_files"):
+        out[key] = list(s1.get(key, [])) + list(s2.get(key, []))
+    return out
 
 
 def run_pass(work_items, root, output_root, grand_start, pause, logger,
@@ -1072,10 +1097,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     total_processed       = 0
     total_skipped_done    = 0
     total_skipped_size    = 0
+    total_skipped_variant = 0
     total_skipped_missing = 0
     total_skipped_corrupt = 0
     total_failed          = 0
     corrupt_files         = []      # absolute paths of unreadable/corrupt images
+    variant_files         = []      # (path, reason) for images left as-is (#17)
     total                 = len(work_items)
     current_folder        = None
     folder_start          = None
@@ -1108,6 +1135,24 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             logger.tee(f"  {prefix} SKIP (file no longer exists)  {local_path}", timestamp=True)
             folder_stats[dirpath]["skipped_missing"] += 1
             total_skipped_missing += 1
+            continue
+
+        # ── Can the engine even round-trip this image? (#17) ─────────────────
+        # Checked BEFORE the already-done branch on purpose: whether some earlier
+        # (pre-0.5.9) run left a flattened output next to it does not change the
+        # fact that this is a file we do not process. Reporting it here is also
+        # how a user finds the outputs that run produced.
+        _variant = image_variant_reason(local_path)
+        if _variant:
+            folder_stats[dirpath]["skipped_variant"] += 1
+            total_skipped_variant += 1
+            variant_files.append((local_path, _variant))
+            logger.log_only(f"  {prefix} SKIP ({_variant})  {local_path}", timestamp=True)
+            # Persist it so the next run classifies it from the cache instead of
+            # re-opening the file (and so a pre-#17 "eligible" entry is corrected).
+            if cache is not None:
+                cache.set(local_path, eligible=False, already_done=False,
+                          skip_reason=_variant)
             continue
 
         # ── Already upscaled? ────────────────────────────────────────────────
@@ -1389,10 +1434,12 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         "total_processed":       total_processed,
         "total_skipped_done":    total_skipped_done,
         "total_skipped_size":    total_skipped_size,
+        "total_skipped_variant": total_skipped_variant,
         "total_skipped_missing": total_skipped_missing,
         "total_skipped_corrupt": total_skipped_corrupt,
         "total_failed":          total_failed,
         "corrupt_files":         corrupt_files,
+        "variant_files":         variant_files,
         "user_quit":             getattr(pause, "quit_requested", False),
         "degraded":              degraded_stop,
         "remote_stopped":        remote_stopped,
@@ -1546,6 +1593,13 @@ def main():
         )
         sys.exit(1)
     print(f"  Engine ready on {ENGINE.device_name}.")
+    # Say it once per run rather than per image (#13a). The engine reads the same
+    # key on the pod, so a remote run reports it the same way.
+    if COPY_METADATA:
+        print("  Metadata: the original's capture date, camera and GPS are copied "
+              "onto each upscaled image.")
+    else:
+        print("  Metadata: NOT copied (upscaled images will have none).")
 
     # Created before the long preparation phases so a quit request ("q" from
     # the GUI, or Q on the keyboard) can cancel scanning / eligibility checks.
@@ -1677,6 +1731,8 @@ def main():
     work_items     = []
     pre_done       = 0
     pre_too_large  = 0
+    pre_variant    = 0
+    variant_list   = []      # (path, reason) - named below, not just counted
     cache_hits     = 0
     total_all      = len(all_items)
     elig_start     = time.time()        # for the GUI "time remaining" estimate
@@ -1719,13 +1775,25 @@ def main():
                 work_items.append(item)
                 continue
             if not cached["eligible"]:
-                pre_too_large += 1
+                if is_variant_reason(cached.get("skip_reason")):
+                    pre_variant += 1
+                    variant_list.append((local_path, cached["skip_reason"]))
+                else:
+                    pre_too_large += 1
                 continue
             # Eligible and not done — add to work list
             work_items.append(item)
             continue
 
         # Cache miss — do full check and store result
+        _variant = image_variant_reason(local_path)
+        if _variant:
+            cache.set(local_path, eligible=False, already_done=False,
+                      skip_reason=_variant)
+            pre_variant += 1
+            variant_list.append((local_path, _variant))
+            continue
+
         if os.path.exists(out_path):
             cache.set(local_path, eligible=True, already_done=True)
             pre_done += 1
@@ -1749,9 +1817,20 @@ def main():
         logger.close()
         sys.exit(0)
 
+    _variant_note = f", {pre_variant} left as-is" if pre_variant else ""
     logger.tee(f"Found {len(work_items)} eligible file(s) "
-               f"({pre_done} already done, {pre_too_large} too large — "
-               f"{cache_hits}/{total_all} from cache).")
+               f"({pre_done} already done, {pre_too_large} too large"
+               f"{_variant_note} — {cache_hits}/{total_all} from cache).")
+
+    # Name them here rather than leaving a bare count (#17). Most variants never
+    # reach run_pass at all: once cached they are filtered out right here, so this
+    # is the only place a re-run can report them.
+    if variant_list:
+        logger.tee(f"  Left as they are - upscaling would discard part of these "
+                   f"images ({len(variant_list)}):")
+        for _vp, _vr in variant_list:
+            logger.log_only(f"    {_vp}  ({_vr})")
+            print(f"    {_osc8_link(_vp)}  ({_vr})")
 
     if not work_items:
         logger.tee("Nothing to process.")
@@ -1796,10 +1875,22 @@ def main():
         for item in rescan_items:
             dirpath, local_path, output_dir, out_name = item
             out_path = os.path.join(output_dir, out_name)
+            cached = cache.get(local_path)
+            # #17 first: an image we do not process stays that way whatever sits
+            # next to it. Without this, an output left by a pre-0.5.9 run would
+            # send it down the already-done branch below, which would overwrite
+            # the variant entry with eligible=True and hide it again.
+            if cached is not None and is_variant_reason(cached.get("skip_reason")):
+                continue
+            if cached is None:
+                _variant = image_variant_reason(local_path)
+                if _variant:
+                    cache.set(local_path, eligible=False, already_done=False,
+                              skip_reason=_variant)
+                    continue
             if os.path.exists(out_path):
                 cache.set(local_path, eligible=True, already_done=True)
                 continue
-            cached = cache.get(local_path)
             if cached is not None:
                 if not cached["eligible"]:
                     continue
@@ -1838,10 +1929,12 @@ def main():
     total_processed       = combined["total_processed"]
     total_skipped_done    = combined["total_skipped_done"]
     total_skipped_size    = combined["total_skipped_size"]
+    total_skipped_variant = combined.get("total_skipped_variant", 0)
     total_skipped_missing = combined["total_skipped_missing"]
     total_skipped_corrupt = combined["total_skipped_corrupt"]
     total_failed          = combined["total_failed"]
     corrupt_files         = combined.get("corrupt_files", [])
+    variant_files         = combined.get("variant_files", [])
 
     col_path = min(60, max(len("Folder"),
         max((len(os.path.relpath(p, root)) for p in folder_stats), default=6)))
@@ -1868,7 +1961,8 @@ def main():
 
     for dp, stats in folder_stats.items():
         rel = os.path.relpath(dp, root) if dp != root else "."
-        total_skipped_folder = stats["skipped_done"] + stats["skipped_size"]
+        total_skipped_folder = (stats["skipped_done"] + stats["skipped_size"] +
+                                stats["skipped_variant"])
         folder_total = (stats["processed"] + total_skipped_folder +
                         stats["skipped_corrupt"] + stats["skipped_missing"] +
                         stats["failed"])
@@ -1884,13 +1978,14 @@ def main():
         print(term_row)
 
     logger.tee("=" * _w)
-    total_skipped = total_skipped_done + total_skipped_size
+    total_skipped = total_skipped_done + total_skipped_size + total_skipped_variant
     grand_total = total_processed + total_skipped + total_skipped_corrupt + total_skipped_missing + total_failed
     logger.tee(row.format("TOTAL", grand_total, total_processed, total_skipped,
                           total_skipped_corrupt, total_failed, fmt_hhmmss(grand_elapsed)))
     logger.tee(sep)
     parts = [f"{total_processed} processed", f"{total_skipped_done} already done",
              f"{total_skipped_size} too large"]
+    if total_skipped_variant > 0: parts.append(f"{total_skipped_variant} left as-is")
     if total_skipped_missing > 0: parts.append(f"{total_skipped_missing} missing")
     if total_skipped_corrupt > 0: parts.append(f"{total_skipped_corrupt} corrupted")
     if total_failed          > 0: parts.append(f"{total_failed} failed")
@@ -1907,6 +2002,22 @@ def main():
         for cf in corrupt_files:
             logger.log_only(f"  {cf}")
             print(f"  {_osc8_link(cf)}")     # terminal: clickable; GUI strips the link
+        logger.tee(sep)
+
+    # List every image left as-is, with the reason. A bare count would be the
+    # same mystery #17 set out to remove, and these are the files a user may want
+    # to handle by other means (see docs/dropped-ideas.md).
+    if variant_files:
+        seen = {}
+        for vp, vr in variant_files:
+            seen.setdefault(vp, vr)
+        logger.tee("")
+        logger.tee(sep)
+        logger.tee(f"  Left as they are ({len(seen)}) - upscaling would discard part of them:")
+        logger.tee("-" * _w)
+        for vp, vr in seen.items():
+            logger.log_only(f"  {vp}  ({vr})")
+            print(f"  {_osc8_link(vp)}  ({vr})")
         logger.tee(sep)
 
     # ── Discord: queue finished / stopped ───────────────────────────────────

@@ -60,7 +60,7 @@ def test_build_plan_matches_video_by_lineage(db_conn, tmp_path):
     out = _write(os.path.join(proc, "holiday", "clip_4K.mp4"), b"the-upscaled-output")
     _record_lineage(db_conn, src, out)
 
-    plan, folders, kept = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, folders, kept, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     assert plan == [(src, out, os.path.join("holiday", "clip.avi"))]
     assert folders == [(os.path.join("holiday"), 1, 0, 0)]
     assert kept == []
@@ -79,7 +79,7 @@ def test_build_plan_matches_video_by_lineage_after_rename(db_conn, tmp_path):
     moved = os.path.join(proc, "renamed_by_user.mp4")
     os.replace(recorded_out, moved)
 
-    plan, _folders, _ = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, _folders, _k, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     assert plan == [(src, moved, "clip.avi")]
 
 
@@ -89,7 +89,7 @@ def test_build_plan_video_without_lineage_is_skipped(db_conn, tmp_path):
     proc = str(tmp_path / "proc")
     _write(os.path.join(orig, "clip.avi"), b"src")
     _write(os.path.join(proc, "clip_1440p.mp4"), b"out")   # plausible name, but no lineage
-    plan, folders, _ = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, folders, _k, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     assert plan == []
     assert folders == [(".", 0, 1, 0)]      # 0 replaced, 1 no-match
 
@@ -108,7 +108,7 @@ def test_clip_like_output_never_matches_whole_source(db_conn, tmp_path):
     _write(os.path.join(orig, "movie.avi"), b"the-whole-movie")     # no lineage
     _write(os.path.join(proc, "movie_scene1_4K.mp4"), b"just-a-clip")  # clip, no lineage
 
-    plan, _folders, _ = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, _folders, _k, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     srcs = {p[0] for p in plan}
     assert lin_s in srcs                                   # the lineaged pair matches
     assert os.path.join(orig, "movie.avi") not in srcs     # the movie is NOT matched to the clip
@@ -120,7 +120,7 @@ def test_build_plan_unmatched_video_skipped_nonmedia_kept(db_conn, tmp_path):
     _write(os.path.join(orig, "lonely.mkv"), b"no-output-for-me")   # no match anywhere
     note = _write(os.path.join(orig, "readme.txt"), b"keep me")     # non-media
 
-    plan, folders, kept = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, folders, kept, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     assert plan == []
     assert folders == [(".", 0, 1, 1)]      # 0 replaced, 1 no-match, 1 non-media kept
     assert kept == [note]
@@ -137,7 +137,7 @@ def test_build_plan_images_and_videos_together(db_conn, tmp_path):
     _record_lineage(db_conn, img_s, img_o)
     _record_lineage(db_conn, vid_s, vid_o)
 
-    plan, folders, _ = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    plan, folders, _k, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
     pairs = {p[0]: p[1] for p in plan}
     assert pairs == {img_s: img_o, vid_s: vid_o}
     assert folders == [(".", 2, 0, 0)]
@@ -165,9 +165,10 @@ def test_execute_archives_original_and_moves_video_in(db_conn, tmp_path):
     out = _write(os.path.join(proc, "holiday", "clip_4K.mp4"), b"out-bytes")
     _record_lineage(db_conn, src, out)
 
-    plan, _f, _k = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
-    done, conflicts, errors = cc.execute(plan, orig, "archive", _FakeLog())
+    plan, _f, _k, _v = cc.build_plan(orig, proc, tr_index=None, conn=db_conn)
+    done, conflicts, errors, restored = cc.execute(plan, orig, "archive", _FakeLog())
     assert (done, conflicts, errors) == (1, 0, 0)
+    assert restored == 0            # videos never get the #13b image backfill
 
     # Original archived, output moved into the original tree keeping its own name.
     assert os.path.isfile(os.path.join(orig, cc.ARCHIVE_DIRNAME, "holiday", "clip.avi"))

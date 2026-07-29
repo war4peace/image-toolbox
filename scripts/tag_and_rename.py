@@ -1583,9 +1583,17 @@ def collect_work_items(root, force_tag=False):
     Outside an "upscaled/" subfolder: only images meeting the resolution
                                       threshold qualify, unless force_tag=True.
     force_tag=True: all image files qualify regardless of resolution.
+
+    Folders this app produced (`__upscaled__`, `__Archive__`, …) are pruned (#16):
+    tagging an upscale AND its original was never intended, and the archive holds
+    pre-upscale copies that force_tag would happily rename. To tag an upscaled
+    tree, point this AT `__upscaled__`: only subdirectories are pruned, never the
+    chosen root.
     """
     items = []
+    pruner = runner_common.DerivedPruner(_CFG)
     for dirpath, dirnames, filenames in os.walk(root):
+        pruner.prune(dirnames)
         is_upscaled_dir = (
             os.path.basename(dirpath).lower() == UPSCALED_SUBDIR.lower()
         )
@@ -1600,6 +1608,9 @@ def collect_work_items(root, force_tag=False):
                 w, h = get_image_dimensions(full_path)
                 if w >= MIN_WIDTH or h >= MIN_HEIGHT:
                     items.append(full_path)
+    _pruned = pruner.summary()
+    if _pruned:
+        print(f"  {_pruned}")
     return items
 
 

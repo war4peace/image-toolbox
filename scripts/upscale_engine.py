@@ -374,6 +374,11 @@ class UpscaleEngine:
         """
         offload_device, resident = self._resident_offload_device(settings)
         self.resident = resident                 # exposed for callers/tests
+        # Carry the original's EXIF onto the output (#13a). ON by default: keeping
+        # the capture date, camera and GPS is what a user expects, and after
+        # Conciliation replaces the original there is no second chance. Off is for
+        # deliberately scrubbed output (sharing photos without GPS).
+        self.copy_metadata = bool(settings.get("copy_metadata", True))
 
         argv = [
             os.path.join(self.repo_dir, "inference_cli.py"),
@@ -466,11 +471,35 @@ class UpscaleEngine:
         return torch.from_numpy(arr[None, ...]).to(torch.float16)
 
     @staticmethod
-    def _save_image(tensor, dest_path):
+    def _metadata_for(src_path, dest_path, size):
+        """The source's sanitised EXIF block for the upscaled file (#13a), or None.
+
+        Wrapped and fail-safe on purpose: a malformed or oversized metadata block
+        from an old camera must never fail the save. Losing the capture date is a
+        disappointment; losing the image is damage.
+        """
+        if not src_path:
+            return None
+        try:
+            import exif_copy
+            return exif_copy.exif_for_upscaled(src_path, dest_path, size=size)
+        except Exception as exc:                   # noqa: BLE001 (module absent/odd EXIF)
+            debug_log("upscale_engine._metadata_for", exc=exc)
+            return None
+
+    @staticmethod
+    def _save_image(tensor, dest_path, src_path=None):
         """
         Save frame 0 of a [T, H, W, C] float tensor (RGB, range [0, 1]) to
         dest_path. Format follows the extension. Atomic: writes to a temp
         file in the destination folder, then renames over the target.
+
+        `src_path` is the ORIGINAL the tensor came from. When given, its metadata
+        (capture date, camera, lens, GPS, copyright) is carried onto the output
+        (#13a) instead of writing a metadata-free image; the caller passes None to
+        opt out. The pixels are already upright by this point, so the copied block
+        has Orientation normalised and the stale embedded thumbnail dropped - see
+        exif_copy.exif_for_upscaled.
         """
         import numpy as np
         from PIL import Image
@@ -480,16 +509,39 @@ class UpscaleEngine:
         img = Image.fromarray(arr[..., :3], mode="RGB")
 
         ext = os.path.splitext(dest_path)[1].lower()
+        # Size from the array we are about to write, so the pixel-describing tags
+        # state the upscaled dimensions rather than the original's.
+        blob = UpscaleEngine._metadata_for(src_path, dest_path,
+                                           (arr.shape[1], arr.shape[0]))
+        meta = {}
+        try:
+            import exif_copy
+            meta = exif_copy.save_kwargs(dest_path, blob)
+        except Exception:                          # noqa: BLE001 (module absent)
+            meta = {}
+
         tmp_path = dest_path + ".tmp" + ext      # keep extension so PIL picks the format
         try:
-            if ext in (".jpg", ".jpeg"):
-                img.save(tmp_path, "jpeg", quality=95, subsampling=0, optimize=True)
-            elif ext == ".webp":
-                img.save(tmp_path, "webp", quality=95)
-            else:
-                # .png and everything else (.bmp/.tiff sources are saved as PNG
-                # content only if the extension says so; PIL infers from ext)
-                img.save(tmp_path)
+            def _write(**extra):
+                if ext in (".jpg", ".jpeg"):
+                    img.save(tmp_path, "jpeg", quality=95, subsampling=0,
+                             optimize=True, **extra)
+                elif ext == ".webp":
+                    img.save(tmp_path, "webp", quality=95, **extra)
+                else:
+                    # .png and everything else (.bmp/.tiff sources are saved as PNG
+                    # content only if the extension says so; PIL infers from ext)
+                    img.save(tmp_path, **extra)
+
+            try:
+                _write(**meta)
+            except Exception as exc:               # noqa: BLE001
+                # The metadata is a bonus, the image is the product: any EXIF the
+                # encoder rejects costs the metadata, never the file.
+                if not meta:
+                    raise
+                debug_log("upscale_engine._save_image: retrying without metadata", exc=exc)
+                _write()
             os.replace(tmp_path, dest_path)
         except Exception:
             if os.path.exists(tmp_path):
@@ -553,7 +605,11 @@ class UpscaleEngine:
                     result = self._run_core(frames)
             finally:
                 self._drain_capture(buf)
-        self._save_image(result, dest_path)
+        # src_path is what the metadata is read from. Under auto-straighten this is
+        # the rotated TEMP COPY, which is the right source in both senses: copy2
+        # preserved the original's EXIF, and orientation.straighten already cleared
+        # the orientation tag it invalidated.
+        self._save_image(result, dest_path, src_path if self.copy_metadata else None)
 
     def _run_core(self, frames):
         return self._cli._process_frames_core(

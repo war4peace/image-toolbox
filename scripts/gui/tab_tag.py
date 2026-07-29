@@ -65,10 +65,49 @@ class TagTab(ToolTab):
         self._refresh_dir_buttons()
 
     def restore_defaults_if_empty(self):
-        if not self.dir_var.get().strip():
-            tag_default = get_default_folder("tag_folder")
-            if tag_default and os.path.isdir(tag_default):
-                self.dir_var.set(tag_default)
+        """Pre-fill "Photo folder". First usable rule wins, then stop:
+
+          1. a value already in the field         (leave it alone)
+          2. Settings -> Default folders -> Tag & Rename Photo folder
+          3. the Batch Upscaler tab's live "Save upscaled to"
+          4. Settings -> Default folders -> Batch Upscaler Output folder
+          5. otherwise empty
+
+        Rules 3 and 4 exist because #16 stopped Tag & Rename descending into
+        `__upscaled__`: the supported way to tag an upscaled tree is now to point
+        this AT that folder, so the app offers it instead of making the user retype
+        a path the Batch Upscaler tab already knows.
+
+        Rule 2 requires the folder to EXIST (a photo SOURCE that is gone is
+        meaningless, and falling through then offers something usable) while 3 and
+        4 take the value as-is: an upscale OUTPUT folder is created by the first
+        run, so the useful pre-fill is normally a folder that does not exist yet.
+        The Batch Upscaler tab treats its own output default the same way.
+        """
+        if self.dir_var.get().strip():
+            return                                  # 1. the user's own value
+
+        tag_default = get_default_folder("tag_folder")
+        if tag_default and os.path.isdir(tag_default):
+            self.dir_var.set(tag_default)           # 2. this tool's pinned default
+            return
+
+        # 3. what the Batch Upscaler is about to write (or wrote last). The tab is
+        #    built before this one, but stay defensive: a missing/half-built tab
+        #    must degrade to the next rule, never break the Tag & Rename tab.
+        upscale_tab = getattr(self.app, "upscale_tab", None)
+        try:
+            live_out = upscale_tab.out_var.get().strip() if upscale_tab else ""
+        except Exception:                           # noqa: BLE001
+            live_out = ""
+        if live_out:
+            self.dir_var.set(live_out)
+            return
+
+        # 4. the Batch Upscaler's pinned output default
+        upscale_default = (get_default_folder("upscale_output") or "").strip()
+        if upscale_default:
+            self.dir_var.set(upscale_default)
 
     def _build(self):
         W = Tooltip.WRAP_NARROW
@@ -79,7 +118,11 @@ class TagTab(ToolTab):
         self.save_dir_btn = ttk.Button(self, text="Save as Default", command=self._save_default)
         self.save_dir_btn.grid(row=0, column=3, sticky="ew", padx=(8, 0), pady=3)
         Tooltip(browse_btn, "Pick the folder of photos to describe and rename. "
-                            "Sub-folders are included.", wraplength=W)
+                            "Sub-folders are included, except folders this app "
+                            "created itself. After upscaling, pick the upscaled "
+                            "folder (normally \"__upscaled__\") so the tagged "
+                            "names end up on the photos that replace your "
+                            "originals.", wraplength=W)
         Tooltip(self.save_dir_btn,
                 "Remember this folder as the default, pre-filled every time the "
                 "app starts.", wraplength=W)

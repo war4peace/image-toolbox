@@ -826,7 +826,7 @@ class RunBudget:
 #  WALK + SPLIT helpers
 # ─────────────────────────────────────────────
 
-def iter_videos(src_root, skip_roots=None):
+def iter_videos(src_root, skip_roots=None, pruner=None):
     """Yield (abs_path, rel_path) for every video under src_root **as they are
     discovered**, skipping the work area. Unsorted (discovery order): walking a
     large tree on a network drive can take many seconds, so a caller that wants
@@ -834,11 +834,18 @@ def iter_videos(src_root, skip_roots=None):
     running, then sorts the collected list itself. `walk_videos` is the sorted,
     fully-materialised convenience wrapper used by the headless runner.
 
-    `skip_roots` prunes whole subtrees by absolute path (in addition to the always
-    -pruned `.imgtbx_video` work dir). The caller passes the OUTPUT root here: when
-    it lives inside the source tree (the default `<source>/__upscaled__`), the walk
-    would otherwise re-read finished upscales as if they were fresh source videos.
-    A skip_root outside src_root is simply never encountered (harmless)."""
+    `skip_roots` prunes whole subtrees by absolute path (in addition to the derived
+    folders `pruner` removes by NAME, which always include the `.imgtbx_video` work
+    dir). The caller passes the OUTPUT root here: when it lives inside the source
+    tree (the default `<source>/__upscaled__`), the walk would otherwise re-read
+    finished upscales as if they were fresh source videos. A skip_root outside
+    src_root is simply never encountered (harmless).
+
+    `pruner` is an optional caller-supplied `runner_common.DerivedPruner`: pass one
+    to read its `.summary()` afterwards (the GUI reports it on the scan line); one is
+    created per walk otherwise. Name-pruning covers what the path prune cannot (#16):
+    Conciliation's `__Archive__`, and an EARLIER run's output folder when this run
+    writes somewhere else."""
     skip = set()
     for r in (skip_roots or ()):
         if r:
@@ -846,11 +853,12 @@ def iter_videos(src_root, skip_roots=None):
                 skip.add(os.path.normcase(os.path.abspath(r)))
             except Exception:                            # noqa: BLE001
                 pass
+    if pruner is None:
+        pruner = runner_common.DerivedPruner()
     for dirpath, dirnames, filenames in os.walk(src_root):
+        pruner.prune(dirnames)                           # our own derived folders (#16)
         keep = []
         for d in dirnames:
-            if d == WORK_DIRNAME:
-                continue
             if skip and os.path.normcase(os.path.abspath(os.path.join(dirpath, d))) in skip:
                 continue                                 # the output subtree, don't rescan it
             keep.append(d)
@@ -863,10 +871,15 @@ def iter_videos(src_root, skip_roots=None):
 
 def walk_videos(src_root, skip_roots=None):
     """All videos under src_root as a sorted (abs_path, rel_path) list, skipping the
-    work area (and any `skip_roots`, e.g. the output tree) so a re-run never tries to
-    upscale its own intermediates or its own finished outputs."""
-    out = list(iter_videos(src_root, skip_roots=skip_roots))
+    work area, this app's other derived folders (#16) and any `skip_roots`, e.g. the
+    output tree, so a re-run never tries to upscale its own intermediates, its own
+    finished outputs, or an original Conciliation moved into `__Archive__`."""
+    pruner = runner_common.DerivedPruner()
+    out = list(iter_videos(src_root, skip_roots=skip_roots, pruner=pruner))
     out.sort(key=lambda t: t[1].lower())
+    summary = pruner.summary()
+    if summary:
+        print(f"  {summary}")
     return out
 
 

@@ -127,13 +127,14 @@ def test_iter_videos_skips_the_output_subtree(tmp_path):
     _touch(os.path.join(out, "!A New Life", "clip_1080p.mp4"))          # a finished upscale
     _touch(os.path.join(src, bv.WORK_DIRNAME, "x_ab12", "in", "seg_00000.mkv"))
 
-    # Without the skip, the walk re-reads the upscale as a source (the reported bug).
-    rels_unguarded = {rel for _ap, rel in bv.iter_videos(src)}
-    assert any(r.startswith("__upscaled__") for r in rels_unguarded)
-
     # With the output root pruned, only the true source remains (work dir always pruned).
     rels = {rel for _ap, rel in bv.iter_videos(src, skip_roots=[out])}
     assert rels == {os.path.join("!A New Life", "clip.avi")}
+
+    # …and even WITHOUT skip_roots, `__upscaled__` is pruned by name (#16): a run
+    # writing somewhere else must not re-read an earlier run's output as a source.
+    rels_no_skip = {rel for _ap, rel in bv.iter_videos(src)}
+    assert rels_no_skip == {os.path.join("!A New Life", "clip.avi")}
 
 
 def test_walk_videos_forwards_skip_roots(tmp_path):

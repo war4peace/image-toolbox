@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.5.9](#059)
 - [0.5.8](#058)
 - [0.5.7](#057)
 - [0.5.5](#055)
@@ -15,6 +16,57 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.5.9
+
+Three fixes to things the app was quietly getting wrong with your files. Nothing to
+turn on: all three are on by default.
+
+### Your photo's details now survive the upscale
+Until now an upscaled image came out with **no information at all**: no capture date,
+no camera, no lens, no GPS, no copyright. That mattered most for the capture date,
+because the upscaled copy then sorted by the day the file was written rather than the
+day the picture was taken, and once Conciliation replaced the original the real date
+was gone for good.
+
+The Batch Upscaler now copies all of it across, and fixes two details while it does:
+the sideways-photo tag is reset (the pixels are already upright, so leaving it would
+make your viewer turn the photo twice), and the tiny stale preview thumbnail is
+dropped instead of showing you the old image at the old size.
+
+**Photos you upscaled before this** are not lost. Conciliation now repairs them at the
+one moment it holds both files, just before it archives or deletes the original: it
+copies in every field the upscaled version is missing and changes nothing it already
+has, including the description Tag & Rename wrote. The preview tells you how many will
+be repaired and repairs nothing itself. It works on JPEG and PNG without re-saving any
+image quality.
+
+Turn it off in **Settings → Batch Upscaler → Copy metadata from the original** if you
+deliberately want scrubbed copies to share, with no GPS and no camera.
+
+### Images the upscaler cannot reproduce are left alone
+The upscaler works in plain 8-bit colour, so it cannot keep transparency (a see-through
+PNG or WebP), the extra pages of a multi-page TIFF, or 16-bit colour depth. It used to
+hand back a flattened copy **under the same name**, which Conciliation then treated as
+a perfectly good replacement and archived (or deleted) the only copy that still had
+those things.
+
+Those files are now recognised, skipped with the reason spelled out ("would lose
+transparency"), and listed individually. Conciliation refuses to replace them too,
+including files you upscaled before this change.
+
+### The app no longer re-processes its own output
+The app writes its results inside the folder it scans (`__upscaled__`,
+`__Archive__`). After an archive-mode conciliation, the Batch Upscaler found every
+archived original and upscaled it all over again, Tag & Rename re-tagged them, and the
+Video Upscaler re-queued them. Nothing was lost, but it wasted hours, and on a rented
+GPU it wasted money. Every scan now skips the folders the app created itself. Pointing
+a tool **at** one of those folders still works, and is the supported way to tag an
+upscaled tree.
+
+<div align="right"><a href="#changelog">↑ Back to top</a></div>
 
 ---
 

@@ -439,7 +439,11 @@ class RemoteSession:
         else:
             # orientation.py rides along so the worker can run the auto-straighten CNN
             # on the pod (remote #1 option B); the local side stays torch-free.
-            scripts = ("upscale_engine.py", "orientation.py")
+            # exif_copy.py: the pod's engine writes the output file, so the metadata
+            # copy (#13a) has to happen there too - the local side only sees the
+            # finished bytes. The upscale config section (with copy_metadata) is
+            # already pushed as worker_settings.json below.
+            scripts = ("upscale_engine.py", "orientation.py", "exif_copy.py")
         for name in scripts:
             self._scp(os.path.join(self.app_root, "scripts", name), f"/root/{name}")
         for name in ("worker.py", "deadman.py"):

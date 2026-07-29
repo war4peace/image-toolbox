@@ -166,7 +166,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | Auto-straighten sideways photos (CNN) | ❌ | ✅ | Runs before upscaling **and** before tagging; confident calls only, ambiguous ones left alone and logged. |
 | Replace originals with processed results | ❌ | ✅ | Conciliation: archive or delete, content-hash lineage matching, non-destructive preview first. |
 | Video upscaling | ❌ | ✅ | Topaz sells that separately as Topaz Video; see the companion document. |
-| Metadata preserved in the output | ⚠️ | ❌ | **Both have a problem here, but Image Toolbox's is worse.** Gigapixel writes the output with an export format choice (Preserve input format / JPEG / PNG / TIFF) and carries metadata across, though users have long reported field loss (lens model, white balance, flash bias on JPEG; near-total loss on TIFF). Image Toolbox's upscaled output currently carries **no EXIF at all**: capture date, camera, GPS are gone. On the roadmap as **#13** in `docs/future-features.md`, and it is the next item to be picked up. |
+| Metadata preserved in the output | ⚠️ | ✅ | Gigapixel writes the output with an export format choice (Preserve input format / JPEG / PNG / TIFF) and carries metadata across, though users have long reported field loss (lens model, white balance, flash bias on JPEG; near-total loss on TIFF). Image Toolbox copies the whole block since 0.5.9 (roadmap #13), with Orientation normalised and the stale thumbnail dropped, and Conciliation backfills anything upscaled before that. |
 | RAW / DNG input | ✅ | ❌ | Gigapixel accepts RAW and DNG (exported as TIFF since 7.0.4). Image Toolbox is JPEG/PNG/WebP/BMP/TIFF only. |
 
 ### 3.4 Comparison and preview UI
@@ -276,13 +276,11 @@ outcome.
   SeedVR2 wants 16 GB to be comfortable, and Image Toolbox's answer to a small
   card is "rent a big one", which costs money. NeuroStream is a serious piece of
   engineering with no counterpart here.
-- **No metadata in the output, at all.** This is the worst gap in the document,
-  and it is worse than Gigapixel's (imperfect) metadata handling. An Image
-  Toolbox upscale currently loses capture date, camera, lens, GPS and everything
-  else, and if Conciliation then replaces the original, the capture date is gone
-  for good. It is roadmap **#13**, it is the cheapest open item, and it should be
-  done before any bulk Conciliation run. Until it ships, this is a data-loss bug
-  wearing a feature request's clothes.
+- ~~**No metadata in the output, at all.**~~ **Closed** by roadmap #13 (0.5.9): the
+  upscaled image now carries the original's capture date, camera, lens, GPS and
+  copyright, and Conciliation puts those fields back into anything upscaled before
+  the fix, at the last moment both files exist. This was the worst gap in the
+  document while it stood.
 - **No RAW support.** Anyone working from camera originals rather than JPEGs is
   simply not served.
 - **No live preview.** Gigapixel lets you audition a model on an image before

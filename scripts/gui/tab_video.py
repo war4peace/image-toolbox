@@ -1284,13 +1284,23 @@ class VideoTab(MqttTaskState, ttk.Frame):
             # Prune the output tree: when "Save upscaled to" lives inside the source
             # folder (the default <source>/__upscaled__), the walk must NOT re-read the
             # finished upscales as if they were new source videos.
-            for abs_path, rel in bv.iter_videos(self._src_root, skip_roots=[self._out_root]):
+            # …and, by name, every other folder this app created (#16): an earlier
+            # run's output tree and Conciliation's __Archive__ (which holds the
+            # pre-upscale originals, so they all look eligible again).
+            import runner_common
+            pruner = runner_common.DerivedPruner()
+            for abs_path, rel in bv.iter_videos(self._src_root,
+                                                skip_roots=[self._out_root],
+                                                pruner=pruner):
                 if seq != self._scan_seq:
                     return
                 files.append((abs_path, rel))
                 if len(files) % 25 == 0:
                     self._scan_q.put(("listing", len(files)))
             files.sort(key=lambda t: t[1].lower())
+            pruned = pruner.summary()
+            if pruned:
+                self._scan_q.put(("pruned", pruned))
             self._scan_q.put(("total", len(files)))
             for abs_path, rel in files:
                 if seq != self._scan_seq:
@@ -1338,6 +1348,8 @@ class VideoTab(MqttTaskState, ttk.Frame):
                 self._scan_adopted.extend(data)
                 for rel, tgt in data:
                     self.console.feed(f"  found on disk (already upscaled elsewhere): {rel} → {tgt}\n")
+            elif kind == "pruned":
+                self.console.feed(f"{data}\n")
             elif kind == "listing":
                 self._scan_listing = data
                 self.status_var.set(f"Listing files … {data} found")

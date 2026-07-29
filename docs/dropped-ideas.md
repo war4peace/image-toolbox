@@ -615,9 +615,10 @@ the model path is 8-bit RGB.
 transparency through an upscale, handling every page of a multi-page TIFF, and writing 16-bit
 output for a 16-bit source.
 
-**What ships instead:** roadmap **#17**, which treats these files as **not images** and
-leaves them untouched, the same way non-media files are already left untouched. That is a
-deliberate holding position, not a verdict on the formats, which is why this entry exists.
+**What shipped instead:** roadmap **#17** (0.5.9-experimental), which treats these files as
+**not images** and leaves them untouched, the same way non-media files are already left
+untouched. That is a deliberate holding position, not a verdict on the formats, which is why
+this entry exists.
 
 **The decision, in the author's words:** at this stage of development it is safer to skip
 these file types than for the author to decide on an aspect he knows too little about. The
@@ -649,7 +650,7 @@ recomposite. It is wrong at the edges by construction, which is precisely why it
 be the silent default, but as an explicit, labelled option it would serve the case.
 
 **Revisit if** users actually ask, i.e. someone reports skipped PNGs as a problem rather than
-as the expected message #17 will print. A second trigger would be the model I/O path moving
+as the expected message #17 prints. A second trigger would be the model I/O path moving
 past 8-bit for some other reason, which would make the 16-bit row worth revisiting on its own.
 
 Until then the skip is correct and, importantly, **reversible**: nothing is written, nothing

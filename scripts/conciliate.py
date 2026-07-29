@@ -21,6 +21,11 @@ a terminal):
                          tree (keeping the processed file's name).
                delete  — delete the original, then move its processed
                          counterpart into the original tree.
+             Before either, an IMAGE pair gets the #13b metadata backfill: every
+             EXIF field the processed file is missing is copied from the original,
+             which is possible here and nowhere else (this is the one moment the
+             app holds both files, already matched, and in delete mode the last
+             moment the original exists at all). Scan/Preview only COUNTS it.
 
 Video note (roadmap #5): a video is matched by content-hash lineage ONLY — no
 name fallback. The Video Upscaler records source<->output lineage on completion
@@ -97,7 +102,24 @@ _gui_event      = runner_common.gui_event
 # resolve_settings({}) yields all-unconfigured backends, so send_notification is
 # then a no-op. This closes the gap where a long archive/delete finished silently
 # while upscale/tag/video all notified (item 9).
-NOTIFY = notifications.resolve_settings(config_store.load(APP_ROOT) or {})
+_CFG   = config_store.load(APP_ROOT) or {}
+NOTIFY = notifications.resolve_settings(_CFG)
+
+# Retroactive metadata backfill (#13b). Shares ONE setting with the upscaler's
+# copy-at-save-time (#13a): a user who wants scrubbed output wants it from both,
+# and two switches for one intention is one more thing to get wrong. Conciliation
+# is the last moment both files exist, so in Delete mode this is the final chance
+# to recover metadata an upscale run made before #13a shipped.
+COPY_METADATA = bool(_CFG.get("upscale", {}).get("copy_metadata", True))
+
+# conciliate.py is otherwise pure file I/O with no Pillow import, which is part of
+# why it is fast and cheap to run. The backfill changes that, so the import is
+# guarded and the feature simply reports itself unavailable rather than becoming a
+# hard requirement of the whole tool.
+try:
+    import exif_copy
+except Exception:                                  # noqa: BLE001 (no Pillow / old install)
+    exif_copy = None
 
 
 def send_notification(title, description, color, fields=None):
@@ -211,9 +233,14 @@ def build_processed_hash_index(processed_root, conn, abort=None):
     cache; only genuinely new/moved files pay a hash, once, then they too are cached.
     """
     index = {}
+    pruner = runner_common.DerivedPruner()
     for dirpath, dirnames, filenames in os.walk(processed_root):
         if abort is not None and abort():
             break
+        # The Video Upscaler's `.imgtbx_video` work area lives inside the output
+        # tree and holds every per-segment intermediate. Hashing multi-GB segments
+        # here is pure waste, and a segment must never become a match candidate (#16).
+        pruner.prune(dirnames)
         for fn in filenames:
             if os.path.splitext(fn)[1].lower() not in MEDIA_EXTS:
                 continue
@@ -287,7 +314,7 @@ def resolve_by_name(o_rel, processed_root, tr_index):
 
 
 def build_plan(original_root, processed_root, tr_index, conn=None,
-               abort=None, status_cb=None):
+               abort=None, status_cb=None, log_cb=None):
     """
     Walk the original tree and pair each image/video with its processed
     counterpart.
@@ -298,22 +325,29 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     guess could mistake a partial clip for a whole-video match). The processed-tree
     hash index is built lazily, only once a lineage match is actually needed.
 
-    Returns (plan, folders, kept_files):
+    Returns (plan, folders, kept_files, variant_files):
       plan       — list of (original_abs, processed_abs, original_rel) to act on.
       folders    — list of (rel_dir, replaced, skipped, kept) per folder, for the
                    preview. 'kept' counts non-media files (never touched);
-                   'skipped' counts media files with no processed counterpart.
+                   'skipped' counts media files with no processed counterpart
+                   PLUS the #17 variants below (both are "left untouched").
       kept_files — absolute paths of the non-media files that were kept, so the
                    preview can list exactly what was left untouched (e.g. a
                    hidden Thumbs.db that Explorer doesn't show).
-    Skips the __Archive__ subfolder and the processed tree if it is nested
-    inside the original tree.
+      variant_files - (abs_path, reason) for originals the upscaler cannot
+                   round-trip (#17), which are never matched or replaced.
+    Skips every folder this app created (__Archive__ at ANY depth, __upscaled__,
+    the video work area: see runner_common.DerivedPruner) plus the processed tree
+    if it is nested inside the original tree under some other name.
     """
-    plan         = []
-    folders      = []
-    kept_files   = []
-    archive_abs  = _norm(os.path.join(original_root, ARCHIVE_DIRNAME))
-    processed_ab = _norm(processed_root)
+    plan          = []
+    folders       = []
+    kept_files    = []
+    variant_files = []
+    processed_ab  = _norm(processed_root)
+    # By NAME, so a nested archive deeper in the tree is skipped too: the old
+    # single `<original_root>/__Archive__` path check only caught the top one (#16).
+    pruner       = runner_common.DerivedPruner(extra=[ARCHIVE_DIRNAME])
 
     has_lineage = bool(conn is not None and db.lineage_has_rows(conn))
     _index_cache = {}   # built on first lineage hit
@@ -329,10 +363,11 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     for dirpath, dirnames, filenames in os.walk(original_root):
         if abort is not None and abort():
             break
-        # Never descend into our own archive or into the processed tree.
+        # Never descend into our own archive/output folders or into the processed tree.
+        pruner.prune(dirnames)
         dirnames[:] = [
             d for d in dirnames
-            if _norm(os.path.join(dirpath, d)) not in (archive_abs, processed_ab)
+            if _norm(os.path.join(dirpath, d)) != processed_ab
         ]
         replaced = skipped = kept = 0
         for fn in sorted(filenames):
@@ -342,6 +377,19 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
                 kept += 1
                 kept_files.append(abs_f)
                 continue
+            # An image the upscaler cannot round-trip is never replaced (#17).
+            # This is checked on the ORIGINAL, before any matching, so it also
+            # protects a tree upscaled BEFORE #17 shipped: that run wrote a
+            # flattened file under the SAME name and extension, which the
+            # mirrored-name fallback would match with full confidence and report
+            # as an ordinary "replaced" - archiving or DELETING the only copy
+            # that still has the transparency / pages / bit depth.
+            _variant = runner_common.image_variant_reason(abs_f)
+            if _variant:
+                variant_files.append((abs_f, _variant))
+                skipped += 1
+                continue
+
             o_rel = os.path.relpath(abs_f, original_root)
             p_abs = None
             if has_lineage:
@@ -362,12 +410,46 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
             folders.append((rel_dir, replaced, skipped, kept))
     if conn is not None:
         conn.commit()   # flush file_hashes computed for original files
-    return plan, folders, kept_files
+    if log_cb is not None:
+        summary = pruner.summary()
+        if summary:
+            log_cb(f"  {summary}")
+    return plan, folders, kept_files, variant_files
 
 
 # ─────────────────────────────────────────────
 #  EXECUTION
 # ─────────────────────────────────────────────
+
+def _is_image_pair(o_abs, p_abs):
+    """#13b is images only. Container-level video metadata is an ffmpeg job with
+    its own rules, so a video pair is left alone (and never opened with Pillow,
+    which would report every one of them as 'unreadable')."""
+    return (os.path.splitext(o_abs)[1].lower() in IMAGE_EXTS
+            and os.path.splitext(p_abs)[1].lower() in IMAGE_EXTS)
+
+
+def count_pending_metadata(plan, abort=None, status_cb=None):
+    """
+    How many pairs in `plan` WOULD gain metadata from their original (#13b).
+
+    Reads only; Scan/Preview promises to touch nothing, so the count has to be
+    produced without writing. Two header reads per pair (Pillow opens lazily and
+    never decodes the pixels), which is nothing next to the whole-file hashing
+    build_plan has already done for the same pairs.
+    """
+    if not COPY_METADATA or exif_copy is None:
+        return 0
+    n = 0
+    for i, (o_abs, p_abs, _rel) in enumerate(plan):
+        if abort is not None and abort():
+            break
+        if status_cb is not None and i and i % 200 == 0:
+            status_cb(f"Checking metadata … ({i}/{len(plan)})")
+        if _is_image_pair(o_abs, p_abs) and exif_copy.pending_backfill(o_abs, p_abs):
+            n += 1
+    return n
+
 
 def _move_processed_in(p_abs, o_rel, original_root):
     """Compute the destination of the processed file inside the original tree
@@ -397,11 +479,35 @@ def remove_empty_dirs(root, log):
     return removed
 
 
+def _backfill_metadata(o_abs, p_abs, o_rel, log):
+    """Copy the fields the processed file is missing from the original (#13b).
+
+    Returns True when something was written. Never raises: this is a bonus pass
+    running immediately before the original is archived or deleted, and it must
+    not be able to abort the file operation it precedes, leave a file in two
+    places, or block the run. A failure is logged and the run carries on.
+    """
+    if not COPY_METADATA or exif_copy is None or not _is_image_pair(o_abs, p_abs):
+        return False
+    try:
+        added, reason = exif_copy.backfill(o_abs, p_abs)
+    except Exception as exc:                       # noqa: BLE001 (belt and braces)
+        log.log_only(f"  metadata: skipped {o_rel} ({type(exc).__name__})")
+        return False
+    if added:
+        log.log_only(f"  metadata: restored {added} field(s) into "
+                     f"{os.path.basename(p_abs)}")
+        return True
+    if reason:
+        log.log_only(f"  metadata: not restored for {o_rel} ({reason})")
+    return False
+
+
 def execute(plan, original_root, mode, log, abort=None):
-    """Perform the conciliation. Returns (done, skipped_conflict, errors)."""
+    """Perform the conciliation. Returns (done, skipped_conflict, errors, restored)."""
     archive_root = os.path.join(original_root, ARCHIVE_DIRNAME)
     total = len(plan)
-    done = conflicts = errors = 0
+    done = conflicts = errors = restored = 0
 
     for i, (o_abs, p_abs, o_rel) in enumerate(plan, 1):
         if abort is not None and abort():
@@ -427,6 +533,13 @@ def execute(plan, original_root, mode, log, abort=None):
             conflicts += 1
             continue
 
+        # Metadata FIRST, while the original is still in place (#13b). In delete
+        # mode this is the last moment it exists at all, and in either mode the
+        # pair is already matched and both files are on disk - the one point in
+        # the app where that is true.
+        if _backfill_metadata(o_abs, p_abs, o_rel, log):
+            restored += 1
+
         try:
             if mode == "archive":
                 arch_dest = os.path.join(archive_root, o_rel)
@@ -447,7 +560,7 @@ def execute(plan, original_root, mode, log, abort=None):
             errors += 1
             log.tee(f"  ERROR on {o_rel}: {exc}")
 
-    return done, conflicts, errors
+    return done, conflicts, errors, restored
 
 
 # ─────────────────────────────────────────────
@@ -484,7 +597,7 @@ def _print_preview_table(folders, log):
         label = rel_dir if rel_dir != "." else "(root)"
         parts = [f"{replaced} replaced"]
         if skipped:
-            parts.append(f"{skipped} without a match (left untouched)")
+            parts.append(f"{skipped} left untouched")
         parts.append(f"{kept} non-media file(s) kept")
         log.tee(f"    {label.ljust(width)}  -  {', '.join(parts)}")
 
@@ -534,9 +647,11 @@ def main():
     _gui_event("STATUS", "Scanning the original folder …")
     log.tee("")
     log.tee("Scanning …")
-    plan, folders, kept_files = build_plan(original_root, processed_root, tr_index,
-                                           conn=conn, abort=_quit_evt.is_set,
-                                           status_cb=lambda m: _gui_event("STATUS", m))
+    plan, folders, kept_files, variant_files = build_plan(
+        original_root, processed_root, tr_index,
+        conn=conn, abort=_quit_evt.is_set,
+        status_cb=lambda m: _gui_event("STATUS", m),
+        log_cb=log.tee)
     if _quit_evt.is_set():
         log.tee("Cancelled during scan.")
         log.close()
@@ -546,12 +661,19 @@ def main():
     total_skipped  = sum(f[2] for f in folders)
     total_kept     = sum(f[3] for f in folders)
 
+    # #13b: how many pairs would have metadata restored. Counted here, written
+    # only by the Run phase below, so Scan/Preview still touches nothing.
+    _gui_event("STATUS", "Checking metadata …")
+    pending_meta = count_pending_metadata(
+        plan, abort=_quit_evt.is_set,
+        status_cb=lambda m: _gui_event("STATUS", m))
+
     for rel_dir, replaced, skipped, kept in folders:
         _gui_event("FOLDER", json.dumps(
             {"dir": rel_dir, "replaced": replaced, "skipped": skipped, "kept": kept}))
     _gui_event("PLAN", json.dumps(
         {"replaced": total_replaced, "skipped": total_skipped,
-         "kept": total_kept, "mode": mode}))
+         "kept": total_kept, "mode": mode, "metadata": pending_meta}))
 
     _print_preview_table(folders, log)
     # List the kept non-image files by full path. These are easy to miss in
@@ -562,10 +684,28 @@ def main():
         log.tee("Non-media files: ")
         for p in kept_files:
             log.tee(p)
+    # Same treatment for the #17 variants: they are inside the "left untouched"
+    # count, and a user who upscaled them before 0.5.9 has a flattened copy in
+    # the processed tree that will now never be moved in. Name them.
+    if variant_files:
+        log.tee("")
+        log.tee("Left untouched - upscaling would discard part of these images:")
+        for p, reason in variant_files:
+            log.tee(f"{p}  ({reason})")
     log.tee("")
     log.tee(f"  Total: {total_replaced} file(s) to replace, "
-            f"{total_skipped} without a match (left untouched), "
+            f"{total_skipped} left untouched, "
             f"{total_kept} non-media file(s) kept.")
+    if variant_files:
+        log.tee(f"  Of the untouched, {len(variant_files)} image(s) were kept "
+                f"because upscaling would discard part of them; the rest had no "
+                f"processed counterpart.")
+    if pending_meta:
+        log.tee(f"  Metadata to restore: {pending_meta} image(s) will get the "
+                f"capture date, camera and other fields their original still has "
+                f"and the processed copy is missing.")
+    elif COPY_METADATA and exif_copy is None:
+        log.tee("  Metadata restore: unavailable (Pillow is not installed).")
 
     if total_replaced == 0:
         _gui_event("STATUS", "Nothing to conciliate.")
@@ -601,8 +741,8 @@ def main():
     log.tee("")
     log.tee("Running …")
     started = time.time()
-    done, conflicts, errors = execute(plan, original_root, mode, log,
-                                      abort=_quit_evt.is_set)
+    done, conflicts, errors, restored = execute(plan, original_root, mode, log,
+                                                abort=_quit_evt.is_set)
     elapsed = time.time() - started
 
     # Folders in the processed tree that we emptied by moving their files out are
@@ -613,6 +753,9 @@ def main():
     log.tee(f"Done in {elapsed:.1f}s — {done} replaced, "
             f"{conflicts} skipped (conflict), {errors} error(s)"
             + (f", {removed_dirs} empty folder(s) removed." if removed_dirs else "."))
+    if restored:
+        log.tee(f"  Metadata restored into {restored} image(s) from their "
+                f"originals (see the log for the per-file detail).")
     # GUI: machine-readable run summary (drives the MQTT last_run topic + the
     # run-finished event). `processed`/`failed`/`elapsed_seconds` mirror the other
     # three runners' key names so ONE Home Assistant automation covers every tool
@@ -620,7 +763,7 @@ def main():
     # template already reading them is unaffected.
     _gui_event("DONE", json.dumps(
         {"done": done, "conflicts": conflicts, "errors": errors,
-         "removed_dirs": removed_dirs,
+         "removed_dirs": removed_dirs, "metadata_restored": restored,
          "processed": done, "failed": errors,
          "elapsed_seconds": round(elapsed, 1),
          "stopped_by_user": _quit_evt.is_set()}))
@@ -631,7 +774,9 @@ def main():
     n_title, n_color = _completion_notice(done, conflicts, errors, _quit_evt.is_set())
     send_notification(
         title       = n_title,
-        description = f"{done} replaced, {conflicts} skipped (conflict), {errors} error(s).",
+        description = (f"{done} replaced, {conflicts} skipped (conflict), "
+                       f"{errors} error(s)"
+                       + (f", metadata restored into {restored}." if restored else ".")),
         color       = n_color,
         fields      = [
             {"name": "Original",  "value": original_root},

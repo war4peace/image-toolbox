@@ -15,8 +15,12 @@ What lives here (the genuinely shared, behaviour-identical pieces):
   * GUI_MARKER / stdin_is_piped() / GUI_MODE / gui_event()  - the @@TBX@@ protocol
   * fmt_duration / fmt_mmss / fmt_hhmmss                     - duration formatting
   * get_image_dimensions() + header parsers                 - Pillow-free size read
+  * image_variant_reason()            - "the upscaler cannot round-trip this
+                                        image" detector (future-features #17)
   * is_oom_error()                    - CUDA/torch OOM classifier (watchdog)
   * remote_pod_stopped(session)       - "did the pod's dead-man's switch fire?"
+  * DerivedPruner                     - keep our own output/archive folders out
+                                        of every input walk (future-features #16)
 
 What deliberately stays per-runner (divergent by design, NOT pure moves):
   * The session loggers (batch_upscale.Logger vs tag_and_rename._TeeOutput vs
@@ -279,6 +283,232 @@ def get_image_dimensions(path):
     except Exception:
         pass
     return (0, 0)
+
+
+# ─────────────────────────────────────────────
+#  IMAGE VARIANTS THE PIPELINE CANNOT ROUND-TRIP  (future-features #17)
+# ─────────────────────────────────────────────
+# The upscale engine is RGB-only end to end: `_load_image` does
+# `img.convert("RGB")` and `_save_image` writes `arr[..., :3]` as mode="RGB",
+# frame 0 only. Anything outside three 8-bit channels of page zero is therefore
+# silently discarded, and the output keeps the SAME name and extension, so
+# Conciliation's mirrored-name fallback matches it with full confidence and
+# reports an ordinary "replaced": the original is archived (or deleted) and the
+# transparency / extra pages / 16-bit depth are gone with it.
+#
+# The decision (#17) is to SKIP these, not to fix them: supporting alpha,
+# multi-page and high-bit-depth output properly is a pile of format design
+# questions this project has not needed to answer, and guessing at them is how
+# quiet data loss happens. Skipping is conservative, reversible, and copies a
+# behaviour the app already has (non-media files are counted, listed and left
+# alone). The other half of that decision - actually supporting the formats -
+# lives in dropped-ideas.md with its revisit trigger.
+#
+# Detection is header-only (Pillow's lazy `Image.open`, no decode) and is not
+# even attempted for the extensions that cannot carry any of the three traits,
+# so a tree of JPEGs - the normal case - pays nothing for this check.
+#
+# CMYK is deliberately NOT treated as a variant: a colour-space conversion is a
+# different argument from losing a channel/page/bit depth, and testing for it
+# would force a Pillow open on every JPEG.
+
+# Extensions that can carry alpha, several pages, or >8-bit samples. JPEG cannot
+# in any form this app will meet, and it is the bulk of a photo tree, so the
+# normal case pays nothing. BMP is in the list for the rare 32-bit file with a
+# real alpha mask; the common BGRX kind reads back as plain RGB, so it does not
+# produce a false positive.
+VARIANT_CANDIDATE_EXTS = (".png", ".webp", ".tif", ".tiff", ".bmp")
+
+# Every variant reason starts with this, so a cached skip_reason can be
+# classified later without a second look at the file (the eligibility cache
+# stores the reason string, not a category).
+VARIANT_PREFIX = "would lose "
+
+# Pillow modes that carry more than 8 bits per sample. Used as the fallback when
+# the format-specific read below can't answer.
+_MODE_BITS = {"I": 32, "F": 32, "I;16": 16, "I;16B": 16, "I;16L": 16,
+              "I;16N": 16, "I;32": 32, "I;32B": 32, "I;32L": 32}
+
+_ALPHA_MODES = ("RGBA", "LA", "PA", "RGBa", "La")
+
+
+def is_variant_reason(reason):
+    """True when `reason` (an eligibility-cache skip_reason) is a #17 variant
+    skip rather than an ordinary too-large skip."""
+    return bool(reason) and str(reason).startswith(VARIANT_PREFIX)
+
+
+def _sample_bits(img, path, ext):
+    """Bits per colour sample, or 8 when it can't be determined.
+
+    Pillow's `mode` is not enough on its own: a 16-bit-per-channel PNG or TIFF
+    is presented as plain "RGB" (Pillow truncates it on load, which is exactly
+    the loss we are looking for), so the format's own header is read instead.
+    """
+    if ext in (".tif", ".tiff"):
+        try:
+            bps = img.tag_v2.get(258)          # BitsPerSample
+            if bps:
+                vals = bps if isinstance(bps, (tuple, list)) else (bps,)
+                return max(int(v) for v in vals)
+        except Exception:
+            pass
+    elif ext == ".png":
+        try:
+            with open(path, "rb") as f:
+                head = f.read(26)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                return int(head[24])           # IHDR bit depth
+        except Exception:
+            pass
+    return _MODE_BITS.get(getattr(img, "mode", ""), 8)
+
+
+def image_variant_reason(path):
+    """
+    Return a short plain-English reason when upscaling `path` would silently
+    discard part of it, else None.
+
+    Reasons are user-facing and always start with VARIANT_PREFIX, e.g.
+    "would lose transparency", "would lose 3 of 4 pages",
+    "would lose transparency, 16-bit depth".
+
+    Never raises. An unreadable file returns None on purpose: the runners
+    already have a "corrupted / unreadable" path that reports it properly, and
+    this check must not steal that classification.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in VARIANT_CANDIDATE_EXTS:
+        return None
+    try:
+        from PIL import Image
+    except Exception:
+        return None                            # no Pillow: nothing to claim
+
+    losses = []
+    try:
+        with Image.open(path) as img:
+            if img.mode in _ALPHA_MODES or "transparency" in (img.info or {}):
+                losses.append("transparency")
+
+            try:
+                pages = int(getattr(img, "n_frames", 1) or 1)
+            except Exception:
+                pages = 1
+            if pages > 1:
+                unit = "frames" if ext == ".webp" else "pages"
+                losses.append(f"{pages - 1} of {pages} {unit}")
+
+            bits = _sample_bits(img, path, ext)
+            if bits > 8:
+                losses.append(f"{bits}-bit depth")
+    except Exception:
+        return None
+
+    return VARIANT_PREFIX + ", ".join(losses) if losses else None
+
+
+# ─────────────────────────────────────────────
+#  DERIVED DIRECTORIES  (future-features #16)
+# ─────────────────────────────────────────────
+# The app writes its outputs INSIDE the tree it scans (the Batch Upscaler's
+# default output is <source>/__upscaled__, Conciliation archives originals into
+# <source>/__Archive__). That nesting is deliberate and correct (a shared
+# sibling root would collide the moment a second source tree is processed), but
+# it means every scanner can walk into another tool's output and treat it as
+# fresh input. The archive case was the expensive one: it holds the only copies
+# still BELOW the resolution target, so the next upscale scan finds them all
+# eligible and re-upscales files the user already conciliated (billed GPU time on
+# a rented pod).
+#
+# The fix is a NAME rule, not a database lookup: the app names its derived
+# folders with a consistent `__name__` convention, so one shared list checked per
+# directory is stateless, free, and retroactive (it works on archives created
+# before this shipped, on a second install, and after `db/cache.db` is deleted,
+# none of which a DB record would survive). Rejected alternatives are recorded in
+# docs/future-features.md #16.
+#
+# The rule is "prune matching SUBDIRECTORIES", never "refuse the root": a user
+# who deliberately points a tool at an `__upscaled__` folder as their chosen root
+# still gets it scanned. Pruning an os.walk `dirnames` list gives that for free:
+# the root is yielded before any pruning can apply to it.
+
+# Case-insensitive (Windows). Add new output folder names here, in one place.
+DERIVED_DIRNAMES = (
+    "__upscaled__",         # Batch Upscaler + Video Upscaler default output
+    "__Archive__",          # Conciliation archive mode (conciliate.ARCHIVE_DIRNAME)
+    ".imgtbx_video",        # Video Upscaler work area (batch_video_upscale.WORK_DIRNAME)
+)
+
+
+def derived_dirnames(cfg=None):
+    """
+    The lowercased set of directory names that are OURS and must never be
+    re-scanned as input. `cfg` (a loaded config.json) adds the configured video
+    output subfolder when the user changed it from the default; passing None
+    loads it best-effort. Never raises.
+    """
+    names = {n.lower() for n in DERIVED_DIRNAMES}
+    if cfg is None:
+        try:
+            import config_store
+            cfg = config_store.load(APP_ROOT)
+        except Exception:               # noqa: BLE001 (fail-safe: the fixed list still applies)
+            cfg = None
+    try:
+        sub = (cfg or {}).get("video", {}).get("output_subdir", "")
+        if isinstance(sub, str) and sub.strip():
+            names.add(sub.strip().lower())
+    except Exception:                   # noqa: BLE001
+        pass
+    return names
+
+
+class DerivedPruner:
+    """
+    Prunes the app's own derived directories out of an os.walk, and remembers
+    what it skipped so the scan can print ONE summary line afterwards (a user
+    wondering why their archived files aren't picked up gets a hint; a per-folder
+    line would drown a big tree).
+
+    Usage:
+        pruner = DerivedPruner(cfg)
+        for dirpath, dirnames, filenames in os.walk(root):
+            pruner.prune(dirnames)
+            ...
+        line = pruner.summary()         # None when nothing was pruned
+    """
+
+    def __init__(self, cfg=None, extra=None):
+        self.names = derived_dirnames(cfg)
+        if extra:
+            self.names |= {e.strip().lower() for e in extra if e and e.strip()}
+        self.count = 0                  # how many directories were pruned
+        self.seen  = set()              # the distinct names actually pruned
+
+    def prune(self, dirnames):
+        """Remove our derived folders from an os.walk `dirnames` list, in place
+        (os.walk only honours in-place edits). Returns the pruned names."""
+        removed = []
+        keep    = []
+        for d in dirnames:
+            if d.lower() in self.names:
+                removed.append(d)
+                self.count += 1
+                self.seen.add(d)
+            else:
+                keep.append(d)
+        if removed:
+            dirnames[:] = keep
+        return removed
+
+    def summary(self):
+        """One line for the scan log, or None when nothing was pruned."""
+        if not self.count:
+            return None
+        names = ", ".join(sorted(self.seen, key=str.lower))
+        return (f"Skipped {self.count} folder(s) this app created "
+                f"(not re-scanned as input): {names}")
 
 
 # ─────────────────────────────────────────────

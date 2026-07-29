@@ -29,7 +29,7 @@ _SEEDVR_EXCLUDE = {"resolution", "max_resolution", "discord_webhook_url",
                    "upscale_cutoff_pct", "output_subdir", "debug",
                    "auto_straighten", "straighten_min_confidence",
                    "watchdog_enabled", "watchdog_factor", "watchdog_consecutive",
-                   "watchdog_min_samples",
+                   "watchdog_min_samples", "copy_metadata",
                    # These are intentionally hidden from the UI: the defaults are
                    # the right ones and a non-technical user can't meaningfully
                    # change them (DiT/VAE model = the 7B FP16 + FP16 VAE combo;
@@ -168,13 +168,13 @@ class SettingsTab(ttk.Frame):
         self.default_vsrc_var = tk.StringVar(value=defs.get("video_source", ""))
         self.default_vout_var = tk.StringVar(value=defs.get("video_output", ""))
         for r, (text, var) in enumerate((
-                ("Batch Upscaler — Photo folder:",  self.default_src_var),
-                ("Batch Upscaler — Output folder:", self.default_out_var),
-                ("Tag & Rename — Photo folder:",    self.default_tag_var),
-                ("Conciliation — Original folder:",  self.default_corig_var),
-                ("Conciliation — Processed folder:", self.default_cproc_var),
-                ("Video Upscaler — Video folder:",   self.default_vsrc_var),
-                ("Video Upscaler — Output folder:",  self.default_vout_var))):
+                ("Batch Upscaler Photo folder:",   self.default_src_var),
+                ("Batch Upscaler Output folder:",  self.default_out_var),
+                ("Tag & Rename Photo folder:",     self.default_tag_var),
+                ("Conciliation Original folder:",  self.default_corig_var),
+                ("Conciliation Processed folder:", self.default_cproc_var),
+                ("Video Upscaler Video folder:",   self.default_vsrc_var),
+                ("Video Upscaler Output folder:",  self.default_vout_var))):
             ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
             ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
             b = ttk.Button(sec, text="Browse…",
@@ -325,6 +325,18 @@ class SettingsTab(ttk.Frame):
         ttk.Label(wd, text="images in a row").pack(side="left", padx=(4, 0))
         Tooltip(wc_spin, "Consecutive slow images before stopping (filters out a "
                          "single odd image).   Recommended: 2")
+
+        self.copy_meta_var = tk.BooleanVar(value=bool(ups.get("copy_metadata", True)))
+        cm_chk = ttk.Checkbutton(sec, text="Copy metadata from the original",
+                                 variable=self.copy_meta_var)
+        cm_chk.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(cm_chk,
+                "Keeps the capture date, camera, lens, exposure, GPS and copyright on the "
+                "upscaled photo. Without this the upscaled copy has none of it, and once "
+                "Conciliation replaces the original the capture date is gone for good. This "
+                "also lets Conciliation put those fields back into photos upscaled before "
+                "this option existed. Turn it OFF only if you want scrubbed copies to share "
+                "(no GPS, no camera).   Recommended: on")
 
         # ── Video Upscaler (#2) ───────────────────────────────────────────────────
         vid = CFG.get("video", {})
@@ -1223,6 +1235,7 @@ class SettingsTab(ttk.Frame):
         ha_url, ha_webhook_id = notifications.split_ha_webhook(
             self.ha_url_var.get(), self.ha_webhook_var.get())
 
+        ups["copy_metadata"] = bool(self.copy_meta_var.get())
         ups["watchdog_enabled"] = bool(self.watchdog_var.get())
         try:
             wd_factor = round(float(self.watchdog_factor_var.get()), 1)
@@ -1380,6 +1393,7 @@ class SettingsTab(ttk.Frame):
         self.cutoff_var.set(int(ups.get("upscale_cutoff_pct", 66)))
         self.up_straighten_var.set(bool(ups.get("auto_straighten", True)))
         self.up_straighten_conf_var.set(float(ups.get("straighten_min_confidence", 0.9)))
+        self.copy_meta_var.set(bool(ups.get("copy_metadata", True)))
         self.watchdog_var.set(bool(ups.get("watchdog_enabled", True)))
         self.watchdog_factor_var.set(float(ups.get("watchdog_factor", 3.0)))
         self.watchdog_consec_var.set(int(ups.get("watchdog_consecutive", 2)))
