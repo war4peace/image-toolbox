@@ -3,9 +3,10 @@
 A feature-by-feature comparison between [Upscayl](https://github.com/upscayl/upscayl)
 and **Image Toolbox** (this project).
 
-Written 2026-07-27 against Upscayl's public repository / website and Image Toolbox
-0.5.8-experimental. Check their repo before relying on their column: this is a
-snapshot of one day's reading, and their side can change without this file noticing.
+Written 2026-07-27 against Upscayl's public repository / website; the Image Toolbox
+column was refreshed 2026-07-29 for **0.6.0-experimental**. Check their repo before
+relying on their column: this is a snapshot of one day's reading, and their side can
+change without this file noticing.
 
 **This is not a competitive pitch.** The two tools are not chasing the same users,
 so there is nothing to win by overstating one or understating the other. The point
@@ -154,8 +155,9 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | Before/after slider | ✅ | ✅ | Both. Image Toolbox's is a floating, resizable window with shared zoom/pan. |
 | Adjustable zoom while comparing | ⚠️ | ✅ | Upscayl's lens is a **fixed 4×**. Image Toolbox: mouse wheel, centred on the pointer, fit up to 400% of the upscaled image's native pixels, with drag-pan, and both sides stay locked together. |
 | Hover magnifier ("lens view") | ✅ | ✅ | A different interaction, not more zoom: the lens shows one patch as original **and** upscaled at once, side by side, where a wipe shows it as one or the other. Closed by roadmap #14 in 0.6.0. Three differences from Upscayl's: the magnification is the **actual upscale ratio** rather than a hard-coded 4×, so the upscaled panel is exactly 1:1 with the file that was produced; the wheel **zooms the lens** 1×/2×/4×/8× on top of that, growing the panels with the window instead of a fixed stamp; and a click **pins** the lens (Upscayl's is hover-only). Works on the video comparison window too. |
+| Re-open a finished batch later and compare | ❌ | ✅ | Upscayl compares the image it has just produced; there is no browser over an output folder from an earlier session. Image Toolbox's **Browse upscaled…** (0.6.0, roadmap #22) opens the output tree at any time: folder tree, paged thumbnail wall, and double-click opens the same comparison window, wipe and lens included. It pairs each upscaled photo back to its original from the mirrored folder structure (so it works on a tree produced months ago, by another install, or after the cache was deleted), follows files Tag & Rename has since renamed, and an opt-in content match handles originals that were moved or renamed. |
 | Drag and drop input | ✅ | ❌ | Image Toolbox is folder-driven. |
-| Thumbnail wall of the running batch | ❌ | ✅ | Outcome-coloured frames: green comparable, red failed, blue in progress. |
+| Thumbnail wall of results | ❌ | ✅ | Outcome-coloured frames: green comparable, red failed, blue in progress. During a run on the tab, and over any already-upscaled folder in the browser above. |
 | Right-click context menu per result | ❌ | ✅ | Open original/upscaled, open folder, compare, copy path. |
 | Resolution shown before processing | ✅ | ✅ | |
 | Frame-accurate video before/after wipe | ❌ | ✅ | Timestamp-aligned scrubbing and frame stepping. |

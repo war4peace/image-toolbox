@@ -6,10 +6,10 @@ A feature-by-feature comparison between
 lives in [`topaz-video-vs-image-toolbox.md`](topaz-video-vs-image-toolbox.md).
 
 Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`
-(app version **1.3.1**, released 2026-06-11) and Image Toolbox 0.5.9-experimental.
-Check Topaz's own pages before relying on their column: their release cadence is
-fast, their pricing changed materially in the last year, and this is a snapshot of
-one day's reading.
+(app version **1.3.1**, released 2026-06-11); the Image Toolbox column was refreshed
+2026-07-29 for **0.6.0-experimental**. Check Topaz's own pages before relying on
+their column: their release cadence is fast, their pricing changed materially in the
+last year, and this is a snapshot of one day's reading.
 
 **This is not a competitive pitch.** Gigapixel is a mature commercial product from
 a company with a real engineering team, two billion processed images behind it, and
@@ -175,10 +175,12 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 |---|:--:|:--:|---|
 | Before/after comparison view | ✅ | ✅ | Image Toolbox's is a floating, resizable window with a vertical wipe and shared zoom/pan. |
 | Side-by-side and split view modes | ✅ | ⚠️ | Gigapixel offers several comparison layouts; Image Toolbox has one wipe. |
-| Adjustable zoom while comparing | ✅ | ✅ | Image Toolbox: wheel zoom centred on the pointer, fit up to 400% of the upscaled native pixels, drag-pan, both sides locked to the same region. |
+| Adjustable zoom while comparing | ✅ | ✅ | Gigapixel: a zoom slider with fixed-zoom presets and a navigator for picking the region. Image Toolbox: wheel zoom centred on the pointer, fit up to 400% of the upscaled native pixels, drag-pan, both sides locked to the same region. |
+| Hover magnifier showing both versions at once | ⚠️ | ✅ | Gigapixel's Split and Side by Side modes put the two versions in one view and zoom into them, which answers the same question a whole frame at a time; no pointer-following loupe is documented. Image Toolbox's **Lens** (0.6.0, roadmap #14) is the patch-level form of it: the spot under the pointer is magnified as original **and** upscaled side by side, at the **actual upscale ratio**, so the upscaled panel is exactly 1:1 with the file that was produced. The wheel zooms the lens (1×/2×/4×/8×, the panels growing with the window), a click pins it for a hands-off look or a screenshot, and Esc backs out one level at a time. |
+| Re-open a finished batch later and compare | ⚠️ | ✅ | Gigapixel's file list holds the current session's imports; the documentation does not describe re-opening an earlier batch to compare it. Image Toolbox's **Browse upscaled…** (0.6.0, roadmap #22) opens the output tree at any time, pairs each upscaled photo back to its original from the mirrored folder structure (so it still works months later, on a tree from another machine, or after the cache was deleted), follows files Tag & Rename has since renamed, and offers an opt-in content match for originals that were moved. Double-click opens the same comparison window. |
 | Live preview before committing the whole image | ✅ | ❌ | Gigapixel auditions the selected model before you commit. Image Toolbox only shows the result after the file is written, though the film strip and the before/after comparison work **mid-run**, so a small test batch answers the same question one step later. |
 | Drag and drop input | ✅ | ❌ | Image Toolbox is folder-driven. |
-| Thumbnail wall of the running batch | ❌ | ✅ | Outcome-coloured frames: green comparable, red failed, blue in progress. |
+| Thumbnail wall of results | ❌ | ✅ | Outcome-coloured frames: green comparable, red failed, blue in progress. During a run on the tab, and over any already-upscaled folder in the browser above. |
 | Right-click context menu per result | ❌ | ✅ | Open original/upscaled, open folder, compare, copy path. |
 | Crop / composition tools | ✅ | ❌ | Including the marketed "6x lossless zoom" crop workflow. |
 
@@ -292,7 +294,10 @@ outcome.
   lands and double-clicking one opens the before/after comparison **mid-run**, so
   the first few images tell you what the settings are doing; Stop finishes the
   current image cleanly; and the source is never touched, so nothing is lost by
-  re-running. In practice you point the tool at a handful of representative
+  re-running. Since 0.6.0 that judgement is no longer tied to the run being on
+  screen either: **Browse upscaled…** re-opens any finished output folder and
+  compares any photo in it against its original, days or months later. In
+  practice you point the tool at a handful of representative
   photos first, look, adjust, then let the real queue go, which is a slower loop
   than a preview but reaches the same place. The one sharp edge worth knowing:
   a re-run **skips any image whose output already exists**, so redoing images at

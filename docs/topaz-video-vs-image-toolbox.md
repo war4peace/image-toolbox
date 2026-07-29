@@ -5,10 +5,11 @@ A feature-by-feature comparison between [Topaz Video](https://www.topazlabs.com/
 project). The image-side comparison against Topaz Gigapixel lives in
 [`topaz-gigapixel-vs-image-toolbox.md`](topaz-gigapixel-vs-image-toolbox.md).
 
-Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`,
-and Image Toolbox 0.5.9-experimental. Check Topaz's own pages before relying on
-their column: their model lineup changes several times a year and their pricing
-changed materially in the last one. This is a snapshot of one day's reading.
+Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`;
+the Image Toolbox column was refreshed 2026-07-29 for **0.6.0-experimental**. Check
+Topaz's own pages before relying on their column: their model lineup changes several
+times a year and their pricing changed materially in the last one. This is a snapshot
+of one day's reading.
 
 **This is not a competitive pitch.** Topaz Video is the reference product in its
 category, used in real post-production pipelines, with plugins for After Effects
@@ -182,7 +183,8 @@ This is the section Image Toolbox was actually built for.
 | CLI / headless | ⚠️ | ✅ | Topaz ships an ffmpeg build with `tvai_*` filters and has a CLI, but pulled most of its official CLI documentation, so community write-ups fill the gap. Image Toolbox: every runner is a standalone script by design, and the GUI drives them over the same seam. |
 | Extract and upscale one scene | ⚠️ | ✅ | Image Toolbox: mark in/out on a live preview and it is queued as a clip through the identical estimate / GPU-pick / stream / resume path as a whole video. The source is never touched. |
 | Side-by-side real-time playback with sound | ✅ | ✅ | Image Toolbox: bundled libVLC, original and upscaled side by side, audio routed to the upscaled player as the sync reference. Falls back to a silent frame-scrub if libVLC is absent. |
-| Frame-accurate before/after wipe | ✅ | ✅ | |
+| Frame-accurate before/after wipe | ✅ | ✅ | Topaz: Single, Side by Side and Split preview modes. Image Toolbox: a vertical wipe with shared zoom and pan, on a timestamp-aligned frame pair. |
+| Hover magnifier showing both versions at once | ⚠️ | ✅ | Topaz's Side by Side and Split modes put the two versions in one view, which answers the same question a whole frame at a time; no pointer-following loupe is documented. Image Toolbox's **Lens** (0.6.0, roadmap #14) magnifies the spot under the pointer as original **and** upscaled side by side on whichever frame you have stopped at, at the actual upscale ratio, so the upscaled panel is exactly 1:1 with the file that was produced. The wheel zooms the lens (1×/2×/4×/8×) and a click pins it. It matters more on video than on stills: an old 320x240 source is already being blown up by the window itself, so the lens starts at least as strong as the view it sits on rather than at a useless 1:1. |
 | Replace originals with the upscaled results | ❌ | ✅ | Conciliation, matching videos by content-hash lineage only (deliberately no name fallback, so a short clip can never replace a whole source), with a non-destructive preview. |
 
 ### 3.6 Operations and integration
