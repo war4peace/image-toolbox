@@ -26,6 +26,7 @@ Source for the open roadmap: `docs/future-features.md`.
 - [Background removal for images and video](#background-removal-for-images-and-video-2026-07-28)
 - [Archival / intermediate codec output](#archival--intermediate-codec-output-2026-07-28)
 - [Processing alpha, multi-page and high-bit-depth images](#processing-alpha-multi-page-and-high-bit-depth-images-2026-07-29)
+- [Managing the network volume via the RunPod S3 API](#managing-the-network-volume-via-the-runpod-s3-api-2026-07-29)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -653,6 +654,124 @@ past 8-bit for some other reason, which would make the 16-bit row worth revisiti
 
 Until then the skip is correct and, importantly, **reversible**: nothing is written, nothing
 is lost, and the skip reason is printed per file so the affected users are self-identifying.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Managing the network volume via the RunPod S3 API (2026-07-29)
+
+> Research the RunPod S3 API (<https://docs.runpod.io/storage/s3-api>). This method might
+> allow adding or removing models from the RunPod network volume without having to spin up
+> a pod.
+
+Researched 2026-07-29 against RunPod's S3 and network-volume docs, and against
+[`pod/provision.sh`](../pod/provision.sh). **Dropped.** Nothing was built.
+
+**The decision, in the author's words:** not worth the effort to implement, for this
+particular application. **Removing models is rare enough.**
+
+That is the right weighing, and the frequency argument is the load-bearing one: the two
+things the API does well (inspect the volume, delete a weight file) are both things this
+app does a handful of times per install, while the cost is permanent surface area plus a
+second credential.
+
+**Revisit if** either the volume becomes something users touch often, or a *free* variant
+appears: if the S3 credentials ever merge into the ordinary RunPod API key, the main
+objection below disappears and the read-only half becomes close to free.
+
+### What the API is, so it is not re-derived
+
+An S3 front end onto an existing network volume, usable with **no compute attached**.
+Endpoint `https://s3api-<DATACENTER>.runpod.io/`, `--region <DATACENTER>`, bucket name =
+the network volume ID, and pod path `/workspace/x/y` maps to `s3://<VOLUME_ID>/x/y`.
+Supported: `Get/Put/Head/Copy/DeleteObject`, `ListObjects(V2)`, the full multipart set.
+**Not** supported: batch `DeleteObjects`, pre-signed URLs, versioning, bucket
+create/delete, ACLs, tagging. 500 MB single-PUT ceiling, so every DiT weight needs
+multipart. Fifteen datacenters, EU-RO-1 among them.
+
+### Why "add models without a pod" fails, in descending order of how fatal it is
+
+**1. Provisioning is not file placement.** This is the ceiling on the whole idea, and no
+API feature moves it. `provision.sh` produces on the volume: a Python venv built
+`--system-site-packages` **against the pod image's exact torch** (stamped by that torch
+version, thousands of files, Linux `.so`s, absolute paths, exec bits); the ollama runtime
+as Linux ELF binaries plus its `lib/ollama` GPU runners; and a `chmod +x`'d static ffmpeg.
+S3 cannot set an exec bit, and none of it can be constructed on Windows. **A from-scratch
+provision will always need a pod.**
+
+**2. The bandwidth direction reverses, and that is the expensive part.** Today the pod
+pulls ~40 GB (three DiT tiers ~26 GB plus three vision tiers ~11 GB) from HuggingFace and
+ollama.com over a datacenter link, while a cheap card (RTX 2000 Ada, ~$0.24/hr) bills for
+20 to 40 minutes: **$0.10 to $0.16 in total**. Via S3 the same bytes route HuggingFace to
+the user's house to RunPod, on a home upload link. That trades roughly fifteen cents for
+hours. The measurement that would decide any upload-side variant is the **WAN upload**
+throughput (not the 10G LAN): ~1 Gbit symmetric makes 40 GB a 6-minute job and flips the
+calculus; 100 Mbit makes it an hour and settles it.
+
+**3. Ollama's store is undocumented and blob-shared.** `OLLAMA_MODELS` is content-addressed
+(`models/blobs/sha256-<hex>` plus `models/manifests/.../<model>/<tag>`), a layout Ollama
+has changed before, and blobs can be shared between manifests. `ollama pull` / `ollama rm`
+on a pod handle that by construction; raw S3 object deletes do not, so deleting the wrong
+blob silently breaks a *different* model. **Ollama models stay a pod job**, permanently.
+
+The one S3-friendly artifact is **SeedVR2 weights**: flat `.safetensors`/`.gguf` files in
+`models/seedvr2/`, no exec bit, no layout magic, and `download_weight` already skips files
+that are present and valid.
+
+### What was genuinely on the table, and is what would be built if this returns
+
+Recorded because it is not what the question asked for, and it is the better half:
+
+1. **Pod-free volume inspection.** `ListObjectsV2` plus `HeadObject` answer, for zero cost
+   and no compute: which DiT and vision tiers are cached, how much of the 50 GB is free,
+   and **whether the model just picked in Settings is actually on the volume**. That last
+   one is money-adjacent: today a mismatched pick is discovered at run start, on a billed
+   pod, and three HTTPS calls would turn a billed failure into a dialog.
+2. **Pod-free deletion of obsolete SeedVR2 weight files.** One `DeleteObject` per path,
+   versus deploying a billed pod to run a two-second `rm`. This is the half the author's
+   "rare enough" applies to directly.
+
+### The costs that decided it
+
+- **A second credential, which is the main objection.** The S3 key is separate from the
+  RunPod API key, created on a different console page, and shown only once (access key =
+  the RunPod user id `user_***`, secret `rps_***`). It would mean new config keys, another
+  entry in `config_store.SECRET_FIELDS`, Settings fields plus a Test button, and one more
+  onboarding step for a **non-technical user**, which cuts against what the first-start
+  wizard exists to do.
+- **`boto3` is not an option.** botocore ships ~100 MB of service JSON and would become the
+  heaviest dependency in the project, for four HTTP verbs. The right shape is hand-rolled
+  SigV4 over `urllib` (~120 lines for List/Head/Delete/Get, `hmac` + `hashlib` + `datetime`,
+  `context=net_ssl.ssl_context()`), in the same spirit as the ctypes `ITaskbarList3` and
+  the urllib GraphQL client. Cheap, but it is still a new module to own.
+- **The pain it would remove was already mostly removed.** Incremental provisioning (0.5.5)
+  keeps every valid artifact and re-fetches only what changed, so a re-provision is already
+  cheap. What is left is the 20-minute pod for the inspect and prune cases, which is
+  exactly the "rare enough" workload.
+
+### Traps, if anyone does pick this up
+
+- **Never list the whole bucket.** `ListObjects` degrades past 10,000 files or 10 GB in a
+  directory (slow, or repeated-next-token errors while ETags are computed). `/workspace/venv`
+  is precisely that shape. Always list under a narrow prefix.
+- **The S3 datacenter list is not the storage-capable datacenter list.** The region picker
+  offers storage-capable DCs from the live GraphQL list; the S3 endpoints are a different,
+  shorter fifteen. CA-MTL hosts volumes but has no S3 endpoint. So the endpoint needs a
+  lookup table with a graceful "not available in this data center" miss, shaped like
+  `region_of`, never an assumption. The volume's DC is already known, so no new user input
+  is needed to derive it.
+- **Concurrency is undocumented, and there is already a scar here.** A volume cannot attach
+  to two pods, and nothing states whether S3 writes are safe while a pod holds it.
+  `provision.sh` already carries a workaround for a venv held open by another pod's file
+  handles. Any mutation would have to be gated on "no toolbox pod running", reusing
+  `_find_existing_pod`.
+- **Smaller ones:** requests with more than 1 h of clock drift are rejected (more lenient
+  than AWS's 15 minutes, but a wrong system clock is a plausible support ticket, so the
+  error should name it); uploads do **not** pre-check free space and fail partway on a full
+  volume, which List makes pre-emptable; `aws s3 sync` is documented as unreliable at
+  scale; object names containing `#` need URL encoding.
+- Storage pricing confirmed at **$0.07/GB/mo** for the first TB, so the 50 GB model volume
+  is ~$3.50/mo. That is the figure behind the standing "a volume bills monthly even when
+  idle" tooltip.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 
