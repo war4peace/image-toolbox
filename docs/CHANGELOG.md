@@ -82,6 +82,10 @@ GPU it wasted money. Every scan now skips the folders the app created itself. Po
 a tool **at** one of those folders still works, and is the supported way to tag an
 upscaled tree.
 
+Because of that, Tag & Rename has to be pointed at the **upscaled** folder rather than
+at your originals, so it now fills that folder in for you: it suggests whatever the
+Batch Upscaler tab is set to save to, or the default folder you pinned in Settings.
+
 <div align="right"><a href="#changelog">↑ Back to top</a></div>
 
 ---
