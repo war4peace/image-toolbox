@@ -21,8 +21,24 @@ Releases page.
 
 ## 0.5.9
 
-Three fixes to things the app was quietly getting wrong with your files. Nothing to
-turn on: all three are on by default.
+Three fixes to things the app was quietly getting wrong with your files, plus an undo
+for the one tool that could not be taken back. Nothing to turn on: it is all on by
+default.
+
+### Conciliation can be undone
+Conciliation was the only tool in the app that changed your original folders, and the
+only one you could not undo. Now every run is recorded as it happens, and **Undo last
+run** puts everything back: each original comes back out of `__Archive__`, each
+upscaled file returns to the processed folder, and your folders look exactly as they
+did before. It still works after closing and reopening the app.
+
+It will not overwrite anything to do it. If you have edited one of the files since the
+run, or something else has taken a file's name, that one is left alone and named in the
+log; the rest are still put back.
+
+**A Delete run cannot be undone** and the button says so instead of pretending: deleted
+files are gone. What the record can still tell you is exactly which originals were
+removed, and it does.
 
 ### Your photo's details now survive the upscale
 Until now an upscaled image came out with **no information at all**: no capture date,

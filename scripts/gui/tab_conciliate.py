@@ -8,6 +8,7 @@ import os
 import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import db
 import mqtt_publisher
 import taskbar_progress
 from gui.common import APP_TITLE, get_default_folder, set_default_folder
@@ -38,8 +39,12 @@ class ConciliateTab(ToolTab):
         self.proc_var  = tk.StringVar()
         self.mode_var  = tk.StringVar(value=CONCILIATE_MODES[0][0])
         self._phase    = "idle"     # idle | scanning | preview | running
+        self._mode     = "conciliate"   # "conciliate" | "undo" — for the exit message
         self._plan_replaced = 0
         self._result   = None       # last DONE summary dict
+        self._undo_result = None    # last UNDONE summary dict
+        self._undo_run = None       # the run the Undo button would reverse
+        self._undo_count = 0        # how many file actions that run recorded
         self._build()
 
         # Restore pinned default folders from config.json
@@ -107,7 +112,8 @@ class ConciliateTab(ToolTab):
         mode_tip = ("What happens to an original once its processed version is "
                     "found.\n"
                     "Archive: the original moves into an __Archive__ subfolder, "
-                    "so it stays recoverable.\n"
+                    "so it stays recoverable and the whole run can be reversed "
+                    "with Undo last run.\n"
                     "Delete: the original is removed for good, which cannot be "
                     "undone from the app.")
         Tooltip(mode_lbl, mode_tip, wraplength=W)
@@ -123,9 +129,12 @@ class ConciliateTab(ToolTab):
         self.scan_btn = ttk.Button(btns, text="Scan / Preview", command=self._scan)
         self.run_btn  = ttk.Button(btns, text="Run", command=self._run, state="disabled")
         self.stop_btn = ttk.Button(btns, text="Stop", command=self._stop, state="disabled")
+        self.undo_btn = ttk.Button(btns, text="Undo last run…", command=self._undo,
+                                   state="disabled")
         self.open_btn = ttk.Button(btns, text="Open original folder", command=self._open_orig)
         self.viewlog_btn = ttk.Button(btns, text="View log", command=self._view_log, state="disabled")
-        for b in (self.scan_btn, self.run_btn, self.stop_btn, self.open_btn, self.viewlog_btn):
+        for b in (self.scan_btn, self.run_btn, self.stop_btn, self.undo_btn,
+                  self.open_btn, self.viewlog_btn):
             b.pack(side="left", padx=(0, 6))
         Tooltip(self.scan_btn,
                 "Work out what would happen and show it in the table below. "
@@ -140,6 +149,10 @@ class ConciliateTab(ToolTab):
                 "End the operation after the file currently being handled. Files "
                 "already replaced stay replaced; the rest are left untouched.",
                 wraplength=W)
+        # The hint is retargeted by _refresh_undo: what this button can do depends
+        # entirely on what the last recorded run did, and saying so on hover is the
+        # only way the user learns it before clicking rather than after.
+        self.undo_tip = Tooltip(self.undo_btn, "", wraplength=W)
         Tooltip(self.open_btn,
                 "Open the Original Files folder in Windows Explorer.", wraplength=W)
         Tooltip(self.viewlog_btn,
@@ -257,15 +270,67 @@ class ConciliateTab(ToolTab):
             except ValueError:
                 self._result = None
             self.app.flash_attention()    # catch the eye when the run finishes
+        elif kind == "UNDONE":
+            # An undo's summary is its own event, not DONE: DONE feeds the MQTT
+            # last_run topic with the replaced/conflict/error keys every other tool
+            # publishes, and an undo's counts mean something different.
+            try:
+                self._undo_result = json.loads(payload)
+            except ValueError:
+                self._undo_result = None
+            self.app.flash_attention()
         else:
             super()._handle_event(kind, payload)
 
     # ── default-folder buttons ────────────────────────────────────────────────
 
+    def _refresh_undo(self):
+        """Work out what 'Undo last run' can do for the folder in the field, and put
+        the answer on its hint. Read from the DB every time rather than remembered
+        in the tab, so a run made in an earlier session is still offered — and so a
+        run someone undid elsewhere stops being offered."""
+        folder = self.orig_var.get().strip()
+        run, count = None, 0
+        if folder and os.path.isdir(folder):
+            try:
+                conn = db.get_conn()
+                run = db.latest_conc_run(conn, folder)
+                if run is not None:
+                    count = db.count_conc_actions(conn, run["id"])
+            except Exception:
+                run, count = None, 0     # fail-safe: no record = nothing offered
+        self._undo_run = run
+        self._undo_count = count
+
+        if not folder:
+            can, tip = False, ("Put back the originals from the last conciliation. "
+                               "Choose the Original Files folder first.")
+        elif run is None:
+            can, tip = False, ("Nothing to put back: no conciliation of this folder "
+                               "has been recorded. Runs made before this version of "
+                               "the app were not recorded and cannot be undone.")
+        elif run["mode"] != "archive":
+            when = (run["started_at"] or "").replace("T", " ")
+            can, tip = False, (f"The last run on this folder ({when}) DELETED its "
+                               f"originals, so there is nothing left to put back. "
+                               f"Press View log to see exactly which files it "
+                               f"removed.")
+        else:
+            when = (run["started_at"] or "").replace("T", " ")
+            can, tip = True, (f"Put everything back as it was before the "
+                              f"conciliation of {when}: {count} original(s) come "
+                              f"back out of __Archive__ and the processed files "
+                              f"return to the Processed Files folder. Anything you "
+                              f"have changed since is left alone and reported.")
+        self.undo_tip.set_text(tip)
+        self.undo_btn.configure(
+            state="normal" if (can and not self.running) else "disabled")
+
     def _refresh_buttons(self):
         ready = bool(self.orig_var.get().strip()) and bool(self.proc_var.get().strip())
         if not self.running:
             self.scan_btn.configure(state="normal" if ready else "disabled")
+        self._refresh_undo()
         self.save_orig_btn.configure(
             state="normal" if os.path.isdir(self.orig_var.get().strip() or "") else "disabled")
         self.save_proc_btn.configure(
@@ -297,7 +362,8 @@ class ConciliateTab(ToolTab):
                 foreground="#b3261e")
         else:
             self.mode_hint.configure(
-                text="Originals are moved to an __Archive__ subfolder.", foreground="#666")
+                text="Originals are moved to an __Archive__ subfolder; the run can be undone.",
+                foreground="#666")
 
     def _mode_code(self):
         for label, code in CONCILIATE_MODES:
@@ -349,9 +415,11 @@ class ConciliateTab(ToolTab):
         self.progress.grid_remove()
         self._plan_replaced = 0
         self._result = None
+        self._undo_result = None
         self._reset_stream_state()
         self.status_lbl.configure(text="Scanning …")
         if self.launch("conciliate.py", [orig, proc, self._mode_code()]):
+            self._mode  = "conciliate"
             self._phase = "scanning"
             self._set_running(True)
 
@@ -381,6 +449,44 @@ class ConciliateTab(ToolTab):
         self.status_lbl.configure(text="Running …")
         self.send("run")
 
+    def _undo(self):
+        """Reverse the last recorded conciliation of this folder (#18)."""
+        run = self._undo_run
+        if run is None or run["mode"] != "archive" or self.running:
+            return
+        if self.app.upscale_tab.running or self.app.tag_tab.running:
+            messagebox.showinfo(
+                APP_TITLE,
+                "Please wait for the Batch Upscaler or Tag & Rename to finish "
+                "before undoing a conciliation — they may be using the same folders.")
+            return
+        folder = self.orig_var.get().strip()
+        if not os.path.isdir(folder):
+            messagebox.showwarning(APP_TITLE, "Please choose a valid Original Files folder.")
+            return
+        when = (run["started_at"] or "").replace("T", " ")
+        if not messagebox.askyesno(
+                APP_TITLE,
+                f"Undo the conciliation of {when}?\n\n"
+                f"{self._undo_count} original file(s) move back out of "
+                f"'__Archive__', and the processed files return to:\n"
+                f"{run['processed_root'] or 'the processed folder'}\n\n"
+                f"Any file changed since that run is left exactly as it is."):
+            return
+
+        self.tree.delete(*self.tree.get_children())
+        self.progress.set(0)
+        self.progress.grid_remove()
+        self._plan_replaced = 0
+        self._result = None
+        self._undo_result = None
+        self._reset_stream_state()
+        self.status_lbl.configure(text="Undoing …")
+        if self.launch("conciliate.py", [folder, "--undo"]):
+            self._mode  = "undo"
+            self._phase = "running"
+            self._set_running(True)
+
     def _stop(self):
         self.send("q")
         self.stop_btn.configure(state="disabled")
@@ -393,14 +499,36 @@ class ConciliateTab(ToolTab):
         self.mode_cmb.configure(state="disabled" if running else "readonly")
         if not running:
             self.run_btn.configure(state="disabled")
+        # _refresh_buttons -> _refresh_undo re-reads the journal, which is what
+        # makes the button disable itself the moment the run it offered is undone.
         self._refresh_buttons()
         self.app.refresh_tab_exclusivity()
 
     def on_exit(self, code):
+        was_undo = (self._mode == "undo")
+        self._mode = "conciliate"
         self._set_running(False)
         self._phase = "idle"
         for delay in (250, 1500):
             self.after(delay, self._tick)
+        if was_undo:
+            u = self._undo_result or {}
+            if u.get("refused"):
+                self.progress.grid_remove()
+                self.status_lbl.configure(text=u["refused"])
+            elif self._undo_result is not None:
+                self.progress.set(100)
+                self.status_lbl.configure(
+                    text=f"Undo finished — {u.get('undone', 0)} restored, "
+                         f"{u.get('conflicts', 0)} skipped (conflict), "
+                         f"{u.get('errors', 0)} error(s).")
+            else:
+                self.status_lbl.configure(
+                    text=f"Undo stopped with an error (code {code}) — see the log.")
+            self.app.mqtt_publish(
+                {mqtt_publisher.TASK_DETAILS_TOPIC: self.status_lbl.cget("text")})
+            super().on_exit(code)
+            return
         if self._result is not None:
             r = self._result
             self.progress.set(100)

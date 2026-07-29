@@ -8,7 +8,7 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 
 The remaining open milestones start with an easy comfort feature deferred to later (a
 hover magnifier, #14).
-The medium tier is a safety feature for the one destructive tool (#18 Conciliation Undo),
+The medium tier is
 two new input/processing capabilities (#19 RAW and DNG input, #20 a Video Stabilization
 tab), one measurement-gated one (#21 denoising), a Video Upscaler feature (#12 mixed
 local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second
@@ -21,7 +21,6 @@ numbering legend, after the open work.
 ## Contents
 
 - [14. Hover magnifier ("lens view") in the comparison window](#14-hover-magnifier-lens-view-in-the-comparison-window-easy-later)
-- [18. Conciliation Undo](#18-conciliation-undo-medium)
 - [19. RAW and DNG input for the Batch Upscaler](#19-raw-and-dng-input-for-the-batch-upscaler-medium)
 - [20. Video Stabilization (new tab)](#20-video-stabilization-new-tab-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
@@ -86,44 +85,6 @@ existing before/after wipe.
   reads pixels, writes nothing, and cannot touch a file. The only real concern is
   redraw cost on a large image while the pointer moves, which the existing
   fast-filter-then-LANCZOS pattern already solves.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
-
----
-
-## 18. Conciliation Undo: Medium
-
-Give Conciliation the same one-click Undo that Tag & Rename has had since early on.
-
-- **The gap, noticed 2026-07-28:** Conciliation is the **only destructive tool in the app and
-  the only one with no undo record**. Tag & Rename records every change *before* anything is
-  modified and offers one-click Undo. Conciliation archives or deletes with nothing but the
-  `__Archive__` folder itself as evidence of what happened, and in **Delete** mode not even
-  that.
-- **What it records:** one row per action at Run time, written **before** the file operation:
-  original path, destination path, action (`archived` / `deleted` / `moved-in` /
-  `added-alongside`), content hash, timestamp, and a run id so one Undo reverts one run.
-  Tag & Rename's undo cache is the model to copy, including its schema versioning.
-- **What Undo can and cannot restore**, stated plainly in the UI rather than discovered:
-  * **Archive mode: fully reversible.** Move the processed file back out, move the original
-    back in from `__Archive__`. Both files still exist.
-  * **Delete mode: not reversible**, and no record can change that: the bytes are gone. The
-    log still has value (it says exactly what was deleted, which is what a user actually asks
-    after a bad run) but the button must be honest and stay disabled, not offer a restore it
-    cannot perform.
-  * A file the user has since edited or moved by hand must not be silently overwritten: check
-    the recorded hash before restoring, and report a conflict instead.
-- **Where:** `conciliate.py` at the two file-operation sites, plus a new table in `db.py`.
-  Note that Conciliation currently writes **nothing** to the DB about its own actions (it
-  only reads `lineage` and writes memoised `file_hashes`), so this is genuinely new state
-  rather than an extension of something.
-- **Interaction with #16:** independent. #16 (shipped) stopped scanners walking into
-  `__Archive__`; this makes the archive reversible. Neither needs the other.
-- **Interaction with #19:** RAW pairs are never replaced (they are folded in alongside), so
-  the Undo action for them is simply "remove the added file", the easiest case.
-- **Risks:** medium, and concentrated in one place. An undo that restores the *wrong* file is
-  worse than no undo, so the hash check is not optional, and the whole thing must fail safe:
-  a broken or missing undo record disables the button rather than guessing.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
@@ -609,13 +570,13 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16 and #17 are complete** (remote upscaling +
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16, #17 and #18 are complete** (remote upscaling +
   funds-floor; RunPod video; video conciliation; self-healing remote runs; local video;
   benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN
   engine; metadata copy + backfill; derived-directory pruning; skipping image variants the
-  pipeline cannot round-trip), so the remaining sequencing is only among the low-priority
-  open milestones below.
-- **Open milestones: #14, #18, #19, #20, #21, #12, #15, #3, #4.**
+  pipeline cannot round-trip; Conciliation Undo), so the remaining sequencing is only among
+  the low-priority open milestones below.
+- **Open milestones: #14, #19, #20, #21, #12, #15, #3, #4.**
 - **#19 (RAW) inherits #17's superset rule**: an original may only be replaced when the
   processed file is a superset of it. #17 satisfies that rule by never producing a
   non-superset; #19 has to keep satisfying it for a format the pipeline *does* process.
@@ -630,8 +591,6 @@ The user installs and runs the application on their Unraid server.
   pipeline at all: separate tab, separate run, composes by file. Its one cross-cutting cost
   is the new MQTT `task/name` value, which is a **contract change** requiring
   `docs/mqtt-integration.md` and `samples/home-assistant/` to be updated in the same change.
-- **#18 (Conciliation Undo) is independent of #16**, despite both touching the archive: #16
-  (shipped) stops scanners walking into it, #18 makes it reversible.
 - **#12 (mixed local+remote queue)** is a medium, self-contained Video Upscaler feature that
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
@@ -672,7 +631,7 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16 and #17** are done and live; they are no
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16, #17 and #18** are done and live; they are no
 longer described in full here (their design of record lives in `CLAUDE.md`,
 `docs/runpod-notes.md`, `docs/video-upscaler.md`, `docs/local-video-upscaler.md`,
 `docs/benchmark-sharing.md`, `docs/telemetry-design.md` and `samples/home-assistant/`).
@@ -772,6 +731,25 @@ The numbers survive only because code and other docs cite the roadmap by them
   Conciliation checks the ORIGINAL before either matching path, so it also protects a tree
   upscaled before the fix. See `CLAUDE.md` (Image variants left as-is) and
   `tests/test_image_variants.py`.
+- **#18: Conciliation Undo.** Shipped 0.5.9-experimental. Conciliation was the app's only
+  destructive tool and the only one with no undo record: the `__Archive__` folder was the
+  sole evidence a run had happened, and a Delete run left not even that. A Run now journals
+  one row per file action (`db.conc_runs` / `conc_actions`) **before** performing it, and an
+  **Undo last run** button on the tab reverses an archive run: each processed file returns to
+  the processed tree, each original comes back out of `__Archive__`. Four decisions carry the
+  feature. **Undo reads the disk, not the row's status**, so an interrupted run (a `pending`
+  row, one of the two moves done) unwinds correctly and a repeated undo is a no-op. **It
+  never overwrites**: both halves of a pair are checked before either moves, so a refusal
+  leaves the pair exactly as it was; a file changed since the run, or a name something else
+  now occupies, is a reported conflict. **A delete run is refused, not attempted** - the
+  bytes are gone and no journal changes that, so the button stays disabled and says why,
+  while the journal is spent on the question a user actually asks after a bad delete run
+  ("what exactly did it remove?"). And **recording is free and fail-safe**: the fingerprint
+  is (size, mtime) plus the content hash only when one is already memoised (`db.cached_hash`,
+  which never reads a file), because recording happens on every run while verifying is the
+  rare recovery path and can afford the read; a journal failure disables the journal, reports
+  itself once, and lets the conciliation finish. See `CLAUDE.md` (Conciliation Undo) and
+  `tests/test_conciliate_undo.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

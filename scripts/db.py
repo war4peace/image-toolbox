@@ -13,6 +13,9 @@ two pairs of cache tables plus the content-hash lineage:
                                       hash (batch_upscale.py, tag_and_rename.py;
                                       read by conciliate.py)
     file_hashes                     – memoised file content hashes, shared
+    conc_runs     / conc_actions    – conciliation undo journal (#18): what a Run
+                                      archived/deleted and moved in, written
+                                      before each file operation (conciliate.py)
 
 The lineage table is the relationship that lets conciliation re-match a source
 photo to its processed counterpart by content even after the user moves or
@@ -203,6 +206,48 @@ CREATE TABLE IF NOT EXISTS video_segments (
 CREATE INDEX IF NOT EXISTS idx_video_seg_parent
     ON video_segments(root_id, rel_path, target, clip_id);
 
+-- Conciliation undo journal (#18). Conciliation is the app's only destructive
+-- tool and used to record NOTHING about its own actions: the __Archive__ folder
+-- was the sole evidence a run had happened, and in Delete mode not even that.
+-- One row per run, one per file action, both written BEFORE the file operation
+-- so a crash mid-run still leaves a usable record (undo is state-driven and
+-- re-checks the disk, so a half-finished pair unwinds correctly).
+--
+-- The recorded fingerprints are what make an undo safe: a file the user has
+-- edited or replaced by hand since the run must NOT be silently overwritten, so
+-- undo verifies (size, mtime) and, when one was recorded, the content hash. The
+-- hash is stored only when it is already memoised in file_hashes (see
+-- cached_hash) - recording runs on every conciliation and must stay free, while
+-- verifying is the rare recovery path and can afford to read.
+CREATE TABLE IF NOT EXISTS conc_runs (
+    id             INTEGER PRIMARY KEY,
+    original_root  TEXT NOT NULL,
+    processed_root TEXT,
+    mode           TEXT NOT NULL,   -- archive | delete
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    started_at     TEXT,
+    finished_at    TEXT,
+    undone_at      TEXT             -- NULL until an undo has run against it
+);
+CREATE TABLE IF NOT EXISTS conc_actions (
+    id             INTEGER PRIMARY KEY,
+    run_id         INTEGER NOT NULL REFERENCES conc_runs(id) ON DELETE CASCADE,
+    action         TEXT NOT NULL,   -- archived | deleted
+    original_path  TEXT NOT NULL,   -- where the original was (and returns to)
+    archive_path   TEXT,            -- where it went; NULL in delete mode (gone)
+    processed_path TEXT NOT NULL,   -- where the processed file came from
+    dest_path      TEXT NOT NULL,   -- where the processed file was moved to
+    orig_size      INTEGER,
+    orig_mtime     REAL,
+    orig_hash      TEXT,            -- NULL when it was not already memoised
+    proc_size      INTEGER,
+    proc_mtime     REAL,
+    proc_hash      TEXT,
+    status         TEXT NOT NULL DEFAULT 'pending',  -- pending|done|undone|conflict|failed
+    recorded_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_conc_actions_run ON conc_actions(run_id);
+
 -- Per-user GPU timing for the remote-pod cost estimator (0.3.9). Cumulative
 -- images + processing seconds per (task, gpu_id), accumulated from finished
 -- remote runs, so a future run on the same card warm-starts its "$ / 100 images"
@@ -260,6 +305,12 @@ CREATE TABLE IF NOT EXISTS video_bench (
 # LARGER output is a safe bound for a smaller one), so a fine grid costs no safety. Must match
 # video_vram_sizer._MP_KEY_MP and batch_video_upscale._MP_KEY_MP.
 MP_KEY_UNIT = 0.05
+
+# Conciliation undo journal (#18). Stamped on every run row; an undo refuses a run
+# recorded by a version it does not understand rather than guessing at its meaning
+# (Tag & Rename's cache versioning is the model). Bump only on a breaking change to
+# what the conc_actions columns MEAN - adding a column with a safe default is not one.
+CONC_UNDO_SCHEMA = 1
 
 _conn = None   # one connection per process
 
@@ -1216,6 +1267,28 @@ def hash_file_cached(conn, path):
     return digest
 
 
+def cached_hash(conn, path):
+    """The memoised content hash of `path`, but ONLY if file_hashes already holds
+    one for its current (mtime, size). Never reads the file: returns None instead.
+
+    This is hash_file_cached's free half. The conciliation undo journal (#18) needs
+    a fingerprint of every file it is about to move, and recording happens on every
+    run, so it must cost nothing: an original has almost always just been hashed by
+    the lineage matching, while a processed file the #13b backfill has rewritten has
+    not, and pays a plain (size, mtime) fingerprint instead of a whole-file read.
+    """
+    try:
+        st = os.stat(path)
+        mtime, size = round(st.st_mtime, 3), st.st_size
+    except OSError:
+        return None
+    row = conn.execute(
+        "SELECT mtime, size, hash FROM file_hashes WHERE path = ?", (_norm(path),)).fetchone()
+    if row is not None and row["mtime"] == mtime and row["size"] == size:
+        return row["hash"] or None
+    return None
+
+
 # ─────────────────────────────────────────────
 #  LINEAGE  (source → upscaled → tagged, by content hash)
 # ─────────────────────────────────────────────
@@ -1286,6 +1359,132 @@ def lineage_final_hash(conn, src_hash):
 def lineage_has_rows(conn):
     """True if any lineage has been recorded (lets callers skip hashing work)."""
     return conn.execute("SELECT 1 FROM lineage LIMIT 1").fetchone() is not None
+
+
+# ─────────────────────────────────────────────
+#  CONCILIATION UNDO JOURNAL  (#18)
+# ─────────────────────────────────────────────
+
+@_locked
+def begin_conc_run(conn, original_root, processed_root, mode):
+    """Open a conciliation run row and return its id. Called once, immediately
+    before the first file operation of a Run."""
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    cur = conn.execute(
+        "INSERT INTO conc_runs (original_root, processed_root, mode, schema_version, "
+        "started_at) VALUES (?, ?, ?, ?, ?)",
+        (_norm(original_root), processed_root, mode, CONC_UNDO_SCHEMA, now))
+    conn.commit()
+    return cur.lastrowid
+
+
+@_locked
+def record_conc_action(conn, run_id, action, original_path, archive_path,
+                       processed_path, dest_path, orig_fp=None, proc_fp=None):
+    """Journal ONE pending file action and return its id. Written BEFORE the move
+    or delete it describes, so a crash still leaves the record. `orig_fp`/`proc_fp`
+    are (size, mtime, hash_or_None) fingerprints taken while both files are still
+    in place. Commits (a record that is lost on a crash is no record at all)."""
+    o_size, o_mtime, o_hash = orig_fp or (None, None, None)
+    p_size, p_mtime, p_hash = proc_fp or (None, None, None)
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    cur = conn.execute(
+        "INSERT INTO conc_actions (run_id, action, original_path, archive_path, "
+        "processed_path, dest_path, orig_size, orig_mtime, orig_hash, proc_size, "
+        "proc_mtime, proc_hash, status, recorded_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)",
+        (run_id, action, original_path, archive_path, processed_path, dest_path,
+         o_size, o_mtime, o_hash, p_size, p_mtime, p_hash, now))
+    conn.commit()
+    return cur.lastrowid
+
+
+@_locked
+def set_conc_action_status(conn, action_id, status, commit=True):
+    """Move one journalled action to its outcome (done / undone / conflict).
+
+    `commit=False` is for the RUN's own 'done' stamp, which is the one status write
+    whose durability does not matter: a row left 'pending' by a crash is exactly
+    what undo is built to resolve (it re-derives the pair's real state from the
+    disk), while the row's CREATION must survive a crash and so commits. Halving
+    the commits halves the journal's cost on a big run, where the file operations
+    themselves are often just renames. The next record_conc_action flushes it.
+    """
+    conn.execute("UPDATE conc_actions SET status = ? WHERE id = ?", (status, action_id))
+    if commit:
+        conn.commit()
+
+
+@_locked
+def finish_conc_run(conn, run_id):
+    """Stamp a run as finished. A run without this stamp was interrupted; undo
+    treats it the same way, since it works from the per-action rows and the disk."""
+    conn.execute("UPDATE conc_runs SET finished_at = ? WHERE id = ?",
+                 (datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), run_id))
+    conn.commit()
+
+
+@_locked
+def mark_conc_run_undone(conn, run_id):
+    """Stamp a run as undone, so the GUI stops offering to undo it again."""
+    conn.execute("UPDATE conc_runs SET undone_at = ? WHERE id = ?",
+                 (datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"), run_id))
+    conn.commit()
+
+
+@_locked
+def latest_conc_run(conn, original_root, include_undone=False):
+    """The most recent conciliation run recorded for this original folder, or None.
+    Path-matched by _norm (the same case/separator folding the rest of the DB uses),
+    so the GUI's folder field finds the run whatever the user typed. By default an
+    already-undone run is skipped: it is no longer an offer, it is history."""
+    sql = "SELECT * FROM conc_runs WHERE original_root = ?"
+    if not include_undone:
+        sql += " AND undone_at IS NULL"
+    sql += " ORDER BY id DESC LIMIT 1"
+    return conn.execute(sql, (_norm(original_root),)).fetchone()
+
+
+@_locked
+def get_conc_actions(conn, run_id, statuses=("pending", "done")):
+    """A run's journalled actions, newest first. Reverse order is what an undo
+    needs: a pair whose processed file took the original's own name is only
+    unwound correctly by undoing the moves in the opposite order to the run.
+    `statuses=None` returns every row (for a report)."""
+    sql = "SELECT * FROM conc_actions WHERE run_id = ?"
+    params = [run_id]
+    if statuses:
+        sql += " AND status IN (" + ",".join("?" * len(statuses)) + ")"
+        params += list(statuses)
+    sql += " ORDER BY id DESC"
+    return conn.execute(sql, params).fetchall()
+
+
+@_locked
+def count_conc_actions(conn, run_id, statuses=("pending", "done")):
+    """How many actions a run has left to undo. The GUI asks this on every refresh
+    of the folder field, and a big run journals thousands of rows, so it counts in
+    SQL rather than fetching them."""
+    sql = "SELECT COUNT(*) FROM conc_actions WHERE run_id = ?"
+    params = [run_id]
+    if statuses:
+        sql += " AND status IN (" + ",".join("?" * len(statuses)) + ")"
+        params += list(statuses)
+    return conn.execute(sql, params).fetchone()[0]
+
+
+@_locked
+def prune_conc_runs(conn, original_root, keep=10):
+    """Keep only the newest `keep` runs for a folder; the rest (and their action
+    rows, via ON DELETE CASCADE) are dropped. A big run journals one row per file,
+    so without this the table grows without limit for no gain: only the most recent
+    run is ever offered for undo, and the older ones are already superseded on disk.
+    Best-effort."""
+    conn.execute(
+        "DELETE FROM conc_runs WHERE original_root = ? AND id NOT IN "
+        "(SELECT id FROM conc_runs WHERE original_root = ? ORDER BY id DESC LIMIT ?)",
+        (_norm(original_root), _norm(original_root), int(keep)))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────

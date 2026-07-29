@@ -39,15 +39,27 @@ untouched. A video is only ever acted on when its processed output is actually
 present in the chosen processed tree, so pointing this at an image-only processed
 folder never touches a video (and vice versa).
 
+Undo (#18): a Run journals every file action to the DB (db.conc_runs /
+conc_actions) BEFORE performing it, so an ARCHIVE run is fully reversible: the
+processed files go back to the processed tree and the originals come back out of
+__Archive__. A DELETE run is journalled too, but only as evidence of what was
+removed: the bytes are gone and no record can bring them back, so undo refuses it
+and lists what was deleted instead. Undo verifies each file is still the one the
+journal recorded before it moves anything, and works from the disk state, so an
+interrupted run unwinds correctly.
+
 Safety rules (non-negotiable):
   * An original file with NO processed counterpart on disk is NEVER touched.
   * Non-media files in the original tree are NEVER touched (counted as "kept").
   * The processed counterpart is moved in only AFTER the original has been
     archived/deleted, so the freed name is available; an unrelated file already
     occupying the destination name aborts that one pair (original left intact).
+  * Undo never overwrites: a file that has changed since the run, or a name that
+    something else now occupies, is reported as a conflict and left alone.
 
 Usage:
     python conciliate.py <original_dir> <processed_dir> [archive|delete]
+    python conciliate.py <original_dir> <processed_dir> --undo   # reverse the last run
 
 GUI control lines (stdin):  run | q
 """
@@ -503,7 +515,96 @@ def _backfill_metadata(o_abs, p_abs, o_rel, log):
     return False
 
 
-def execute(plan, original_root, mode, log, abort=None):
+class UndoRecorder:
+    """Journals what a Run does, so it can be reversed afterwards (#18).
+
+    Conciliation is the app's only destructive tool and was the only one with no
+    undo record: the __Archive__ folder was the sole evidence a run had happened,
+    and a Delete run left not even that. Every action is written BEFORE the file
+    operation it describes, which is what makes an interrupted run recoverable: the
+    row exists, and undo decides what to do from the disk rather than from a status.
+
+    Fail-safe, deliberately: a DB failure disables the journal for the rest of the
+    run and is reported ONCE, loudly, on the log. Aborting a conciliation because
+    its safety net failed would cost the user the thing they actually asked for.
+    """
+
+    def __init__(self, conn, original_root, processed_root, mode, log):
+        self._conn = conn
+        self._original_root = original_root
+        self._processed_root = processed_root
+        self._mode = mode
+        self._log = log
+        self.run_id = None
+        self.enabled = conn is not None
+
+    def _fail(self, exc):
+        if self.enabled:
+            self.enabled = False
+            self._log.tee(f"  WARNING: could not record the undo journal ({exc}). "
+                          f"The conciliation continues, but this run will not be "
+                          f"undoable from the app.")
+
+    def begin(self):
+        if not self.enabled:
+            return
+        try:
+            self.run_id = db.begin_conc_run(self._conn, self._original_root,
+                                            self._processed_root, self._mode)
+        except Exception as exc:                       # noqa: BLE001 (fail-safe)
+            self._fail(exc)
+
+    def fingerprint(self, path):
+        """(size, mtime, hash-if-already-memoised) for a file about to be moved.
+        The hash is taken only when db already holds a valid one, so recording
+        never reads a file: see db.cached_hash for why that trade is the right way
+        round (recording is every run, verifying is the rare recovery)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return (None, None, None)
+        digest = None
+        try:
+            digest = db.cached_hash(self._conn, path)
+        except Exception:                              # noqa: BLE001 (fail-safe)
+            digest = None
+        return (st.st_size, round(st.st_mtime, 3), digest)
+
+    def record(self, action, original_path, archive_path, processed_path, dest_path):
+        """Journal one pending pair and return its action id (None when disabled)."""
+        if not self.enabled or self.run_id is None:
+            return None
+        try:
+            return db.record_conc_action(
+                self._conn, self.run_id, action, original_path, archive_path,
+                processed_path, dest_path,
+                orig_fp=self.fingerprint(original_path),
+                proc_fp=self.fingerprint(processed_path))
+        except Exception as exc:                       # noqa: BLE001 (fail-safe)
+            self._fail(exc)
+            return None
+
+    def mark(self, action_id, status):
+        if not self.enabled or action_id is None:
+            return
+        try:
+            # No commit: see db.set_conc_action_status. The next record commits it,
+            # and finish() flushes the last one.
+            db.set_conc_action_status(self._conn, action_id, status, commit=False)
+        except Exception as exc:                       # noqa: BLE001 (fail-safe)
+            self._fail(exc)
+
+    def finish(self):
+        if not self.enabled or self.run_id is None:
+            return
+        try:
+            db.finish_conc_run(self._conn, self.run_id)
+            db.prune_conc_runs(self._conn, self._original_root)
+        except Exception as exc:                       # noqa: BLE001 (fail-safe)
+            self._fail(exc)
+
+
+def execute(plan, original_root, mode, log, abort=None, recorder=None):
     """Perform the conciliation. Returns (done, skipped_conflict, errors, restored)."""
     archive_root = os.path.join(original_root, ARCHIVE_DIRNAME)
     total = len(plan)
@@ -540,27 +641,229 @@ def execute(plan, original_root, mode, log, abort=None):
         if _backfill_metadata(o_abs, p_abs, o_rel, log):
             restored += 1
 
+        arch_dest = os.path.join(archive_root, o_rel) if mode == "archive" else None
+        action_id = None
         try:
             if mode == "archive":
-                arch_dest = os.path.join(archive_root, o_rel)
                 os.makedirs(os.path.dirname(arch_dest), exist_ok=True)
                 if os.path.exists(arch_dest):
                     log.tee(f"  SKIP (already archived): {o_rel}")
                     conflicts += 1
                     continue
+
+            # Journal the pair BEFORE either file moves (#18). Both must still be
+            # in place for their fingerprints to mean anything, and a row written
+            # afterwards is missing in exactly the case that makes it matter: a
+            # crash, a power cut, a half-moved pair. A row left 'pending' says
+            # "started, outcome unknown", which is what undo is built to resolve.
+            if recorder is not None:
+                action_id = recorder.record(
+                    "archived" if mode == "archive" else "deleted",
+                    o_abs, arch_dest, p_abs, dest)
+
+            if mode == "archive":
                 shutil.move(o_abs, arch_dest)
             else:  # delete
                 os.remove(o_abs)
 
             new_dest = _move_processed_in(p_abs, o_rel, original_root)
             done += 1
+            if recorder is not None:
+                recorder.mark(action_id, "done")
             log.log_only(f"  OK: {o_rel} -> {os.path.relpath(new_dest, original_root)}"
                          f"  ({'archived' if mode == 'archive' else 'deleted'} original)")
         except Exception as exc:
             errors += 1
+            # The row stays 'pending' on purpose: the pair may be half-done, and
+            # 'pending' is precisely the state undo re-derives from the disk.
             log.tee(f"  ERROR on {o_rel}: {exc}")
 
     return done, conflicts, errors, restored
+
+
+# ─────────────────────────────────────────────
+#  UNDO  (#18)
+# ─────────────────────────────────────────────
+
+# Timestamp comparison tolerance. A move preserves mtime, but SMB and FAT-derived
+# filesystems round it (FAT to 2 s), so an exact match would report spurious
+# conflicts on the network shares this app is routinely pointed at. Two seconds is
+# far below the gap between a run and a human deciding to undo it, and the content
+# hash (when one was recorded) is the real check anyway.
+_MTIME_TOL = 2.0
+
+
+def _still_recorded_file(path, size, mtime, digest):
+    """True if `path` is still the file the undo journal recorded.
+
+    Cheap gate first: an ordinary edit changes (size, mtime) and that costs one
+    stat. The content hash is verified only when one was recorded and the gate
+    passed, which catches the remaining case (a deliberate replacement that kept
+    both). Undo is the rare path, so it can afford the read; recording, which runs
+    on every conciliation, never does.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if size is not None and st.st_size != size:
+        return False
+    if mtime is not None and abs(st.st_mtime - mtime) > _MTIME_TOL:
+        return False
+    if digest:
+        return db.content_hash(path) == digest
+    return True
+
+
+def undo_one(row):
+    """Reverse ONE journalled pair. Returns (status, message) where status is
+    'undone', 'skipped' (nothing left to do) or 'conflict'.
+
+    Nothing is moved until BOTH halves have been checked, so a refusal leaves the
+    pair exactly as it was rather than half-unwound. The checks are deliberately
+    about the disk, not the row's status: a run that crashed mid-pair leaves a
+    'pending' row whose real state is only knowable by looking.
+    """
+    orig = row["original_path"]
+    arch = row["archive_path"]
+    proc = row["processed_path"]
+    dest = row["dest_path"]
+
+    if not arch:
+        return "conflict", "the original was deleted, not archived"
+
+    dest_here = os.path.isfile(dest)
+    proc_here = os.path.isfile(proc)
+    arch_here = os.path.isfile(arch)
+    orig_here = os.path.isfile(orig)
+    same_name = _norm(dest) == _norm(orig)
+
+    # Nothing to reverse: the original is back at its own name and the processed
+    # file is back in the processed tree. Covers an undo re-run (so undo is
+    # idempotent) and a journalled pair whose file operations never started.
+    # Checked FIRST because when the processed file took the original's own name,
+    # "a file exists at dest" is true in both states and says nothing on its own.
+    if orig_here and proc_here and not arch_here:
+        return "skipped", "already undone"
+
+    # ── half 1: the processed file goes back to the processed tree ───────────
+    move_processed = False
+    if dest_here:
+        if not _still_recorded_file(dest, row["proc_size"], row["proc_mtime"],
+                                    row["proc_hash"]):
+            return "conflict", f"{dest} has changed since the run"
+        if proc_here:
+            return "conflict", f"{proc} is occupied by another file"
+        move_processed = True
+    elif not proc_here:
+        return "conflict", "the processed file is missing from both folders"
+
+    # ── half 2: the original comes back out of the archive ───────────────────
+    move_original = False
+    if arch_here:
+        if not _still_recorded_file(arch, row["orig_size"], row["orig_mtime"],
+                                    row["orig_hash"]):
+            return "conflict", f"{arch} has changed since the run"
+        # The original's own name is freed by half 1 when the processed file took
+        # it, which is the usual case; any OTHER occupant is somebody else's file.
+        if orig_here and not (same_name and move_processed):
+            return "conflict", f"{orig} is occupied by another file"
+        move_original = True
+    elif not orig_here or (same_name and move_processed):
+        # `same_name and move_processed` is the trap: a file DOES sit at the
+        # original's path, but half 1 is about to move it away because it is the
+        # processed file, not the original. Reading that as "the original is
+        # already back" would leave the tree with neither.
+        return "conflict", "the archived original is missing"
+
+    if not move_processed and not move_original:
+        return "skipped", "already undone"
+
+    # ── perform, processed file first so it frees the original's name ────────
+    if move_processed:
+        os.makedirs(os.path.dirname(proc), exist_ok=True)
+        shutil.move(dest, proc)
+    if move_original:
+        os.makedirs(os.path.dirname(orig), exist_ok=True)
+        shutil.move(arch, orig)
+    return "undone", ""
+
+
+def run_undo(original_root, log, abort=None):
+    """Reverse the most recent recorded conciliation of `original_root`.
+    Returns (undone, conflicts, errors, reason) — `reason` is set (and the counts
+    are zero) when there was nothing that COULD be undone."""
+    conn = db.get_conn()
+    run = db.latest_conc_run(conn, original_root)
+    if run is None:
+        return 0, 0, 0, ("No conciliation of this folder has been recorded, so "
+                         "there is nothing to undo. Runs made before this version "
+                         "of the app were not journalled.")
+    if run["schema_version"] != db.CONC_UNDO_SCHEMA:
+        return 0, 0, 0, (f"That run was recorded by a different version of the undo "
+                         f"journal (v{run['schema_version']}), so this version will "
+                         f"not act on it.")
+
+    rows = db.get_conc_actions(conn, run["id"])
+    when = (run["started_at"] or "").replace("T", " ")
+
+    if run["mode"] != "archive":
+        # Honest by design: the bytes are gone and no journal can bring them back.
+        # The record still earns its place, so spend it on the question a user
+        # actually asks after a bad delete run: what exactly did it remove?
+        log.tee("")
+        log.tee(f"The last run on this folder ({when}) DELETED its originals, so "
+                f"they cannot be restored.")
+        log.tee(f"For the record, these {len(rows)} original file(s) were deleted:")
+        for r in rows:
+            log.tee(f"  {r['original_path']}")
+        return 0, 0, 0, ("The last run deleted its originals; deleted files cannot "
+                         "be restored. The log lists exactly what was removed.")
+
+    total = len(rows)
+    log.tee("")
+    log.tee(f"Undoing the conciliation of {when} — {total} file(s).")
+    log.tee("  Each processed file goes back to the processed folder and each "
+            "original comes back out of __Archive__.")
+    log.tee("")
+
+    undone = conflicts = errors = 0
+    for i, row in enumerate(rows, 1):
+        if abort is not None and abort():
+            log.tee("  Stopped at user request.")
+            break
+        if i % 25 == 0 or i == total:
+            _gui_event("PROG", f"{i}|{total}")
+        try:
+            status, message = undo_one(row)
+        except Exception as exc:                       # noqa: BLE001 (per-file)
+            errors += 1
+            log.tee(f"  ERROR on {row['original_path']}: {exc}")
+            continue
+        if status == "conflict":
+            conflicts += 1
+            log.tee(f"  SKIP: {row['original_path']} — {message}")
+            db.set_conc_action_status(conn, row["id"], "conflict")
+        else:
+            if status == "undone":
+                undone += 1
+            log.log_only(f"  OK: restored {row['original_path']}")
+            db.set_conc_action_status(conn, row["id"], "undone")
+
+    # The archive folders we emptied are no longer useful; the processed tree's
+    # folders were recreated on the way back, so only this side needs cleaning.
+    removed = remove_empty_dirs(os.path.join(original_root, ARCHIVE_DIRNAME), log)
+
+    if conflicts == 0 and errors == 0 and (abort is None or not abort()):
+        db.mark_conc_run_undone(conn, run["id"])
+    log.tee("")
+    log.tee(f"Undo finished — {undone} restored, {conflicts} skipped (conflict), "
+            f"{errors} error(s)"
+            + (f", {removed} empty archive folder(s) removed." if removed else "."))
+    if conflicts:
+        log.tee("  The skipped files were left exactly as they were: each one had "
+                "changed, moved, or its name is now taken by something else.")
+    return undone, conflicts, errors, None
 
 
 # ─────────────────────────────────────────────
@@ -602,21 +905,83 @@ def _print_preview_table(folders, log):
         log.tee(f"    {label.ljust(width)}  -  {', '.join(parts)}")
 
 
+def _run_undo_main(original_root):
+    """The --undo entry point: reverse the last recorded run on this folder (#18).
+
+    Deliberately NOT a two-phase scan/confirm like a normal run: the GUI already
+    confirms, and there is no plan to build — the journal IS the plan, so the only
+    honest preview is the one the caller already saw.
+    """
+    log = Logger(original_root)
+    _gui_event("LOG", log.path)
+    log.tee(f"Original folder:  {original_root}")
+    log.tee("Operation:        Undo the last conciliation")
+    _gui_event("STATUS", "Undoing the last conciliation …")
+
+    started = time.time()
+    undone, conflicts, errors, reason = run_undo(
+        original_root, log, abort=_quit_evt.is_set)
+    elapsed = time.time() - started
+
+    if reason:
+        log.tee("")
+        log.tee(reason)
+        _gui_event("STATUS", reason)
+        _gui_event("UNDONE", json.dumps({"undone": 0, "conflicts": 0, "errors": 0,
+                                         "refused": reason}))
+        log.close()
+        sys.exit(0)
+
+    _gui_event("UNDONE", json.dumps(
+        {"undone": undone, "conflicts": conflicts, "errors": errors,
+         "elapsed_seconds": round(elapsed, 1),
+         "stopped_by_user": _quit_evt.is_set()}))
+    _gui_event("STATUS", f"Undo finished — {undone} file(s) restored.")
+    send_notification(
+        title       = ("Conciliation -- Undo Finished" if not (conflicts or errors)
+                       else "Conciliation -- Undo Finished with Issues"),
+        description = (f"{undone} restored, {conflicts} skipped (conflict), "
+                       f"{errors} error(s)."),
+        color       = (notifications.COLOR_GREEN if not (conflicts or errors)
+                       else notifications.COLOR_YELLOW),
+        fields      = [
+            {"name": "Original", "value": original_root},
+            {"name": "Elapsed",  "value": f"{elapsed:.1f}s"},
+            {"name": "Machine",  "value": os.environ.get("COMPUTERNAME", "unknown")},
+        ],
+    )
+    log.close()
+    sys.exit(0 if errors == 0 else 1)
+
+
 def main():
     args = [a for a in sys.argv[1:]]
-    if len(args) < 2:
+    undo_mode = "--undo" in args
+    args = [a for a in args if not a.startswith("--")]
+    # Undo takes ONE folder: every path it needs is in the journal, and the
+    # processed folder may not even exist any more (a finished run empties it and
+    # its now-empty folders are removed).
+    if len(args) < (1 if undo_mode else 2):
         print("Usage: python conciliate.py <original_dir> <processed_dir> [archive|delete]")
+        print("       python conciliate.py <original_dir> --undo")
         sys.exit(0)
 
     original_root = os.path.abspath(args[0])
+    if not os.path.isdir(original_root):
+        print(f"ERROR: Original folder not found: '{original_root}'")
+        sys.exit(1)
+
+    if GUI_MODE:
+        threading.Thread(target=_watch_stdin, daemon=True).start()
+
+    if undo_mode:
+        _run_undo_main(original_root)
+        return
+
     processed_root = os.path.abspath(args[1])
     mode = (args[2].lower() if len(args) >= 3 else "archive")
     if mode not in ("archive", "delete"):
         print(f"ERROR: unknown mode '{mode}' (expected 'archive' or 'delete').")
-        sys.exit(1)
-
-    if not os.path.isdir(original_root):
-        print(f"ERROR: Original folder not found: '{original_root}'")
         sys.exit(1)
     if not os.path.isdir(processed_root):
         print(f"ERROR: Processed folder not found: '{processed_root}'")
@@ -624,9 +989,6 @@ def main():
     if _norm(original_root) == _norm(processed_root):
         print("ERROR: The original and processed folders must be different.")
         sys.exit(1)
-
-    if GUI_MODE:
-        threading.Thread(target=_watch_stdin, daemon=True).start()
 
     log = Logger(original_root)
     _gui_event("LOG", log.path)
@@ -741,8 +1103,15 @@ def main():
     log.tee("")
     log.tee("Running …")
     started = time.time()
+    # Journal what this run does, so it can be undone afterwards (#18). Archive
+    # mode is fully reversible; a delete run is recorded only as evidence of what
+    # was removed, which undo reports and refuses to act on.
+    recorder = UndoRecorder(conn, original_root, processed_root, mode, log)
+    recorder.begin()
     done, conflicts, errors, restored = execute(plan, original_root, mode, log,
-                                                abort=_quit_evt.is_set)
+                                                abort=_quit_evt.is_set,
+                                                recorder=recorder)
+    recorder.finish()
     elapsed = time.time() - started
 
     # Folders in the processed tree that we emptied by moving their files out are
@@ -756,6 +1125,12 @@ def main():
     if restored:
         log.tee(f"  Metadata restored into {restored} image(s) from their "
                 f"originals (see the log for the per-file detail).")
+    if done and recorder.enabled and recorder.run_id:
+        log.tee("  This run was recorded: "
+                + ("use 'Undo last run' on the Conciliation tab to reverse it."
+                   if mode == "archive" else
+                   "the log lists every deleted original, but deleted files "
+                   "cannot be restored."))
     # GUI: machine-readable run summary (drives the MQTT last_run topic + the
     # run-finished event). `processed`/`failed`/`elapsed_seconds` mirror the other
     # three runners' key names so ONE Home Assistant automation covers every tool
