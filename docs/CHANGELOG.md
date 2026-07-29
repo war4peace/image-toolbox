@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.6.0](#060)
 - [0.5.9](#059)
 - [0.5.8](#058)
 - [0.5.7](#057)
@@ -16,6 +17,38 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.6.0
+
+### A magnifier in the comparison window
+The comparison window has a new **Lens** tick-box. With it on, the spot under your mouse
+is shown twice, side by side: the original on the left, the upscaled version on the
+right, both blown up. You see the difference in one look, instead of sliding the divider
+back and forth and trying to remember what was there a second ago.
+
+The right-hand half is shown at the upscaled file's **real pixels** (the labels say so:
+"Upscaled · 1:1"), and the left half is blown up by exactly as much as the upscale was,
+so what you are comparing is what you actually got.
+
+**Scroll to zoom the lens**: 1x, 2x, 4x, 8x, and the two panels grow with it, so on a
+big monitor you get a proper look instead of a postage stamp. The labels always tell you
+where you are ("Original · 16.0×" / "Upscaled · 8:1"). The panels stop growing before
+they cover the picture they came from; past that point zooming keeps going by showing a
+smaller patch. If the picture is small (an old 320x240 video, say) the window is already
+blowing it up, so the lens **starts at a zoom that is at least as strong as what you are
+already looking at** rather than at a useless 1:1. Ctrl+scroll still zooms the picture
+behind the lens.
+
+**Click the picture to pin the lens** where it is, so you can take your hand off the
+mouse, look properly, or take a screenshot. Click again, or press Esc, to release it.
+Without a pin it simply follows the mouse and disappears when you move away. The divider
+comes back the moment you untick Lens. The tick-box and the zoom are remembered for next
+time, and the shortcut is **L**.
+
+It works the same way on the video comparison window, on whichever frame you have
+stopped at.
 
 ---
 

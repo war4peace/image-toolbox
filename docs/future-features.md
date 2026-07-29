@@ -6,10 +6,8 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-The remaining open milestones start with an easy comfort feature deferred to later (a
-hover magnifier, #14).
-The medium tier is
-two new input/processing capabilities (#19 RAW and DNG input, #20 a Video Stabilization
+The remaining open milestones are all medium or larger: two new input/processing
+capabilities (#19 RAW and DNG input, #20 a Video Stabilization
 tab), one measurement-gated one (#21 denoising), a Video Upscaler feature (#12 mixed
 local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second
 GPU provider). Two lower-priority ones each introduce a new process model, networking, or
@@ -20,7 +18,6 @@ numbering legend, after the open work.
 
 ## Contents
 
-- [14. Hover magnifier ("lens view") in the comparison window](#14-hover-magnifier-lens-view-in-the-comparison-window-easy-later)
 - [19. RAW and DNG input for the Batch Upscaler](#19-raw-and-dng-input-for-the-batch-upscaler-medium)
 - [20. Video Stabilization (new tab)](#20-video-stabilization-new-tab-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
@@ -31,62 +28,6 @@ numbering legend, after the open work.
 - [Sequencing & dependencies](#sequencing--dependencies)
 - [Shipped milestones (numbering legend)](#shipped-milestones-numbering-legend)
 - [Decided against / constraints](#decided-against--constraints)
-
----
-
-## 14. Hover magnifier ("lens view") in the comparison window: Easy (later)
-Add a hover-driven magnifier to `ComparisonWindow` that shows one patch of the
-image as original **and** upscaled at the same time, side by side, alongside the
-existing before/after wipe.
-
-> **Scheduled for later.** A comfort feature, not a gap in capability: the
-> comparison window already compares the two images perfectly well. Pick it up
-> when the higher-value work is done.
-
-- **Where the idea comes from:** Upscayl has this, and reading its
-  implementation (`renderer/components/main-content/lens-view.tsx`) is worth it,
-  because the marketing name hides what it does. It shows the **original**
-  full-frame with a crosshair cursor and a 48 px square outline tracking the
-  mouse, and pops up **two 192 px panels side by side** under the cursor,
-  labelled *Original* and *Upscayl AI*, both magnifying that same spot at a
-  hard-coded **4x**. Both panels are sampled against the *original's* natural
-  dimensions times 4, so on a 4x upscale the right-hand panel lands on the
-  upscaled file's true 1:1 pixels while the left-hand one shows the original
-  interpolated to match. Hover-driven and transient: no zoom control, no panning,
-  no click to freeze, and it vanishes when the pointer leaves the image.
-- **What is actually missing here, precisely:** not zoom. `ComparisonWindow` is
-  the stronger zoom by every measure already (continuous wheel zoom centred on
-  the pointer, drag-pan, up to 400% of the upscaled image's native pixels via
-  `ABS_MAX`, a crisp LANCZOS pass once the gesture settles, both sides locked to
-  the same region so they cannot drift apart). What is missing is
-  **simultaneity**: a wipe shows any given patch as *either* original *or*
-  upscaled and you slide the divider to swap, whereas a lens shows the same patch
-  **twice at once**. The eye compares two things next to each other instead of
-  remembering what was there a moment ago, which is a real perceptual difference
-  on fine detail (exactly the detail SeedVR2 either recovers or invents).
-- **The hard half is already built:** the window decodes an arbitrary region of
-  either image at an arbitrary scale (Pillow `resize` with a float `box`, used
-  for the visible slice today). A lens is a second pair of those calls at a fixed
-  scale, drawn into two small canvas areas, plus mouse tracking.
-- **Design decisions to make:**
-  * **Fixed zoom or follow the window's zoom?** Upscayl hard-codes 4x. Deriving
-    it from the actual upscale ratio (so the upscaled panel is always native 1:1)
-    is more honest and is what makes the comparison meaningful.
-  * **Hover-transient or click-to-pin?** Transient matches Upscayl and needs no
-    UI. Pinning suits inspecting one spot while changing zoom, and suits a
-    screenshot.
-  * **Does it coexist with the wipe or replace it?** Upscayl treats lens and
-    slider as two separate view modes. A toggle button is the cheaper answer than
-    trying to run both gestures on one canvas at once.
-  * **Video too?** `VideoComparisonWindow` subclasses the same base, so a lens
-    would come along nearly free on the still-frame video compare. Worth
-    confirming it does not fight the frame-stepping controls.
-- **Risks:** low, and contained. It is a view-only feature in one GUI module: it
-  reads pixels, writes nothing, and cannot touch a file. The only real concern is
-  redraw cost on a large image while the pointer moves, which the existing
-  fast-filter-then-LANCZOS pattern already solves.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -570,13 +511,13 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16, #17 and #18 are complete** (remote upscaling +
-  funds-floor; RunPod video; video conciliation; self-healing remote runs; local video;
-  benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples; Real-ESRGAN
-  engine; metadata copy + backfill; derived-directory pruning; skipping image variants the
-  pipeline cannot round-trip; Conciliation Undo), so the remaining sequencing is only among
-  the low-priority open milestones below.
-- **Open milestones: #14, #19, #20, #21, #12, #15, #3, #4.**
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17 and #18 are complete** (remote
+  upscaling + funds-floor; RunPod video; video conciliation; self-healing remote runs; local
+  video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples;
+  Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
+  pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo), so the
+  remaining sequencing is only among the low-priority open milestones below.
+- **Open milestones: #19, #20, #21, #12, #15, #3, #4.**
 - **#19 (RAW) inherits #17's superset rule**: an original may only be replaced when the
   processed file is a superset of it. #17 satisfies that rule by never producing a
   non-superset; #19 has to keep satisfying it for a format the pipeline *does* process.
@@ -595,13 +536,9 @@ The user installs and runs the application on their Unraid server.
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
   done over MQTT, the old telemetry coupling no longer drives sequencing.
-- **#14 is deliberately parked.** It is easy and self-contained (one GUI module,
-  view-only, cannot touch a file), but it is comfort rather than capability: the
-  comparison window already does the job. It has no dependencies, so it can be
-  picked up whenever there is appetite for a small, low-risk piece of work.
 - **#15 is gated by spend, not by other features.** It needs a paid account and
   billed GPU time to answer three questions no public page answers, so its
-  ordering is set by when that spend happens, not by #14/#12. Nothing else
+  ordering is set by when that spend happens, not by #12. Nothing else
   depends on it, and it does not depend on anything else. Note the overlap with
   #12: both add a dimension to "where does this job run", so whichever lands
   second inherits the other's grouping/selector work (a job would then carry
@@ -631,7 +568,7 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #16, #17 and #18** are done and live; they are no
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17 and #18** are done and live; they are no
 longer described in full here (their design of record lives in `CLAUDE.md`,
 `docs/runpod-notes.md`, `docs/video-upscaler.md`, `docs/local-video-upscaler.md`,
 `docs/benchmark-sharing.md`, `docs/telemetry-design.md` and `samples/home-assistant/`).
@@ -702,6 +639,34 @@ The numbers survive only because code and other docs cite the roadmap by them
   stripped before they can describe a strip layout inside a JPEG. One Settings checkbox
   (`upscale.copy_metadata`, default on) governs both halves. See `CLAUDE.md` (Metadata carried
   across) and `tests/test_exif_copy.py`.
+- **#14: Hover magnifier ("lens view") in the comparison window.** Shipped
+  0.6.0-experimental. A **Lens** toggle on both comparison windows magnifies the patch
+  under the pointer as original AND upscaled side by side, which is the one thing a
+  before/after wipe cannot do: a wipe shows a patch as *either*, so the eye compares
+  against a memory. The four design questions the entry left open were answered as
+  follows. **Magnification is derived from the real upscale ratio**, not hard-coded like
+  Upscayl's 4x, so the right-hand panel is exactly 1:1 with the file that was produced
+  (and is a plain `crop`, not a resample, so "1:1" is literally true); a same-size pair
+  has no ratio to use and falls back to a fixed 4x, labelled honestly. **The wheel zooms
+  the lens** 1x/2x/4x/8x on top of that ratio (Ctrl+wheel keeps zooming the picture
+  behind), which the first cut lacked and badly needed: on a 320x240 -> 640x480 video in
+  a maximised window the canvas already draws the image at ~2.7x, so a fixed 1:1 panel
+  showed the patch SMALLER than it looked behind the lens, in a fixed 180 px stamp. The
+  panel now follows the window size, a zoom step grows it until the panels would swallow
+  the picture (past that the zoom narrows the patch instead), and `lens_zoom_floor`
+  starts the lens at least as strong as the view it sits on. **It is a mode,
+  not an overlay:** while the lens is on, the divider is put away and the canvas shows
+  the upscaled image full-frame as the context to magnify out of, because the wipe wants
+  the drag and the lens wants the hover. **Transient AND pinnable** — it follows the
+  pointer and vanishes with it, and a click (a press-release that did not move) pins it,
+  for looking at one spot while the hand moves, and for a screenshot. **Video came along
+  whole**: a decoded frame pair is just another (old, new) pair to the renderer, and it
+  does not fight the transport. Zoom and pan keep working and do not change the lens. The
+  sample rect is computed ONCE in normalized coordinates and mapped onto each image,
+  which is what stops the two panels drifting apart at the clamped edges — the one
+  failure a lens must not have, because it would read as a difference between the images.
+  Pointer moves redraw the panels only (the base blit is left alone, tagged items). See
+  `CLAUDE.md` (Comparison) and `tests/test_lens_view.py`.
 - **#16: Derived directories must not be re-scanned as input.** Shipped
   0.5.9-experimental, a correctness fix rather than a feature. The app writes its outputs
   inside the tree it scans (`<source>/__upscaled__`, `<source>/__Archive__`), and only

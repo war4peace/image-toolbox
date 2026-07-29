@@ -122,7 +122,50 @@ each side is decoded (Pillow `resize` with a float `box`); gestures render with 
 fast filter and a crisp LANCZOS pass follows when they settle. Pairing is
 **current-run**: the upscaler's `RESULT` event carries the output path, which the
 strip remembers (`FilmStrip._compare`). Double-clicking a red/unframed thumbnail
-(or any Tag & Rename thumbnail) just opens the file. See `ComparisonWindow`.
+(or any Tag & Rename thumbnail) just opens the file. A **Lens** toggle (0.6.0,
+future-features #14) adds the one comparison the wipe cannot make: it magnifies the
+patch under the pointer as original AND upscaled **side by side**, so the eye
+compares two things next to each other instead of remembering what the divider was
+showing a moment ago. Four decisions define it. The **magnification is the real
+upscale ratio**, not a hard-coded 4x, which puts the right-hand panel at exactly
+1:1 with the file that was produced (a `crop`, not a resample, so the "1:1" label is
+literally true); a same-size pair has no ratio to use and falls back to a fixed 4x,
+labelled as such. **The wheel zooms the lens** through `LENS_ZOOMS` (1/2/4/8) on top
+of that ratio, with Ctrl+wheel left as the escape hatch to the picture behind. That
+was NOT in the first cut and the gap it left was severe: a fixed 180 px panel at a
+fixed 1:1 is useless on a small pair, because a 320x240 -> 640x480 video in a
+maximised window is ALREADY drawn at ~2.7x on the canvas, so the "magnifier" showed
+the patch **smaller** than it appeared behind it, in a stamp you had to squint at. So
+three things scale now: the base panel follows the window (`LENS_PANEL_FRAC` of its
+width, not a constant), a zoom step grows the panel further until `lens_panel_size`'s
+`LENS_FIT_W/H` cap says the panels would swallow the picture they magnify out of
+(past that the zoom keeps rising by narrowing the patch instead), and
+`lens_zoom_floor` starts the lens at least as strong as the view it sits on, applied
+once per pair and once per switch into lens mode, deferred to the first draw that has
+BOTH a real image and a realised canvas (the video window decodes its frames on a
+thread, and the first render runs inside `__init__` at 1x1) and cancelled the moment
+the user touches the wheel. Both panels are LANCZOS at every zoom, deliberately: the
+same filter on both sides is what keeps the comparison fair, and nearest-neighbour on
+the upscaled half would show it blocky against a smoothly interpolated original. It
+is a **mode, not an overlay**: while it is on the divider is put
+away and the canvas shows the upscaled image full-frame as the context to magnify out
+of, because two pointer gestures on one canvas fight (the wipe wants the drag, the
+lens wants the hover). It is **transient and pinnable**: it follows the pointer and
+goes away with it, and a click (a press-release that did not move, `CLICK_TOL`) pins
+it for inspecting one spot with the hand off the mouse, or for a screenshot; Esc
+releases. And the **video window inherits it whole** (a decoded frame pair is just
+another (old, new) pair to the renderer), without fighting the frame-stepping
+transport. The sample rect is computed ONCE in normalized coordinates
+(`_lens_sample`) and mapped onto each image: deriving a box per image would let the
+panels drift apart where the clamp bites at an edge, and a lens showing two different
+places reads as a difference between the IMAGES, which is the one failure it must not
+have. The arithmetic is five pure module-level functions (`lens_magnification` /
+`lens_span` / `lens_placement` / `lens_panel_size` / `lens_zoom_floor`) so it is
+tested without a display. A pointer move OR a wheel notch redraws only the
+`"lens"`-tagged items, never the base blit underneath (that is the expensive part).
+The toggle and the zoom are remembered (`compare_lens` / `compare_lens_zoom`), the
+pinned spot is not (it means nothing on the next image). See `ComparisonWindow` and
+`tests/test_lens_view.py`.
 
 **Film-strip context menu** (0.3.0) — right-clicking a thumbnail
 (`FilmStrip._on_right_click`, hit-tested via the shared `_path_at`) opens an
@@ -826,7 +869,7 @@ widget does NOT override the first: it binds `<Enter>` with `add="+"`, so both
 pop up stacked), and `use_window_button_style()`, the bold label for a button
 that opens a window which is exclusive/modal/persistent AND wants prolonged focus
 (Segments…, Benchmark GPU…, Provision…, the first-start wizard; log windows stay
-plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
+plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + the **lens view** on both of them, 0.6.0/#14, whose geometry is three pure display-free functions at module level, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **RGB-only end to end** (`convert("RGB")` in, `arr[..., :3]` out, frame 0 only), which is why alpha / multi-page / >8-bit images are detected and skipped upstream rather than silently flattened here (#17). `_save_image` also carries the SOURCE's metadata onto the output via `exif_copy` (#13a) with a retry-without-metadata fallback, so an odd EXIF block can never cost the image. **GPU work happens wherever this runs** -- which is why the metadata copy lives here and not in `batch_upscale`: on a remote run the pod writes the file. |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
@@ -925,8 +968,8 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `future-features.md` (roadmap: open milestones #14, #18/#19/#20/#21,
-  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#16/#17 kept only as a
+- `docs/` — `future-features.md` (roadmap: open milestones #19/#20/#21,
+  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18 kept only as a
   numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai),
   `runpod-notes.md` (remote-pod upscaling notes), `video-upscaler.md` /

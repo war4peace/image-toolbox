@@ -153,7 +153,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 |---|:--:|:--:|---|
 | Before/after slider | ✅ | ✅ | Both. Image Toolbox's is a floating, resizable window with shared zoom/pan. |
 | Adjustable zoom while comparing | ⚠️ | ✅ | Upscayl's lens is a **fixed 4×**. Image Toolbox: mouse wheel, centred on the pointer, fit up to 400% of the upscaled image's native pixels, with drag-pan, and both sides stay locked together. |
-| Hover magnifier ("lens view") | ✅ | ❌ | A different interaction, not more zoom: the lens shows one patch as original **and** upscaled at once, side by side, where a wipe shows it as one or the other. On the roadmap as **#14** in `docs/future-features.md`. |
+| Hover magnifier ("lens view") | ✅ | ✅ | A different interaction, not more zoom: the lens shows one patch as original **and** upscaled at once, side by side, where a wipe shows it as one or the other. Closed by roadmap #14 in 0.6.0. Three differences from Upscayl's: the magnification is the **actual upscale ratio** rather than a hard-coded 4×, so the upscaled panel is exactly 1:1 with the file that was produced; the wheel **zooms the lens** 1×/2×/4×/8× on top of that, growing the panels with the window instead of a fixed stamp; and a click **pins** the lens (Upscayl's is hover-only). Works on the video comparison window too. |
 | Drag and drop input | ✅ | ❌ | Image Toolbox is folder-driven. |
 | Thumbnail wall of the running batch | ❌ | ✅ | Outcome-coloured frames: green comparable, red failed, blue in progress. |
 | Right-click context menu per result | ❌ | ✅ | Open original/upscaled, open folder, compare, copy path. |
@@ -212,7 +212,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 2. Runs on AMD, Intel and Apple Silicon GPUs.
 3. Imports arbitrary custom ncnn models, so the community model ecosystem is open to it.
 4. Fixed 2×/3×/4× and 16× chained upscaling, and a custom output width.
-5. A localised, themed, drag-and-drop desktop UI with a magnifier/lens compare view.
+5. A localised, themed, drag-and-drop desktop UI.
 6. Small download, trivial install, works within a minute of first launch.
 
 **Only Image Toolbox:**
