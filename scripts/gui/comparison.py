@@ -309,8 +309,10 @@ class ComparisonWindow(tk.Toplevel):
                 "by side, instead of sliding the divider back and forth. "
                 "Scroll to zoom the lens (1x / 2x / 4x / 8x, the panels grow with "
                 "it); at 1x the upscaled half is its own real pixels. Click the "
-                "image to pin the lens in place, click again (or press Esc) to "
-                "release. Ctrl+scroll still zooms the picture behind. Shortcut: L.",
+                "image to pin the lens in place, click again to release. "
+                "Ctrl+scroll still zooms the picture behind. Shortcut: L. Esc "
+                "steps back out: it releases a pinned lens, then turns the lens "
+                "off, then closes the window.",
                 wraplength=Tooltip.WRAP_NARROW)
         self._lens_hint = ttk.Label(mid, foreground="#6b7280")
         self._lens_hint.pack(side="left", padx=(8, 0))
@@ -326,13 +328,37 @@ class ComparisonWindow(tk.Toplevel):
         self._on_lens_toggle()
 
     def _on_escape(self, _event=None):
-        """Release a pinned lens. Deliberately does NOT close the window: Esc is
-        the way out of the pin, and a window holding a large decoded pair should
-        not vanish on a stray keypress."""
+        """Esc backs out exactly ONE level per press, innermost first:
+
+            pinned lens  ->  lens mode  ->  the window
+
+        So from a pinned lens it takes three presses to leave, from an unpinned
+        lens two, and from the plain wipe one. Each press undoes the most recent
+        thing the user turned on, which is the only ordering that never surprises
+        them: the lens hint promises "click or Esc to release", so a pin has to
+        win while it exists, and a lens the user is looking through should not
+        take the window with it.
+
+        Leaving lens mode goes through `lens_var` + `_on_lens_toggle`, exactly as
+        the L shortcut and the checkbox do, so Esc-off and L-off are the same
+        action (the tick clears, and the preference is remembered) rather than
+        two paths that could drift apart.
+
+        (Until 0.6.0 Esc released the pin and did nothing else, on the reasoning
+        that a window holding a large decoded pair should not vanish on a stray
+        keypress. Re-opening it is one double-click and the re-decode is well
+        under a second, so that cost was overstated.)
+        """
         if self._lens_pin is not None:
             self._lens_pin = None
             self._update_lens_hint()
             self._render()
+            return
+        if self._lens_on:
+            self.lens_var.set(False)
+            self._on_lens_toggle()
+            return
+        self._close()
 
     def _on_lens_toggle(self):
         self._lens_on = bool(self.lens_var.get())
@@ -379,7 +405,9 @@ class ComparisonWindow(tk.Toplevel):
         elif self._lens_pin is not None:
             text = f"scroll to zoom ({self._lens_zoom}×) · click or Esc to release"
         else:
-            text = f"scroll to zoom ({self._lens_zoom}×) · click to pin"
+            # Esc is named here too: it is the way back out of lens mode, and an
+            # unpinned lens is the state the user reaches it from.
+            text = f"scroll to zoom ({self._lens_zoom}×) · click to pin · Esc to exit"
         try:
             self._lens_hint.configure(text=text)
         except tk.TclError:

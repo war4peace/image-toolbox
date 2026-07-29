@@ -119,7 +119,19 @@ pixels) and pan (drag, clamped to keep the view filled) are **shared**, so the
 two halves always show the same region — making the quality gain directly
 visible. Drag the divider handle to slide the wipe. Only the visible slice of
 each side is decoded (Pillow `resize` with a float `box`); gestures render with a
-fast filter and a crisp LANCZOS pass follows when they settle. Pairing is
+fast filter and a crisp LANCZOS pass follows when they settle. **Esc backs out
+exactly ONE level per press** (0.6.0), innermost first: **pinned lens -> lens mode
+-> the window**. So a pinned lens takes three presses to leave, an unpinned lens
+two, the plain wipe one. Each press undoes the most recent thing the user turned
+on, which is the only ordering that never surprises them (the lens hint promises
+"click or Esc to release", so a pin must win while it exists, and a lens the user
+is looking through must not take the window with it). Leaving lens mode goes
+through `lens_var` + `_on_lens_toggle`, exactly as the L shortcut and the checkbox
+do, so Esc-off and L-off are one action and the remembered preference cannot
+drift. Before 0.6.0 Esc released the pin and did nothing else, on the reasoning
+that a window holding a large decoded pair should not vanish on a stray keypress;
+re-opening is one double-click and the re-decode is well under a second, so that
+cost was overstated. Pairing is
 **current-run**: the upscaler's `RESULT` event carries the output path, which the
 strip remembers (`FilmStrip._compare`). Double-clicking a red/unframed thumbnail
 (or any Tag & Rename thumbnail) just opens the file. A **Lens** toggle (0.6.0,

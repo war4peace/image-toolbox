@@ -47,6 +47,11 @@ Without a pin it simply follows the mouse and disappears when you move away. The
 comes back the moment you untick Lens. The tick-box and the zoom are remembered for next
 time, and the shortcut is **L**.
 
+**Esc steps back out one level at a time**, starting with whatever you turned on last: it
+releases a pinned lens, then turns the lens off, then closes the window. So from a pinned
+lens it takes three presses to leave, and a stray press never throws away more than the
+one thing you just did.
+
 It works the same way on the video comparison window, on whichever frame you have
 stopped at.
 

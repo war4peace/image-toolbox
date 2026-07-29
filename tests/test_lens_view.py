@@ -288,7 +288,9 @@ def test_a_drag_pans_and_does_not_pin(win):
     assert win._lens_pin is None
 
 
-def test_escape_releases_the_pin_but_leaves_the_window_open(win):
+def test_escape_releases_the_pin_first_and_leaves_the_window_open(win):
+    """Esc backs out one level at a time, and the pin is the inner one: the lens
+    hint says "click or Esc to release", so it has to win while a pin exists."""
     win.lens_var.set(True)
     win._on_lens_toggle()
     win._toggle_pin(450, 300)
@@ -296,6 +298,66 @@ def test_escape_releases_the_pin_but_leaves_the_window_open(win):
     win._on_escape()
     assert win._lens_pin is None
     assert win.winfo_exists()
+
+
+def test_escape_leaves_lens_mode_before_it_leaves_the_window(win):
+    """Second level of the same rule: a lens the user is looking through must not
+    take the window with it."""
+    win.lens_var.set(True)
+    win._on_lens_toggle()
+    assert win._lens_on and win._lens_pin is None
+    win._on_escape()
+    assert win._lens_on is False
+    assert win.lens_var.get() is False          # the tick clears with it
+    assert win.winfo_exists()
+
+
+def test_escape_from_a_pinned_lens_takes_three_presses_to_leave(win):
+    """The whole ladder in one test: pin -> lens -> window, one level per press,
+    innermost first, so each press undoes the most recent thing turned on."""
+    win.lens_var.set(True)
+    win._on_lens_toggle()
+    win._toggle_pin(450, 300)
+    assert win._lens_pin is not None
+
+    win._on_escape()
+    assert win._lens_pin is None and win._lens_on and win.winfo_exists()
+    win._on_escape()
+    assert not win._lens_on and win.winfo_exists()
+    win._on_escape()
+    assert not win.winfo_exists()
+
+
+def test_escape_closes_the_window_when_nothing_is_pinned(win):
+    """0.6.0: with no lens and no pin to back out of, Esc does what every other
+    viewer does. The window is reached by a double-click from the browser the
+    user wants to get back to, and re-decoding the pair costs under a second."""
+    assert win._lens_pin is None and not win._lens_on
+    win._on_escape()
+    assert not win.winfo_exists()
+
+
+def test_escape_off_and_l_off_are_the_same_action(win):
+    """Esc leaves lens mode through lens_var + _on_lens_toggle, exactly as the L
+    shortcut and the checkbox do, so the two cannot drift apart (the saved
+    preference in particular)."""
+    win.lens_var.set(True)
+    win._on_lens_toggle()
+    win._on_escape()
+    esc_state = (win._lens_on, win.lens_var.get(),
+                 dict(win._app.settings).get(win.LENS_SETTING))
+
+    win.lens_var.set(True)
+    win._on_lens_toggle()
+    win._on_lens_key()                          # the L shortcut
+    l_state = (win._lens_on, win.lens_var.get(),
+               dict(win._app.settings).get(win.LENS_SETTING))
+    assert esc_state == l_state == (False, False, False)
+
+
+def test_escape_bound_to_the_window_reaches_that_handler(win):
+    """The behaviour is only real if the KEY is wired to it."""
+    assert "_on_escape" in win.bind("<Escape>")
 
 
 def test_the_toggle_is_remembered_across_sessions(win):
