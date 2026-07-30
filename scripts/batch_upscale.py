@@ -52,6 +52,7 @@ except Exception:
 import db
 import notifications
 import runner_common
+import raw_decode                    # RAW / DNG input (#19); rawpy stays lazy inside it
 
 # Fail-safe diagnostic trail for the swallowed-error handlers (guarded import).
 try:
@@ -92,6 +93,13 @@ SEEDVR2_REPO_DIR    = _resolve_path(_S.get("repo_dir", ""),  "seedvr2")
 SEEDVR2_MODEL_DIR   = _resolve_path(_S.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
 
 IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+# RAW / DNG input (#19). Kept as its OWN set rather than folded into IMAGE_EXTS,
+# because a RAW is not interchangeable with the others anywhere downstream: it is
+# never written to (Tag & Rename must not touch it), it never keeps its extension
+# on output, and Conciliation must never archive or delete one. `INPUT_EXTS` is
+# what the walk accepts; every later branch asks which of the two it is.
+RAW_EXTS            = set(raw_decode.RAW_EXTS)
+INPUT_EXTS          = IMAGE_EXTS | RAW_EXTS
 OUTPUT_SUBDIR       = _U.get("output_subdir",    "upscaled")
 RESOLUTION          = _U.get("resolution",       2160)
 MAX_RESOLUTION      = _U.get("max_resolution",   3840)
@@ -522,9 +530,19 @@ def should_skip_resolution(path, cutoff_pct=None):
     "too large" only when it would be skipped in BOTH orientations. The precise,
     orientation-aware skip is made at process time once the CNN has run, against
     the real upright dimensions (see run_pass).
+
+    A RAW is NEVER too large (#19). For every other format "already at target"
+    means "nothing to do, it already displays"; a RAW displays nowhere, so its
+    render is the deliverable whatever its size, and the size only decides
+    render-only vs render-then-upscale. Answering here rather than at each caller
+    is what keeps the eligibility scan, its cache, the rescan filter and the run
+    loop agreeing with each other — they all ask this one question.
     """
     if cutoff_pct is None:
         cutoff_pct = UPSCALE_CUTOFF_PCT
+
+    if os.path.splitext(path)[1].lower() in RAW_EXTS:
+        return False, ""
 
     w, h = get_image_dimensions(path)
     if w == 0 and h == 0:
@@ -654,6 +672,129 @@ def detect_rotation(path):
         return 0, ""
 
     return deg, f"straightened before upscale (detected {deg}deg @ {conf:.2f})"
+
+
+def detect_rotation_image(pil_img):
+    """`detect_rotation` for an ALREADY-OPEN image (#19).
+
+    A RAW has no file the CNN can be pointed at: opening one with Pillow returns
+    the small preview in IFD 0 for a CR2/NEF/DNG and fails outright for a
+    CR3/ORF/RW2, so the rendered image has to be handed over in memory. Routes to
+    the pod in remote mode exactly as detect_rotation does, so the two differ only
+    in what they are given."""
+    if not AUTO_STRAIGHTEN or _STRAIGHTEN_DISABLED:
+        return 0, ""
+    import orientation
+    try:
+        if REMOTE_STRAIGHTEN and ENGINE is not None:
+            deg, conf = ENGINE.analyse_image(pil_img)
+        else:
+            deg, conf = orientation.analyse_image(pil_img)
+    except Exception as exc:
+        return 0, f"orientation check skipped: {exc}"
+
+    if not orientation.should_rotate(deg, conf, STRAIGHTEN_CONFIDENCE):
+        if deg != 0:
+            why = "180deg" if deg == 180 else f"below {STRAIGHTEN_CONFIDENCE:.2f} confidence"
+            return 0, f"orientation: {deg}deg @ {conf:.2f} — left as-is ({why})"
+        return 0, ""
+
+    return deg, f"straightened before upscale (detected {deg}deg @ {conf:.2f})"
+
+
+def _straighten_image(pil_img, degrees):
+    """Rotate an in-memory image upright for CNN class `degrees`. Returns the
+    rotated image, or the original on any failure (never raises: a rotation that
+    cannot be worked out must not cost the picture)."""
+    try:
+        import orientation
+        transpose_const, _cw = orientation._ensure_correct_map()[degrees]
+        return pil_img.transpose(transpose_const)
+    except Exception as exc:                       # noqa: BLE001
+        debug_log("batch_upscale._straighten_image", exc=exc)
+        return pil_img
+
+
+def _save_render(pil_img, dest_path, exif_blob):
+    """Write a rendered RAW to `dest_path` as JPEG, atomically.
+
+    Quality 95 with chroma subsampling disabled, matching
+    upscale_engine._save_image, so a rendered-only file and an upscaled one are
+    encoded identically and a user never has to know which path a photo took.
+
+    The metadata block is sanitised through exif_copy, NOT written raw: the
+    pixels handed in here are already upright (LibRaw's flip applied during the
+    render, auto-straighten possibly on top), so the source's Orientation would
+    make every viewer rotate an upright photo a second time - the same trap #13
+    fixed for the upscale path, arrived at from a different direction.
+    """
+    meta = {}
+    try:
+        import exif_copy
+        blob = exif_copy.exif_for_upscaled_blob(exif_blob, dest_path, pil_img.size)
+        meta = exif_copy.save_kwargs(dest_path, blob)
+    except Exception as exc:                       # noqa: BLE001 (module absent / odd block)
+        debug_log("batch_upscale._save_render: metadata skipped", exc=exc)
+
+    tmp_path = dest_path + ".tmp.jpg"
+    try:
+        try:
+            pil_img.save(tmp_path, "jpeg", quality=95, subsampling=0,
+                         optimize=True, **meta)
+        except Exception as exc:                   # noqa: BLE001
+            # The metadata is a bonus, the image is the product (the same rule
+            # upscale_engine._save_image follows).
+            if not meta:
+                raise
+            debug_log("batch_upscale._save_render: retrying without metadata", exc=exc)
+            pil_img.save(tmp_path, "jpeg", quality=95, subsampling=0, optimize=True)
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        _safe_remove(tmp_path)
+        raise
+
+
+def _write_upscale_input(pil_img, exif_blob):
+    """Write the rendered RAW to ONE temp file for the upscaler to read, and
+    return its path.
+
+    PNG, never JPEG. The whole point of rendering from RAW is to avoid the
+    generational loss the app exists to undo, and a JPEG temp here would spend a
+    generation before SeedVR2 sees a pixel - the easy accident, because `.jpg` is
+    what the output is. compress_level=1 because this file lives for one image:
+    deflate effort buys nothing and costs seconds on a 24 MP frame.
+
+    The EXIF is sanitised before it is written (Orientation forced to 1), which
+    is load-bearing rather than tidy: upscale_engine._load_image runs
+    ImageOps.exif_transpose on whatever it is given, so a temp carrying the
+    camera's original Orientation would have its already-upright pixels rotated
+    again. Carrying the block at all is what lets the REMOTE path work unchanged -
+    the pod receives an ordinary PNG with metadata and needs to know nothing
+    about RAW.
+    """
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".png", prefix="itbx_raw_")
+    os.close(fd)
+    try:
+        meta = {}
+        try:
+            import exif_copy
+            blob = exif_copy.exif_for_upscaled_blob(exif_blob, tmp, pil_img.size)
+            meta = exif_copy.save_kwargs(tmp, blob)
+        except Exception as exc:                   # noqa: BLE001
+            debug_log("batch_upscale._write_upscale_input: metadata skipped", exc=exc)
+        try:
+            pil_img.save(tmp, "png", compress_level=1, **meta)
+        except Exception as exc:                   # noqa: BLE001
+            if not meta:
+                raise
+            debug_log("batch_upscale._write_upscale_input: retrying without metadata",
+                      exc=exc)
+            pil_img.save(tmp, "png", compress_level=1)
+        return tmp
+    except Exception:
+        _safe_remove(tmp)
+        raise
 
 
 def _make_straightened_copy(src_path, degrees):
@@ -936,14 +1077,19 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None,
         output_dir = os.path.normpath(os.path.join(output_root, rel_dir))
 
         for filename in sorted(filenames):
-            if os.path.splitext(filename)[1].lower() not in IMAGE_EXTS:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in INPUT_EXTS:
                 continue
             local_path = os.path.join(dirpath, filename)
             if local_path in already_done:
                 continue
             stem     = os.path.splitext(filename)[0]
-            ext      = os.path.splitext(filename)[1].lower()
-            out_name = f"{stem}{ext}"
+            # A RAW always becomes `<stem>_raw.jpg` (#19): it cannot keep its own
+            # extension, and it must not take the plain `<stem>.jpg` that a
+            # sibling camera JPEG of the same shot would map to. See
+            # raw_decode.render_name.
+            out_name = (raw_decode.render_name(filename) if ext in RAW_EXTS
+                        else f"{stem}{ext}")
             items.append((dirpath, local_path, output_dir, out_name))
 
         # Live progress: update in place every folder
@@ -1004,7 +1150,7 @@ def _emit_skip_summary(dirpath, root, folder_stats, logger):
 # "skipped_corrupt", so `merged[d]["skipped_corrupt"] += ...` KeyError'd and took
 # down the whole end-of-run summary (table + DONE event + MQTT + notification) on
 # any run that had a rescan second pass. See item 4.
-_FOLDER_STAT_KEYS = ("processed", "skipped_done", "skipped_size",
+_FOLDER_STAT_KEYS = ("processed", "rendered", "skipped_done", "skipped_size",
                      "skipped_variant", "skipped_missing", "skipped_corrupt",
                      "failed")
 
@@ -1035,9 +1181,9 @@ def _merge_pass_stats(s1, s2):
     # whole end-of-run summary again, which is the failure this function's
     # _FOLDER_STAT_KEYS factory was written to stop.
     out = {"folder_stats": merged}
-    for key in ("total_processed", "total_skipped_done", "total_skipped_size",
-                "total_skipped_variant", "total_skipped_missing",
-                "total_skipped_corrupt", "total_failed"):
+    for key in ("total_processed", "total_rendered", "total_skipped_done",
+                "total_skipped_size", "total_skipped_variant",
+                "total_skipped_missing", "total_skipped_corrupt", "total_failed"):
         out[key] = s1.get(key, 0) + s2.get(key, 0)
     for key in ("corrupt_files", "variant_files"):
         out[key] = list(s1.get(key, [])) + list(s2.get(key, []))
@@ -1095,6 +1241,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     folder_stats = defaultdict(_new_folder_stats)
 
     total_processed       = 0
+    total_rendered        = 0      # RAW written at native size, no upscale (#19)
     total_skipped_done    = 0
     total_skipped_size    = 0
     total_skipped_variant = 0
@@ -1169,12 +1316,26 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             _gui_event("RESULT", json.dumps([local_path, "ok", out_path]))
             continue
 
+        is_raw = os.path.splitext(local_path)[1].lower() in RAW_EXTS
+
         # ── Too large? ───────────────────────────────────────────────────────
-        skip, reason = should_skip_resolution(local_path)
-        if skip:
-            folder_stats[dirpath]["skipped_size"] += 1
-            total_skipped_size += 1
-            continue
+        # A RAW is deliberately exempt from the early size skip (#19). For every
+        # other format an over-target file needs nothing done to it: it already
+        # displays. A RAW displays NOWHERE - not in a browser, not on a TV, not
+        # in this app's own film strip - so the render IS the deliverable and
+        # skipping it would produce nothing at all. Measured on 24 real camera
+        # files: at the shipped 4K target and 66% cutoff, ZERO of them would ever
+        # have been upscaled (docs/raw-preview-survey.csv), because RAW is by
+        # nature a high-resolution format and this app targets low-resolution
+        # photos. The size check still runs below, on the true upright
+        # dimensions; it just decides render-only vs render-then-upscale instead
+        # of do-something vs do-nothing.
+        if not is_raw:
+            skip, reason = should_skip_resolution(local_path)
+            if skip:
+                folder_stats[dirpath]["skipped_size"] += 1
+                total_skipped_size += 1
+                continue
 
         # ── Process ──────────────────────────────────────────────────────────
         raw_w, raw_h = get_image_dimensions(local_path)
@@ -1199,9 +1360,37 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # drive both the skip decision and the SeedVR2 target, so the output
         # fits a 4K screen once rotated. The source is never modified — a temp
         # copy is rotated and upscaled, then removed in the finally below.
-        rot_deg, rot_msg = detect_rotation(local_path)
-        rotate           = rot_deg in (90, 270)
-        w, h             = (raw_h, raw_w) if rotate else (raw_w, raw_h)
+        #
+        # A RAW takes the other branch: decode ONCE, here, and carry the picture
+        # in memory through the rest of the chain (render -> straighten -> upscale,
+        # and its upright size comes from the real pixels). The alternative,
+        # a temp file per stage, would put a RAW through several lossy
+        # generations before SeedVR2 ever sees a pixel — a self-inflicted version
+        # of exactly the degradation this app exists to undo. Exactly one temp is
+        # written, further down, and only when the file is actually upscaled.
+        render = None
+        if is_raw:
+            try:
+                render = raw_decode.render(local_path)
+            except Exception as exc:                 # noqa: BLE001
+                import datetime as _dt
+                _ts = _dt.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
+                print(f"{_ts} |   {prefix} SKIP (RAW unreadable) {_osc8_link(local_path)}")
+                logger.log_only(f"  {prefix} SKIP (RAW could not be decoded: {exc})  "
+                                f"{local_path}", timestamp=True)
+                folder_stats[dirpath]["skipped_corrupt"] += 1
+                total_skipped_corrupt += 1
+                corrupt_files.append(local_path)
+                continue
+            rot_deg, rot_msg = detect_rotation_image(render.image)
+            rotate           = rot_deg in (90, 270)
+            if rotate:
+                render.image = _straighten_image(render.image, rot_deg)
+            w, h = render.image.size                 # authoritative: the real pixels
+        else:
+            rot_deg, rot_msg = detect_rotation(local_path)
+            rotate           = rot_deg in (90, 270)
+            w, h             = (raw_h, raw_w) if rotate else (raw_w, raw_h)
 
         # Precise, orientation-aware skip against the true upright dimensions.
         # The scan pre-check (should_skip_resolution) is deliberately lenient —
@@ -1209,17 +1398,33 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # so the authoritative decision has to be made here, now the real
         # orientation is known, for both the rotated and upright cases.
         skip, reason = _skip_for_dims(w, h, UPSCALE_CUTOFF_PCT)
-        if skip:
+        # For a RAW the same verdict means something different: not "do nothing"
+        # but "the render is already big enough, write it and stop there".
+        render_only = bool(skip and is_raw)
+        if skip and not is_raw:
             folder_stats[dirpath]["skipped_size"] += 1
             total_skipped_size += 1
             note = " (upright, after straighten)" if rotate else ""
             logger.log_only(f"  {prefix} SKIP ({reason}){note}  {local_path}", timestamp=True)
             continue
 
-        # Build the upscale source: a rotated temp copy when straightening.
+        # Build the upscale source: a rotated temp copy when straightening, or
+        # the single lossless temp the RAW chain writes at its end.
         src_path = local_path
         tmp_path = None
-        if rotate:
+        if is_raw:
+            if not render_only:
+                try:
+                    tmp_path = _write_upscale_input(render.image, render.exif)
+                    src_path = tmp_path
+                except Exception as exc:             # noqa: BLE001
+                    # Nothing has been written yet, so fall back to the render:
+                    # a viewable JPEG at native size beats no output at all.
+                    debug_log("batch_upscale: RAW temp write failed", exc=exc)
+                    logger.log_only(f"  {prefix} could not stage the RAW for upscaling "
+                                    f"({exc}) — writing the render as-is", timestamp=True)
+                    render_only = True
+        elif rotate:
             tmp_path = _make_straightened_copy(local_path, rot_deg)
             if tmp_path is None:
                 rotate  = False                      # rotation failed — upscale as-is
@@ -1228,11 +1433,18 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             else:
                 src_path = tmp_path
 
-        scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
-        out_w   = round(w * scale)
-        out_h   = round(h * scale)
-        dim_str = (f"{raw_w}x{raw_h}px ↻ {w}x{h}px -> {out_w}x{out_h}px"
-                   if rotate else f"{w}x{h}px -> {out_w}x{out_h}px")
+        if render_only:
+            out_w, out_h = w, h
+            dim_str = (f"{raw_w}x{raw_h}px ↻ {w}x{h}px (render only, {render.how})"
+                       if rotate else f"{w}x{h}px (render only, {render.how})")
+        else:
+            scale   = min(MAX_RESOLUTION / w, RESOLUTION / h)
+            out_w   = round(w * scale)
+            out_h   = round(h * scale)
+            dim_str = (f"{raw_w}x{raw_h}px ↻ {w}x{h}px -> {out_w}x{out_h}px"
+                       if rotate else f"{w}x{h}px -> {out_w}x{out_h}px")
+            if is_raw:
+                dim_str = f"{dim_str} ({render.how})"
 
         os.makedirs(output_dir, exist_ok=True)
         _gui_event("IMG", local_path)    # GUI preview strip: current image
@@ -1246,7 +1458,10 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
         # Log is written only after completion (with timing) — not here
 
         try:
-            ENGINE.upscale(src_path, out_path, compute_seedvr2_resolution(w, h))
+            if render_only:
+                _save_render(render.image, out_path, render.exif)
+            else:
+                ENGINE.upscale(src_path, out_path, compute_seedvr2_resolution(w, h))
 
             img_elapsed   = time.time() - img_start
             grand_elapsed = time.time() - grand_start - pause.paused_seconds
@@ -1263,20 +1478,38 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             consecutive_failures = 0
             processed_paths.add(local_path)
             # Green + output path so a double-click can compare original↔upscaled.
-            _gui_event("RESULT", json.dumps([local_path, "ok", out_path]))
+            # A RAW gets "ok" with NO output path on purpose, whether it was
+            # upscaled or only rendered. The comparison window draws the ORIGINAL
+            # as its "before" half, and the original here is a RAW: Pillow cannot
+            # open a CR3/ORF/RW2 at all and answers a CR2/NEF/DNG with the small
+            # preview in IFD 0. Beyond that, for a render-only file there is no
+            # before/after to show in the first place - the output IS the first
+            # viewable version this photo has ever had.
+            _gui_event("RESULT", json.dumps([local_path, "ok"] if is_raw
+                                            else [local_path, "ok", out_path]))
             if cache is not None:
                 cache.mark_done(local_path)
                 cache.record_lineage(local_path, out_path)
                 cache.save()
-            folder_stats[dirpath]["processed"] += 1
-            total_processed += 1
-            # GUI ETA: pause-excluded elapsed, images actually processed this
-            # session, current position and total. The trailing 'P' marks this as
-            # the real image-PROCESSING phase (scan/verify/eligibility ETAs omit
-            # it), so the GUI only tracks cost while images are actually upscaled.
-            # The GUI averages over the processed count (NOT the counter, which
-            # also advances on skips).
-            _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}|P")
+            if render_only:
+                # Counted apart from `processed`, and deliberately excluded from
+                # BOTH the ETA average and the watchdog below. A render is ~1000x
+                # faster than an upscale (measured: 0.3 s vs minutes), so folding
+                # the two together would collapse the ETA's per-image average and,
+                # worse, hand the watchdog a "healthy rate" no real upscale could
+                # ever match — making it trip on the first genuine image.
+                folder_stats[dirpath]["rendered"] += 1
+                total_rendered += 1
+            else:
+                folder_stats[dirpath]["processed"] += 1
+                total_processed += 1
+                # GUI ETA: pause-excluded elapsed, images actually processed this
+                # session, current position and total. The trailing 'P' marks this
+                # as the real image-PROCESSING phase (scan/verify/eligibility ETAs
+                # omit it), so the GUI only tracks cost while images are actually
+                # upscaled. The GUI averages over the processed count (NOT the
+                # counter, which also advances on skips).
+                _gui_event("ETA", f"{grand_elapsed:.3f}|{total_processed}|{idx}|{total}|P")
 
             # ── Performance watchdog: degradation detection ──────────────────
             # Seconds per output megapixel vs the run's healthy minimum. The
@@ -1284,7 +1517,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
             # can't poison it (unlike a rolling average), and per-MP normalisation
             # keeps the comparison fair across mixed resolutions. Trip on a
             # sustained jump to >= WATCHDOG_FACTOR x that floor.
-            if WATCHDOG_ENABLED:
+            if WATCHDOG_ENABLED and not render_only:
                 out_mp = max((out_w * out_h) / 1_000_000.0, 1e-6)
                 spmp   = img_elapsed / out_mp
                 samples_seen += 1
@@ -1432,6 +1665,7 @@ def run_pass(work_items, root, output_root, grand_start, pause, logger,
     return {
         "folder_stats":          folder_stats,
         "total_processed":       total_processed,
+        "total_rendered":        total_rendered,
         "total_skipped_done":    total_skipped_done,
         "total_skipped_size":    total_skipped_size,
         "total_skipped_variant": total_skipped_variant,
@@ -1927,6 +2161,7 @@ def main():
     combined        = _merge_pass_stats(stats1, stats2)
     folder_stats    = combined["folder_stats"]
     total_processed       = combined["total_processed"]
+    total_rendered        = combined.get("total_rendered", 0)
     total_skipped_done    = combined["total_skipped_done"]
     total_skipped_size    = combined["total_skipped_size"]
     total_skipped_variant = combined.get("total_skipped_variant", 0)
@@ -1963,12 +2198,17 @@ def main():
         rel = os.path.relpath(dp, root) if dp != root else "."
         total_skipped_folder = (stats["skipped_done"] + stats["skipped_size"] +
                                 stats["skipped_variant"])
-        folder_total = (stats["processed"] + total_skipped_folder +
+        # A rendered RAW counts under "Processed": the user got a file out of it.
+        # The two are split apart only in the one-line summary below, where the
+        # distinction (upscaled vs rendered at native size) actually tells them
+        # something.
+        folder_done  = stats["processed"] + stats.get("rendered", 0)
+        folder_total = (folder_done + total_skipped_folder +
                         stats["skipped_corrupt"] + stats["skipped_missing"] +
                         stats["failed"])
         rel_truncated = trunc(rel, col_path)
         plain_row = row.format(rel_truncated, folder_total,
-                               stats["processed"], total_skipped_folder,
+                               folder_done, total_skipped_folder,
                                stats["skipped_corrupt"], stats["failed"],
                                fmt_duration(stats["elapsed"]))
         # Terminal: replace the plain folder name with a clickable link
@@ -1979,12 +2219,17 @@ def main():
 
     logger.tee("=" * _w)
     total_skipped = total_skipped_done + total_skipped_size + total_skipped_variant
-    grand_total = total_processed + total_skipped + total_skipped_corrupt + total_skipped_missing + total_failed
-    logger.tee(row.format("TOTAL", grand_total, total_processed, total_skipped,
+    total_done  = total_processed + total_rendered
+    grand_total = total_done + total_skipped + total_skipped_corrupt + total_skipped_missing + total_failed
+    logger.tee(row.format("TOTAL", grand_total, total_done, total_skipped,
                           total_skipped_corrupt, total_failed, fmt_hhmmss(grand_elapsed)))
     logger.tee(sep)
-    parts = [f"{total_processed} processed", f"{total_skipped_done} already done",
-             f"{total_skipped_size} too large"]
+    parts = [f"{total_processed} processed"]
+    # Named separately because it is the honest description AND the answer to the
+    # question a RAW user will otherwise ask: the file was converted to a viewable
+    # JPEG but not enlarged, because it was already at or above the target.
+    if total_rendered > 0: parts.append(f"{total_rendered} RAW rendered (already at target)")
+    parts += [f"{total_skipped_done} already done", f"{total_skipped_size} too large"]
     if total_skipped_variant > 0: parts.append(f"{total_skipped_variant} left as-is")
     if total_skipped_missing > 0: parts.append(f"{total_skipped_missing} missing")
     if total_skipped_corrupt > 0: parts.append(f"{total_skipped_corrupt} corrupted")

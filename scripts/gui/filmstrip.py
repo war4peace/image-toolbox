@@ -18,6 +18,24 @@ from tkinter import ttk
 
 from gui.common import CREATE_NO_WINDOW
 
+# RAW/DNG thumbnails (#19). Guarded so an install that predates raw_decode - or
+# one where rawpy failed to install - simply draws RAW cells the way it always
+# did (blank) instead of failing to build the strip at all.
+try:
+    import raw_decode
+
+    def _is_raw(path):
+        return raw_decode.is_raw(path)
+
+    def _raw_thumb(path, box):
+        return raw_decode.thumbnail(path, box)
+except Exception:                       # noqa: BLE001
+    def _is_raw(_path):
+        return False
+
+    def _raw_thumb(_path, _box):
+        return None
+
 
 THUMB_MASTER = 512           # px — bounding box the master thumbnail is decoded to
 CELL_DEFAULT = 150           # px — default square cell edge for one thumbnail
@@ -533,6 +551,13 @@ class FilmStrip(ttk.Frame):
             # times before giving up — otherwise that thumbnail stays blank.
             for attempt in range(4):
                 src = self._resolve_renamed(p)
+                # A RAW cannot be opened by Pillow at all (#19), so it would burn
+                # the whole retry loop below and still draw an empty cell. Its
+                # embedded preview is right there and costs nothing.
+                if _is_raw(src):
+                    img = _raw_thumb(src, THUMB_MASTER)
+                    if img is not None:
+                        break
                 try:
                     with Image.open(src) as f:
                         f.draft("RGB", (THUMB_MASTER, THUMB_MASTER))

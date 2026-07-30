@@ -402,7 +402,11 @@ try {
         # matplotlib (+ numpy) draws the telemetry usage graphs (#9); a remote-only
         # install still watches the rented pod's live graph, so it needs it too
         # (Local/Both already get it via seedvr2's requirements).
-        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi", "matplotlib")
+        # rawpy (#19): RAW/DNG input. Needed in EVERY install mode, remote-only
+        # included, because the RAW decode happens LOCALLY even for a remote run -
+        # the pod is handed an ordinary PNG and never learns that RAW exists. A
+        # 0.9 MB wheel whose only dependency is numpy, which is already here.
+        Invoke-Pip @("install", "pillow", "piexif", "paho-mqtt", "python-vlc", "certifi", "matplotlib", "rawpy")
     } else {
         Step "Installing PyTorch with CUDA support (this is the long part)"
         Invoke-Pip @("install", "--upgrade", "pip", "--quiet")
@@ -414,7 +418,8 @@ try {
         # spandrel (#11): loads the Real-ESRGAN-class models for the fast fixed-ratio local
         # video engine. Tiny, pure-Python, reuses the torch already installed above; Local/
         # Both only (a Remote-only install has no local GPU to run it on).
-        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc", "certifi", "spandrel")
+        # rawpy (#19): RAW/DNG input, all install modes (see the remote-only branch).
+        Invoke-Pip @("install", "-r", "seedvr2\requirements.txt", "pillow", "piexif", "timm", "paho-mqtt", "python-vlc", "certifi", "spandrel", "rawpy")
     }
 
     # -- 5b. OpenSSH (Remote mode reaches the pod over SSH) -------------------

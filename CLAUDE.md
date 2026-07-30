@@ -61,6 +61,69 @@ then deleted. Uses the same CNN/threshold as Tag & Rename (`orientation.py`); th
 eligibility/skip check is orientation-aware. Toggle + threshold in Settings →
 Upscaling.
 
+**RAW and DNG input** (0.6.0, future-features #19) — the Batch Upscaler accepts
+`.dng .cr2 .cr3 .nef .arw .orf .rw2 .raf .pef .srw` and renders each to a viewable
+JPEG. **The app renders RAW, it does not develop it**: a raw developing UI
+(exposure/WB/curve) is permanently out of scope, so the render is either the
+camera's own embedded full-size JPEG preview (S2) or a LibRaw demosaic with fixed
+defaults (S1), never our opinion. Three measured findings shaped it, from 24 CC0
+camera files 2004-2020 (`docs/raw-preview-survey.csv`). **(1) A RAW is never
+eligible for upscaling**: at the shipped 4K target + 66% cutoff, ZERO of the 24
+would ever be upscaled (1 with the cutoff off), because RAW is by nature a
+high-resolution format and this app targets low-resolution photos. So a RAW is
+**exempt from the size skip** and the size check only chooses **render-only** vs
+**render-then-upscale** -- without that the feature produces nothing at all, for
+anyone. Renders are counted and reported separately (`N RAW rendered (already at
+target)`) and are excluded from the ETA average AND the watchdog, since a render is
+~1000x faster than an upscale and would otherwise hand the watchdog a "healthy
+rate" no real upscale could match. **(2) The IFD-0 trap is real** (15/24): a
+TIFF/EP raw puts a small preview in IFD 0 by spec and Pillow sniffs content, not
+extension, so the dimension reader's Pillow fallback does not fail, it answers
+confidently and WRONGLY -- and not always obviously (a 20D CR2 reads as 1536x1024,
+a 5D as 2496x1664). So a RAW extension **never reaches Pillow**:
+`get_image_dimensions` branches to LibRaw first and an unreadable RAW returns
+(0,0) and is reported unreadable, exactly like a corrupt JPEG. `sizes.iwidth/iheight`
+are **pre-flip** (verified: `postprocess(user_flip=5|6)` swaps the shape, `0|3` do
+not), so `upright_size()` applies the swap in one place; the scan's header read and
+the render can differ by the 2% preview tolerance, so `run_pass` re-derives the size
+from the rendered pixels and decides there. **(3) The preview does NOT carry the
+camera's EXIF intact** (the plan assumed it did): a preview block is typically 12+4
+tags with the exposure triple but **no DateTimeOriginal and no GPS**, while the
+container's own block is rich but unreadable by Pillow for CR3/ORF/RW2/RAF/ARW/SRW
+(9 of 24). Neither covers the set, so metadata is **merged from both**,
+container-first, using exif_copy's own "copy what is missing, keep what is present"
+rule: 24/24 outputs carry a capture date, against 15/24 or 23/24 from either source
+alone. Raw-**development** tags are stripped first (the DNG range from 50706 up): a
+DNG block measures 79-317 KB against a JPEG APP1 ceiling of 64 KB, so before that
+strip exif_copy correctly refused the whole block and those files came out with NO
+metadata. The chain is **decode -> auto-straighten -> upscale, passing arrays**, with
+**exactly one** temp written and only when the file is actually upscaled; that temp
+is **lossless PNG, never JPEG** (the easy accident, since `.jpg` is what the output
+is) and carries sanitised EXIF with Orientation forced to 1 -- load-bearing, because
+`upscale_engine._load_image` runs `exif_transpose` on whatever it is given. Carrying
+the block is also what lets the **remote** path work unchanged: the decode happens
+LOCALLY even for a pod run, so the pod receives an ordinary PNG and never learns RAW
+exists. Output is **`<stem>_raw.jpg`**, not `<stem>.jpg`: shooting RAW+JPEG is
+ordinary and `IMG_1234.CR2` + `IMG_1234.JPG` would otherwise both map to one output,
+where the first processed wins and the second is silently counted "already
+upscaled". **Tag & Rename ignores RAW** (writing `ImageDescription` into a
+proprietary container is the source mutation the app forbids) and **Conciliation
+never archives or deletes a RAW original** -- an explicit, tested guard, not a side
+effect of an extension list, because a rendered JPEG is not a superset of a negative
+but one 8-bit interpretation of it with the sensor data gone. A RAW never offers
+**Compare** (the window draws the ORIGINAL as its "before" half, which Pillow cannot
+open), and the film strip draws RAW cells from the embedded preview (~45 ms) instead
+of leaving them blank. `rawpy` ships in all three install modes; its wheel carries
+the LibRaw LGPL licence itself, so nothing needs copying. Conciliation's
+fold-the-render-in-alongside (the other half of #19's decision 8) is **dropped**, not
+pending: it buys a filing convenience with a new action type inside the app's only
+destructive tool, and since a RAW is never upscaled the render belongs in the output
+folder like everything else the app produces. **So what shipped is in practice a RAW
+RENDERER, and the upscale half is scaffolding**: it starts working the day a target
+exists that makes a RAW small, which is why the revisit trigger recorded in
+`docs/dropped-ideas.md` is an 8K resolution target. See `raw_decode.py` and
+`tests/test_raw_input.py`.
+
 **Tag & Rename** — analyses each image with a local Ollama vision model, writes
 a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`.
 **Auto-straighten** (on by default) uses a small CNN to rotate sideways photos
@@ -965,6 +1028,7 @@ plain by design, the rule is recorded above the style constant)); **`gui/compari
 | `benchmarks.py` (~120 lines) | Author-benchmark lookup for the remote-pod "$ / 100 images" cost readout (0.3.9). Reads the human-maintained `docs/image-benchmarks.csv` (shipped to `{app}/docs` by the installer) and answers "what did 100 images cost on this GPU in the author's runs" for a task+card+live price; the user's own `db.gpu_perf` history supersedes it once they've run a card enough. Pure stdlib, fail-safe (any miss → None → GUI shows "N/A"). |
 | `bench_share.py` (~330 lines) | Benchmark sharing (0.5.1, future-features #8), torch-free/stdlib, fail-safe. The CSV serializer for the shared per-card VIDEO benchmark summary (`write_csv`/`read_csv`/`to_text`, a `# imgtbx-bench v1` sentinel, a malformed row is skipped not raised); `fetch_community` (anonymous GitHub GET of the curated `docs/video-benchmarks.csv` via `net_ssl`, offline-cacheable); `new_rows` (dedup a contribution against the published corpus by measurement identity, ignoring volatile date/price); and the **maintainer** `--merge` tool (ingest submissions into a private gitignored `benchmarks.db`, newest-wins dedupe, a physical-plausibility **sanity gate**, re-export the diffable master). Consumed by `video_benchmark` (`build_share_rows`/`import_rows`/`auto_update`) and `gui.common.contribute_benchmark`. See docs/benchmark-sharing.md. |
 | `exif_copy.py` (~330 lines) | Metadata transfer (0.5.9, future-features #13), Pillow-only and fail-safe. `exif_for_upscaled()` reads the source's block, normalises Orientation to 1 (the pipeline already applied it), corrects the pixel dimensions to the output size, and strips a TIFF source's structural tags before they can describe a strip layout inside a JPEG; `save_kwargs()` splats it into `Image.save` for the formats that can carry one (BMP is excluded: Pillow accepts `exif=` and writes nothing). `pending_backfill()` / `backfill()` are Conciliation's retroactive half: "copy what is missing, keep what is present", JPEG via `piexif.insert` (byte-identical scan data) and PNG via an atomic lossless re-save, everything else refused with a named reason. Every entry point swallows its own errors and returns "nothing to do" -- 13a runs inside an upscale and 13b runs one statement before an archive or a delete. Pushed to the pod with `upscale_engine.py`. |
+| `raw_decode.py` (~380 lines) | RAW / DNG input (0.6.0, future-features #19). Owns `RAW_EXTS`, the header-only `raw_dimensions()` (LibRaw, flip-corrected, and the reason a RAW never reaches Pillow), `render()` (the preview-vs-demosaic choice plus the container+preview metadata merge), `thumbnail()` for the film strip, and `render_name()` (the `_raw.jpg` rule that stops a RAW and its sibling camera JPEG mapping to one output). The geometry is pure module-level functions (`upright_size` / `preview_is_full_size`), tested without rawpy. rawpy and Pillow are lazy inside it, so importing it stays instant and torch-free -- which is why `runner_common` can import it at module level for the one shared extension list. |
 | `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers, `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename; the Video Upscaler records a whole-video source→output row here too, 0.4.9 item 10); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools;
 `cached_hash` is its read-only half, which returns a hash only if one is already
@@ -1052,16 +1116,21 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `future-features.md` (roadmap: open milestones #19/#20/#21,
-  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#22 kept only as a
-  numbering legend), `dropped-ideas.md` (ideas
-  investigated and decided against + the standing constraints: AMD/ROCm, vast.ai),
+- `docs/` — `future-features.md` (roadmap: open milestones #20/#21,
+  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#22 kept only
+  as a numbering legend), `dropped-ideas.md` (ideas
+  investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
+  incl. folding a RAW render back into the source tree, whose revisit trigger is an
+  8K target),
   `runpod-notes.md` (remote-pod upscaling notes), `video-upscaler.md` /
   `local-video-upscaler.md` (design + as-built notes for the Video Upscaler: remote #2
   and the local GPU path #7), `benchmark-sharing.md` (as-built notes for the
   crowdsourced benchmark corpus, #8), `tag-and-rename.md` (vision-model design +
   as-built notes for Tag & Rename: the model tiers + the `ollama_num_ctx` cap, with
-  `tag-rename-benchmarks.csv` the raw 100-image measurements), `notifications.md` (the Discord/Telegram/ntfy backends: setup, the severity contract, what was rejected), `mqtt-integration.md`
+  `tag-rename-benchmarks.csv` the raw 100-image measurements),
+  `raw-preview-survey.csv` (the 24-file RAW measurement behind #19: preview hit
+  rate, the IFD-0 trap per camera, and the skip verdict that made "render always"
+  the only workable shape), `notifications.md` (the Discord/Telegram/ntfy backends: setup, the severity contract, what was rejected), `mqtt-integration.md`
   (the MQTT/Home Assistant contract: every topic, the retained-state vs one-shot-event
   split, the per-tool `last_run` keys, and what was rejected — the single source for
   anything MQTT), `telemetry-design.md` (the `system/*` topics + the in-app usage
@@ -1084,6 +1153,12 @@ Engine, packaging & CI:
   seedvr2; the Remote-only bootstrap installs it too (the pod's live graph). A
   hand-rolled tkinter-Canvas chart was prototyped and rejected: the win is
   axes/scaling/legends/resize for free and a blitted crosshair, not toolkit speed.
+  And `rawpy` (0.6.0, RAW/DNG input #19, imported lazily + fail-safe: absent rawpy
+  means RAW files are simply not offered, never a broken run). It is a 0.9 MB wheel
+  whose only dependency is numpy, which every install already has, and it earns its
+  place because LibRaw is the whole feature -- there is no stdlib route to a
+  demosaic. It ships in **all three** install modes, Remote-only included, because
+  the decode happens LOCALLY even for a pod run.
   Adding anything else (e.g. a web framework) needs the same deliberation.
 - **Stay Windows-aware.** Paths, the PowerShell bootstrap, and
   `CREATE_NO_WINDOW` are Windows-specific; cross-platform work (Linux/Unraid)

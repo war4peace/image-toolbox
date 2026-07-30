@@ -1,0 +1,25 @@
+camera,year,ext,true_size,preview_size,preview_kind,preview_full_size,preview_has_exif,libraw_flip,app_reports_today,app_size_correct,skip_at_4k_cutoff66,skip_at_4k_cutoff0
+Canon EOS 20D,2004,.cr2,3522x2348,1536x1024,JPEG,no,yes,0,1536x1024,NO,height 2348px >= 2160px,height 2348px >= 2160px
+Nikon D70,2004,.nef,3039x2014,3008x2000,JPEG,yes,yes,0,160x120,NO,within cutoff (3039x2014px),UPSCALED
+Olympus E-300,2004,.orf,3340x2504,1600x1200,JPEG,no,yes,0,unreadable,n/a,height 2504px >= 2160px,height 2504px >= 2160px
+Canon EOS 350D,2005,.cr2,3474x2314,3456x2304,JPEG,yes,yes,0,3456x2304,NO,height 2314px >= 2160px,height 2314px >= 2160px
+Canon EOS 5D,2005,.cr2,4386x2920,2496x1664,JPEG,no,yes,0,2496x1664,NO,width 4386px >= 3840px,width 4386px >= 3840px
+Nikon D200,2005,.nef,3899x2616,3872x2592,JPEG,yes,yes,0,160x120,NO,width 3899px >= 3840px,width 3899px >= 3840px
+Olympus E-500,2005,.orf,3340x2504,1600x1200,JPEG,no,yes,0,unreadable,n/a,height 2504px >= 2160px,height 2504px >= 2160px
+Nikon D80,2006,.nef,3900x2613,3872x2592,JPEG,yes,yes,0,160x120,NO,width 3900px >= 3840px,width 3900px >= 3840px
+Nikon D80 (converted DNG),2006,.dng,3900x2611,1024x683,JPEG,no,yes,0,256x171,NO,width 3900px >= 3840px,width 3900px >= 3840px
+Pentax K10D,2006,.pef,3896x2616,3872x2592,JPEG,yes,yes,0,unreadable,n/a,width 3896px >= 3840px,width 3896px >= 3840px
+Pentax K10D (in-camera DNG),2006,.dng,3896x2616,3872x2592,JPEG,yes,yes,0,160x120,NO,width 3896px >= 3840px,width 3896px >= 3840px
+Sony DSLR-A100,2006,.arw,3881x2607,640x480,JPEG,no,yes,0,unreadable,n/a,width 3881px >= 3840px,width 3881px >= 3840px
+Fujifilm FinePix S5 Pro,2007,.raf,3552x3551,1440x960,JPEG,no,yes,0,unreadable,n/a,height 3551px >= 2160px,height 3551px >= 2160px
+Sony DSLR-A700,2007,.arw,4256x2856,1616x1080,JPEG,no,yes,0,unreadable,n/a,width 4256px >= 3840px,width 4256px >= 3840px
+Canon EOS 5D Mark II,2008,.cr2,5634x3752,5616x3744,JPEG,yes,yes,0,5616x3744,NO,width 5634px >= 3840px,width 5634px >= 3840px
+Leica M9,2009,.dng,5216x3472,320x216,BITMAP,no,no,0,320x216,NO,width 5216px >= 3840px,width 5216px >= 3840px
+Nikon D7000,2010,.nef,4948x3280,4928x3264,JPEG,yes,yes,0,160x120,NO,width 4948px >= 3840px,width 4948px >= 3840px
+Panasonic DMC-GH2,2010,.rw2,4624x3472,1920x1440,JPEG,no,yes,0,unreadable,n/a,width 4624px >= 3840px,width 4624px >= 3840px
+Samsung NX10,2010,.srw,4688x3116,4592x3056,JPEG,no,yes,0,unreadable,n/a,width 4688px >= 3840px,width 4688px >= 3840px
+Adobe DNG Converter (5D Mk III),2012,.dng,5796x3870,5760x3840,JPEG,yes,yes,0,256x171,NO,width 5796px >= 3840px,width 5796px >= 3840px
+Ricoh GR,2013,.dng,4944x3280,640x424,JPEG,no,yes,0,160x120,NO,width 4944px >= 3840px,width 4944px >= 3840px
+Apple iPhone XS,2018,.dng,4032x3024,852x640,JPEG,no,yes,0,852x640,NO,width 4032px >= 3840px,width 4032px >= 3840px
+Google Pixel 3a,2019,.dng,4032x3024,672x504,JPEG,no,yes,0,672x504,NO,width 4032px >= 3840px,width 4032px >= 3840px
+Canon EOS R5,2020,.cr3,8191x5463,8192x5464,JPEG,yes,yes,0,unreadable,n/a,width 8191px >= 3840px,width 8191px >= 3840px

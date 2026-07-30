@@ -175,7 +175,7 @@ def test_conciliation_skips_a_nested_archive(tmp_path):
     _touch(os.path.join(orig, "2019", "a.jpg"), b"a")
     _touch(os.path.join(orig, "2019", "__Archive__", "old.jpg"), b"old")
 
-    _plan, folders, _kept, _v = cc.build_plan(orig, proc, tr_index=None, conn=None)
+    _plan, folders, _kept, *_ = cc.build_plan(orig, proc, tr_index=None, conn=None)
     scanned = {rel for rel, _r, _s, _k in folders}
     assert not any("__Archive__" in r for r in scanned)
 

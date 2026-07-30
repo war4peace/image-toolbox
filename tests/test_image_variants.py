@@ -220,7 +220,7 @@ def test_conciliation_refuses_to_replace_a_transparent_png(db_conn, tmp_path):
     _alpha(orig / "logo.png")
     _plain(proc / "logo.png")            # what the old upscaler produced
 
-    plan, folders, _kept, variants = cc.build_plan(str(orig), str(proc),
+    plan, folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
                                                    tr_index=None, conn=db_conn)
     assert plan == []
     assert [os.path.basename(p) for p, _r in variants] == ["logo.png"]
@@ -235,7 +235,7 @@ def test_conciliation_still_replaces_an_ordinary_image(db_conn, tmp_path):
     _plain(orig / "photo.png")
     _plain(proc / "photo.png", size=(400, 300))
 
-    plan, _folders, _kept, variants = cc.build_plan(str(orig), str(proc),
+    plan, _folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
                                                     tr_index=None, conn=db_conn)
     assert len(plan) == 1
     assert variants == []
@@ -252,7 +252,7 @@ def test_conciliation_refuses_a_variant_even_with_recorded_lineage(db_conn, tmp_
                               db.hash_file_cached(db_conn, src),
                               db.hash_file_cached(db_conn, out), src, out)
 
-    plan, _folders, _kept, variants = cc.build_plan(str(orig), str(proc),
+    plan, _folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
                                                     tr_index=None, conn=db_conn)
     assert plan == []
     assert len(variants) == 1

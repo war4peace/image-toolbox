@@ -143,16 +143,28 @@ def _preprocess_pil(pil_img):
     return torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0)
 
 
-def analyse(path):
-    """Return (degrees, confidence): degrees in {0,90,180,270}, confidence 0..1."""
+def analyse_image(pil_img):
+    """Return (degrees, confidence) for an ALREADY-OPEN image.
+
+    Split out of analyse() for RAW input (#19), where there is no file to point
+    at: a RAW is rendered to an in-memory image and the chain deliberately holds
+    ONE array rather than writing an intermediate per stage. Both entry points
+    run the same preprocessing, so the two paths cannot drift apart in accuracy.
+    """
     import torch
-    from PIL import Image
     model, dev = _get_model()
-    x = _preprocess_pil(Image.open(path)).to(dev)
+    x = _preprocess_pil(pil_img).to(dev)
     with torch.no_grad():
         p = model(x)[0].cpu().numpy()
     cls = int(p.argmax())
     return _CLASSES[cls], float(p[cls])
+
+
+def analyse(path):
+    """Return (degrees, confidence): degrees in {0,90,180,270}, confidence 0..1."""
+    from PIL import Image
+    with Image.open(path) as img:
+        return analyse_image(img)
 
 
 def should_rotate(degrees, confidence, min_confidence):

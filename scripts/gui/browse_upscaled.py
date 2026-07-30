@@ -70,6 +70,17 @@ BROWSE_PAGE_SIZE = 200
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 
 
+def _is_raw_render(name):
+    """True when `name` is a JPEG this app rendered from a RAW (#19). Guarded the
+    same way filmstrip's RAW support is, so an install predating raw_decode just
+    treats it as an ordinary output."""
+    try:
+        import raw_decode
+        return raw_decode.is_render_name(name)
+    except Exception:                       # noqa: BLE001
+        return False
+
+
 # ─────────────────────────────────────────────
 #  PAIRING  (pure — no Tk, no filesystem except the injected `isfile`)
 # ─────────────────────────────────────────────
@@ -305,7 +316,16 @@ def scan_pairs(output_root, source_root, inv_tag=None,
                 continue
             out_abs = os.path.normpath(os.path.join(dirpath, fn))
             out_rel = os.path.join(rel_dir, fn) if rel_dir else fn
-            src = pair_source(out_rel, source_root, inv_tag)
+            # A RAW render is deliberately left unpaired (#19). Its source is a
+            # negative, and the comparison window draws the source as its "before"
+            # half: Pillow cannot open a CR3/ORF/RW2 at all, and answers a
+            # CR2/NEF/DNG with the small preview in IFD 0. For a render-only file
+            # there is no before/after either - the output IS the first viewable
+            # version. An unpaired entry already behaves correctly here (keyed by
+            # its own path, opens on double-click, no green frame), so this only
+            # skips work the mirror inversion could never have completed anyway.
+            src = None if _is_raw_render(fn) else pair_source(out_rel, source_root,
+                                                              inv_tag)
             # Same file on both sides (a source root pointed at the output root):
             # not a pair, and showing it against itself would be a lie.
             if src and os.path.normcase(src) == os.path.normcase(out_abs):

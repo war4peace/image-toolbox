@@ -100,6 +100,16 @@ IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
 VIDEO_EXTS  = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg",
                ".flv", ".webm", ".3gp", ".ts", ".mts", ".m2ts", ".vob"}
 MEDIA_EXTS  = IMAGE_EXTS | VIDEO_EXTS
+# RAW originals (#19). Deliberately NOT part of MEDIA_EXTS: nothing here ever
+# acts on one. Sourced from raw_decode so the list lives in one place; the
+# fallback keeps this module runnable on an install that predates it, and an
+# empty set simply means a RAW is treated as an untouched non-media file - which
+# is the same safe outcome, just less clearly reported.
+try:
+    from raw_decode import RAW_EXTS as _RAW_EXTS
+    RAW_EXTS = set(_RAW_EXTS)
+except Exception:                                  # noqa: BLE001 (old install)
+    RAW_EXTS = set()
 ARCHIVE_DIRNAME = "__Archive__"
 
 # The @@TBX@@ event protocol + GUI-mode detection live in runner_common.
@@ -337,7 +347,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     guess could mistake a partial clip for a whole-video match). The processed-tree
     hash index is built lazily, only once a lineage match is actually needed.
 
-    Returns (plan, folders, kept_files, variant_files):
+    Returns (plan, folders, kept_files, variant_files, raw_files):
       plan       — list of (original_abs, processed_abs, original_rel) to act on.
       folders    — list of (rel_dir, replaced, skipped, kept) per folder, for the
                    preview. 'kept' counts non-media files (never touched);
@@ -348,6 +358,11 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
                    hidden Thumbs.db that Explorer doesn't show).
       variant_files - (abs_path, reason) for originals the upscaler cannot
                    round-trip (#17), which are never matched or replaced.
+      raw_files  - absolute paths of the RAW originals, which are never matched
+                   or replaced either (#19). Returned separately from the other
+                   two so the preview can say "your negatives were left alone"
+                   in those words: a user handing this tool a folder of CR2s
+                   needs to see that as a decision, not infer it from a count.
     Skips every folder this app created (__Archive__ at ANY depth, __upscaled__,
     the video work area: see runner_common.DerivedPruner) plus the processed tree
     if it is nested inside the original tree under some other name.
@@ -356,6 +371,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     folders       = []
     kept_files    = []
     variant_files = []
+    raw_files     = []
     processed_ab  = _norm(processed_root)
     # By NAME, so a nested archive deeper in the tree is skipped too: the old
     # single `<original_root>/__Archive__` path check only caught the top one (#16).
@@ -385,6 +401,19 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
         for fn in sorted(filenames):
             abs_f = os.path.join(dirpath, fn)
             ext = os.path.splitext(fn)[1].lower()
+            # A RAW original is NEVER archived or deleted (#19), and this says so
+            # out loud rather than relying on RAW being absent from MEDIA_EXTS.
+            # The rule is the general one - replace an original only when the
+            # processed file is a SUPERSET of it - and a rendered JPEG is not a
+            # superset of a negative: it is one interpretation of it, at 8 bits,
+            # already demosaiced, with the sensor data gone. Losing that is
+            # unrecoverable and would be the single worst thing this app could do
+            # to a photographer's archive, so the guard is explicit, is tested,
+            # and must not be "simplified" into the extension list above.
+            if ext in RAW_EXTS:
+                raw_files.append(abs_f)
+                skipped += 1
+                continue
             if ext not in MEDIA_EXTS:
                 kept += 1
                 kept_files.append(abs_f)
@@ -426,7 +455,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
         summary = pruner.summary()
         if summary:
             log_cb(f"  {summary}")
-    return plan, folders, kept_files, variant_files
+    return plan, folders, kept_files, variant_files, raw_files
 
 
 # ─────────────────────────────────────────────
@@ -1009,7 +1038,7 @@ def main():
     _gui_event("STATUS", "Scanning the original folder …")
     log.tee("")
     log.tee("Scanning …")
-    plan, folders, kept_files, variant_files = build_plan(
+    plan, folders, kept_files, variant_files, raw_files = build_plan(
         original_root, processed_root, tr_index,
         conn=conn, abort=_quit_evt.is_set,
         status_cb=lambda m: _gui_event("STATUS", m),
@@ -1054,6 +1083,15 @@ def main():
         log.tee("Left untouched - upscaling would discard part of these images:")
         for p, reason in variant_files:
             log.tee(f"{p}  ({reason})")
+    # RAW originals are never replaced (#19). Spelled out for the same reason the
+    # two lists above are: a user pointing this at a folder of negatives has to
+    # be able to SEE that they are safe, and see it before pressing Run in Delete
+    # mode, not work it out from a count that says "left untouched".
+    if raw_files:
+        log.tee("")
+        log.tee("RAW originals - never archived or deleted, whatever the mode:")
+        for p in raw_files:
+            log.tee(p)
     log.tee("")
     log.tee(f"  Total: {total_replaced} file(s) to replace, "
             f"{total_skipped} left untouched, "
@@ -1062,6 +1100,11 @@ def main():
         log.tee(f"  Of the untouched, {len(variant_files)} image(s) were kept "
                 f"because upscaling would discard part of them; the rest had no "
                 f"processed counterpart.")
+    if raw_files:
+        log.tee(f"  Of the untouched, {len(raw_files)} are RAW originals: a "
+                f"rendered JPEG is one interpretation of a negative, not a "
+                f"replacement for it, so they are kept and their renders stay in "
+                f"the processed folder.")
     if pending_meta:
         log.tee(f"  Metadata to restore: {pending_meta} image(s) will get the "
                 f"capture date, camera and other fields their original still has "

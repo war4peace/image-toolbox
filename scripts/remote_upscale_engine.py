@@ -145,10 +145,26 @@ class RemoteUpscaleEngine:
         The thumbnail is built WITHOUT applying EXIF orientation, matching the
         local orientation.analyse (which reads the stored pixels) so the detected
         class means the same thing on both paths."""
-        from io import BytesIO
         from PIL import Image
         try:
-            im = Image.open(src_path).convert("RGB")
+            with Image.open(src_path) as im:
+                return self.analyse_image(im)
+        except Exception:
+            return 0, 0.0
+
+    def analyse_image(self, pil_img):
+        """`analyse` for an ALREADY-OPEN image, mirroring orientation.analyse_image.
+
+        Needed for RAW input (#19): a RAW is rendered locally to an in-memory
+        image, and there is no file the pod's /orient could be pointed at. Opening
+        the source with Pillow - which is what analyse() does - returns the size
+        of the TIFF preview in IFD 0 for a CR2/NEF/DNG and fails outright for a
+        CR3/ORF/RW2, so on a remote run auto-straighten would have quietly stopped
+        working for RAW rather than failing visibly."""
+        from io import BytesIO
+        from PIL import Image                       # noqa: F401 (thumbnail path)
+        try:
+            im = pil_img.convert("RGB")
             im.thumbnail((512, 512))                 # longest side <= 512px
             buf = BytesIO()
             im.save(buf, format="JPEG", quality=85)

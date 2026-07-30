@@ -179,6 +179,40 @@ def exif_for_upscaled(src_path, dest_path, size=None):
     exif, ok = _open_exif(src_path)
     if not ok or exif is None:
         return None
+    return _sanitised(exif, dest_path, size)
+
+
+def exif_for_upscaled_blob(blob, dest_path, size=None):
+    """
+    `exif_for_upscaled` for a metadata block already in hand rather than a file
+    on disk. Same corrections, same output.
+
+    This exists for RAW input (#19), where the metadata is not IN the file the
+    pixels came from: it is merged from the RAW container's block and the
+    embedded preview's, neither of which alone covers the format set. Splitting
+    the sanitiser out means the RAW path cannot drift from the file path - the
+    Orientation rule in particular is one both must obey, and for a RAW the
+    reason is different but the answer is the same (LibRaw's `flip` is applied
+    during the render, so the pixels handed on are already upright and copying
+    the source's Orientation would rotate them a second time).
+    """
+    if not blob:
+        return None
+    try:
+        from PIL import Image
+        exif = Image.Exif()
+        exif.load(blob)                            # tolerates the "Exif\0\0" prefix
+        exif.get_ifd(_EXIF_IFD)
+        exif.get_ifd(_GPS_IFD)
+    except Exception as exc:                       # noqa: BLE001 (malformed block)
+        debug_log("exif_copy.exif_for_upscaled_blob", exc=exc)
+        return None
+    return _sanitised(exif, dest_path, size)
+
+
+def _sanitised(exif, dest_path, size):
+    """The shared body of the two entry points above: strip what describes the
+    SOURCE FILE, correct what describes the PICTURE, serialise."""
     try:
         for tag in list(dict(exif)):
             if tag in _STRUCTURAL:
@@ -209,7 +243,7 @@ def exif_for_upscaled(src_path, dest_path, size=None):
         if gps:
             exif[_GPS_IFD] = gps
     except Exception as exc:                       # noqa: BLE001
-        debug_log("exif_copy.exif_for_upscaled", exc=exc)
+        debug_log("exif_copy._sanitised", exc=exc)
         return None
     return _serialise(exif, os.path.splitext(dest_path)[1])
 

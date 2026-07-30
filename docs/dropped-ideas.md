@@ -27,6 +27,7 @@ Source for the open roadmap: `docs/future-features.md`.
 - [Archival / intermediate codec output](#archival--intermediate-codec-output-2026-07-28)
 - [Processing alpha, multi-page and high-bit-depth images](#processing-alpha-multi-page-and-high-bit-depth-images-2026-07-29)
 - [Managing the network volume via the RunPod S3 API](#managing-the-network-volume-via-the-runpod-s3-api-2026-07-29)
+- [Folding a RAW render back into the source tree](#folding-a-raw-render-back-into-the-source-tree-2026-07-30)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -773,6 +774,49 @@ Recorded because it is not what the question asked for, and it is the better hal
 - Storage pricing confirmed at **$0.07/GB/mo** for the first TB, so the 50 GB model volume
   is ~$3.50/mo. That is the figure behind the standing "a volume bills monthly even when
   idle" tooltip.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+## Folding a RAW render back into the source tree (2026-07-30)
+
+Roadmap **#19** decision 8 had two halves. Conciliation must never archive or delete a RAW
+original (**shipped**, explicit and tested), and it should **fold the render in alongside**
+the negative, ending with `IMG_1234.CR2`, `IMG_1234.JPG` (the camera's own) and the app's
+render in the same folder. The second half is **dropped**. Nothing was built for it.
+
+**Why.** Two independent reasons, and the second is the one that actually settles it.
+
+**1. It is a new destructive-tool mode bought for a filing convenience.** Conciliation has
+only ever *replaced*. Adding "move this extra file in alongside" means a new preview count, a
+case-insensitive collision check (Windows: a pre-existing `_raw.jpg` and `_RAW.JPG` are one
+file), idempotence so a second run cannot stack suffixes, and a new action type in the #18
+undo journal. That is real surface area inside the app's only destructive tool, and its
+entire payoff is that a file the user can already see sits in a different folder.
+
+**2. RAW input turned out to be a scaffold, not a workflow.** The measurement behind #19
+(`raw-preview-survey.csv`, 24 CC0 camera files) found that at the shipped 4K target **zero of
+them would ever be upscaled** - RAW is a high-resolution format and this app targets
+low-resolution photos. So what the feature actually does today is **render**: it makes
+negatives viewable, which they otherwise are not, anywhere. The output of a render belongs in
+the output folder, next to every other thing the app produced. Folding it back into the
+source tree is a gesture that only makes sense for the *upscale* workflow, and for RAW that
+workflow currently has no members.
+
+**Where it leaves things.** The render stays in the processed folder, which is exactly where
+it is today and where `Browse upscaled…` already shows it. The user copies it out if they
+want it filed with the negative - a one-time drag, against a permanent code path.
+
+**Revisit if** the upscale half of RAW input starts firing for real, which needs a reason for
+a RAW to be below target. The concrete one is an **8K resolution target**: at 7680x4320 most
+of the survey corpus becomes eligible overnight, RAW stops being a render-only format, and
+"the upscaled version should live beside the negative" becomes a real request rather than a
+tidiness argument. A second, weaker trigger is a user actually asking for it.
+
+**One naming decision is parked with this**, and must be re-taken rather than inherited if it
+returns. The render is `<stem>_raw.jpg`, chosen so a RAW and its sibling camera JPEG cannot
+map to the same output. #19's original text said the folded-in file should be
+`<stem>_upscaled.jpg`, which was written when the plan assumed RAW files get upscaled; on the
+measured behaviour that name would be **false on nearly every file**.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

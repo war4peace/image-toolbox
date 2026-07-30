@@ -6,18 +6,17 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-Every open milestone is now medium or larger: two new input/processing capabilities (#19 RAW
-and DNG input, #20 a Video Stabilization tab), one measurement-gated one (#21 denoising), a
-Video Upscaler feature (#12 mixed local+remote queue) and a remote-side one blocked on funds
-rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new
-process model, networking, or packaging (HTTP interface #3, Unraid #4). The **shipped**
-milestones are kept below as a numbering legend, after the open work.
+Every open milestone is now medium or larger: one new processing capability (#20 a Video
+Stabilization tab), one measurement-gated one (#21 denoising), a Video Upscaler feature
+(#12 mixed local+remote queue) and a remote-side one blocked on funds rather than design
+(#15 a second GPU provider). Two lower-priority ones each introduce a new process model,
+networking, or packaging (HTTP interface #3, Unraid #4). The **shipped** milestones are kept
+below as a numbering legend, after the open work.
 
 ---
 
 ## Contents
 
-- [19. RAW and DNG input for the Batch Upscaler](#19-raw-and-dng-input-for-the-batch-upscaler-medium)
 - [20. Video Stabilization (new tab)](#20-video-stabilization-new-tab-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
@@ -27,137 +26,6 @@ milestones are kept below as a numbering legend, after the open work.
 - [Sequencing & dependencies](#sequencing--dependencies)
 - [Shipped milestones (numbering legend)](#shipped-milestones-numbering-legend)
 - [Decided against / constraints](#decided-against--constraints)
-
----
-
-## 19. RAW and DNG input for the Batch Upscaler: Medium
-
-Accept RAW files as Batch Upscaler input, rendering each to a JPEG that the existing pipeline
-then upscales. Researched and scoped 2026-07-28; the decisions below are settled, and one
-measurement is outstanding.
-
-**Scope: the app renders RAW, it does not develop it.** A RAW is sensor data plus
-instructions, so turning it into a picture means choosing a demosaic, white balance, tone
-curve and colour space. Those choices *are* the photo, and this app has never had a rendering
-opinion. A raw developing UI (exposure/WB/curve controls) is **out of scope permanently**.
-
-### Settled decisions
-
-| # | Decision | Note |
-|---|---|---|
-| 1 | **Use the camera's embedded full-size JPEG preview** when there is one ("S2"), and fall back to a LibRaw demosaic with fixed defaults ("S1") when there is not | The preview is the manufacturer's own rendering, i.e. exactly what the camera would have written in JPEG mode, and it carries the camera's EXIF intact. No opinion required from us, and it is faster |
-| 2 | **Use S2 only when the preview is essentially the full image** (within ~2% of `sizes.iwidth`/`iheight`) | Makes S2 and S1 dimension-identical **by construction**, which is what lets the scan read sizes from the header alone. See "the trap" below |
-| 3 | **Output is `.jpg`** | The app exists to make old photos display natively on monitors and TVs, not to produce a mastering format. Revisit `.tif` only on repeated demand |
-| 4 | **`rawpy` ships in all three install modes** | 0.87 MB Windows wheel (cp312), depends only on `numpy` (already present), torch-free. The decode happens locally even for a remote run, so the pod never needs to know RAW exists |
-| 5 | **Ship the LibRaw licence text** | rawpy is MIT, bundled LibRaw is LGPL-2.1. `bootstrap.ps1` already does exactly this for the GPL ffmpeg build (`ffmpeg\LICENSE.txt`) |
-| 6 | **Support the common set**: `.dng .cr2 .cr3 .nef .arw .orf .rw2 .raf .pef .srw` | LibRaw covers all of them; the marginal cost is the extension list |
-| 7 | **Tag & Rename ignores RAW entirely**, tagging and renaming both | Tagging means writing `ImageDescription` **into** the file, and writing into a proprietary RAW container is exactly the source mutation the app forbids. Its `IMAGE_EXTS` already excludes them, so this costs nothing to honour |
-| 8 | **Conciliation never archives or deletes a RAW original.** It folds the render in **alongside**, as `<name>_upscaled.jpg` | Ends with three files: `IMG_1234.CR2`, `IMG_1234.JPG` (the camera's own), `IMG_1234_upscaled.jpg`. Lowercase `.jpg` per the app's own convention, regardless of the sibling's case |
-| 9 | **Key that exception on the superset test, not on "is it RAW"** | The rule is "replace only when the processed file is a superset of the original". One test, two outcomes, no format list to maintain |
-
-### The trap that makes this dangerous if rushed
-
-`runner_common.get_image_dimensions()` reads the **first IFD** of a TIFF, and Pillow sniffs
-content rather than extension. A DNG (and CR2/NEF/ARW, all TIFF/EP derivatives) puts a
-**small preview in IFD 0** by spec. Reproduced with a two-IFD TIFF named `.dng` whose real
-image is 6000x4000:
-
-```
-Pillow opens .dng as: TIFF   size (256, 171)
-get_image_dimensions ->  (256, 171)
-```
-
-So adding `.dng` to `IMAGE_EXTS` and changing nothing else would make the scan see a 256x171
-image, judge it far below the target, upscale **the thumbnail**, and write a 4K file built
-from a 256 px preview. It would not fail. It would produce plausible garbage in bulk,
-silently.
-
-**The rule that dissolves it: measure the pixels you are actually going to upscale.**
-Concretely:
-
-1. `get_image_dimensions()` gains a RAW branch taken **before** the TIFF branch.
-2. **A RAW extension must never fall through to Pillow.** This inverts the module's usual
-   fail-safe instinct: here the fallback answers *confidently and wrongly*, so an unreadable
-   RAW returns `(0, 0)` and is reported unreadable, exactly like a corrupt JPEG.
-3. Because of decision 2 above, the scan reads `sizes.iwidth`/`iheight` (header parse, no
-   thumb unpack, no demosaic) and is correct whichever path the run later takes.
-
-`sizes.flip` comes from the same header parse, so a RAW's **upright** dimensions are known
-without decoding anything, which is what lets the expensive decode sit after the skip check.
-
-### The prepare pipeline (shared with #21)
-
-RAW decode, auto-straighten and (if #21 ships) denoise all want the same thing: produce a
-working copy, point the upscaler at it, clean up. Today `_make_straightened_copy` owns that
-pattern privately. The agreed shape is one chain:
-
-> **RAW decode -> auto-straighten -> denoise -> upscale**, source never touched.
-
-- **The order is deliberate.** Denoise-then-straighten would also work on pixels (a 90 degree
-  rotation is lossless), but it would feed the orientation CNN an input distribution it was
-  never validated against, and "only confident calls act" is what makes that CNN safe.
-- **Stages pass arrays, not files.** Three file hops with JPEG temps would put a RAW through
-  **three lossy generations** before SeedVR2 sees a pixel, which is a self-inflicted version
-  of the degradation the app exists to undo. Hold one in-memory array; write **exactly one**
-  temp at the end. The honest cost: `orientation.analyse()` takes a **path** today and needs
-  an array-accepting variant. If that refactor is declined, use lossless PNG/TIFF temps
-  instead: more disk and time, no quality loss. **JPEG temps must not be used**, and that is
-  the easy accident because `.jpg` is what the output is.
-- **The chain runs AFTER the skip decision.** A 24 MP body is 6000x4000, wider than the 4K
-  target, so most modern RAW files will be skipped; decoding first would spend the most
-  expensive step on files that never upscale. Free to get right, because dimensions and
-  orientation both come from the header.
-- **Delete the temp in a `finally`, not on success.** Otherwise a folder that fails leaks one
-  temp per image, and those are the largest files the pipeline produces.
-
-### Consequences elsewhere
-
-- **Output naming:** `run_pass` builds `out_name = f"{stem}{ext}"`, keeping the source
-  extension, and `_save_image` lets Pillow infer the format from it. `photo.CR2` is a Pillow
-  "unknown file extension" error on every file, so the extension mapping is not optional.
-- **Conciliation's fold-back is a NEW mode** for a tool that until now only replaced. It needs
-  its own preview count ("added alongside: N"), a real collision check (Windows is
-  case-insensitive, so a pre-existing `_upscaled.jpg` and `.JPG` are one file), and
-  idempotence so a second run cannot produce `_upscaled_upscaled.jpg`.
-- **The added file re-enters the app's input space.** It lands in the source tree as a `.jpg`,
-  so later scans see it. It will be above target and skipped, and Tag & Rename *should* see
-  it (per decision 7, the render is what gets tagged). Both fine, both worth knowing.
-- **The decode strategy is a METADATA decision, not just an imaging one.** Shipped #13 reads
-  the source's block with Pillow's `getexif()`, which handles JPEG, WebP, PNG and TIFF and
-  **not** a proprietary RAW container; `rawpy` is a LibRaw *imaging* wrapper that exposes
-  pixels and sizes, not an EXIF library. So under **S2** (extract the camera's embedded
-  full-size JPEG preview) #13 works unchanged, because the "source" it reads from is that
-  preview and it carries the camera's EXIF intact. Under **S1** (demosaic the sensor data)
-  there is nothing for it to read from, and the metadata has to come from somewhere else
-  (`exifread`, or piexif against the TIFF IFD of a DNG/CR2). **S2 makes the metadata free;
-  S1 makes it a second piece of work.**
-- **#13's orientation trap has a RAW-specific shape.** #13 forces the written `Orientation`
-  to 1 on the assertion "the pipeline already applied it" (`ImageOps.exif_transpose` in
-  `_load_image`, plus auto-straighten). A RAW carries no EXIF `Orientation` for
-  `exif_transpose` to consume: it carries LibRaw's own `flip` flag, which `postprocess()`
-  applies by default. The outcome is the same (the pixels come out upright, so 1 is still
-  correct) but nothing in today's code path is what makes it so, and the assertion has to be
-  re-established rather than inherited.
-- **#13b needs no RAW carve-out, by construction.** Conciliation may never archive or delete
-  a RAW original (decision 8 above folds the render in ALONGSIDE it), so a RAW never becomes
-  a conciliated pair and the backfill never sees one.
-- **Most modern RAW files will be skipped as already-above-target**, so this feature mainly
-  serves **old** RAW: 2003-2010, 6-8 MP early DSLRs. That is the same demographic the app
-  already serves, but it is worth saying out loud because it changes who it is for.
-
-### Outstanding before building
-
-**One measurement:** how often is a full-size embedded preview actually present? It decides
-how much work S2 does versus S1. It needs real files from several manufacturers, skewed to
-2003-2010 bodies, from the CC0 corpus at <https://raw.pixls.us/>. The same run verifies the
-IFD-0 trap against real camera files rather than the proxy reproduction above. See
-`docs/manual-todos.md` item 2 (untracked).
-
-**Risks:** medium. The failure mode is silent (Trap 1) rather than loud, which is exactly the
-kind this project treats seriously, and the Conciliation carve-out must ship in the same
-version or the first user to conciliate a RAW folder loses their negatives.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -306,7 +174,7 @@ Upscaler (images) and the Video Upscaler (videos).
 | # | Decision | Why |
 |---|---|---|
 | 1 | **Denoise BEFORE the model, not after** | After the model, the noise is no longer noise: SeedVR2 reads it as evidence of texture and reconstructs **plausible structure** from it at 4x scale, correlated and edge-consistent. A denoiser then has nothing to key on and can only blur everything uniformly. Cost also scales with output pixels (4-16x more), and the pre-split `-vf` seam already exists |
-| 2 | **A checkbox in both upscalers, not a tab** | The seams already exist: for images it is the third stage of #19's prepare pipeline, for video it is a `denoise` flag on `SplitPlan` appending to the same `-vf` chain that already carries `bwdif`. A tab is a whole new surface for an unproven feature |
+| 2 | **A checkbox in both upscalers, not a tab** | The seams already exist: for images it is a stage in the prepare pipeline #19 built (decode -> straighten -> **denoise** -> upscale, all on one in-memory array), for video it is a `denoise` flag on `SplitPlan` appending to the same `-vf` chain that already carries `bwdif`. A tab is a whole new surface for an unproven feature |
 | 3 | **One implementation, at most two entry points** | Two independently-tuned filter chains spelled the same way will drift. A shared module with a checkbox calling into it is fine |
 | 4 | **Fixed conservative `hqdn3d`, no strength UI** | Over-denoising an old tape removes the grain **and** the detail, and the model then invents something else entirely. A conservative default is the honest v1; expose a knob only if the measurement shows people need to tune it |
 | 5 | **`nlmeans` is refused outright** | Measured at **0.06x realtime** (79 s for 125 frames of 1080p), i.e. 16x the clip duration, to feed a model that will re-invent the detail anyway |
@@ -516,13 +384,13 @@ The user installs and runs the application on their Unraid server.
   Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
   already-upscaled images), so the remaining sequencing is only among the open milestones below.
-- **Open milestones: #19, #20, #21, #12, #15, #3, #4.**
-- **#19 (RAW) inherits #17's superset rule**: an original may only be replaced when the
-  processed file is a superset of it. #17 satisfies that rule by never producing a
-  non-superset; #19 has to keep satisfying it for a format the pipeline *does* process.
-- **#19 (RAW) is gated on one measurement**, not on other features: how often a full-size
-  embedded preview exists. It shares its prepare-pipeline design with #21, so whichever
-  lands first builds the chain and the other slots a stage into it.
+- **Open milestones: #20, #21, #12, #15, #3, #4.**
+- **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
+  decoded into an in-memory image, straightened in memory, and written to **exactly one**
+  lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,
+  `orientation.analyse_image`). Denoise slots in as a stage on that array, before the temp.
+  The rule that matters is already enforced there and must not be relaxed: **no JPEG temp**,
+  because it would spend a generation of quality before SeedVR2 sees a pixel.
 - **#21 (denoise) is gated on the A/B harness and may never be built at all.** It is the only
   open milestone whose *value* is unknown rather than its cost. Do not start it before the
   measurement; a "no visible benefit" result moves it to `dropped-ideas.md`, which is a
@@ -567,7 +435,7 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22** are
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19 and #22** are
 done and live. **This section is a pointer list, not a record.** Each entry says what the
 number meant and where the design of record actually lives; nothing is described in full
 here. The numbers survive because code and other docs cite the roadmap by them (`remote
@@ -630,6 +498,16 @@ kept in two places drifts, and the stale copy is the one that gets read.
   happens, and an archive run can be reversed from that journal; a delete run is refused
   rather than attempted. See `CLAUDE.md` (Conciliation Undo) and
   `tests/test_conciliate_undo.py`.
+- **#19: RAW and DNG input.** Shipped 0.6.0. The Batch Upscaler accepts ten RAW formats and
+  renders each to a viewable JPEG, from the camera's own embedded preview where there is one
+  and a LibRaw demosaic where there is not. Two findings are worth knowing before touching it:
+  a RAW is **never eligible for upscaling** at the shipped target (measured 0 of 24, which is
+  why it is exempt from the size skip and renders regardless), and a RAW extension must
+  **never reach Pillow**, which answers confidently and wrongly for a TIFF/EP container. So
+  what shipped is in practice a **RAW renderer**, and the upscale half is scaffolding waiting
+  for a target high enough to make a RAW small - see the 8K revisit trigger in
+  `docs/dropped-ideas.md`. See `CLAUDE.md` (RAW and DNG input),
+  `docs/raw-preview-survey.csv` (the measurement) and `tests/test_raw_input.py`.
 - **#22: Browse already-upscaled images.** Shipped 0.6.0. A **Browse upscaled…** window
   pairs an output tree back to its originals long after the run ended, by inverting the
   upscaler's own mirror. See `CLAUDE.md` (Browse upscaled) and

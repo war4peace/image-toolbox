@@ -441,7 +441,7 @@ def test_conciliation_restores_metadata_before_the_original_goes_away(db_conn, t
     _source(orig_root / "photo.jpg", "jpeg")
     _plain(proc_root / "photo.jpg", "jpeg")
 
-    plan, _f, _k, _v = cc.build_plan(str(orig_root), str(proc_root),
+    plan, _f, _k, *_ = cc.build_plan(str(orig_root), str(proc_root),
                                      tr_index=None, conn=db_conn)
     assert len(plan) == 1
     assert cc.count_pending_metadata(plan) == 1
@@ -465,7 +465,7 @@ def test_conciliation_metadata_preview_writes_nothing(db_conn, tmp_path):
     proc = _plain(proc_root / "photo.jpg", "jpeg")
     before = open(proc, "rb").read()
 
-    plan, _f, _k, _v = cc.build_plan(str(orig_root), str(proc_root),
+    plan, _f, _k, *_ = cc.build_plan(str(orig_root), str(proc_root),
                                      tr_index=None, conn=db_conn)
     assert cc.count_pending_metadata(plan) == 1
     assert open(proc, "rb").read() == before
@@ -484,7 +484,7 @@ def test_conciliation_carries_on_when_the_metadata_pass_fails(db_conn, tmp_path,
         raise RuntimeError("piexif exploded")
 
     monkeypatch.setattr(cc.exif_copy, "backfill", _boom)
-    plan, _f, _k, _v = cc.build_plan(str(orig_root), str(proc_root),
+    plan, _f, _k, *_ = cc.build_plan(str(orig_root), str(proc_root),
                                      tr_index=None, conn=db_conn)
     done, conflicts, errors, restored = cc.execute(plan, str(orig_root), "archive",
                                                    _FakeLog())
@@ -501,7 +501,7 @@ def test_conciliation_skips_the_metadata_pass_when_it_is_turned_off(db_conn, tmp
     _plain(proc_root / "photo.jpg", "jpeg")
     monkeypatch.setattr(cc, "COPY_METADATA", False)
 
-    plan, _f, _k, _v = cc.build_plan(str(orig_root), str(proc_root),
+    plan, _f, _k, *_ = cc.build_plan(str(orig_root), str(proc_root),
                                      tr_index=None, conn=db_conn)
     assert cc.count_pending_metadata(plan) == 0
     _d, _c, _e, restored = cc.execute(plan, str(orig_root), "archive", _FakeLog())

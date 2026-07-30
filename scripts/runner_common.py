@@ -168,6 +168,15 @@ def fmt_hhmmss(seconds):
 # raising, tag_and_rename's Pillow fallback never got a chance to correct it. Now
 # tested against real Pillow-written WebP files.
 
+# RAW extensions live in raw_decode, which owns them (#19). Imported at module
+# level on purpose: raw_decode's own top-level imports are os + io, so this stays
+# torch-free, Pillow-free and instant; rawpy and Pillow are lazy inside it.
+try:
+    from raw_decode import RAW_EXTS
+except Exception:                       # noqa: BLE001 (old install without the module)
+    RAW_EXTS = ()
+
+
 def _read_png_dimensions(f):
     f.read(8)                       # PNG signature
     f.read(4)                       # first chunk length
@@ -258,8 +267,26 @@ def _read_tiff_dimensions(f):
 def get_image_dimensions(path):
     """Return (width, height), or (0, 0) if it can't be determined. Tries the
     fast header reader first, then falls back to Pillow (handles progressive
-    JPEGs and other edge cases). Never raises."""
+    JPEGs and other edge cases). Never raises.
+
+    RAW is answered by LibRaw and NEVER reaches the Pillow fallback (#19). This
+    inverts the module's usual instinct, and it has to: a DNG/CR2/NEF/ARW is a
+    TIFF/EP derivative that puts a small preview in IFD 0 by spec, and Pillow
+    sniffs content rather than extension - so the fallback does not fail, it
+    answers confidently and WRONGLY. Measured on 24 real camera files
+    (docs/raw-preview-survey.csv): 15 report a wrong size that way, and several
+    of those are plausible photo sizes rather than obvious thumbnails (a 20D CR2
+    reads as 1536x1024, a 5D as 2496x1664). That would upscale a preview into a
+    4K file, in bulk, without ever looking wrong in a log. An unreadable RAW
+    returns (0, 0) and is reported unreadable, exactly like a corrupt JPEG.
+    """
     ext = os.path.splitext(path)[1].lower()
+    if ext in RAW_EXTS:
+        try:
+            import raw_decode
+            return raw_decode.raw_dimensions(path)
+        except Exception:                   # noqa: BLE001 (module absent: still no Pillow)
+            return (0, 0)
     try:
         with open(path, "rb") as f:
             if ext == ".png":
