@@ -6,16 +6,18 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-Every open milestone is now medium or larger: one measurement-gated processing capability
-(#21 denoising), a Video Upscaler feature (#12 mixed local+remote queue) and a remote-side
-one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones
-each introduce a new process model, networking, or packaging (HTTP interface #3, Unraid #4).
-The **shipped** milestones are kept below as a numbering legend, after the open work.
+Every open milestone is now medium or larger: workflow around a shipped foundation (#23 the
+Video Stabilization tab), one measurement-gated processing capability (#21 denoising), a
+Video Upscaler feature (#12 mixed local+remote queue) and a remote-side one blocked on funds
+rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new
+process model, networking, or packaging (HTTP interface #3, Unraid #4). The **shipped**
+milestones are kept below as a numbering legend, after the open work.
 
 ---
 
 ## Contents
 
+- [23. Video Stabilization tab improvements](#23-video-stabilization-tab-improvements-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [15. Second remote GPU provider (packet.ai)](#15-second-remote-gpu-provider-packetai-medium)
@@ -27,6 +29,129 @@ The **shipped** milestones are kept below as a numbering legend, after the open 
 
 ---
 
+## 23. Video Stabilization tab improvements: Medium
+
+#20 shipped the **foundation**: correct two-pass `vidstab`, a coverage-preserving default,
+and a health gate that refuses a build whose filter corrupts its own output. What it does
+not have is the workflow around it. It takes one file, chosen by hand, and hands back one
+file with no way to see what changed. These six improvements make it usable on a
+collection rather than on a clip.
+
+| # | Improvement | Size |
+|---|---|---|
+| 1 | Send a video to this tab from the Video Upscaler (right-click -> *Stabilize…*) | Small |
+| 2 | Folder loader: pick a folder, list every video under it | Medium |
+| 3 | Queue: select several from that list and run them as a batch | Medium |
+| 4 | Comparison window (original vs stabilised, side by side) | Small-Medium |
+| 5 | Lineage recording for stabilised videos | Small, **but see the trap** |
+| 6 | "Save as Default" buttons on the folder fields | Trivial |
+
+### 1. Hand-off from the Video Upscaler
+
+Mechanically tiny (`stabilize_tab.src_var.set(path)` then select the tab; the output field
+derives itself since 0.6.0). Two constraints decide whether it is *correct*:
+
+- **Offer the SOURCE video, never an upscaled output.** #20's documented ordering is
+  stabilise **before** upscaling, so the crop happens at source resolution and the
+  box-fit target still fills the finished framing. A *Stabilize…* entry on an output row
+  silently inverts that, and the result looks fine until someone compares framing.
+- **Disabled during a run.** Run exclusivity greys every other tab while any tool runs
+  (`refresh_tab_exclusivity`), so a hand-off mid-run would target a tab the user cannot
+  reach. Disable the entry rather than queueing the intent.
+
+### 2 + 3. Folder loader and queue
+
+**This does not reverse #20's "not a batch tool" decision, and the distinction matters.**
+That decision is about the ALGORITHM being whole-file: `vidstab` measures camera motion
+across the entire clip, so smoothing it per segment jolts at every boundary. A queue of N
+**independent whole-file jobs** preserves that exactly. Nobody should later "simplify" the
+queue into segmenting a single video.
+
+What actually has to change:
+
+- **The per-file "Save result as" field does not survive a queue.** A batch needs an output
+  **folder** plus the existing `<stem>_stabilized.mp4` rule. `stabilize_output` (the
+  Settings default added in 0.6.0) is its natural home.
+- **The walk needs `DerivedPruner` (#16), and that is NOT sufficient on its own.** Pruning
+  skips the app's own output *directories*, but a stabilised file defaults to sitting
+  **beside its source** as `<stem>_stabilized.mp4`, which is not a derived directory. So a
+  second scan of the same folder re-offers every result as fresh input. The list must
+  additionally recognise an already-stabilised file (by suffix, or better by "an output
+  for this source already exists", the way the upscaler reports "already upscaled"). This
+  is the strongest argument for making `stabilize_output` the recommended batch setup.
+- **Resume becomes worth having, where #20 deliberately has none.** One file finishes in
+  well under its own duration, so Stop discards. A queue of fifty does not, so the queue
+  needs file-level resume (which FILE, never which pass: a pass is not resumable, and pass
+  1's `.trf` is a temp).
+- **Progress gains a file index.** `PROG` is currently whole-job frames for one file; a
+  queue needs the Video Upscaler's `[i/N]` shape alongside it.
+- **Persistence**: either a `stabilize_*` table or a reuse of the `video_*` queue shape.
+  Reusing it is tempting and probably wrong, since those rows carry target/engine/GPU
+  columns that mean nothing here.
+
+### 4. Comparison window
+
+**This is the easiest pair the comparison code has ever been handed.** At the shipped
+defaults (`optzoom=0`, `crop=keep`, and `bwdif=mode=0` which preserves frame count) the
+output has the **same dimensions and the same frame count** as the source, so the two are
+1:1 and timestamp-aligned, with none of the geometry mismatch the upscaler's windows exist
+to handle. `VideoPlaybackWindow` (side by side, real time, with audio) should carry it.
+
+**On whether a frame comparison is useful: yes, but for a different question, and it must
+not be the default view.** Steadiness is a temporal artifact, so only motion answers "is it
+steadier" - a paused pair mostly shows that the frame has *moved*, which reads as a
+difference rather than as an improvement. What a frozen pair *does* answer is what
+`crop=keep` did at the **edges**: the border pixels filled in from previous frames, which
+is the documented cost of choosing coverage over steadiness and the one thing a user might
+genuinely want to inspect closely. That makes the still wipe worth keeping as the secondary
+view, where the **lens (#14) is the useful part** for peering at a border. So: playback
+first, frame wipe available, not the other way round.
+
+### 5. Lineage recording
+
+**The trap, and it is a data-loss one.** `db.lineage` is not a provenance log, it is what
+**Conciliation matches on** - and video conciliation is **lineage-ONLY** (#5 deliberately
+gave it no name fallback). So recording a stabilised output as its source's lineage child
+makes Conciliation offer to **archive or delete the original** and move the stabilised copy
+into its place.
+
+That collides head-on with #20's decision 2: stabilisation is opt-in per video precisely
+because *"its failure mode is silent and permanent"* and *"shakiness is not a defect the way
+interlacing is"*. Replacing originals with stabilised copies across a collection is that
+failure mode at scale, and unlike an upscale it is not even arguably a strict improvement.
+
+So this splits into two decisions that must not be taken as one:
+
+- **(a) Record provenance so the pair can be found later.** Clearly useful, and it is what
+  makes item 4 work outside the session that produced the file - the same gap #22 closed
+  for images.
+- **(b) Whether Conciliation may ACT on it.** Default **no**. Either give the lineage row a
+  kind/discriminator that conciliation ignores, or keep stabilisation out of the lineage
+  table entirely and pair by name. Whichever, decide it explicitly and test it, because the
+  failure is a destructive tool quietly gaining a new class of target.
+
+### 6. "Save as Default" buttons
+
+Trivial, and the only reason it is listed: every other tool tab has them, so their absence
+here reads as an oversight. `set_default_folder` + `app.sync_settings_defaults()`, writing
+the `stabilize_source` / `stabilize_output` keys that already exist in Settings. Note the
+source button saves the file's **folder**, since the field itself holds one file.
+
+### Sequencing within the milestone
+
+**6 -> 1 -> 4 -> 2+3 -> 5.** Item 6 is minutes. Item 1 is small and immediately useful.
+Item 4 makes the tool judgeable at all, which is what tells you whether the defaults are
+right on real footage (#20 was validated on synthetic clips only). Items 2+3 are the bulk
+and want item 4 already there, because a batch you cannot review is a batch you cannot
+trust. Item 5 is last, not because it is hard, but because its Conciliation interaction
+deserves a deliberate decision rather than a convenient one.
+
+**Risks:** low for 1/4/6, medium for 2+3 (a scan that re-offers its own outputs is the
+likely bug, and a queue makes it repeat at scale), and **the only real risk is item 5**,
+where getting it wrong points the app's one destructive tool at files it was never meant
+to replace.
+
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -257,7 +382,7 @@ The user installs and runs the application on their Unraid server.
   Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
   already-upscaled images), so the remaining sequencing is only among the open milestones below.
-- **Open milestones: #21, #12, #15, #3, #4.**
+- **Open milestones: #23, #21, #12, #15, #3, #4.**
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
   lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,
@@ -273,6 +398,12 @@ The user installs and runs the application on their Unraid server.
   8.1.x corrupts memory in `vidstabtransform`. Anything else built on a less-travelled ffmpeg
   filter should assume the same risk and measure the filter's *determinism* early, not just
   whether it runs.
+- **#23 (Video Stabilization improvements) has no blockers and no measurement gate**, which
+  makes it the most startable open milestone. It is workflow around a shipped foundation
+  rather than new processing, and it splits cleanly: three of its six items are small and
+  independent. Only item 5 (lineage) needs a decision before code, because `db.lineage` is
+  what Conciliation matches on, so recording a stabilised output there points the app's one
+  destructive tool at a new class of file.
 - **#12 (mixed local+remote queue)** is a medium, self-contained Video Upscaler feature that
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
