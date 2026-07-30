@@ -1,7 +1,7 @@
 """
 gui/app.py
 ----------
-The App window (tk.Tk) that hosts the six tabs plus main(). Split out of the
+The App window (tk.Tk) that hosts the seven tabs plus main(). Split out of the
 former toolbox_gui.py (0.4.3). Constructs the tabs, owns the shared log/comparison
 windows, the bottom status bar + funds readout, system-telemetry sampling, MQTT
 and taskbar publishing, and the single-instance/DPI startup in main().
@@ -58,6 +58,8 @@ from gui.tab_runpod import RunPodTab
 
 from gui.tab_conciliate import ConciliateTab
 
+from gui.tab_stabilize import StabilizeTab
+
 from gui.dialogs import UpdateDialog
 
 from gui.tab_video import VideoTab
@@ -104,12 +106,16 @@ class App(tk.Tk):
         self.video_tab      = VideoTab(self.nb, self)
         self.tag_tab        = TagTab(self.nb, self)
         self.conciliate_tab = ConciliateTab(self.nb, self)
+        self.stabilize_tab  = StabilizeTab(self.nb, self)
         self.settings_tab   = SettingsTab(self.nb, self)
         self.runpod_tab     = RunPodTab(self.nb, self)
         self.nb.add(self.upscale_tab,    text="  Batch Upscaler  ")
         self.nb.add(self.tag_tab,        text="  Tag & Rename  ")
         self.nb.add(self.video_tab,      text="  Video Upscaler  ")
         self.nb.add(self.conciliate_tab, text="  Conciliation  ")
+        # After Conciliation, not with the three GPU tools: Video Stabilization uses
+        # no GPU, no pod and no network, so it does not belong in that group (#20).
+        self.nb.add(self.stabilize_tab,  text="  Video Stabilization  ")
         self.nb.add(self.settings_tab,   text="  Settings  ")
         self.nb.add(self.runpod_tab,     text="  RunPod  ")
         # Tabs whose selection is remembered across restarts (gui_settings.json
@@ -121,6 +127,7 @@ class App(tk.Tk):
             ("tag",        self.tag_tab),
             ("video",      self.video_tab),
             ("conciliate", self.conciliate_tab),
+            ("stabilize",  self.stabilize_tab),
         ]
         # RunPod funds readout state (bottom bar). Cached briefly so switching tabs
         # doesn't hammer the balance API.
@@ -141,7 +148,8 @@ class App(tk.Tk):
         self._telemetry_lock = threading.Lock()
         self.telemetry_rows = [t.telemetry_row for t in
                                (self.upscale_tab, self.tag_tab,
-                                self.conciliate_tab, self.video_tab)
+                                self.conciliate_tab, self.video_tab,
+                                self.stabilize_tab)
                                if t.telemetry_row is not None]
         # Per-run telemetry history + graph windows (usage graphs, #9). Keyed by
         # source: "local" (one machine, fanned out to every tab's local row) and
@@ -615,7 +623,8 @@ class App(tk.Tk):
         Stop button remain in reach; Settings/RunPod are locked too, since a mid-run config
         change is unsafe. Called from every tool's run start/stop transition, where `.running`
         is already accurate. Supersedes the older per-pair locks (which stay as a subset)."""
-        tool_tabs = (self.upscale_tab, self.tag_tab, self.conciliate_tab, self.video_tab)
+        tool_tabs = (self.upscale_tab, self.tag_tab, self.conciliate_tab, self.video_tab,
+                     self.stabilize_tab)
         active = next((t for t in tool_tabs if getattr(t, "running", False)), None)
         for tab_id in self.nb.tabs():
             widget = self.nb.nametowidget(tab_id)
@@ -821,7 +830,7 @@ class App(tk.Tk):
     def _any_task_running(self):
         return any(t.running for t in
                    (self.upscale_tab, self.tag_tab, self.conciliate_tab,
-                    self.video_tab))
+                    self.video_tab, self.stabilize_tab))
 
     def _idle_telemetry_tick(self):
         """Sample while idle so the readout stays live between runs. Skips when a
@@ -1065,7 +1074,7 @@ class App(tk.Tk):
             marks.append((label, time.perf_counter() - t0))
 
         busy = [t for t in (self.upscale_tab, self.video_tab, self.tag_tab,
-                            self.conciliate_tab) if t.running]
+                            self.conciliate_tab, self.stabilize_tab) if t.running]
         if busy:
             if not messagebox.askyesno(
                     APP_TITLE, "A task is still running.\nStop it and close the app?"):

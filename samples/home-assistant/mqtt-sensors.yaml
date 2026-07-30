@@ -74,7 +74,8 @@
     unique_id: image_toolbox_task_details
 
   # 0.5.8: also reports "video upscaling" (the Video Upscaler was silent before).
-  # Values: idle / upscaling / tagging / conciliating / video upscaling.
+  # 0.6.0: adds "stabilizing" (the Video Stabilization tab).
+  # Values: idle / upscaling / tagging / conciliating / video upscaling / stabilizing.
   - name: "Image Toolbox Task Name"
     state_topic: image-toolbox/task/name
     unique_id: image_toolbox_task_name

@@ -124,7 +124,8 @@ actions:
       # conciliating); this maps it to the tab name you see in the app.
       title: >-
         {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
-                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation',
+                      'stabilize': 'Video Stabilization'} %}
         {%- set tool = trigger.payload_json.tool | default('run') %}
         Image Toolbox: {{ nice.get(tool, tool) }} finished
       message: >-
@@ -161,7 +162,8 @@ actions:
     data:
       title: >-
         {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
-                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation',
+                      'stabilize': 'Video Stabilization'} %}
         {%- set tool = trigger.payload_json.tool | default('run') %}
         Image Toolbox: {{ nice.get(tool, tool) }} needs a look
       message: >-
@@ -221,7 +223,8 @@ actions:
     data:
       title: >-
         {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
-                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation',
+                      'stabilize': 'Video Stabilization'} %}
         {%- set tool = state_attr('sensor.image_toolbox_last_run_summary', 'tool') | default('run') %}
         Image Toolbox: {{ nice.get(tool, tool) }} finished
       message: >-
@@ -279,7 +282,8 @@ actions:
     data:
       title: >-
         {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
-                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation',
+                      'stabilize': 'Video Stabilization'} %}
         {%- set tool = trigger.payload_json.tool | default('a run') %}
         Image Toolbox: {{ nice.get(tool, tool) }} started
       message: "Started at {{ trigger.payload_json.started_at }}."

@@ -6,18 +6,16 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-Every open milestone is now medium or larger: one new processing capability (#20 a Video
-Stabilization tab), one measurement-gated one (#21 denoising), a Video Upscaler feature
-(#12 mixed local+remote queue) and a remote-side one blocked on funds rather than design
-(#15 a second GPU provider). Two lower-priority ones each introduce a new process model,
-networking, or packaging (HTTP interface #3, Unraid #4). The **shipped** milestones are kept
-below as a numbering legend, after the open work.
+Every open milestone is now medium or larger: one measurement-gated processing capability
+(#21 denoising), a Video Upscaler feature (#12 mixed local+remote queue) and a remote-side
+one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones
+each introduce a new process model, networking, or packaging (HTTP interface #3, Unraid #4).
+The **shipped** milestones are kept below as a numbering legend, after the open work.
 
 ---
 
 ## Contents
 
-- [20. Video Stabilization (new tab)](#20-video-stabilization-new-tab-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [15. Second remote GPU provider (packet.ai)](#15-second-remote-gpu-provider-packetai-medium)
@@ -29,131 +27,6 @@ below as a numbering legend, after the open work.
 
 ---
 
-## 20. Video Stabilization (new tab): Medium
-
-Stabilise shaky old footage, as an **independent feature with its own tab**, not as a stage
-of the Video Upscaler. Researched and measured 2026-07-28.
-
-### Shape
-
-- **Name: "Video Stabilization".** Tab position: **after Conciliation.** The existing order
-  deliberately groups the three GPU tools together, and this is not one of them.
-- **Not a batch tool.** It takes **one video**: prompt for the input file, prompt for the
-  output path and filename. One job at a time.
-- **All other tabs are locked while a stabilization runs**, matching the run-exclusivity
-  model 0.5.2 established.
-- **No GPU, no pod, no remote mode.** Architecturally it is a sibling of **Conciliation**
-  (local file work) rather than of the Video Upscaler: no VRAM sizing, no batch tuning, no
-  benchmark corpus, no funds guard, no degraded-GPU watchdog.
-- **It composes by folder/file, not by pipeline.** Stabilise a video, then feed the result to
-  the Video Upscaler. The ordering that matters (stabilise **before** upscaling, so the crop
-  happens at source resolution and the box-fit target still fills the frame) is preserved by
-  the user's own sequencing.
-
-### Why it is a separate feature, and not a Video Upscaler option
-
-`vidstab` is a **two-pass global** algorithm: pass 1 measures camera motion across the
-**whole file**, pass 2 smooths that trajectory and warps each frame. The Video Upscaler
-splits into ~60 s segments and processes them independently. Run per segment and every
-segment boundary gets a **visible jolt**, because each stretch is smoothed toward its own
-mean. Forcing it into that pipeline would have meant a full-length temp file per video, an
-extra serial pass, and time that is **not resumable at segment granularity**. Outside the
-pipeline none of that arises: whole-file is simply its natural shape.
-
-### Settled decisions
-
-| # | Decision | Why |
-|---|---|---|
-| 1 | **`vidstab` (two-pass), not `deshake`** | `deshake`'s only advantage was that it survives a segment split, and moving out of the pipeline removed the constraint it was solving. `deshake` is measurably weaker (block-matching, cannot see slow drift). `deshake_opencl` rejected outright: a runtime-optional GPU dependency for a marginal step |
-| 2 | **Off by default, opted into per video** | Its failure mode is **silent and permanent**: content leaves the frame and nothing in the output says so. And shakiness is not a defect the way interlacing is: a handheld pan is how the footage was shot |
-| 3 | **Never auto-detected** | Measured: the *unmodified* camcorder clip already scores a 9.64% correction, so a detector would fire on nearly everything |
-| 4 | **Coverage over steadiness. Default `optzoom=0` + `crop=keep`, and a conservative `smoothing`** | Old digital footage is amateur footage from small cameras. Forcing steadiness risks removing a lot of real content, and content at the edge of frame is often the reason the clip is treasured |
-
-### The measurements that produced decision 4
-
-1200x900 clips from a real camcorder source, `vidstabdetect shakiness=8 accuracy=15`, then
-`vidstabtransform optzoom=1` (**the ffmpeg default everyone copies**). The figure is
-libvidstab's own reported `Final zoom`:
-
-| Clip | `smoothing` | Final zoom | Frame area kept |
-|---|---:|---:|---:|
-| No added shake (source's own handheld motion only) | 30 | **9.64%** | ~83% |
-| + mild added shake | 30 | 10.05% | ~83% |
-| + moderate added shake | 30 | 11.22% | ~80% |
-| + severe added shake | 30 | 12.75% | **~79%** |
-| No added shake | **10** | **4.34%** | ~92% |
-
-- **The default discards about a fifth of the picture.** Not a sliver.
-- **The floor is high and barely moves with shake**, because `optzoom=1` picks one **static**
-  zoom that must cover the **worst frame in the whole clip**. A single jolt in a ten-minute
-  video sets the crop for all ten minutes.
-- **`smoothing` is the real lever**: 9.64% at 30 versus 4.34% at 10, on the same clip. It is
-  a direct steadiness-versus-coverage trade, which is what decision 4 resolves.
-
-The alternatives, both of which preserve the whole frame:
-
-| Setting | What the edges do | Loses content? |
-|---|---|---|
-| `optzoom=1` (ffmpeg default) | zoomed until no border is ever visible | **Yes**, ~10-13% per dimension |
-| **`optzoom=0` + `crop=keep`** (chosen) | border pixels filled in from **previous frames** | **No.** Worst case the extreme edge looks slightly stale for a few frames |
-| `optzoom=0` + `crop=black` | black bars that move with the correction | No, but it looks broken |
-
-### Cost and speed
-
-**Measured** at 1080p: pass 1 runs at 3.8x realtime, pass 2 at 2.4x, so a full stabilise is
-about **0.7x the clip duration** for both passes. Negligible next to anything GPU-bound.
-
-`libvidstab` is present in **both** ffmpeg builds `bootstrap.ps1` uses, so there is no new
-dependency and no build change: BtbN's win64-gpl includes `scripts.d/50-vidstab.sh`, and
-gyan's release-essentials lists `libvidstab`. Worth a runtime capability check anyway
-(`ffmpeg -filters`) so a user with a hand-installed ffmpeg gets a clear message rather than a
-cryptic failure.
-
-### Implementation notes
-
-- **The transform-file path is a real trap** and the error message is useless.
-  `vidstabdetect=result=<path>` and `vidstabtransform=input=<path>` take a **file path inside
-  a filter argument**, where `:` is the option separator and `\` is an escape. An absolute
-  Windows path (`C:\Users\...\t.trf`) fails with a bare
-  `Error opening output files: Invalid argument`, naming neither the filter nor the path.
-  Reproduced: the identical command with the working directory set to that folder and a bare
-  relative filename works immediately. `os.chdir` is not acceptable in a threaded GUI
-  process, so either escape the drive colon (`C\:/Users/.../t.trf`, forward slashes) or keep
-  the `.trf` in a temp dir and pass a bare filename with the child process's `cwd` set to it.
-  **Write a unit test for whichever is chosen**, because nothing about the failure points at
-  the cause.
-- **Output codec:** this output *feeds* the upscaler, so it is not a throwaway intermediate
-  and should be encoded well. Reuse `vp.pick_encoder()` plus the 10-bit
-  `fixed_ratio_engine._delivery_pix_fmt` rule (`hevc_nvenc` -> `p010le`, `libx265` ->
-  `yuv420p10le`, else 8-bit).
-- **Audio** is muxed back from the source unchanged, following the Video Upscaler's existing
-  `-c copy` audio path and its mp4-friendly-codec exception.
-- **Progress** is per pass (two passes, each with a frame count), which is simpler than the
-  Video Upscaler's segment model. No resume needed: a single file finishes in well under its
-  own duration, so Stop simply discards.
-
-### MQTT and notifications
-
-- **A new `task/name` value is a CONTRACT change, not an implementation detail.** The values
-  are matched by the shipped Home Assistant automations. Adding "stabilizing" requires
-  updating **`docs/mqtt-integration.md`** (the single source of truth for every topic and
-  payload key) **and** `samples/home-assistant/`, in the same change.
-- The rest comes free from the `MqttTaskState` mixin: `task/details`, `task/runtime`,
-  `task/progress`, `task/eta`, the `last_run` summary, and the non-retained
-  `event/run_started` / `event/run_finished` pair.
-- **Notifications:** use `send_notification` with a `notifications.COLOR_*` **constant**,
-  never a raw int. `tests/test_notification_severity.py` fails the build on a raw colour
-  literal in a runner, which is the guard that exists because the Video Upscaler once shipped
-  a palette matching no entry and degraded quietly.
-- Taskbar progress, the taskbar attention flash on completion, and the telemetry row all come
-  from `ToolTab` unchanged. The telemetry row will show CPU/RAM activity and an idle GPU,
-  which is correct and worth not "fixing".
-
-**Risks:** low. It writes one new file to a user-chosen path, never touches the source, needs
-no GPU and no network, and its worst failure is a badly cropped output that the user can
-simply redo with stabilisation off.
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -384,7 +257,7 @@ The user installs and runs the application on their Unraid server.
   Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
   already-upscaled images), so the remaining sequencing is only among the open milestones below.
-- **Open milestones: #20, #21, #12, #15, #3, #4.**
+- **Open milestones: #21, #12, #15, #3, #4.**
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
   lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,
@@ -395,10 +268,11 @@ The user installs and runs the application on their Unraid server.
   open milestone whose *value* is unknown rather than its cost. Do not start it before the
   measurement; a "no visible benefit" result moves it to `dropped-ideas.md`, which is a
   successful outcome.
-- **#20 (Video Stabilization) has no dependencies** and does not touch the Video Upscaler's
-  pipeline at all: separate tab, separate run, composes by file. Its one cross-cutting cost
-  is the new MQTT `task/name` value, which is a **contract change** requiring
-  `docs/mqtt-integration.md` and `samples/home-assistant/` to be updated in the same change.
+- **#20 (Video Stabilization) shipped in 0.6.0** and cost one thing nobody predicted: it
+  forced the app-wide **ffmpeg pin off the 8.1 release branch onto master**, because every
+  8.1.x corrupts memory in `vidstabtransform`. Anything else built on a less-travelled ffmpeg
+  filter should assume the same risk and measure the filter's *determinism* early, not just
+  whether it runs.
 - **#12 (mixed local+remote queue)** is a medium, self-contained Video Upscaler feature that
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
@@ -435,8 +309,8 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19 and #22** are
-done and live. **This section is a pointer list, not a record.** Each entry says what the
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20 and #22**
+are done and live. **This section is a pointer list, not a record.** Each entry says what the
 number meant and where the design of record actually lives; nothing is described in full
 here. The numbers survive because code and other docs cite the roadmap by them (`remote
 #1`, `Video Upscaler #2`, `local #7`), so deleting the entries outright would strand those
@@ -508,6 +382,16 @@ kept in two places drifts, and the stale copy is the one that gets read.
   for a target high enough to make a RAW small - see the 8K revisit trigger in
   `docs/dropped-ideas.md`. See `CLAUDE.md` (RAW and DNG input),
   `docs/raw-preview-survey.csv` (the measurement) and `tests/test_raw_input.py`.
+- **#20: Video Stabilization (new tab).** Shipped 0.6.0. A tab after Conciliation that
+  steadies ONE shaky video into one new file with two-pass `vidstab`: no GPU, no pod, no
+  network. It defaults to `optzoom=0` + `crop=keep` rather than the `optzoom=1` every ffmpeg
+  tutorial copies, because that default discards a measured ~17-21% of the picture and the
+  amount is set by the single worst jolt in the clip. The thing to know before touching it:
+  **every ffmpeg 8.1.x corrupts memory in `vidstabtransform`** (fixed upstream by
+  `316531e61cf`, on master, not on `release/8.1`), usually with no crash at all - just
+  different pixels on every run - which is why `bootstrap.ps1` pins a master build and why
+  the tool runs a determinism self-test before it will process anything. See `CLAUDE.md`
+  (Video Stabilization) and `tests/test_video_stabilize.py`.
 - **#22: Browse already-upscaled images.** Shipped 0.6.0. A **Browse upscaled…** window
   pairs an output tree back to its originals long after the run ended, by inverting the
   upscaler's own mirror. See `CLAUDE.md` (Browse upscaled) and

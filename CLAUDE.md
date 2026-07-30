@@ -521,6 +521,77 @@ videos never reach it (`_is_image_pair`; container metadata is an ffmpeg job).
 bare Pillow re-save had been stripping EXIF from every PNG/WebP/TIFF it straightened.
 See `exif_copy.py` and `tests/test_exif_copy.py`.
 
+**Video Stabilization** (0.6.0, future-features #20) — a tab (after Conciliation)
+that steadies ONE shaky video into one new file. Architecturally a sibling of
+**Conciliation**, not of the Video Upscaler: local ffmpeg work, **no GPU, no pod,
+no remote mode**, so no VRAM sizing, batch tuning, benchmark corpus, funds guard or
+degraded-GPU watchdog, and no "Run on" row. It is **not a batch tool** and it
+**composes by file, not by pipeline**: stabilise, then feed the result to the Video
+Upscaler (that ordering matters, since the crop happens at source resolution and the
+box-fit target still fills the frame). The reason it is a separate feature rather
+than a Video Upscaler option is that `vidstab` is a **two-pass GLOBAL** algorithm:
+pass 1 measures camera motion across the WHOLE file, pass 2 smooths that trajectory.
+The Video Upscaler splits into ~60 s segments processed independently, so running it
+per segment puts a **visible jolt at every boundary**, each stretch having been
+smoothed toward its own mean. **Coverage over steadiness** is the shipped default and
+it is the opposite of what every ffmpeg tutorial does: `optzoom=1` picks ONE static
+zoom that must cover the worst frame in the clip, which measured **~17-21% of the
+picture discarded** on real camcorder footage, set by a single jolt in a ten-minute
+video. So the default is `optzoom=0` + `crop=keep` (whole frame kept, borders filled
+from previous frames); the zoom is a tick-box that leads with what it costs.
+`smoothing` is the real steadiness/coverage lever (measured 9.64% of the frame lost
+at 30 against 4.34% at 10) and is the one exposed knob. Stabilisation is never
+auto-detected: an UNMODIFIED camcorder clip already scores a 9.64% correction, so a
+detector would fire on nearly everything, and shakiness is not a defect the way
+interlacing is. An **interlaced** source is deinterlaced (`bwdif`) in BOTH passes,
+because pass 1 would otherwise measure the motion of two instants woven into one
+frame. Output is a deliverable, not the split pipeline's intermediate, so it takes
+`vp.delivery_pix_fmt` (10-bit where the codec allows) rather than `pick_encoder`'s
+8-bit default; audio is carried in the same pass-2 command. Progress is per pass
+(`Y` is twice the frame count), and there is no resume: a file finishes in well under
+its own duration, so Stop discards the `.part` output. Two Settings defaults
+(`stabilize_source` / `stabilize_output`) act where they can mean something rather
+than pre-filling a field: this tab takes ONE FILE, so no pinned folder can name the
+source. The first opens the Browse dialog in the right place; the second decides where
+the suggested result goes. The **output field is re-derived on every source change**,
+not only when empty (the tidy-looking version was a trap: after one run the field is
+never empty, so a second video inherited the first one's name and the run then offered
+to replace it). Only the NAME is rebuilt; the folder comes from the first rule that has
+one - what is already in the field, then `stabilize_output`, else beside the source.
+
+**The ffmpeg constraint is the headline, and it moved the app's pin.** Every ffmpeg
+**8.1.x** release CORRUPTS MEMORY in `vidstabtransform`: libvidstab's
+`vsTransformPrepare()` keeps a stale shallow copy of the source frame when it
+alternates between its in-place and separate-buffer paths, and FFmpeg 8.1's scheduler
+change is what started making frames arrive non-writable and alternating them (fixed
+upstream by **`316531e61cf`**, 2026-04-01, FFmpeg #22595 — on **master**, NOT on
+`release/8.1`, and 8.2 is unreleased). Measured on a 300-frame 720p clip, 12 identical
+runs: n8.1.2 produced **12 different outputs**, a master build produced 12 identical
+ones. **The crash is the lucky symptom** (intermittent, ~10-40% on some clips, 0/12 on
+others) — the constant one is silently wrong pixels in a run that reports success. So
+`bootstrap.ps1` now pins a **hash-verified master autobuild** instead of the n8.1
+branch (an immutable dated BtbN release, which is actually a stronger pin than the
+rolling `latest` URL it replaced), and writes a **build stamp** (`ffmpeg/build.txt`)
+because the old "is ffmpeg.exe there?" check would otherwise keep a broken build
+forever on every existing install. Belt and braces, since the offline fallback is
+still a release-branch build and a user's own ffmpeg can be anything: the runner runs
+a **behavioural health check** before every stabilise (`vidstab_health`) — stabilise a
+synthetic clip twice, compare framemd5, and refuse if they differ. Non-determinism is
+the signal rather than the crash **because it is far more sensitive**, and a
+version-string table would need editing every time either side changes. Measured
+10/10 correct in both directions at ~0.5 s.
+
+**The pin move had a price, and it is the one to expect again**: master REMOVED
+`-vsync` (deprecated in favour of `-fps_mode` since 5.1), so the Video Upscaler's
+CFR-normalising split died with `Unrecognized option 'vsync'` before writing a
+frame. Fixed by `-fps_mode cfr`, which BOTH branches understand, so it is not a
+master-only spelling and must not be "simplified" back
+(`tests/test_video_pipeline.py`). A sweep of all 44 ffmpeg options this codebase
+passes found no other removal, but **that sweep is the thing to repeat when the pin
+moves again** — a pre-release branch drops deprecated options, and only the split
+happened to have a test that caught this one. See `video_stabilize.py` and
+`tests/test_video_stabilize.py`.
+
 **Video Upscaler** (experimental, future-features #2) — upscales a folder of
 videos with the same SeedVR2 engine the Batch Upscaler uses for stills, to a
 selectable **target** (1080p / 1440p / 4K) via **box-fit** (first reachable edge
@@ -653,7 +724,7 @@ vout because a GPU vout crashes across the embedded-HWND resize/pause lifecycle
 fail-safe: if libVLC is absent the tool falls back to a silent frame-scrub. See
 section 16 of `docs/video-upscaler.md`.
 
-**Tooltips everywhere** (0.5.2) — every interactive control on all six tabs has
+**Tooltips everywhere** (0.5.2) — every interactive control on all seven tabs has
 hover help (~160 tooltips; buttons, checkboxes, picklists, spinboxes and the
 scan/queue/preview lists). Written for a non-technical user: plain language, and
 the money- or data-affecting controls lead with the consequence (Conciliation's
@@ -693,12 +764,23 @@ Video Upscaler the row sits under the folder fields (above "Eligible videos") an
 also carries the **readiness line** and, right-aligned, **Benchmark GPU…** (which
 acts on the card picked on that row); the readiness line no longer repeats the
 card name + VRAM the picker already shows. **Tab order** is Batch Upscaler · Tag &
-Rename · Video Upscaler · Conciliation · Settings · RunPod: the three GPU tools
-sit together, with Conciliation (the post-processing step) after them.
+Rename · Video Upscaler · Conciliation · Video Stabilization · Settings · RunPod:
+the three GPU tools sit together, with the two that use no GPU (Conciliation, the
+post-processing step, then Video Stabilization) after them. Video Stabilization
+does NOT get a "Run on" row at all: it has no local/remote choice to make.
 
 **Settings** — Ollama URL (with reachability check) and model picklist;
 auto-straighten toggle/threshold; Resolution Target and skip-cutoff; SeedVR
-pipeline options; Discord webhook (with Test); default folders per tool. Settings
+pipeline options; Discord webhook (with Test); default folders per tool. The
+**Default folders** rows are grouped per tool in **tab order** (Batch Upscaler ·
+Tag & Rename · Video Upscaler · Conciliation · Video Stabilization); that had
+drifted as tools were added, and nine near-identical folder rows are only scannable
+in a predictable order, so `tests/test_settings_default_folders.py` pins both the row
+order and the keys `_collect` writes. Those two can drift apart independently (one is
+widget layout, the other a dict literal a few hundred lines away), and the second is
+the dangerous one: `_collect` rebuilds the whole `defaults` dict from the form, so a
+key missing there is silently DROPPED from `config.json` on the next Save - which is
+why a tab cannot just invent a default of its own. Settings
 take effect only on **Save**; an **unsaved-changes guard** compares the form
 against `config.json` and shows a Save / Don't save / Cancel prompt when leaving
 the Settings tab or closing the app with pending edits (`SettingsTab.is_dirty` /
@@ -890,8 +972,8 @@ installer forgot to ship — is caught) and hooks `sys.excepthook`,
 `threading.excepthook`, and `tkinter.Tk.report_callback_exception`. On a crash it
 writes `logs/crash_<timestamp>.log` (app/Python/platform header + full traceback)
 and shows a native ctypes message box pointing at the file, so the crash is
-visible even when tkinter itself broke. The three subprocess runners
-(`batch_upscale.py`, `tag_and_rename.py`, `conciliate.py`) also arm it with
+visible even when tkinter itself broke. The four subprocess runners
+(`batch_upscale.py`, `tag_and_rename.py`, `conciliate.py`, `video_stabilize.py`) also arm it with
 `install(notify=False)` — they write the same crash log but skip the dialog,
 since their traceback already reaches the GUI log pane via stderr. Stdlib only.
 (An Event Viewer entry was considered but dropped — writing the Application log
@@ -1016,11 +1098,12 @@ widget does NOT override the first: it binds `<Enter>` with `add="+"`, so both
 pop up stacked), and `use_window_button_style()`, the bold label for a button
 that opens a window which is exclusive/modal/persistent AND wants prolonged focus
 (Segments…, Benchmark GPU…, Provision…, the first-start wizard; log windows stay
-plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + the **lens view** on both of them, 0.6.0/#14, whose geometry is three pure display-free functions at module level, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames, + the additive `show_page`/`page_count` #22 needed to drive pages without a "current" image); **`gui/browse_upscaled.py`** (0.6.0/#22, `BrowseUpscaledWindow`: browse an already-upscaled tree and compare any pair long after the run ended — folder tree + paged thumbnail wall, pairing by inverting the upscaler's own mirror, opt-in content matching; its pairing/paging arithmetic is pure module-level functions); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the six tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
+plain by design, the rule is recorded above the style constant)); **`gui/comparison.py`** (ComparisonWindow + VideoComparisonWindow, the floating before/after wipe views, 0.2.9, + the **lens view** on both of them, 0.6.0/#14, whose geometry is three pure display-free functions at module level, + `VideoPlaybackWindow`, the libVLC real-time side-by-side player with audio, 0.4.7); **`gui/filmstrip.py`** (FilmStrip thumbnail wall, green/red outcome frames, + the additive `show_page`/`page_count` #22 needed to drive pages without a "current" image); **`gui/browse_upscaled.py`** (0.6.0/#22, `BrowseUpscaledWindow`: browse an already-upscaled tree and compare any pair long after the run ended — folder tree + paged thumbnail wall, pairing by inverting the upscaler's own mirror, opt-in content matching; its pairing/paging arithmetic is pure module-level functions); **`gui/wizard_recommend.py`** (0.4.6, pure/tkinter-free: the GPU-VRAM → model tier logic, unit-tested); **`gui/wizard.py`** (0.4.6, `FirstStartWizard`: first-launch GPU-aware model onboarding); **`gui/tooltab.py`** (`ToolTab` base: subprocess plumbing, `@@TBX@@` marker parsing, preview strip, MQTT/taskbar task-state publishing; plus **`MqttTaskState`**, 0.5.8, the widget-free `task/*` + `last_run` publishing on its own so the non-ToolTab Video Upscaler mixes it in instead of going silent); one module per tab (**`tab_upscale`/`tab_tag`/`tab_settings`/`tab_runpod`/`tab_conciliate`/`tab_video`/`tab_stabilize`**); the Video Upscaler's two 0.4.7 helpers **`gui/video_player.py`** (the shared libVLC player: bootstrap-downloaded libVLC, software `wingdi` vout for crash-safety, fail-safe if libVLC is absent) and **`gui/video_segment_picker.py`** (the scene extractor's in/out range picker on a live preview); **`gui/telemetry_graph.py`** (0.5.3, `TelemetryGraphWindow`: the per-run telemetry usage-graph window, feature #9 — embedded matplotlib, capacity-pinned stacked charts, a dynamic/global range-toggle bar, a blitted crosshair; imported lazily + fail-safe, opened by clicking a telemetry row, reads a `system_telemetry.TelemetryHistory`); + **`gui/dialogs.py`** (UpdateDialog + `OllamaPullDialog`, the modal one-model pull); and **`gui/app.py`** (`App` window hosting the seven tabs + `main()`; shows the wizard on first launch). Tabs talk to `App` only via `self.app` at runtime, so no tab imports `gui.app`. The installer ships `..\scripts\gui\*.py` (its own `[Files]` entry — the top-level glob is non-recursive) and the import smoke test sweeps every `gui.*` module. |
 | `batch_upscale.py` (~1.5k lines) | Upscale batch runner (CLI + GUI-driven). Walks the source tree, mirrors it to the output root via `os.path.relpath`, drives `UpscaleEngine`, manages the resume cache in `scans/`, and sends Discord notifications. Auto-straightens (0.2.7) before upscaling: `detect_rotation` runs the `orientation.py` CNN, `_make_straightened_copy` rotates a temp copy upright (source untouched), and the skip/target math uses the upright dimensions (`_skip_for_dims`; `should_skip_resolution` is conservative — only skips when both orientations would). |
 | `upscale_engine.py` (~250 lines) | `UpscaleEngine` — wraps the in-process SeedVR2 pipeline (`seedvr2/inference_cli.py`). Loads DiT/VAE once and caches them; loads images with EXIF orientation; writes output atomically (temp + rename), format per extension. **RGB-only end to end** (`convert("RGB")` in, `arr[..., :3]` out, frame 0 only), which is why alpha / multi-page / >8-bit images are detected and skipped upstream rather than silently flattened here (#17). `_save_image` also carries the SOURCE's metadata onto the output via `exif_copy` (#13a) with a retry-without-metadata fallback, so an odd EXIF block can never cost the image. **GPU work happens wherever this runs** -- which is why the metadata copy lives here and not in `batch_upscale`: on a remote run the pod writes the file. |
 | `tag_and_rename.py` (~1.7k lines) | Tag & Rename runner. Calls Ollama, writes EXIF, renames, records an undo cache; integrates auto-straighten. Has its own Discord + cache-schema versioning. |
 | `conciliate.py` (~750 lines) | Conciliation runner (CLI + GUI-driven), images **and videos** (#5, 0.5.1). Two phases over stdin (`run`/`q`): scan builds the original→processed plan over `MEDIA_EXTS` (matching by content-hash lineage first — path-independent, survives folder moves — then a mirrored-name fallback for images only; videos are lineage-only so a partial clip can't be mistaken for a whole-video match), then run archives/deletes originals and moves processed files into the original tree, backfilling each image pair's missing metadata first (#13b, `exif_copy` behind a guarded import). Every file action is journalled to the DB before it happens (`UndoRecorder`), and a third mode, `--undo`, reverses an archive run from that journal (#18, `undo_one`/`run_undo`). No GPU/heavy imports — pure file I/O plus that one optional Pillow call. |
+| `video_stabilize.py` (~650 lines) | Video Stabilization runner (CLI + GUI-driven, #20, 0.6.0), stdlib + the bundled ffmpeg, torch-free, no GPU. Two-pass `vidstab` over ONE file: `vidstabdetect` measures the whole clip's camera motion, `vidstabtransform` smooths it and writes the deliverable (audio carried in the same command, 10-bit via `vp.delivery_pix_fmt`, `.part` + rename so a killed run leaves no truncated file). Two things here are load-bearing rather than routine. **`vidstab_health`** proves the filter is DETERMINISTIC before touching a real video, because every ffmpeg 8.1.x silently corrupts its output (see "Video Stabilization" above); it is behavioural, not a version check. And the **transform-file path never enters the filter string**: `result=`/`input=` take a path inside a filter argument, where `:` separates options, so an absolute Windows path fails with a bare "Invalid argument" naming neither the filter nor the path — and the obvious one-backslash escape STILL fails (measured; only a double-escaped colon works). The module sidesteps it entirely by writing the `.trf` into a private temp dir and passing a BARE filename with the child's `cwd` set there, which is immune to spaces/quotes/brackets in the user's paths too, not just the drive colon. `vp._run` gained a `cwd` parameter for it. |
 | **Video Upscaler cluster** (`batch_video_upscale.py`, `video_pipeline.py`, `video_estimate.py`, `remote_video_engine.py`, `local_video_engine.py`, `local_video_worker.py`, `video_benchmark.py`, `video_vram_sizer.py`, `gui/video_benchmark.py`; plus `pod/bench_video.py`, `pod/ram_probe.py`) | The Video Upscaler (future-features #2, remote; local GPU path #7 added 0.5.0). `batch_video_upscale.py` (~1.4k lines) is the orchestrator (CLI + GUI-driven): walk → split → stream each segment to the pod → reassemble → drift check, with resume/installments from the db.py `video_*` tables and an injected engine (`--passthrough` runs the whole pipeline with a local stream-copy no-pod engine for testing). When the pod **OOM-recovers** a segment's batch (e.g. 33→9), that corrected batch is **carried forward** to the same video's later segments (`updated_learned_batch`, 0.4.8) so they start at the safe size instead of re-discovering it (a failed forward pass + VRAM churn) on every segment; an explicit config batch stays the ceiling. **Self-healing (0.5.0, future-features #6, video only):** with the GUI's opt-in `IMGTBX_AUTO_RESUME`, `_run_supervised` wraps deploy + `run_queue` in a heal loop, `run_queue(auto_resume=True)` re-raises a pod-liveness failure as `PodLost` (not a source `fail_count` bump), and the loop reconnects a surviving pod (`_pod_still_running`) or waits unbounded for the identical card (`_wait_for_gpu_stock`) and redeploys it; the funds guard / user Stop / completed queue are the only non-redeploy stops. `video_pipeline.py` (~700 lines) is ALL the local ffmpeg container work (probe / plan_split / split / CFR-normalize / forced-keyframe re-encode / **deinterlace** / concat / audio-mux / duration-drift), stdlib + bundled ffmpeg, torch-free, never touches the source. An **interlaced source** (`detect_interlaced`: idet when `field_order` is unknown, e.g. a MiniDV 576i WMV) forces a `bwdif=mode=0` deinterlacing re-encode: interlaced fields upscale combed AND NVENC has no interlaced-HEVC path, which had produced an all-black deliverable (0.4.8 fix). A **black-output guard** (`mean_luma_head` / `is_black_reencode`) aborts a video whose first segment is black while the source isn't, *before* it is streamed to the pod. `video_estimate.py` (~200 lines) is the GUI cost/duration estimator (`recommend_gpus` intersects the live GPU list with a per-(target,GPU) rate table, drops cards below the target's VRAM floor, sorts by cheapest total queue cost). `remote_video_engine.py` (~200 lines, `RemoteVideoEngine`) subclasses `RemoteUpscaleEngine` to reuse its ssh-tunnel/health/telemetry/close machinery but streams a segment **async** (submit/poll/fetch) since a segment takes minutes to hours. On the pod, `pod/bench_video.py` (Phase-1 per-frame + max-batch/VRAM benchmark) and `pod/ram_probe.py` (validates streaming bounds RAM vs. load-all) answer the GPU questions in `docs/video-upscaler.md`. `local_video_engine.py` / `local_video_worker.py` run SeedVR2 **in-process on the local GPU** (feature #7, 0.5.0): `video_vram_sizer.py` sizes the batch predictively from the card's VRAM (OOM back-off + the degraded-GPU watchdog), and the default in-process path avoids a per-segment subprocess. `video_benchmark.py` + `gui/video_benchmark.py` are the one-click **Benchmark GPU** sweep (VRAM-aware geometric-climb + binary-refine, warm-up) that measures each target's real ceiling and s/frame on the actual card (LOCAL or a rented pod), persisting per-probe rows to db.py `video_bench` and calibrating the AUTO batch, the offered targets and the estimate; resumable. Runs through the same `@@TBX@@`/runner_common seam and `pod/worker.py --mode video`. |
 | **Real-ESRGAN engine cluster** (`esrgan_models.py`, `fixed_ratio_engine.py`; plus `pod/worker.py --mode esrgan`) | The second video upscaling engine (feature #11, 0.5.6): fixed-ratio **Real-ESRGAN** (a GAN) as a fast, VRAM-light alternative to SeedVR2's per-frame diffusion. `esrgan_models.py` (~220 lines) is the torch-free model catalog: two tiers (`compact` = `realesr-general-x4v3`, native x4 only; `quality` = `RealESRGAN_x4plus` x4 + `RealESRGAN_x2plus` x2), `tier_scales`/`resolve_for_ratio` (native-scale weight per requested ratio, no fake x4-then-downscale), and the pinned weight URLs + SHAs (self-download). `fixed_ratio_engine.py` (~430 lines, `FixedRatioVideoEngine`) is the drop-in `process_segment` engine that decodes → tiled spandrel upscale → encodes, batch=1 optimal, reporting peak VRAM; its segments ARE the deliverable, so it encodes **10-bit where the codec allows** (`_delivery_pix_fmt`: `hevc_nvenc`→`p010le`, `libx265`→`yuv420p10le`, else 8-bit `yuv420p`) instead of inheriting `pick_encoder()`'s 8-bit default, which was chosen for the split's throwaway intermediate and made this engine quietly worse than SeedVR2's 10-bit output. The two 8-bit fallbacks are deliberate: `h264_nvenc` has NO 10-bit path (measured: `p010le` → "No capable devices found"), and libx264's 10-bit is H.264 High10, which most TVs can't hardware-decode; runs **local** in-process or **remote** via the volume-free esrgan pod (`RemoteSession(mode="esrgan")`, own pod name `esrgan-toolbox-remote`, RunPod cuda12.4.1 image; the worker builds the engine per job and swaps the model per `&model=` query). Wired into the Video Upscaler via a **Method** switch: each job carries its `engine` + picked GPU (a per-item GPU column on `video_outputs`), the queue groups by (engine, GPU) and Start runs each group on its own pod (grouped multi-pod, dynamic re-grouping mid-run). The estimator and Benchmark GPU window treat ESRGAN as a distinct method (single s/frame + peak-VRAM probe per cell, no batch sweep, no compile; a separate `esrgan-mp-<tier>` rate namespace so a GAN's rate never proxies SeedVR2's ~100x-costlier diffusion). See `docs/local-video-upscaler.md` §23, `docs/video-upscaler.md` §18. |
 | **torch.compile enablement** (`triton_setup.py`, `msvc_setup.py`) | Local video `torch.compile` needs BOTH halves (feature #7, 0.5.0): Triton AND a C compiler. `triton_setup.py` installs the pinned, SHA-verified `triton-windows` wheel on demand and redirects the inductor/Triton caches to a space-free dir (PyTorch doesn't quote the compile source path, so the default `%TEMP%/torchinductor_<user>` breaks any account name with a space). `msvc_setup.py` finds and ACTIVATES MSVC (runs vcvarsall/VsDevCmd, or builds the INCLUDE/LIB/PATH env straight from disk) and **verifies it by compiling a hello-world** (Visual Studio never puts cl.exe on PATH, and a stub cl.exe with no SDK passes every cheap check). `batch_video_upscale.gate_local_compile` probes both halves and runs uncompiled if either is missing, preventing the piped-stdio first-segment hang; the first-start wizard offers the Triton install + a link to Microsoft's C++ Build Tools page. Stdlib + pip; fail-safe. |
@@ -1091,11 +1174,19 @@ Engine, packaging & CI:
   itself is not needed). Treat as vendored/third-party.
 - `.venv/` — the Python 3.12 environment (PyTorch CUDA + seedvr2 requirements).
 - `bootstrap.ps1` — first-launch bootstrapper: downloads Python, PyTorch CUDA,
-  the SeedVR2 engine, a static ffmpeg build (Video Upscaler), a bundled libVLC
+  the SeedVR2 engine, a static ffmpeg build (Video Upscaler + Video Stabilization),
+  a bundled libVLC
   (`Install-LibVlc`, in-app video playback, both install modes), and pip-installs
   `paho-mqtt` + `python-vlc` (and `matplotlib` for the telemetry graphs #9, added
   explicitly on Remote-only since it has no seedvr2 stack to pull it in).
-  Idempotent. `Image Toolbox.cmd` launches
+  Idempotent. **The ffmpeg pin is a MASTER build, not a release branch** (0.6.0):
+  every 8.1.x corrupts memory in `vidstabtransform`, which #20 is built on, and the
+  fix (`316531e61cf`) is on master only. It is an immutable dated BtbN autobuild, so
+  unlike the old rolling `latest` URL it is **SHA-256 pinned**; a `ffmpeg/build.txt`
+  stamp is what makes an EXISTING install replace its older bundled ffmpeg, since the
+  previous "is ffmpeg.exe there?" check would have kept a broken one forever. Move
+  back to a release branch once one ships containing that commit (8.2, or a
+  backported 8.1.3). `Image Toolbox.cmd` launches
   it + the app (it launches `scripts\toolbox_gui.py`). The final "starting"
   window auto-closes on a 10-second countdown (press any key to close early).
 - `installer/ImageToolbox.iss` — Inno Setup script; ships only the scripts +
@@ -1116,9 +1207,9 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `future-features.md` (roadmap: open milestones #20/#21,
-  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#22 kept only
-  as a numbering legend), `dropped-ideas.md` (ideas
+- `docs/` — `future-features.md` (roadmap: open milestones #21,
+  #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
+  kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
   incl. folding a RAW render back into the source tree, whose revisit trigger is an
   8K target),

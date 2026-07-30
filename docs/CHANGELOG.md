@@ -22,6 +22,51 @@ Releases page.
 
 ## 0.6.0
 
+### Steady up shaky old footage
+A new **Video Stabilization** tab, next to Conciliation. Point it at one shaky video, say
+where to save the result, press Start. It never touches your original: the steadied
+version is written as a new file.
+
+It takes **one video at a time**, not a folder, because steadying works by watching the
+camera move across the *whole* clip and then smoothing that path: chopped into pieces, every
+join would jolt. It runs in two passes for that reason (the first watches, the second
+writes), and together they take a little under the length of the video itself. There is no
+GPU involved and nothing is rented.
+
+**It keeps your whole picture.** Steadying normally works by zooming in far enough that the
+wobbling edges never show, which quietly throws away the outer part of every frame: measured
+on real camcorder footage, about **a fifth of the picture**, and the amount is set by the
+single worst jolt in the whole video. This app does not do that by default. Instead it keeps
+the full frame and fills the edges in from nearby moments, so at worst a sliver at the very
+edge looks a moment stale. If you would rather have the zoom, there is a tick-box, labelled
+with what it costs.
+
+**Steadiness** is adjustable. Higher steadies more but pulls harder on the picture; lower
+follows the original camera movement more closely. Remember that a deliberate pan or a slow
+zoom is not shake, so if a result looks like it is fighting the camera, lower it.
+
+Interlaced footage (old MiniDV camcorder tapes) is de-interlaced automatically first, since
+otherwise the measuring pass is reading two different instants woven into one frame.
+
+**Stabilise first, then upscale**, if you want both: that way the Video Upscaler's
+resolution target applies to the finished framing.
+
+The **"Save result as" box follows the video you pick**, so choosing a second clip does
+not leave the first one's name behind (which would have had the app offering to replace
+a result you had just made). If you point it at a folder of your own, that folder is
+kept and only the name changes. **Settings → Default folders** has a pair for it too: a
+starting folder for the Browse dialog, and a folder to collect results in (leave it
+empty to save each result next to the video it came from). That whole section is now
+listed in the same order as the tabs.
+
+One thing worth knowing: the app now downloads a **newer ffmpeg** than before. Every ffmpeg
+in the 8.1 series has a bug in its stabilisation filter that makes it produce a slightly
+different, and wrong, result every time it runs, usually with no crash and no warning. It
+was fixed upstream in April. The app bundles a build with the fix, and it checks the filter
+is behaving before it will touch your video, so it can never hand you a quietly corrupted
+result. If you have an older install, run `Image Toolbox.cmd` once and it will replace the
+bundled ffmpeg for you.
+
 ### A magnifier in the comparison window
 The comparison window has a new **Lens** tick-box. With it on, the spot under your mouse
 is shown twice, side by side: the original on the left, the upscaled version on the

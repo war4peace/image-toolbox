@@ -107,7 +107,8 @@ cards:
     icon_color: blue
     primary: >-
       {%- set nice = {'upscale': 'Batch Upscaler', 'tag': 'Tag & Rename',
-                      'video': 'Video Upscaler', 'conciliating': 'Conciliation'} %}
+                      'video': 'Video Upscaler', 'conciliating': 'Conciliation',
+                      'stabilize': 'Video Stabilization'} %}
       {%- set tool = state_attr('sensor.image_toolbox_last_run_summary', 'tool') | default('Last run') %}
       Last run: {{ nice.get(tool, tool) }}
     secondary: >-

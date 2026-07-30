@@ -81,9 +81,9 @@ All under the base topic `image-toolbox/`. Every topic here is a **constant** in
 
 | Topic | Payload |
 |---|---|
-| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` / `video upscaling` |
+| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` / `video upscaling` / `stabilizing` |
 | `task/details` | the human phase line, mirroring the tab's status |
-| `task/progress` | `X/Y`. **Files** for the image tools, **frames** for the Video Upscaler |
+| `task/progress` | `X/Y`. **Files** for the image tools, **frames** for the Video Upscaler, and for Video Stabilization frames across **both** passes (so `Y` is twice the frame count: pass 1 fills the first half, pass 2 the second) |
 | `task/eta` | estimated time remaining, formatted |
 | `task/runtime` | seconds of active-task runtime |
 | `task/average_processing_time` | seconds per item (per frame on video) |
@@ -152,7 +152,7 @@ Four keys are **shared on purpose**, so one Home Assistant automation covers eve
 
 | Key | Meaning |
 |---|---|
-| `tool` | `upscale` / `tag` / `conciliating` / `video` |
+| `tool` | `upscale` / `tag` / `conciliating` / `video` / `stabilize` |
 | `processed` | items finished |
 | `failed` | items that failed |
 | `elapsed_seconds` | how long the run took |
@@ -165,6 +165,7 @@ The rest are per tool:
 | Tag & Rename | `rotated`, `skipped`, `stop_reason` |
 | Conciliation | `done`, `conflicts`, `errors`, `removed_dirs`, `stopped_by_user` |
 | Video Upscaler | `total`, `files`, `stop_reason`, `stopped_by_user`, `cost`, `source` |
+| Video Stabilization | `source`, `output`, `frames`, `smoothing`, `optzoom`, `crop`, `deinterlaced`, `size_bytes`, `stopped_by_user`, `stop_reason` |
 
 Notes worth knowing before writing a template:
 

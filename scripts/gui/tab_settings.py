@@ -167,23 +167,44 @@ class SettingsTab(ttk.Frame):
         self.default_cproc_var = tk.StringVar(value=defs.get("conciliate_processed", ""))
         self.default_vsrc_var = tk.StringVar(value=defs.get("video_source", ""))
         self.default_vout_var = tk.StringVar(value=defs.get("video_output", ""))
-        for r, (text, var) in enumerate((
-                ("Batch Upscaler Photo folder:",   self.default_src_var),
-                ("Batch Upscaler Output folder:",  self.default_out_var),
-                ("Tag & Rename Photo folder:",     self.default_tag_var),
-                ("Conciliation Original folder:",  self.default_corig_var),
-                ("Conciliation Processed folder:", self.default_cproc_var),
-                ("Video Upscaler Video folder:",   self.default_vsrc_var),
-                ("Video Upscaler Output folder:",  self.default_vout_var))):
-            ttk.Label(sec, text=text).grid(row=r, column=0, sticky="w", pady=3)
-            ttk.Entry(sec, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+        self.default_stsrc_var = tk.StringVar(value=defs.get("stabilize_source", ""))
+        self.default_stout_var = tk.StringVar(value=defs.get("stabilize_output", ""))
+        # Grouped per tool, in the SAME order as the tabs themselves (Batch Upscaler,
+        # Tag & Rename, Video Upscaler, Conciliation, Video Stabilization). The list
+        # had drifted out of that order as tools were added, which makes a long column
+        # of similar-looking folder rows harder to scan than it needs to be.
+        # The two Stabilization rows mean something slightly different from the rest,
+        # because that tab takes ONE FILE rather than a folder, so they carry their own
+        # hint instead of the generic one.
+        stab_src_tip = ("Where the Video Stabilization tab's Browse dialog starts "
+                        "looking for footage. It picks one video at a time, so this is "
+                        "a starting folder, not a batch to process.")
+        stab_out_tip = ("Where a steadied video is saved. Leave this empty to save each "
+                        "result next to the video it came from.")
+        for r, (text, var, own_tip) in enumerate((
+                ("Batch Upscaler Photo folder:",       self.default_src_var,   None),
+                ("Batch Upscaler Output folder:",      self.default_out_var,   None),
+                ("Tag & Rename Photo folder:",         self.default_tag_var,   None),
+                ("Video Upscaler Video folder:",       self.default_vsrc_var,  None),
+                ("Video Upscaler Output folder:",      self.default_vout_var,  None),
+                ("Conciliation Original folder:",      self.default_corig_var, None),
+                ("Conciliation Processed folder:",     self.default_cproc_var, None),
+                ("Video Stabilization Video folder:",  self.default_stsrc_var, stab_src_tip),
+                ("Video Stabilization Output folder:", self.default_stout_var, stab_out_tip))):
+            lbl = ttk.Label(sec, text=text)
+            lbl.grid(row=r, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(sec, textvariable=var)
+            entry.grid(row=r, column=1, sticky="ew", padx=6, pady=3)
             b = ttk.Button(sec, text="Browse…",
                            command=lambda v=var: self._pick_folder(v))
             b.grid(row=r, column=2, pady=3)
-            # Same wording for all seven, naming the field it fills, so the row is
+            # Same wording for all nine, naming the field it fills, so the row is
             # unambiguous when several Browse buttons sit above one another.
             Tooltip(b, f"Choose the folder that {text.rstrip(':')} starts with "
                        f"every time the app opens.", wraplength=W)
+            if own_tip:
+                Tooltip(lbl, own_tip, wraplength=W)
+                Tooltip(entry, own_tip, wraplength=W)
 
         # ── Ollama ────────────────────────────────────────────────────────────
         sec = self._section(body, "Ollama")
@@ -1075,10 +1096,12 @@ class SettingsTab(ttk.Frame):
         self.default_src_var.set(defs.get("upscale_source", ""))
         self.default_out_var.set(defs.get("upscale_output", ""))
         self.default_tag_var.set(defs.get("tag_folder", ""))
-        self.default_corig_var.set(defs.get("conciliate_original", ""))
-        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
         self.default_vsrc_var.set(defs.get("video_source", ""))
         self.default_vout_var.set(defs.get("video_output", ""))
+        self.default_corig_var.set(defs.get("conciliate_original", ""))
+        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.default_stsrc_var.set(defs.get("stabilize_source", ""))
+        self.default_stout_var.set(defs.get("stabilize_output", ""))
 
     def _video_codec_label(self, vid):
         """The codec combobox label matching the saved video_backend/use_10bit."""
@@ -1267,10 +1290,12 @@ class SettingsTab(ttk.Frame):
                 "upscale_source": self.default_src_var.get().strip(),
                 "upscale_output": self.default_out_var.get().strip(),
                 "tag_folder":     self.default_tag_var.get().strip(),
-                "conciliate_original":  self.default_corig_var.get().strip(),
-                "conciliate_processed": self.default_cproc_var.get().strip(),
                 "video_source":  self.default_vsrc_var.get().strip(),
                 "video_output":  self.default_vout_var.get().strip(),
+                "conciliate_original":  self.default_corig_var.get().strip(),
+                "conciliate_processed": self.default_cproc_var.get().strip(),
+                "stabilize_source": self.default_stsrc_var.get().strip(),
+                "stabilize_output": self.default_stout_var.get().strip(),
             },
             "tagging": {
                 "auto_straighten": bool(self.straighten_var.get()),
@@ -1380,10 +1405,12 @@ class SettingsTab(ttk.Frame):
         self.default_src_var.set(defs.get("upscale_source", ""))
         self.default_out_var.set(defs.get("upscale_output", ""))
         self.default_tag_var.set(defs.get("tag_folder", ""))
-        self.default_corig_var.set(defs.get("conciliate_original", ""))
-        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
         self.default_vsrc_var.set(defs.get("video_source", ""))
         self.default_vout_var.set(defs.get("video_output", ""))
+        self.default_corig_var.set(defs.get("conciliate_original", ""))
+        self.default_cproc_var.set(defs.get("conciliate_processed", ""))
+        self.default_stsrc_var.set(defs.get("stabilize_source", ""))
+        self.default_stout_var.set(defs.get("stabilize_output", ""))
         self.ollama_url_var.set(ollama.get("url", "http://127.0.0.1:11434"))
         self.ollama_model_var.set(ollama.get("model", "qwen2.5vl:7b"))
         self.straighten_var.set(bool(tag.get("auto_straighten", True)))

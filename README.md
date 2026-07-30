@@ -26,6 +26,7 @@ Batch Upscaler runs the [SeedVR2](https://github.com/ByteDance-Seed/SeedVR) upsc
   - [Tag & Rename](#tag--rename)
   - [Conciliation](#conciliation)
   - [Video Upscaler](#video-upscaler)
+  - [Video Stabilization](#video-stabilization)
   - [Settings](#settings)
   - [Notifications](#notifications)
   - [Home Assistant (MQTT)](#home-assistant-mqtt)
@@ -117,7 +118,7 @@ The GUI and the scripts share the same logs and cache database (`db/cache.db`), 
 
 ## The app
 
-Windows GUI (mostly Python standard-library tkinter) with six tabs.
+Windows GUI (mostly Python standard-library tkinter) with seven tabs.
 
 ### Common features
 
@@ -218,6 +219,17 @@ Upscales a folder of videos with the same SeedVR2 engine the Batch Upscaler uses
 - **Local runs are guarded, not gated:** on your own GPU the batch is sized predictively from your card's VRAM (so it fits on the first try), targets that would run out of memory aren't offered, a watchdog stops a run that starts thrashing a long GPU session (the Benchmark GPU tool above measures its real safe batch and speed). For best results, close other GPU-heavy apps before a local run.
 
 Video upscaling is compute-heavy: as a rough guide, one hour of footage upscaled to 1080p costs about $28-46 of GPU time on a rented card (the in-app estimator shows the real numbers for your queue before you commit), or nothing but time and power usage on your own GPU. Remote runs require a RunPod account, like the other remote features; local runs need an NVIDIA GPU with a CUDA build of PyTorch.
+
+<div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
+
+### Video Stabilization
+
+- **Steady up shaky old footage** (0.6.0). One video in, one new file out; your original is never touched. No GPU, nothing rented, no account: it runs on your own machine and takes a little under the length of the video.
+- **One video at a time, not a folder.** Steadying works by watching the camera move across the *whole* clip and then smoothing that path, so it runs in two passes (the first watches, the second writes). Cut into pieces, every join would jolt.
+- **It keeps your whole picture.** The usual way to steady video is to zoom in far enough that the wobbling edges never show, which quietly throws away the outer part of every frame: measured on real camcorder footage, about **a fifth of it**, decided by the single worst jolt in the whole clip. This app instead keeps the full frame and fills the edges from nearby moments, so at worst a sliver at the very edge looks a moment stale. The zoom is available as a tick-box if you want it, labelled with what it costs.
+- **Steadiness is adjustable.** Higher steadies more but pulls harder on the picture; lower stays closer to the original camera movement. A deliberate pan or slow zoom is not shake, so if a result looks like it's fighting the camera, lower it.
+- **Old camcorder tapes are handled:** interlaced footage is de-interlaced first, because otherwise the measuring pass is reading two different moments woven into one frame.
+- **Stabilise first, then upscale** if you want both, so the Video Upscaler's resolution target applies to the finished framing.
 
 <div align="right"><a href="#image-toolbox">↑ Back to top</a></div>
 

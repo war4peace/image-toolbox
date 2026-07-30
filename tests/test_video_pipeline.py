@@ -9,6 +9,7 @@ VideoInfo values. The `copy` path (which shells out to ffprobe for the keyframe
 gap) is left to the live round-trip in video_pipeline's own CLI.
 """
 
+import subprocess
 from fractions import Fraction
 
 import video_pipeline as vp
@@ -226,3 +227,37 @@ def test_sub_frame_duration_delta_is_within_tolerance():
     out = make_info(nb_frames=900, duration=30.010)   # 10 ms < one-frame tol
     rep = vp.check_drift(src, out, segment_frame_counts=[900])
     assert rep.ok is True
+
+
+# ─────────────────────────────────────────────
+#  ffmpeg option compatibility (0.6.0 master pin)
+# ─────────────────────────────────────────────
+
+def test_reencode_split_uses_fps_mode_not_the_removed_vsync(tmp_path, monkeypatch):
+    """0.6.0 moved the ffmpeg pin from the 8.1 release branch to master, because every
+    8.1.x corrupts vidstab output (#20). ffmpeg REMOVED `-vsync` on master (deprecated
+    in favour of `-fps_mode` since 5.1), so the CFR-normalising split died with
+    "Unrecognized option 'vsync'" before writing a frame. `-fps_mode` is understood by
+    both, so this is not a master-only spelling and must not be "simplified" back."""
+    captured = {}
+
+    def _fake_run(args, **kw):
+        captured["args"] = args
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(vp, "_run", _fake_run)
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg.exe", "ffprobe.exe"))
+    monkeypatch.setattr(vp, "pick_encoder", lambda prefer_hw=True: ("libx264", [], False))
+
+    info = vp.VideoInfo(path="in.avi", width=320, height=240,
+                        r_fps=Fraction(25), avg_fps=Fraction(25), nb_frames=100,
+                        duration=4.0, vcodec="mjpeg", pix_fmt="yuvj422p",
+                        has_audio=False, acodec=None, is_vfr=True)
+    plan = vp.SplitPlan(mode="reencode", reason="vfr", segment_seconds=60.0,
+                        fps=Fraction(25))
+    vp.split(info, plan, str(tmp_path / "segs"))
+
+    args = captured["args"]
+    assert "-fps_mode" in args, "the CFR-normalising split must set a frame-rate mode"
+    assert args[args.index("-fps_mode") + 1] == "cfr"
+    assert "-vsync" not in args, "-vsync was removed upstream; ffmpeg refuses to start"

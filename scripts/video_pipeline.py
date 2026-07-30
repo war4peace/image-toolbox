@@ -145,8 +145,13 @@ def _check(cp, args, check):
     return cp
 
 
-def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
+def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None, cwd=None):
     """Run an ffmpeg/ffprobe command (no console window) and return a CompletedProcess.
+
+    `cwd` sets the CHILD's working directory (the parent's is never changed, which would
+    not be safe in a threaded GUI process). Video Stabilization uses it to pass the
+    vidstab transform file as a bare filename, since a path inside a filter argument has
+    to survive two levels of ffmpeg escaping - see video_stabilize.py.
 
     Bounded so a stalled child can't hang the whole pipeline indefinitely:
       * stall_timeout - kill if the process emits NO output for this many seconds. For the
@@ -172,6 +177,7 @@ def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
             stderr=subprocess.PIPE if capture else None,
             creationflags=_CREATE_NO_WINDOW,
             text=True,
+            cwd=cwd,
         )
         return _check(cp, args, check)
 
@@ -182,6 +188,7 @@ def _run(args, capture=True, check=True, stall_timeout=None, hard_timeout=None):
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         creationflags=_CREATE_NO_WINDOW,
+        cwd=cwd,
     )
     out_buf, err_buf = [], []
     last = [time.monotonic()]
@@ -554,13 +561,39 @@ def pick_encoder(prefer_hw=True):
     return "libx264", ["-preset", "medium", "-crf", "18"], False
 
 
+# 10-bit delivery pixel format per encoder, for the callers whose output is the
+# DELIVERABLE rather than the split's throwaway intermediate (the Real-ESRGAN engine's
+# segments, and the Video Stabilization tab's single output file, #20). pick_encoder's
+# own 8-bit yuv420p was chosen for the intermediate. Both callers feed the encoder 8-bit
+# frames, so the win is not extra source information: it is the encoder's own precision,
+# i.e. less banding on gradients.
+#
+# It has to be per-codec, and the two omissions are deliberate, not oversights:
+#   * h264_nvenc has NO 10-bit encode path at all. Measured: `-pix_fmt p010le` dies with
+#     "No capable devices found" before a frame is written, so a blanket 10-bit would break
+#     the fallback for an old card whose NVENC lacks HEVC.
+#   * libx264 CAN encode 10-bit, but that is H.264 High10, which most TVs and set-top boxes
+#     cannot hardware-decode. This app's deliverable exists to play natively on a monitor or
+#     a TV, so 10-bit H.264 trades a visible benefit for an invisible-until-it-fails one.
+# HEVC has neither problem (Main 10 is universally supported), hence the two entries.
+_DELIVERY_PIX_FMT = {"hevc_nvenc": "p010le",         # NVENC's native 10-bit surface format
+                     "libx265":    "yuv420p10le"}
+
+
+def delivery_pix_fmt(codec):
+    """The pixel format to deliver in for `codec`: 10-bit where the codec supports it AND the
+    result stays widely playable, else the 8-bit yuv420p. See _DELIVERY_PIX_FMT for why
+    h264_nvenc and libx264 are not in the table."""
+    return _DELIVERY_PIX_FMT.get(codec, "yuv420p")
+
+
 def plan_split(info: VideoInfo, segment_seconds=60.0, max_segment_seconds=120.0,
                force_reencode=False) -> SplitPlan:
     """
     Decide how to split (6.1 / 6.3 / 6.4). Default is a free, lossless `-c copy`
     stream split. Re-encode (CFR normalize + forced keyframes) is triggered only
     by a real reason:
-      * VFR source            -> -vsync cfr kills progressive lip-sync drift (6.3)
+      * VFR source            -> -fps_mode cfr kills progressive lip-sync drift (6.3)
       * sparse GOP            -> keyframes so far apart that a `-c copy` segment
                                  would exceed max_segment_seconds (6.1)
       * interlaced source     -> deinterlace (bwdif), which needs a re-encode; also
@@ -640,7 +673,7 @@ def split(info: VideoInfo, plan: SplitPlan, out_dir, segment_ext=SEGMENT_EXT):
 
     copy mode:     instant, lossless, no GPU. Cuts snap to keyframes >= the
                    requested time (frame-accurate on all-intra sources like mjpeg).
-    reencode mode: one ffmpeg pass folding -vsync cfr + forced keyframes + the
+    reencode mode: one ffmpeg pass folding -fps_mode cfr + forced keyframes + the
                    segmenter, so VFR/sparse-GOP files become cleanly splittable.
     """
     ffmpeg, _ = find_ffmpeg()
@@ -652,7 +685,13 @@ def split(info: VideoInfo, plan: SplitPlan, out_dir, segment_ext=SEGMENT_EXT):
     if plan.mode == "reencode":
         codec, enc_args, _hw = pick_encoder()
         fps = plan.fps if plan.fps and plan.fps > 0 else Fraction(30)
-        args += ["-vsync", "cfr", "-r", f"{fps.numerator}/{fps.denominator}"]
+        # `-fps_mode cfr`, NOT the older `-vsync cfr`: ffmpeg REMOVED -vsync on the
+        # master branch (it had been deprecated in favour of -fps_mode since 5.1), and
+        # 0.6.0 moved the app's pin to master because every 8.1.x corrupts vidstab
+        # output (#20). A -vsync split died with "Unrecognized option 'vsync'" before
+        # a frame was written. -fps_mode is understood by BOTH, including the 8.1.x
+        # gyan fallback, so this is not a master-only spelling.
+        args += ["-fps_mode", "cfr", "-r", f"{fps.numerator}/{fps.denominator}"]
         if plan.deinterlace:
             # bwdif=mode=0: one progressive frame per input frame, so the frame count
             # (and thus audio sync) is preserved; mode=1 would double the rate. Runs

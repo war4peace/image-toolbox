@@ -57,14 +57,35 @@ $SEEDVR2_COMMIT = "4490bd1f482e026674543386bb2a4d176da245b9"   # v2.5.24, 2025-1
 $SEEDVR2_ZIP    = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler/archive/$SEEDVR2_COMMIT.zip"
 $TORCH_INDEX    = "https://download.pytorch.org/whl/cu128"
 # ffmpeg for the Video Upscaler (a GPL build with nvenc + libx264/libx265 - see
-# docs/video-upscaler.md 6.4). Primary source is BtbN's GitHub build: it comes off
-# the github.com CDN (fast, unlike gyan.dev's ~275 KB/s) and the URL is durable,
-# pinned to the ffmpeg 8.1 branch. BtbN rebuilds that build in place and ships no
-# .sha256 sidecar, so it can't be hash-pinned; integrity there rests on HTTPS to
-# github.com plus a functional version check after extraction. gyan.dev's moving
-# release-essentials build is the fallback, verified against its .sha256 sidecar.
-$FFMPEG_LABEL    = "n8.1 win64-gpl"
-$FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
+# docs/video-upscaler.md 6.4) and the Video Stabilization tab (#20). Primary source
+# is BtbN's GitHub build: it comes off the github.com CDN (fast, unlike gyan.dev's
+# ~275 KB/s).
+#
+# Pinned to a MASTER build, not the 8.1 release branch, and that is deliberate:
+# every 8.1.x release CORRUPTS MEMORY in vidstabtransform, which #20 is built on.
+# libvidstab's vsTransformPrepare() keeps a stale shallow copy of the source frame
+# when it alternates between its in-place and separate-buffer paths, and FFmpeg 8.1's
+# scheduler change is what started making frames arrive non-writable and alternating
+# them. Fixed upstream by 316531e61cf (2026-04-01, "always use in-place transform
+# path", FFmpeg #22595), which is on master and NOT on release/8.1. Measured here on
+# a 300-frame 720p clip, 12 identical runs: n8.1.2 produced 12 DIFFERENT outputs
+# (silent garbage, and intermittent segfaults on other clips); this master build
+# produced 12 identical ones. Move back to a release branch once one ships that
+# contains 316531e61cf (8.2 or a backported 8.1.3).
+#
+# Unlike the old "latest"-tag URL (rebuilt in place, so unpinnable), this is BtbN's
+# IMMUTABLE dated autobuild release, so it is hash-pinned like the libVLC download.
+# The zip CONTAINER differs between the dated and rolling copies of the same build
+# (recompression) while the extracted binaries are byte-identical - so the hash below
+# belongs to this exact URL, and bumping the pin means recomputing it.
+$FFMPEG_LABEL    = "master N-125856-g2ae2413488 win64-gpl"
+$FFMPEG_BUILD_ID = "N-125856-g2ae2413488"
+$FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-30-13-32/ffmpeg-N-125856-g2ae2413488-win64-gpl.zip"
+$FFMPEG_SHA256   = "a75242e13048a3be44eaad9daf145f7b86de7c595d1cd43e28e76cd45efacb9a"
+# Fallback only (github.com unreachable), verified against its .sha256 sidecar. This
+# is a RELEASE-branch build, so it is very likely one of the vidstab-broken 8.1.x
+# ones: it keeps the Video Upscaler working, and video_stabilize.py's own health
+# check is what stops the Stabilization tab from running on it.
 $FFMPEG_GYAN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 # libVLC for in-app video playback with audio (docs/video-upscaler.md 16.2): the
@@ -144,21 +165,69 @@ function Install-Ffmpeg($appRoot) {
     # where video_pipeline.find_ffmpeg() looks for it. Only ffmpeg.exe + ffprobe.exe
     # are kept (ffplay is not needed); the build's GPL LICENSE ships alongside.
     $binDir = Join-Path $appRoot "ffmpeg\bin"
-    if ((Test-Path (Join-Path $binDir "ffmpeg.exe")) -and (Test-Path (Join-Path $binDir "ffprobe.exe"))) {
-        Write-Host "  Already present - keeping it."
+    # Which build is already installed. Written after a successful install; absent on
+    # anything bootstrapped before the pin carried an id. "Is ffmpeg.exe there?" is NOT
+    # sufficient any more: every install made before this pin has a working-looking
+    # ffmpeg.exe that silently corrupts vidstab output (see the pin comment), and a
+    # plain existence check would keep it forever. A stamp mismatch re-downloads.
+    $stampPath = Join-Path $appRoot "ffmpeg\build.txt"
+    $haveExes  = (Test-Path (Join-Path $binDir "ffmpeg.exe")) -and
+                 (Test-Path (Join-Path $binDir "ffprobe.exe"))
+    $stamp     = ""
+    if (Test-Path $stampPath) { $stamp = (Get-Content $stampPath -Raw -ErrorAction SilentlyContinue).Trim() }
+    if ($haveExes -and $stamp -eq $FFMPEG_BUILD_ID) {
+        Write-Host "  Already present ($FFMPEG_BUILD_ID) - keeping it."
         return
+    }
+    if ($haveExes) {
+        $was = if ($stamp) { $stamp } else { "an older build (pre-0.6.0, vidstab-broken)" }
+        Write-Host "  Replacing ffmpeg ($was -> $FFMPEG_BUILD_ID) ..." -ForegroundColor Yellow
+        # Delete the old binaries FIRST rather than relying on Copy-Item -Force to
+        # overwrite them. Two reasons: a half-replaced pair (new ffmpeg.exe, old
+        # ffprobe.exe) is a state nothing else in the app would notice, and Windows
+        # refuses to overwrite a RUNNING executable - which is exactly the case when a
+        # user launches the app, sees the stabilisation refusal, and re-runs the
+        # bootstrapper without closing it. Failing here, loudly and before anything is
+        # downloaded, beats failing silently after a 170 MB download.
+        foreach ($exe in @("ffmpeg.exe", "ffprobe.exe")) {
+            $old = Join-Path $binDir $exe
+            if (Test-Path $old) {
+                try {
+                    Remove-Item -LiteralPath $old -Force -ErrorAction Stop
+                } catch {
+                    throw ("could not remove the old $exe - it is most likely still " +
+                           "running. Close Image Toolbox (and any ffmpeg window) and " +
+                           "run this again. [$($_.Exception.Message)]")
+                }
+            }
+        }
+        # The stamp goes too, so an install interrupted between here and the end is
+        # not left claiming a build it no longer has.
+        if (Test-Path $stampPath) { Remove-Item -LiteralPath $stampPath -Force -ErrorAction SilentlyContinue }
     }
     $zip = Join-Path $env:TEMP "ffmpeg-imgtbx.zip"
     Remove-Item $zip -ErrorAction SilentlyContinue
-    $hashChecked = $false
-    # 1) Primary: BtbN's GitHub build (fast github.com CDN; no hash sidecar, so
-    #    integrity is HTTPS + the functional version check below).
+    $hashChecked  = $false
+    $usedFallback = $false
+    # 1) Primary: BtbN's GitHub build. The dated autobuild URL is immutable, so unlike
+    #    the old rolling "latest" pin this one IS hash-verified.
     try {
         Write-Host "  Downloading ffmpeg ($FFMPEG_LABEL) from GitHub ..."
         Get-Download $FFMPEG_BTBN_URL $zip
+        $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $FFMPEG_SHA256) {
+            Remove-Item $zip -ErrorAction SilentlyContinue
+            throw "ffmpeg download failed its SHA-256 check (got $actual, expected $FFMPEG_SHA256)."
+        }
+        Write-Host "  SHA-256 verified."
+        $hashChecked = $true
     } catch {
         # 2) Fallback: gyan.dev's release-essentials build, verified against its
-        #    published .sha256 sidecar.
+        #    published .sha256 sidecar. Marked so the stamp written below can NEVER
+        #    read as the pinned build: this is a release-branch ffmpeg, so it is
+        #    probably vidstab-broken, and the next launch that can reach GitHub must
+        #    upgrade it rather than see a matching stamp and keep it.
+        $usedFallback = $true
         Write-Host "  GitHub source unavailable ($_)" -ForegroundColor Yellow
         Write-Host "  Trying the gyan.dev build (may be slower) ..." -ForegroundColor Yellow
         Remove-Item $zip -ErrorAction SilentlyContinue
@@ -200,6 +269,12 @@ function Install-Ffmpeg($appRoot) {
         throw "the downloaded ffprobe.exe did not run correctly (exit $code): $line"
     }
     if (-not $hashChecked) { Write-Host "  Verified: $line" }
+    # Stamp what was installed, so the next launch can tell this build from the one
+    # the pin now asks for. Only the primary path may claim the pinned id; a fallback
+    # install records the version it actually got, which never matches and so gets
+    # upgraded on the first launch that can reach GitHub.
+    $installedId = if ($usedFallback) { "fallback: $line" } else { $FFMPEG_BUILD_ID }
+    Set-Content -Path $stampPath -Value $installedId -Encoding utf8
     Remove-Item $zip -ErrorAction SilentlyContinue
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "  Installed: $(Join-Path $binDir 'ffmpeg.exe')"

@@ -208,7 +208,7 @@ All under the base topic `image-toolbox/`:
 | `last_used` | timestamp the app last exited cleanly |
 | `event/run_started` | **not retained.** `{tool, started_at}`, one shot, when a run starts |
 | `event/run_finished` | **not retained.** The same object as `last_run`, one shot, when a run ends. Trigger on this, not on `last_run` (see [Notifications](#notifications)) |
-| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` / `video upscaling` |
+| `task/name` | `idle` / `upscaling` / `tagging` / `conciliating` / `video upscaling` / `stabilizing` |
 | `task/details` | human-readable current phase |
 | `task/progress` / `task/eta` | `X/Y` and estimated time remaining |
 | `task/runtime` | seconds of active-task runtime |

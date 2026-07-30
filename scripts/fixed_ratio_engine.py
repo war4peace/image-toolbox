@@ -69,26 +69,10 @@ _TILE_FLOOR = 128                                    # smallest tile the OOM ret
 # 10-bit delivery pixel format per encoder. This engine's segments ARE the deliverable, so
 # they should match what the SeedVR2 path already writes (libx265 crf 12, yuv420p10le) rather
 # than inherit pick_encoder()'s 8-bit yuv420p, which was chosen for the split's throwaway
-# INTERMEDIATE. Both engines feed the encoder 8-bit RGB, so the win is not extra source
-# information: it is the encoder's own precision, i.e. less banding on gradients.
-#
-# It has to be per-codec, and the two omissions are deliberate, not oversights:
-#   * h264_nvenc has NO 10-bit encode path at all. Measured: `-pix_fmt p010le` dies with
-#     "No capable devices found" before a frame is written, so a blanket 10-bit would break
-#     the fallback for an old card whose NVENC lacks HEVC.
-#   * libx264 CAN encode 10-bit, but that is H.264 High10, which most TVs and set-top boxes
-#     cannot hardware-decode. This app's deliverable exists to play natively on a monitor or
-#     a TV, so 10-bit H.264 trades a visible benefit for an invisible-until-it-fails one.
-# HEVC has neither problem (Main 10 is universally supported), hence the two entries.
-_DELIVERY_PIX_FMT = {"hevc_nvenc": "p010le",         # NVENC's native 10-bit surface format
-                     "libx265":    "yuv420p10le"}
-
-
-def _delivery_pix_fmt(codec):
-    """The pixel format to deliver in for `codec`: 10-bit where the codec supports it AND the
-    result stays widely playable, else the 8-bit yuv420p this engine used before. See
-    _DELIVERY_PIX_FMT for why h264_nvenc and libx264 are not in the table."""
-    return _DELIVERY_PIX_FMT.get(codec, "yuv420p")
+# INTERMEDIATE. The rule (and the reasoning behind the two codecs deliberately left out of
+# it) lives in video_pipeline beside pick_encoder, since the Stabilization tab's output is a
+# deliverable for the same reason and must not drift from this one.
+_delivery_pix_fmt = vp.delivery_pix_fmt
 
 
 def _terminate(proc):
