@@ -224,7 +224,9 @@ at least 256x256.** NVENC refuses smaller dimensions outright (`InitializeEncode
 Frame dimensions are less than the minimum supported value`), so the first attempt, at 64x64,
 reported NO NVENC on a machine with a working 3090. A probe that fails closed on good hardware
 is worse than no probe: it would have quietly moved every user to the CPU encoder. Five tests
-pin the behaviour, including the minimum frame size and the once-per-process caching.
+pin the behaviour, including the minimum frame size and the once-per-process caching, and the
+fix was confirmed on the VM that found it: with no NVIDIA GPU present the run picks the CPU
+encoder and completes.
 
 ### D3 (fixed): a finished-but-failed Stabilization run looked like a hung one
 
