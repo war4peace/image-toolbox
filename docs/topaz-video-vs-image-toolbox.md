@@ -6,7 +6,7 @@ project). The image-side comparison against Topaz Gigapixel lives in
 [`topaz-gigapixel-vs-image-toolbox.md`](topaz-gigapixel-vs-image-toolbox.md).
 
 Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`;
-the Image Toolbox column was refreshed 2026-07-29 for **0.6.0-experimental**. Check
+the Image Toolbox column was refreshed 2026-07-29 for **0.6.0**. Check
 Topaz's own pages before relying on their column: their model lineup changes several
 times a year and their pricing changed materially in the last one. This is a snapshot
 of one day's reading.

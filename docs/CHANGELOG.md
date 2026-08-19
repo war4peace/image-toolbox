@@ -22,6 +22,39 @@ Releases page.
 
 ## 0.6.0
 
+### Your camera's RAW files now work
+The Batch Upscaler accepts **RAW photos**: `.dng`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.orf`,
+`.rw2`, `.raf`, `.pef` and `.srw`. Point it at a folder of them and you get ordinary JPEGs
+you can actually look at, send, and print.
+
+**It renders your RAW files, it does not develop them.** There are no exposure, white
+balance or curve controls, and there will not be: that is a different program. Where your
+camera stored a full-size preview inside the file, that preview is what you get, which means
+the picture is your camera's own rendering. Where it did not, the app develops the sensor
+data with neutral defaults. Either way the result is not our opinion of your photo.
+
+**RAW files are hardly ever upscaled, and that is expected.** RAW is a high-resolution
+format and this app exists to rescue low-resolution photos: out of 24 real camera files from
+2004 to 2020, not one was small enough to need upscaling. So a RAW is always rendered, and
+only upscaled if it genuinely is small. They are counted separately at the end of a run
+("N RAW rendered (already at target)") so the numbers make sense.
+
+Results are named `<name>_raw.jpg`. If you shoot RAW+JPEG, `IMG_1234.CR2` and `IMG_1234.JPG`
+therefore produce two separate files instead of quietly overwriting one another.
+
+**Your capture date, camera, lens and GPS come across.** The date is the one that matters,
+since without it the copy sorts by the day it was made rather than the day you took it. The
+information is gathered from both places a RAW keeps it, because neither place has all of it
+on its own.
+
+**Your RAW files are never touched, and never replaced.** Tag & Rename skips them rather than
+writing a description into a camera's own file format, and Conciliation will never archive or
+delete a RAW original, even when a rendered copy exists. A JPEG is one interpretation of a
+negative, not a replacement for it, so the negative stays.
+
+RAW photos show up in the thumbnail strip like everything else. They do not offer
+side-by-side comparison, because there is no "before" picture to show: the RAW is the before.
+
 ### Steady up shaky old footage
 A new **Video Stabilization** tab, next to Conciliation. Point it at a folder of shaky
 videos, press **Scan folder**, then Start. It never touches your originals: each steadied
@@ -152,6 +185,33 @@ disappear behind it.
 One thing it does not do yet: if you have already **conciliated** a folder (replaced your
 originals with the upscaled copies), the output folder is empty afterwards, so there is
 nothing left there to browse. The window says so rather than looking broken.
+
+### Fixes
+**The app would not start again after you reinstalled Python.** If Python was uninstalled,
+upgraded or moved (usually while installing something else entirely), Image Toolbox stopped
+starting: no window, no error, nothing in the logs, and only a full reinstall brought it
+back. The app now checks its Python environment still works before it starts, repairs it in
+place where it can, and rebuilds it only if it has to.
+
+**Video Stabilization on a PC without an NVIDIA card.** It asked for the graphics card's
+video encoder without checking there was one, and failed at the first frame with an
+unhelpful number. It now tests the encoder before using it and falls back to the processor,
+which is slower but works everywhere.
+
+**A stabilisation run that ended with a failure looked like a frozen app.** The progress bar
+stayed half full and both buttons were greyed out. Worse, a video that failed could not be
+tried again without removing it from the list. A failed video can now simply be started
+again, and the log always records how the run ended.
+
+**A warning if your graphics card is small.** The app has always said 8 GB of video memory
+is the minimum, but only told you when the card was rented, never when it was your own. If
+your card is below that, its entry now says so and you get told once what to expect. It is a
+warning, not a block: a smaller card is usually slower rather than incapable, and some jobs
+run on it perfectly well.
+
+**The bundled ffmpeg is downloaded reliably again.** The exact build the app asks for had
+been removed from where it was published, so new installs quietly fell back to a different
+one. It is now pinned to a build that is kept long-term.
 
 ---
 

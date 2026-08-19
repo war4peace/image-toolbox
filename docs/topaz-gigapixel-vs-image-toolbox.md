@@ -7,7 +7,7 @@ lives in [`topaz-video-vs-image-toolbox.md`](topaz-video-vs-image-toolbox.md).
 
 Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`
 (app version **1.3.1**, released 2026-06-11); the Image Toolbox column was refreshed
-2026-07-29 for **0.6.0-experimental**. Check Topaz's own pages before relying on
+2026-07-29 for **0.6.0**. Check Topaz's own pages before relying on
 their column: their release cadence is fast, their pricing changed materially in the
 last year, and this is a snapshot of one day's reading.
 

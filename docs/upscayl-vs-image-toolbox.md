@@ -4,7 +4,7 @@ A feature-by-feature comparison between [Upscayl](https://github.com/upscayl/ups
 and **Image Toolbox** (this project).
 
 Written 2026-07-27 against Upscayl's public repository / website; the Image Toolbox
-column was refreshed 2026-07-29 for **0.6.0-experimental**. Check their repo before
+column was refreshed 2026-07-29 for **0.6.0**. Check their repo before
 relying on their column: this is a snapshot of one day's reading, and their side can
 change without this file noticing.
 
