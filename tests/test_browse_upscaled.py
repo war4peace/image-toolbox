@@ -733,10 +733,25 @@ def test_the_browser_first_opens_at_the_main_windows_first_run_size(
     _touch(str(out / "a.jpg"))
     app = SimpleNamespace(settings={}, show_comparison=lambda *a: None)
 
+    # What the window ASKS for, not what it ends up with. Windows shrinks a window
+    # to fit the screen, so reading the geometry back after realisation tests the
+    # display rather than the decision: on a 1024-wide CI runner this window is
+    # honestly reported as "1028x720" and the assertion failed on a machine where
+    # nothing was wrong. The invariant is which size it requests.
+    asked = []
+    original = bu.BrowseUpscaledWindow.geometry
+
+    def spy(self, *args):
+        if args:
+            asked.append(args[0])
+        return original(self, *args)
+
+    monkeypatch.setattr(bu.BrowseUpscaledWindow, "geometry", spy, raising=False)
+
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
         root.update()
-        assert win.geometry().startswith(DEFAULT_WINDOW_GEOMETRY)
+        assert asked and asked[0] == DEFAULT_WINDOW_GEOMETRY
     finally:
         win._close()
         root.withdraw()
