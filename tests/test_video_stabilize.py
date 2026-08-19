@@ -1,5 +1,5 @@
 """
-Video Stabilization (future-features #20).
+Video Stabilization (future-features #20, workflow #23).
 
 Two things here are load-bearing rather than routine, and both exist because the
 failure they guard against is silent:
@@ -18,6 +18,14 @@ failure they guard against is silent:
    release/8.1), and the damage is usually NOT a crash - it is different pixels on
    every run of an identical command. So the tool proves the filter is
    deterministic before it will touch a real video, and refuses otherwise.
+
+#23 adds a third, and it is the one with teeth:
+
+3. THE PAIR RECORD IS NOT LINEAGE. `db.lineage` is what Conciliation MATCHES ON,
+   and video conciliation is lineage-only, so a stabilised output recorded there
+   would make the app's one destructive tool offer to archive or DELETE the
+   original in favour of a copy with ~10-21% of its picture potentially gone. The
+   pair lives in its own table, and these tests hold that line.
 """
 
 import json
@@ -341,13 +349,25 @@ def tab(root):
     published = {}
 
     class _FakeApp:
-        def refresh_tab_exclusivity(self): pass
-        def mqtt_publish(self, values): published.update(values)
-        def taskbar_progress(self, *_a): pass
-        def flash_attention(self): pass
+        """Records MQTT publishes; every other App call is a no-op. The catch-all is
+        deliberate: these tests are about the TAB, and stubbing each App method by
+        hand meant a test of on_exit failed on `taskbar_clear` rather than on
+        anything it was checking."""
+
+        def mqtt_publish(self, values, **_kw): published.update(values)
+
+        def __getattr__(self, _name):
+            return lambda *a, **k: None
 
     nb = ttk.Notebook(root)
     t = StabilizeTab(nb, _FakeApp())
+    # The tab pre-fills both folder fields from the saved defaults (#23 item 6), so
+    # without this the tests read the DEVELOPER'S config.json: the day a real
+    # `stabilize_output` was saved, every "is there already a result next to the
+    # source" test started looking in that folder instead and failed. A tab test must
+    # depend on what the test sets up, never on the machine it runs on.
+    t.folder_var.set("")
+    t.out_var.set("")
     t.published = published
     yield t
     t.destroy()
@@ -359,10 +379,14 @@ RUNNER_EVENTS = [
     ("LOG", r"C:\logs\stab_abc.log"),
     ("STATUS", "Pass 1 of 2 - measuring camera motion …"),
     ("PASS", '{"pass": 1, "of": 2, "name": "Measuring motion"}'),
+    ("FILE", '{"index": 2, "total": 5, "source": "b.mp4", "output": "b_stabilized.mp4",'
+             ' "name": "b.mp4"}'),
+    ("RESULT", '{"source": "b.mp4", "output": "b_stabilized.mp4", "ok": true,'
+               ' "frames": 300}'),
     ("PROG", "150|600"),
     ("ETA", "12.5|150|150|600"),
     ("REFUSED", '{"reason": "This ffmpeg build cannot stabilise video correctly."}'),
-    ("DONE", '{"tool": "stabilize", "output": "out.mp4", "frames": 300}'),
+    ("DONE", '{"tool": "stabilize", "queued": 1, "processed": 1, "failed": 0}'),
 ]
 
 
@@ -386,6 +410,50 @@ def test_tab_progress_is_reported_across_both_passes(tab):
     assert tab.progress is not None
 
 
+def test_the_status_line_says_which_of_many_videos_is_running(tab):
+    """The runner's own per-pass line cannot know it is one of fifty, so the tab owns
+    the status line while a video is in progress and composes it from FILE + PASS."""
+    tab._handle_event("FILE", json.dumps({"index": 3, "total": 12, "source": "c.mp4",
+                                          "name": "holiday.mp4"}))
+    tab._handle_event("PASS", json.dumps({"pass": 2, "of": 2, "name": "Stabilising"}))
+    text = tab.status_lbl.cget("text")
+    assert "[3/12]" in text and "holiday.mp4" in text and "pass 2 of 2" in text
+    # The runner's own pass line must not overwrite it and drop the file name.
+    tab._handle_event("STATUS", "Pass 2 of 2 - stabilising and encoding …")
+    assert tab.status_lbl.cget("text") == text
+    # …but once the run is over the runner's closing summary is the whole story.
+    tab._handle_event("DONE", '{"tool": "stabilize", "processed": 12, "failed": 0}')
+    tab._handle_event("STATUS", "Done - 12 stabilised")
+    assert tab.status_lbl.cget("text") == "Done - 12 stabilised"
+
+
+def test_the_video_a_stop_interrupted_goes_back_to_queued(tab, tmp_path):
+    """It genuinely IS queued again - a stabilise has no resume, so the abandoned
+    `.part` was discarded. Left showing "Working…" it would also make Start refuse
+    ("nothing is queued") on the very file the user stopped to come back to."""
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"x")
+    tab.add_sources([str(src)])
+    tab._handle_event("FILE", json.dumps({"index": 1, "total": 1, "source": str(src),
+                                          "name": "a.mp4"}))
+    assert list(tab._rows.values())[0]["status"] == "Working…"
+    tab._handle_event("DONE", '{"tool": "stabilize", "processed": 0, "failed": 0,'
+                              ' "stopped_by_user": true}')
+    tab.on_exit(0)
+    assert list(tab._rows.values())[0]["status"] == "Queued"
+
+
+def test_a_result_event_marks_the_row_it_names(tab, tmp_path):
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"x")
+    tab.add_sources([str(src)])
+    out = list(tab._rows.values())[0]["output"]
+    tab._handle_event("RESULT", json.dumps({"source": str(src), "output": out,
+                                            "ok": False, "reason": "unreadable"}))
+    row = list(tab._rows.values())[0]
+    assert row["status"] == "Failed" and row["reason"] == "unreadable"
+
+
 def test_a_refusal_is_kept_whole_for_the_dialog(tab):
     """The refusal is several sentences plus what to do about it, and the tab shows
     it in a dialog - so it must survive intact, not be truncated to a status line."""
@@ -396,88 +464,538 @@ def test_a_refusal_is_kept_whole_for_the_dialog(tab):
 
 
 # ─────────────────────────────────────────────
-#  The output field must follow the source
+#  Each video's result must be its own file
 # ─────────────────────────────────────────────
 #
-# Reported from real use: after stabilising one video, choosing a second left the
-# "Save result as" field still naming the FIRST one. The run then offered to replace
-# that file - a dialog inviting the user to destroy the result they had just made.
+# The invariants here predate the queue (#23) - they were reported from real use of
+# #20's single-file tab, where the "Save result as" field kept naming the PREVIOUS
+# video and the run then offered to replace the result the user had just made. The
+# field is gone, but every one of those invariants still has to hold, now per row of
+# the list rather than per keystroke of one field.
 
 
-def _pick(tab, path):
-    """What choosing a file in the Browse dialog does to the tab."""
-    tab.src_var.set(str(path))
-    tab.update_idletasks()
+def _outputs(tab):
+    return {os.path.basename(r["source"]): r["output"] for r in tab._rows.values()}
 
 
-def test_choosing_a_second_video_renames_the_output(tab, tmp_path):
+def test_each_video_gets_its_own_result_name(tab, tmp_path):
     first = tmp_path / "VID 00001-20100609-2226.3GP"
     second = tmp_path / "VID 00004-20110601-2112.3GP"
     for f in (first, second):
         f.write_bytes(b"x")
 
-    _pick(tab, first)
-    assert os.path.basename(tab.out_var.get()) == "VID 00001-20100609-2226_stabilized.mp4"
+    tab.add_sources([str(first), str(second)])
+    outs = _outputs(tab)
+    assert os.path.basename(outs["VID 00001-20100609-2226.3GP"]) == \
+        "VID 00001-20100609-2226_stabilized.mp4"
+    assert os.path.basename(outs["VID 00004-20110601-2112.3GP"]) == \
+        "VID 00004-20110601-2112_stabilized.mp4"
 
-    _pick(tab, second)
-    assert os.path.basename(tab.out_var.get()) == "VID 00004-20110601-2112_stabilized.mp4"
 
-
-def test_a_finished_run_does_not_leave_the_old_name_behind(tab, tmp_path):
-    """The exact reported sequence: stabilise one video (so its output now EXISTS on
-    disk), then choose another. The field must name the second video, not the first."""
-    first = tmp_path / "a.3gp"
-    second = tmp_path / "b.3gp"
-    for f in (first, second):
+def test_two_videos_with_one_name_do_not_claim_one_output(tab, tmp_path):
+    """The queue's own version of the old bug, and it is worse: neither output EXISTS
+    yet while the queue is being planned, so nothing on disk stops the second run
+    from writing over the first one's result the moment it finishes."""
+    a = tmp_path / "holiday" / "clip.avi"
+    b = tmp_path / "wedding" / "clip.avi"
+    out = tmp_path / "steady"
+    for f in (a, b):
+        f.parent.mkdir(parents=True, exist_ok=True)
         f.write_bytes(b"x")
+    out.mkdir()
 
-    _pick(tab, first)
-    produced = tab.out_var.get()
-    open(produced, "wb").write(b"stabilised result")     # the run happened
-
-    _pick(tab, second)
-    assert os.path.basename(tab.out_var.get()) == "b_stabilized.mp4"
-    assert os.path.normcase(tab.out_var.get()) != os.path.normcase(produced)
+    tab.out_var.set(str(out))
+    tab.add_sources([str(a), str(b)])
+    produced = [r["output"] for r in tab._rows.values()]
+    assert len(set(os.path.normcase(p) for p in produced)) == 2
 
 
-def test_re_picking_the_same_video_will_not_overwrite_the_previous_result(tab, tmp_path):
+def test_a_video_that_already_has_a_result_is_not_queued_again(tab, tmp_path):
+    """Resume: re-scanning a folder must pick up where the last run stopped, not
+    redo it. This is the whole reason a queue needs no database."""
     src = tmp_path / "a.3gp"
     src.write_bytes(b"x")
+    (tmp_path / "a_stabilized.mp4").write_bytes(b"result")
 
-    _pick(tab, src)
-    produced = tab.out_var.get()
-    open(produced, "wb").write(b"stabilised result")
-
-    tab.src_var.set("")                                  # re-open the picker...
-    _pick(tab, src)                                      # ...and choose the same file
-    assert os.path.basename(tab.out_var.get()) == "a_stabilized_2.mp4"
-    assert not os.path.exists(tab.out_var.get())
+    tab.add_sources([str(src)])
+    row = list(tab._rows.values())[0]
+    assert row["status"] == "Stabilised"
+    assert os.path.basename(row["output"]) == "a_stabilized.mp4"
 
 
-def test_a_chosen_output_folder_survives_a_source_change(tab, tmp_path):
-    """Only the NAME is rebuilt. A user collecting results in one folder should not
-    have to re-browse for every video."""
+def test_stabilising_again_never_overwrites_the_previous_result(tab, tmp_path):
+    """A second attempt is usually a different Steadiness on a result the user is
+    still judging. It gets a new file."""
+    src = tmp_path / "a.3gp"
+    src.write_bytes(b"x")
+    produced = tmp_path / "a_stabilized.mp4"
+    produced.write_bytes(b"result")
+
+    tab.add_sources([str(src)])
+    tab.tree.selection_set(list(tab._rows)[0])
+    tab._requeue_selected()
+    row = list(tab._rows.values())[0]
+    assert row["status"] == "Queued"
+    assert os.path.basename(row["output"]) == "a_stabilized_2.mp4"
+    assert not os.path.exists(row["output"])
+
+
+def test_results_follow_the_chosen_output_folder(tab, tmp_path):
+    """A user collecting results in one folder should not have to say so per video."""
     src_dir = tmp_path / "footage"
     out_dir = tmp_path / "stabilised"
     src_dir.mkdir()
     out_dir.mkdir()
-    first = src_dir / "a.3gp"
-    second = src_dir / "b.3gp"
-    for f in (first, second):
-        f.write_bytes(b"x")
+    for name in ("a.3gp", "b.3gp"):
+        (src_dir / name).write_bytes(b"x")
 
-    _pick(tab, first)
-    tab.out_var.set(str(out_dir / "a_stabilized.mp4"))    # user browses elsewhere
-    tab.update_idletasks()
-
-    _pick(tab, second)
-    assert os.path.dirname(tab.out_var.get()) == str(out_dir)
-    assert os.path.basename(tab.out_var.get()) == "b_stabilized.mp4"
+    tab.out_var.set(str(out_dir))
+    tab.add_sources([str(src_dir / "a.3gp"), str(src_dir / "b.3gp")])
+    for row in tab._rows.values():
+        assert os.path.dirname(row["output"]) == str(out_dir)
 
 
 def test_the_output_is_never_the_source_itself(tab, tmp_path):
     """A stabilise that ate its own input is not recoverable."""
     src = tmp_path / "clip_stabilized.mp4"
     src.write_bytes(b"x")
-    _pick(tab, src)
-    assert os.path.normcase(tab.out_var.get()) != os.path.normcase(str(src))
+    tab.add_sources([str(src)])
+    row = list(tab._rows.values())[0]
+    assert os.path.normcase(row["output"]) != os.path.normcase(str(src))
+
+
+# ─────────────────────────────────────────────
+#  The hand-off from the Video Upscaler  (#23 item 1)
+# ─────────────────────────────────────────────
+
+
+def test_the_prune_summary_survives_the_list_being_re_counted(tab, tmp_path):
+    """#16's rule is that a scan explains itself once, and this is the moment a user
+    wonders why the count is smaller than the folder looks. It has to be REMEMBERED,
+    not written once: the summary line is rewritten by anything that re-counts the
+    list, and the output-folder trace does exactly that a moment after a scan."""
+    src = tmp_path / "a.mp4"
+    src.write_bytes(b"x")
+    tab._scan_done([str(src)], "Skipped 1 folder(s) this app created: __Archive__",
+                   {str(src): None})
+    assert "__Archive__" in tab.status_lbl.cget("text")
+    tab._set_summary_status()                     # what a re-count does
+    assert "__Archive__" in tab.status_lbl.cget("text")
+
+
+def test_a_handed_over_video_is_queued_and_selected(tab, tmp_path):
+    src = tmp_path / "shaky.mp4"
+    src.write_bytes(b"x")
+    assert tab.add_sources([str(src)]) == 1
+    assert list(tab._rows.values())[0]["status"] == "Queued"
+
+
+def test_the_same_video_is_not_added_twice(tab, tmp_path):
+    src = tmp_path / "shaky.mp4"
+    src.write_bytes(b"x")
+    tab.add_sources([str(src)])
+    assert tab.add_sources([str(src)]) == 0
+    assert len(tab._rows) == 1
+
+
+# ─────────────────────────────────────────────
+#  The folder walk  (#23 item 2)
+# ─────────────────────────────────────────────
+
+
+def test_the_walk_never_offers_its_own_results_back(tmp_path):
+    """A result defaults to sitting BESIDE its source, which is not a derived
+    directory - so DerivedPruner (#16) cannot catch it and the name rule must. Without
+    this, scanning the same folder twice queues every result as fresh input, and the
+    third scan queues the results of the results."""
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    (tmp_path / "a_stabilized.mp4").write_bytes(b"x")
+    (tmp_path / "a_stabilized_2.mp4").write_bytes(b"x")
+    found, _pruner = vs.iter_videos(str(tmp_path))
+    assert [os.path.basename(p) for p in found] == ["a.mp4"]
+
+
+def test_the_walk_skips_the_apps_own_derived_directories(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    for derived in ("__Archive__", "__upscaled__"):
+        d = tmp_path / derived
+        d.mkdir()
+        (d / "old.mp4").write_bytes(b"x")
+    found, pruner = vs.iter_videos(str(tmp_path))
+    assert [os.path.basename(p) for p in found] == ["a.mp4"]
+    assert pruner.summary()
+
+
+def test_the_walk_can_stay_out_of_subfolders(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.mp4").write_bytes(b"x")
+    assert len(vs.iter_videos(str(tmp_path))[0]) == 2
+    assert len(vs.iter_videos(str(tmp_path), recursive=False)[0]) == 1
+
+
+def test_non_video_files_are_ignored(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_bytes(b"x")
+    (tmp_path / "photo.jpg").write_bytes(b"x")
+    assert len(vs.iter_videos(str(tmp_path))[0]) == 1
+
+
+# ─────────────────────────────────────────────
+#  Planning a queue  (#23 item 3)
+# ─────────────────────────────────────────────
+
+
+def test_a_video_that_already_has_a_result_is_skipped_not_redone(tmp_path):
+    """The resume story, and the reason a queue needs no database: re-running a
+    folder does the files that are missing a result and reports the rest."""
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    (tmp_path / "b.mp4").write_bytes(b"x")
+    (tmp_path / "a_stabilized.mp4").write_bytes(b"x")
+    jobs, skipped = vs.plan_jobs([str(tmp_path / "a.mp4"), str(tmp_path / "b.mp4")])
+    assert [os.path.basename(j["source"]) for j in jobs] == ["b.mp4"]
+    assert [os.path.basename(s["source"]) for s in skipped] == ["a.mp4"]
+
+
+def test_redo_makes_a_new_file_and_never_touches_the_old_one(tmp_path):
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    previous = tmp_path / "a_stabilized.mp4"
+    previous.write_bytes(b"result")
+    jobs, skipped = vs.plan_jobs([str(tmp_path / "a.mp4")], redo=True)
+    assert not skipped
+    assert os.path.basename(jobs[0]["output"]) == "a_stabilized_2.mp4"
+    assert previous.read_bytes() == b"result"
+
+
+def test_two_sources_with_one_stem_get_two_outputs(tmp_path):
+    """Neither output exists yet while the queue is planned, so nothing on DISK stops
+    the second job from writing over the first one's result when it finishes. The
+    claimed-names set is what does."""
+    for folder in ("holiday", "wedding"):
+        d = tmp_path / folder
+        d.mkdir()
+        (d / "clip.avi").write_bytes(b"x")
+    out = tmp_path / "steady"
+    out.mkdir()
+    jobs, _ = vs.plan_jobs([str(tmp_path / "holiday" / "clip.avi"),
+                            str(tmp_path / "wedding" / "clip.avi")], outdir=str(out))
+    assert len({os.path.normcase(j["output"]) for j in jobs}) == 2
+
+
+def test_a_queue_file_round_trips(tmp_path):
+    qf = tmp_path / "q.json"
+    qf.write_text(json.dumps({"jobs": [{"source": r"C:\a\x.mp4",
+                                        "output": r"C:\out\x_stabilized.mp4"}]}),
+                  encoding="utf-8")
+    jobs = vs.load_queue_file(str(qf))
+    assert jobs == [{"source": r"C:\a\x.mp4", "output": r"C:\out\x_stabilized.mp4"}]
+
+
+# ─────────────────────────────────────────────
+#  Whole-run progress  (QueueProgress)
+# ─────────────────────────────────────────────
+
+
+def _events(monkeypatch):
+    seen = []
+    monkeypatch.setattr(vs, "_gui_event", lambda k, p: seen.append((k, p)))
+    return seen
+
+
+def test_progress_spans_both_passes_of_one_file(monkeypatch):
+    """A per-pass bar would reach 100% halfway through the job and then start again."""
+    seen = _events(monkeypatch)
+    p = vs.QueueProgress(100)
+    p.begin_file(100)
+    p.report(1, 100, force=True)
+    p.report(2, 100, force=True)
+    assert [v for k, v in seen if k == "PROG"] == ["100|200", "200|200"]
+
+
+def test_progress_spans_the_whole_queue_not_one_file(monkeypatch):
+    """Fifty videos of wildly different lengths make a file counter a poor progress
+    signal, which is why the budget is measured up front."""
+    seen = _events(monkeypatch)
+    p = vs.QueueProgress(300)            # three 100-frame videos -> 600 pass-frames
+    p.begin_file(100)
+    p.report(2, 100, force=True)
+    p.end_file()
+    p.begin_file(100)
+    p.report(1, 50, force=True)
+    assert [v for k, v in seen if k == "PROG"] == ["200|600", "250|600"]
+
+
+def test_pass_one_correcting_the_frame_count_moves_the_whole_budget(monkeypatch):
+    """A header count can be an estimate; pass 1 counts exactly. The queue budget has
+    to follow, or every later ETA is wrong."""
+    _events(monkeypatch)
+    p = vs.QueueProgress(200)
+    p.begin_file(100)
+    p.correct_file(120)
+    assert p.budget == 2 * 200 - 200 + 240
+
+
+def test_a_failed_file_still_advances_the_budget(monkeypatch):
+    """Otherwise the bar stalls at whatever fraction the failed file reached."""
+    _events(monkeypatch)
+    p = vs.QueueProgress(200)
+    p.begin_file(100)
+    p.end_file()
+    assert p.done == 200
+
+
+# ─────────────────────────────────────────────
+#  The queue keeps going  (#23 item 3)
+# ─────────────────────────────────────────────
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def tee(self, msg=""):
+        self.lines.append(msg)
+
+    def log_only(self, msg):
+        self.lines.append(msg)
+
+
+_OPTS = {"smoothing": 10, "shakiness": 8, "accuracy": 15, "optzoom": 0, "crop": "keep"}
+
+
+def test_one_bad_video_does_not_cost_the_rest_of_the_queue(monkeypatch):
+    """One unreadable file in fifty must not end the run."""
+    _events(monkeypatch)
+    monkeypatch.setattr(vs, "probe_queue", lambda jobs, log: (300, []))
+    done = []
+
+    def fake(src, dest, log, **kw):
+        if "bad" in src:
+            raise vs.StabilizeError("cannot read that file")
+        done.append(src)
+        return {"output": dest, "frames": 100, "elapsed_seconds": 1}
+
+    monkeypatch.setattr(vs, "stabilize", fake)
+    jobs = [{"source": f"{n}.mp4", "output": f"{n}_stabilized.mp4"}
+            for n in ("a", "bad", "c")]
+    summary = vs.run_queue(jobs, _Log(), _OPTS, "ffmpeg")
+    assert summary["processed"] == 2 and summary["failed"] == 1
+    assert done == ["a.mp4", "c.mp4"]
+
+
+def test_a_stop_ends_the_queue_and_leaves_the_rest_alone(monkeypatch):
+    _events(monkeypatch)
+    monkeypatch.setattr(vs, "probe_queue", lambda jobs, log: (300, []))
+    started = []
+
+    def fake(src, dest, log, **kw):
+        started.append(src)
+        if len(started) == 2:
+            raise KeyboardInterrupt("stopped by user")
+        return {"output": dest, "frames": 100, "elapsed_seconds": 1}
+
+    monkeypatch.setattr(vs, "stabilize", fake)
+    jobs = [{"source": f"{n}.mp4", "output": f"{n}_stabilized.mp4"}
+            for n in ("a", "b", "c")]
+    summary = vs.run_queue(jobs, _Log(), _OPTS, "ffmpeg")
+    assert summary["stopped_by_user"] is True
+    assert summary["processed"] == 1
+    assert started == ["a.mp4", "b.mp4"]          # "c" was never touched
+
+
+def test_the_health_check_runs_once_for_the_whole_queue(monkeypatch):
+    """Half a second is nothing for one video and fifty times nothing for fifty - and
+    a broken build must refuse the RUN, not fail each of fifty files with the same
+    paragraph."""
+    calls = []
+    monkeypatch.setattr(vs, "vidstab_health",
+                        lambda *a, **k: (calls.append(1), (True, "ok"))[1])
+    monkeypatch.setattr(vs, "vidstab_available", lambda *a, **k: True)
+    monkeypatch.setattr(vs, "ffmpeg_version_line", lambda *a, **k: "ffmpeg n8.2")
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    vs.preflight(_Log())
+    assert len(calls) == 1
+
+
+def test_a_partly_failed_run_is_orange_not_red():
+    """The run delivered; calling it Failed sends the user hunting for a disaster
+    that is one unreadable file."""
+    title, color = vs.completion_notice(True, False, failed=1)
+    assert color == notifications.COLOR_ORANGE
+    assert "error" in title.lower()
+
+
+# ─────────────────────────────────────────────
+#  The pair record must stay out of conciliation's reach  (#23 item 5)
+# ─────────────────────────────────────────────
+
+
+@pytest.fixture
+def stab_db(tmp_path, monkeypatch):
+    """A throwaway cache.db, so these never touch the developer's own."""
+    import db
+
+    monkeypatch.setattr(db, "DB_DIR", str(tmp_path / "db"))
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "db" / "cache.db"))
+    monkeypatch.setattr(db, "_conn", None)
+    conn = db.get_conn()
+    yield db, conn
+    conn.close()
+    db._conn = None
+
+
+def test_a_stabilised_pair_is_not_recorded_as_lineage(stab_db, tmp_path):
+    """THE data-loss guard of this milestone. `lineage` is what Conciliation matches
+    on, and video conciliation is lineage-ONLY: a row there would make the app's one
+    destructive tool offer to archive or DELETE an original in favour of a copy that
+    may be missing a fifth of its picture."""
+    db, conn = stab_db
+    src = tmp_path / "shaky.mp4"
+    out = tmp_path / "shaky_stabilized.mp4"
+    for f in (src, out):
+        f.write_bytes(b"x")
+    db.record_stabilized(conn, str(src), str(out), smoothing=10, optzoom=0, frames=300)
+    assert db.lineage_has_rows(conn) is False
+    assert db.stabilized_output(conn, str(src)) == os.path.abspath(str(out))
+
+
+def test_a_pair_whose_result_was_deleted_reads_as_not_stabilised(stab_db, tmp_path):
+    """Otherwise the tab offers to compare a file that is gone, and the folder scan
+    skips work that needs doing."""
+    db, conn = stab_db
+    src = tmp_path / "shaky.mp4"
+    out = tmp_path / "shaky_stabilized.mp4"
+    for f in (src, out):
+        f.write_bytes(b"x")
+    db.record_stabilized(conn, str(src), str(out))
+    os.remove(out)
+    assert db.stabilized_output(conn, str(src)) is None
+
+
+def test_re_stabilising_replaces_the_recorded_pair(stab_db, tmp_path):
+    """One row per source, newest wins: the question is "what is the current result
+    for this file", not "what have I ever made from it"."""
+    db, conn = stab_db
+    src = tmp_path / "shaky.mp4"
+    first = tmp_path / "shaky_stabilized.mp4"
+    second = tmp_path / "shaky_stabilized_2.mp4"
+    for f in (src, first, second):
+        f.write_bytes(b"x")
+    db.record_stabilized(conn, str(src), str(first))
+    db.record_stabilized(conn, str(src), str(second))
+    assert db.stabilized_output(conn, str(src)) == os.path.abspath(str(second))
+    db.forget_stabilized(conn, str(src))
+    assert db.stabilized_output(conn, str(src)) is None
+
+
+# ── the end-of-run log line (docs/known-defects.md D3) ──────────────────────
+
+
+class _CaptureLog:
+    """Minimal stand-in for video_stabilize.Logger."""
+
+    def __init__(self):
+        self.lines = []
+
+    def tee(self, msg=""):
+        self.lines.append(msg)
+
+    def close(self):
+        pass
+
+
+def test_the_log_records_how_the_run_ended(monkeypatch):
+    """Nothing else in _report_completion writes to the log, so without this line a
+    run that finished and a run that died mid-loop leave IDENTICAL log files. That
+    ambiguity is what made a stuck run undiagnosable (D3): the line's presence is
+    the evidence that the loop completed."""
+    monkeypatch.setattr(vs, "send_notification", lambda *a, **k: None)
+    monkeypatch.setattr(vs, "_gui_event", lambda *a, **k: None)
+    log = _CaptureLog()
+    summary = {"tool": "stabilize", "queued": 3, "processed": 2, "failed": 1,
+               "skipped": 4, "stopped_by_user": False, "elapsed_seconds": 90,
+               "results": [], "failures": []}
+    vs._report_completion(summary, 2, 1, "", log)
+    ended = [l for l in log.lines if "Run ended:" in l]
+    assert len(ended) == 1
+    assert "2 stabilised" in ended[0]
+    assert "1 failed" in ended[0]
+    assert "4 already done" in ended[0]
+
+
+def test_the_end_of_run_line_says_when_the_user_stopped_it(monkeypatch):
+    """A stopped run is not a failed one, and the log is what is read afterwards."""
+    monkeypatch.setattr(vs, "send_notification", lambda *a, **k: None)
+    monkeypatch.setattr(vs, "_gui_event", lambda *a, **k: None)
+    log = _CaptureLog()
+    summary = {"tool": "stabilize", "queued": 5, "processed": 1, "failed": 0,
+               "stopped_by_user": True, "elapsed_seconds": 12,
+               "results": [], "failures": []}
+    vs._report_completion(summary, 1, 0, "", log)
+    ended = [l for l in log.lines if "Run ended:" in l][0]
+    assert "stopped by user" in ended
+
+
+def test_the_end_of_run_line_is_written_before_the_notification(monkeypatch):
+    """Order is the whole point: a notification backend that blocks must not be able
+    to swallow the evidence that the run reached the end."""
+    order = []
+    monkeypatch.setattr(vs, "_gui_event", lambda *a, **k: order.append("gui"))
+    monkeypatch.setattr(vs, "send_notification",
+                        lambda *a, **k: order.append("notify"))
+    log = _CaptureLog()
+    log.tee = lambda msg="": order.append("log") or log.lines.append(msg)
+    summary = {"tool": "stabilize", "queued": 1, "processed": 0, "failed": 1,
+               "stopped_by_user": False, "elapsed_seconds": 1,
+               "results": [], "failures": [{"source": "a.mp4", "reason": "boom"}]}
+    vs._report_completion(summary, 0, 1, "", log)
+    assert order.index("log") < order.index("notify")
+
+
+# ── a finished-but-failed run must not look like a hung one (D3) ────────────
+
+
+def _fail_one_video(tab, tmp_path):
+    """Drive the tab through the exact 2026-08-19 VM run: one video, pass 2 dies."""
+    src = tmp_path / "shaky.mp4"
+    src.write_bytes(b"x")
+    tab.add_sources([str(src)])
+    tab._set_running(True)
+    iid = list(tab._rows)[0]
+    tab._handle_event("FILE", json.dumps({"index": 1, "total": 1, "source": str(src),
+                                     "output": tab._rows[iid]["output"]}))
+    tab.progress.set(50)
+    tab._handle_event("RESULT", json.dumps({"source": str(src),
+                                       "output": tab._rows[iid]["output"],
+                                       "ok": False, "reason": "ffmpeg failed"}))
+    tab._handle_event("DONE", json.dumps({"tool": "stabilize", "queued": 1, "processed": 0,
+                                     "failed": 1, "stopped_by_user": False,
+                                     "elapsed_seconds": 1}))
+    tab.on_exit(1)
+    return iid
+
+
+def test_a_failed_video_can_be_started_again(tab, tmp_path):
+    """The failure is nearly always environmental (an encoder the machine cannot run,
+    a locked file). With Failed excluded from Start there was no way to retry it, and
+    both buttons ended up greyed out, which reads as a hung app."""
+    _fail_one_video(tab, tmp_path)
+    assert str(tab.start_btn.cget("state")) == "normal"
+
+
+def test_retrying_clears_last_runs_verdict_from_the_row(tab, tmp_path, monkeypatch):
+    """A row waiting its turn must not still say "Failed"."""
+    iid = _fail_one_video(tab, tmp_path)
+    assert tab._rows[iid]["status"] == "Failed"
+    monkeypatch.setattr(tab, "launch", lambda *a, **k: None)
+    tab._start()
+    assert tab._rows[iid]["status"] == "Queued"
+    assert tab.tree.set(iid, "status") == "Queued"
+
+
+def test_the_progress_bar_does_not_outlive_a_failed_run(tab, tmp_path):
+    """It sat at 50% (one of two passes) after the run had ended. A bar frozen
+    mid-way is the most direct way an app can claim to still be working."""
+    _fail_one_video(tab, tmp_path)
+    assert not tab.progress.winfo_ismapped()

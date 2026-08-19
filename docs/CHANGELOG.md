@@ -23,15 +23,32 @@ Releases page.
 ## 0.6.0
 
 ### Steady up shaky old footage
-A new **Video Stabilization** tab, next to Conciliation. Point it at one shaky video, say
-where to save the result, press Start. It never touches your original: the steadied
+A new **Video Stabilization** tab, next to Conciliation. Point it at a folder of shaky
+videos, press **Scan folder**, then Start. It never touches your originals: each steadied
 version is written as a new file.
 
-It takes **one video at a time**, not a folder, because steadying works by watching the
+Each video is steadied **whole**, one after another, because steadying works by watching the
 camera move across the *whole* clip and then smoothing that path: chopped into pieces, every
 join would jolt. It runs in two passes for that reason (the first watches, the second
 writes), and together they take a little under the length of the video itself. There is no
 GPU involved and nothing is rented.
+
+**You can stop and come back.** Videos that already have a result are listed as
+*Stabilised* and skipped, so scanning the same folder again simply picks up where you left
+off, however long later, and however the run ended. If you stop mid-run, the video it was
+working on goes back to *Queued* and the rest are untouched. One video that cannot be read
+does not cost you the rest of the batch: it is marked *Failed*, with the reason on the
+right-click menu, and the run carries on.
+
+**Watch the before and after, with sound.** Double-click any finished video and the
+original and the steadied copy play side by side. That is the view that answers "is it
+actually steadier", because steadiness is something you can only see in motion: a frozen
+pair mostly shows you that the frame has moved. The still before/after wipe is on the
+right-click menu too, and it is the one for a close look at the *edges*, where the frame
+is filled in from nearby moments.
+
+You can also send a video straight over from the **Video Upscaler**: right-click it in the
+list there and choose *Stabilize…*.
 
 **It keeps your whole picture.** Steadying normally works by zooming in far enough that the
 wobbling edges never show, which quietly throws away the outer part of every frame: measured
@@ -51,13 +68,16 @@ otherwise the measuring pass is reading two different instants woven into one fr
 **Stabilise first, then upscale**, if you want both: that way the Video Upscaler's
 resolution target applies to the finished framing.
 
-The **"Save result as" box follows the video you pick**, so choosing a second clip does
-not leave the first one's name behind (which would have had the app offering to replace
-a result you had just made). If you point it at a folder of your own, that folder is
-kept and only the name changes. **Settings → Default folders** has a pair for it too: a
-starting folder for the Browse dialog, and a folder to collect results in (leave it
-empty to save each result next to the video it came from). That whole section is now
-listed in the same order as the tabs.
+Each result is named after the video it came from, and **never over an existing file** —
+if you deliberately steady the same video again (right-click → *Stabilise again*), you get
+a second file, so the first one is still there to compare against. Two videos with the
+same name in different folders get two results, not one.
+
+**Where results go** is up to you: leave "Save results to" empty and each one is written
+next to its own video, or give it a folder and they all collect there. A separate folder
+is the tidier choice, because it keeps results out of the list the next time you scan.
+Both fields have a **Save as Default** button, and **Settings → Default folders** has the
+same pair. That whole section is now listed in the same order as the tabs.
 
 One thing worth knowing: the app now downloads a **newer ffmpeg** than before. Every ffmpeg
 in the 8.1 series has a bug in its stabilisation filter that makes it produce a slightly

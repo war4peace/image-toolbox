@@ -73,19 +73,31 @@ $TORCH_INDEX    = "https://download.pytorch.org/whl/cu128"
 # produced 12 identical ones. Move back to a release branch once one ships that
 # contains 316531e61cf (8.2 or a backported 8.1.3).
 #
-# Unlike the old "latest"-tag URL (rebuilt in place, so unpinnable), this is BtbN's
-# IMMUTABLE dated autobuild release, so it is hash-pinned like the libVLC download.
-# The zip CONTAINER differs between the dated and rolling copies of the same build
+# Unlike the old "latest"-tag URL (rebuilt in place, so unpinnable), a dated autobuild
+# release is immutable, so it is hash-pinned like the libVLC download. The zip
+# CONTAINER differs between the dated and rolling copies of the same build
 # (recompression) while the extracted binaries are byte-identical - so the hash below
 # belongs to this exact URL, and bumping the pin means recomputing it.
-$FFMPEG_LABEL    = "master N-125856-g2ae2413488 win64-gpl"
-$FFMPEG_BUILD_ID = "N-125856-g2ae2413488"
-$FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-30-13-32/ffmpeg-N-125856-g2ae2413488-win64-gpl.zip"
-$FFMPEG_SHA256   = "a75242e13048a3be44eaad9daf145f7b86de7c595d1cd43e28e76cd45efacb9a"
+#
+# PIN A MONTH-END BUILD, i.e. one dated the last day of a month. Immutable is not the
+# same as permanent, and the first pin here got that wrong: BtbN keeps only about the
+# last FOURTEEN daily autobuilds and then, from older months, only the month-end one
+# (verified 2026-08-19: dailies back to 2026-08-05, then 2026-07-31, 2026-06-30,
+# 2026-05-31 ... 2024-09-30). The original pin was dated 2026-07-30, ONE DAY before
+# the snapshot that is kept, so it 404'd about two weeks after it was written and
+# every install since then silently took the gyan.dev fallback below - a
+# release-branch build, on which the Stabilization tab then refuses to run. The
+# month-end builds have survived two years, which is a real pin.
+$FFMPEG_LABEL    = "master N-125875-g5d4d3bdc61 win64-gpl"
+$FFMPEG_BUILD_ID = "N-125875-g5d4d3bdc61"
+$FFMPEG_BTBN_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-N-125875-g5d4d3bdc61-win64-gpl.zip"
+$FFMPEG_SHA256   = "68a5e966533002785c3e4b9a98327e21d5277802668bf889d94086cb6426cbb4"
 # Fallback only (github.com unreachable), verified against its .sha256 sidecar. This
-# is a RELEASE-branch build, so it is very likely one of the vidstab-broken 8.1.x
-# ones: it keeps the Video Upscaler working, and video_stabilize.py's own health
-# check is what stops the Stabilization tab from running on it.
+# is a RELEASE-branch build, so it MAY be one of the vidstab-broken 8.1.x ones - it
+# keeps the Video Upscaler working either way, and video_stabilize.py's own health
+# check is what decides whether the Stabilization tab may run on it. Which is the
+# point of a behavioural check rather than a version table: measured 2026-08-19, the
+# build this URL serves had moved on to 9.0.1, and the health check passed it.
 $FFMPEG_GYAN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 # libVLC for in-app video playback with audio (docs/video-upscaler.md 16.2): the

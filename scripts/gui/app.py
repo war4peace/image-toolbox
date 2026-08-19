@@ -615,6 +615,27 @@ class App(tk.Tk):
         if fn is not None:
             fn()
 
+    def active_tool_tab(self):
+        """The tool tab with a run in progress, or None. The one place that answers
+        "is anything running" - exclusivity locks the tabs from it, and so does any
+        feature that HANDS WORK to another tab (#23 item 1), which must not target a
+        tab exclusivity has made unreachable."""
+        tool_tabs = (self.upscale_tab, self.tag_tab, self.conciliate_tab,
+                     self.video_tab, self.stabilize_tab)
+        return next((t for t in tool_tabs if getattr(t, "running", False)), None)
+
+    def send_to_stabilize(self, paths):
+        """Hand SOURCE videos to the Video Stabilization tab and go there (#23 item
+        1). Refuses while any run is active, because exclusivity has already greyed
+        every other tab out: the hand-off would land on a tab the user cannot reach,
+        and queueing the intent for later is a promise the app would have to keep
+        across a Stop it does not control."""
+        if self.active_tool_tab() is not None:
+            messagebox.showinfo(APP_TITLE, "Finish the run in progress first, then "
+                                           "send the video over.")
+            return False
+        return bool(self.stabilize_tab.add_sources(list(paths), select_tab=True))
+
     def refresh_tab_exclusivity(self):
         """Exclusivity: while ANY tool run is active, disable every OTHER notebook tab so a
         second run can't be started. Two concurrent runs would fight over the local GPU and
@@ -623,9 +644,7 @@ class App(tk.Tk):
         Stop button remain in reach; Settings/RunPod are locked too, since a mid-run config
         change is unsafe. Called from every tool's run start/stop transition, where `.running`
         is already accurate. Supersedes the older per-pair locks (which stay as a subset)."""
-        tool_tabs = (self.upscale_tab, self.tag_tab, self.conciliate_tab, self.video_tab,
-                     self.stabilize_tab)
-        active = next((t for t in tool_tabs if getattr(t, "running", False)), None)
+        active = self.active_tool_tab()
         for tab_id in self.nb.tabs():
             widget = self.nb.nametowidget(tab_id)
             keep = active is None or widget is active

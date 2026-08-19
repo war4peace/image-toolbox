@@ -16,6 +16,9 @@ two pairs of cache tables plus the content-hash lineage:
     conc_runs     / conc_actions    – conciliation undo journal (#18): what a Run
                                       archived/deleted and moved in, written
                                       before each file operation (conciliate.py)
+    stab_pairs                      – source→stabilised links (#23 item 5), in
+                                      their OWN table precisely so conciliation
+                                      can never act on them (video_stabilize.py)
 
 The lineage table is the relationship that lets conciliation re-match a source
 photo to its processed counterpart by content even after the user moves or
@@ -111,6 +114,37 @@ CREATE TABLE IF NOT EXISTS lineage (
 CREATE INDEX IF NOT EXISTS idx_lineage_src      ON lineage(src_hash);
 CREATE INDEX IF NOT EXISTS idx_lineage_upscaled ON lineage(upscaled_hash);
 CREATE INDEX IF NOT EXISTS idx_lineage_tagged   ON lineage(tagged_hash);
+
+-- Video Stabilization pairs (#23 item 5). A source video and the steadied copy
+-- made from it, so the pair can still be COMPARED (and reported as "already
+-- stabilised") long after the run that produced it - the same gap #22 closed for
+-- images.
+--
+-- IT IS A SEPARATE TABLE, AND THAT IS THE WHOLE POINT. The obvious home is
+-- `lineage`, and putting it there would be a data-loss bug: lineage is not a
+-- provenance log, it is what Conciliation MATCHES ON, and video conciliation is
+-- lineage-ONLY (#5 deliberately gave it no name fallback). A stabilised output
+-- recorded as its source's lineage child would make Conciliation offer to archive
+-- or DELETE the original and move the stabilised copy into its place - across a
+-- whole collection, and for a transformation that is opt-in per video precisely
+-- because it discards picture silently and permanently. A discriminator column
+-- would work only for as long as every future query remembers to check it; a
+-- table conciliation does not read cannot be forgotten.
+--
+-- Keyed by the source PATH, not by content hash: nothing here needs to survive a
+-- move (it answers "is there a result for this file, here, now"), and hashing a
+-- multi-GB video to answer that would cost more than the question is worth. A
+-- moved pair simply reverts to the name rule, which is the retroactive fallback
+-- anyway.
+CREATE TABLE IF NOT EXISTS stab_pairs (
+    source_path TEXT PRIMARY KEY,   -- normcase'd absolute path of the source
+    output_path TEXT NOT NULL,      -- absolute path of the steadied copy
+    smoothing   INTEGER,            -- the settings it was made with, for the log
+    optzoom     INTEGER,
+    frames      INTEGER,
+    created_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stab_pairs_out ON stab_pairs(output_path);
 
 -- Memoised file content hashes, shared by every tool. Keyed by absolute path
 -- and validated by (mtime, size) so an unchanged file is hashed only once.
@@ -1359,6 +1393,56 @@ def lineage_final_hash(conn, src_hash):
 def lineage_has_rows(conn):
     """True if any lineage has been recorded (lets callers skip hashing work)."""
     return conn.execute("SELECT 1 FROM lineage LIMIT 1").fetchone() is not None
+
+
+# ─────────────────────────────────────────────
+#  VIDEO STABILIZATION PAIRS  (#23 item 5)
+# ─────────────────────────────────────────────
+#
+# Deliberately NOT part of `lineage`, and not reachable from any conciliation
+# query - see the stab_pairs table comment for why that is a safety property
+# rather than a filing preference.
+
+@_locked
+def record_stabilized(conn, source_path, output_path, smoothing=None,
+                      optzoom=None, frames=None):
+    """Record that `output_path` is the steadied copy of `source_path`. One row per
+    source, newest wins: re-stabilising a video with different settings replaces the
+    pair, because the question this answers is "what is the current result for this
+    file", not "what have I ever made from it"."""
+    now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn.execute(
+        "INSERT INTO stab_pairs (source_path, output_path, smoothing, optzoom, "
+        "frames, created_at) VALUES (?,?,?,?,?,?) "
+        "ON CONFLICT(source_path) DO UPDATE SET output_path=excluded.output_path, "
+        "smoothing=excluded.smoothing, optzoom=excluded.optzoom, "
+        "frames=excluded.frames, created_at=excluded.created_at",
+        (_norm(source_path), os.path.abspath(output_path),
+         smoothing, optzoom, frames, now))
+    conn.commit()
+
+
+@_locked
+def stabilized_output(conn, source_path):
+    """The recorded steadied copy of `source_path`, or None. Returns the path only
+    if the file is STILL THERE: a recorded pair whose output the user has since
+    deleted must read as "not stabilised", or the tab would offer to compare a file
+    that is gone and the folder scan would skip work that needs doing."""
+    row = conn.execute(
+        "SELECT output_path FROM stab_pairs WHERE source_path = ?",
+        (_norm(source_path),)).fetchone()
+    if row is None:
+        return None
+    out = row["output_path"]
+    return out if out and os.path.isfile(out) else None
+
+
+@_locked
+def forget_stabilized(conn, source_path):
+    """Drop a recorded pair (the user chose to stabilise this source again)."""
+    conn.execute("DELETE FROM stab_pairs WHERE source_path = ?",
+                 (_norm(source_path),))
+    conn.commit()
 
 
 # ─────────────────────────────────────────────

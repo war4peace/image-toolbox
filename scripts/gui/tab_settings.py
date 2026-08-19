@@ -176,11 +176,13 @@ class SettingsTab(ttk.Frame):
         # The two Stabilization rows mean something slightly different from the rest,
         # because that tab takes ONE FILE rather than a folder, so they carry their own
         # hint instead of the generic one.
-        stab_src_tip = ("Where the Video Stabilization tab's Browse dialog starts "
-                        "looking for footage. It picks one video at a time, so this is "
-                        "a starting folder, not a batch to process.")
-        stab_out_tip = ("Where a steadied video is saved. Leave this empty to save each "
-                        "result next to the video it came from.")
+        stab_src_tip = ("The folder of footage the Video Stabilization tab starts "
+                        "with. Pressing Scan folder there lists every video under it, "
+                        "including subfolders.")
+        stab_out_tip = ("Where steadied videos are saved. Leave this empty to save "
+                        "each result next to the video it came from - but a separate "
+                        "folder is tidier, because it keeps results out of the list "
+                        "the next time that folder is scanned.")
         for r, (text, var, own_tip) in enumerate((
                 ("Batch Upscaler Photo folder:",       self.default_src_var,   None),
                 ("Batch Upscaler Output folder:",      self.default_out_var,   None),

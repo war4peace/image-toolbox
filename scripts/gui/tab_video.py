@@ -1838,6 +1838,15 @@ class VideoTab(MqttTaskState, ttk.Frame):
         m.add_command(label="Extract segment…",
                       command=lambda: self._open_segment_picker(row),
                       state="normal" if can_extract else "disabled")
+        # Hand-off to Video Stabilization (#23 item 1). Offered on the SOURCE row
+        # only, never on an upscaled output: #20's documented ordering is stabilise
+        # BEFORE upscaling, so the crop happens at source resolution and the box-fit
+        # target still fills the finished framing. Reversing it looks fine until
+        # someone compares framing. Disabled during a run, because exclusivity has
+        # greyed the target tab out (see App.send_to_stabilize).
+        m.add_command(label="Stabilize…",
+                      command=lambda: self.app.send_to_stabilize([row["abs"]]),
+                      state="disabled" if self.app.active_tool_tab() else "normal")
         m.add_separator()
         m.add_command(label="Open source video", command=lambda: self._open_path(row["abs"]))
         m.add_command(label="Open source folder",

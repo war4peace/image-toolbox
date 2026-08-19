@@ -6,19 +6,20 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-Every open milestone is now medium or larger: workflow around a shipped foundation (#23 the
-Video Stabilization tab), one measurement-gated processing capability (#21 denoising), a
-Video Upscaler feature (#12 mixed local+remote queue) and a remote-side one blocked on funds
-rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new
-process model, networking, or packaging (HTTP interface #3, Unraid #4). The **shipped**
-milestones are kept below as a numbering legend, after the open work.
+One open milestone is small (#24, enriching what a bug report auto-fills). The rest are
+medium or larger: one measurement-gated processing capability
+(#21 denoising, deferred behind RunPod API work and gated on a measurement that has not been
+run), a Video Upscaler feature (#12 mixed local+remote queue) and a remote-side
+one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones
+each introduce a new process model, networking, or packaging (HTTP interface #3, Unraid #4).
+The **shipped** milestones are kept below as a numbering legend, after the open work.
 
 ---
 
 ## Contents
 
-- [23. Video Stabilization tab improvements](#23-video-stabilization-tab-improvements-medium)
-- [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement)
+- [24. Make a bug report actionable without asking](#24-make-a-bug-report-actionable-without-asking-small-medium)
+- [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [15. Second remote GPU provider (packet.ai)](#15-second-remote-gpu-provider-packetai-medium)
 - [3. HTTP interface](#3-http-interface-hard-low-priority)
@@ -29,143 +30,226 @@ milestones are kept below as a numbering legend, after the open work.
 
 ---
 
-## 23. Video Stabilization tab improvements: Medium
+## 24. Make a bug report actionable without asking: Small-Medium
 
-#20 shipped the **foundation**: correct two-pass `vidstab`, a coverage-preserving default,
-and a health gate that refuses a build whose filter corrupts its own output. What it does
-not have is the workflow around it. It takes one file, chosen by hand, and hands back one
-file with no way to see what changed. These six improvements make it usable on a
-collection rather than on a clip.
+Enrich what `gui.common._issue_url` auto-fills, so a terse report still carries enough to
+diagnose. There is already an in-app **Report an issue** path that opens a pre-filled GitHub
+new-issue page: it fills the app version, the OS, the Python version, the GPU **name**, and a
+"please attach" line pointing at the newest crash log.
 
-| # | Improvement | Size |
+**The trigger.** A real report, in full: title "not working", body "the output folders seem
+empty", plus the auto-filled `GPU: NVIDIA GeForce RTX 2060`. Nothing there is enough to
+answer it, yet **the app knew the answer at the time and threw it away**: an empty output
+folder is almost always a completed run that skipped everything as already near the target, or
+a tree that has been conciliated (both correct behaviour), and the run summary said so. The
+user is not going to write that down. The app can.
+
+The premise: **a user who writes two words is the normal case, not a failure of the user.**
+The lever is the automated half, and everything below already exists somewhere in the process.
+
+### What to add, in order of what it would have settled
+
+| # | Field | Settles |
 |---|---|---|
-| 1 | Send a video to this tab from the Video Upscaler (right-click -> *Stabilize…*) | Small |
-| 2 | Folder loader: pick a folder, list every video under it | Medium |
-| 3 | Queue: select several from that list and run them as a batch | Medium |
-| 4 | Comparison window (original vs stabilised, side by side) | Small-Medium |
-| 5 | Lineage recording for stabilised videos | Small, **but see the trap** |
-| 6 | "Save as Default" buttons on the folder fields | Trivial |
+| 1 | **The last run's summary per tool**: which tool, when, and its counts (processed / skipped / failed / duration), from the same dict already published to MQTT as `last_run` | "The output folder is empty" in one line, without a round trip. The single highest-value item here |
+| 2 | **VRAM total, not just the GPU name** (`sample_gpu` already returns it, and a card name does not imply its memory: the RTX 2060 shipped in 6 GB and 12 GB) | Whether the card is under the 8 GB minimum, i.e. `known-defects.md` D4 |
+| 3 | **Install mode** (Local / Remote / Both, from `install_mode.txt`) | Which half of the app is even in play. A Remote-only install has no local GPU stack at all |
+| 4 | **The relevant settings for the tool that was last used**: Resolution Target, skip-cutoff, model, "Run on" mode | The most common "not working" is a correct run the settings explain |
+| 5 | **The ffmpeg build stamp** (`ffmpeg/build.txt`) and whether `.venv` looks healthy | D1 and the vidstab pin, both of which are invisible from the outside and both of which we have now hit |
+| 6 | **The tail of the newest run log, inline** rather than "please attach" | Users do not attach files. Bounded, see the cap below |
 
-### 1. Hand-off from the Video Upscaler
+### Constraints that shape it
 
-Mechanically tiny (`stabilize_tab.src_var.set(path)` then select the tab; the output field
-derives itself since 0.6.0). Two constraints decide whether it is *correct*:
+- **The URL cap is the real limit.** A pre-filled new-issue URL must stay under ~8 KB
+  (`_MAX_ISSUE_URL = 7800` already encodes this for benchmark contributions). So the body gets
+  a **budget**, filled in the order above, and the log tail is what shrinks. The benchmark path
+  already has the escape hatch to copy: over the cap, fall back to pointing at a file the app
+  wrote to disk.
+- **A "Copy diagnostics" button is the other half**, and probably the better one: it writes
+  the full block to the clipboard with no cap at all, and it is also what a user can paste into
+  a forum, a chat, or an email that never becomes a GitHub issue.
+- **Nothing may be sent anywhere.** This is a pre-filled browser form the user reads and can
+  edit before submitting, which is the whole reason it is safe to put more in it. That
+  property must not be traded away for convenience.
+- **Paths carry the user's name and their folder structure.** Include what is needed
+  (`ffmpeg/build.txt`'s contents, yes; the full path of every photo folder, no), and never any
+  value from `config.local.json` (`config_store.SECRET_FIELDS` is the list: API key, MQTT
+  password, notification tokens and webhook URLs, where a webhook id IS the credential).
+  Redaction has to be a rule about what is collected, not a filter applied afterwards.
+- **Where the last-run summaries come from is a design choice**, not obvious. They are
+  currently published and forgotten. Persisting a small ring of them (a few rows keyed by tool)
+  is one option; scraping the newest per-tool log file is another and stores nothing new.
 
-- **Offer the SOURCE video, never an upscaled output.** #20's documented ordering is
-  stabilise **before** upscaling, so the crop happens at source resolution and the
-  box-fit target still fills the finished framing. A *Stabilize…* entry on an output row
-  silently inverts that, and the result looks fine until someone compares framing.
-- **Disabled during a run.** Run exclusivity greys every other tab while any tool runs
-  (`refresh_tab_exclusivity`), so a hand-off mid-run would target a tab the user cannot
-  reach. Disable the entry rather than queueing the intent.
+### The human half, and the trap in it
 
-### 2 + 3. Folder loader and queue
-
-**This does not reverse #20's "not a batch tool" decision, and the distinction matters.**
-That decision is about the ALGORITHM being whole-file: `vidstab` measures camera motion
-across the entire clip, so smoothing it per segment jolts at every boundary. A queue of N
-**independent whole-file jobs** preserves that exactly. Nobody should later "simplify" the
-queue into segmenting a single video.
-
-What actually has to change:
-
-- **The per-file "Save result as" field does not survive a queue.** A batch needs an output
-  **folder** plus the existing `<stem>_stabilized.mp4` rule. `stabilize_output` (the
-  Settings default added in 0.6.0) is its natural home.
-- **The walk needs `DerivedPruner` (#16), and that is NOT sufficient on its own.** Pruning
-  skips the app's own output *directories*, but a stabilised file defaults to sitting
-  **beside its source** as `<stem>_stabilized.mp4`, which is not a derived directory. So a
-  second scan of the same folder re-offers every result as fresh input. The list must
-  additionally recognise an already-stabilised file (by suffix, or better by "an output
-  for this source already exists", the way the upscaler reports "already upscaled"). This
-  is the strongest argument for making `stabilize_output` the recommended batch setup.
-- **Resume becomes worth having, where #20 deliberately has none.** One file finishes in
-  well under its own duration, so Stop discards. A queue of fifty does not, so the queue
-  needs file-level resume (which FILE, never which pass: a pass is not resumable, and pass
-  1's `.trf` is a temp).
-- **Progress gains a file index.** `PROG` is currently whole-job frames for one file; a
-  queue needs the Video Upscaler's `[i/N]` shape alongside it.
-- **Persistence**: either a `stabilize_*` table or a reuse of the `video_*` queue shape.
-  Reusing it is tempting and probably wrong, since those rows carry target/engine/GPU
-  columns that mean nothing here.
-
-### 4. Comparison window
-
-**This is the easiest pair the comparison code has ever been handed.** At the shipped
-defaults (`optzoom=0`, `crop=keep`, and `bwdif=mode=0` which preserves frame count) the
-output has the **same dimensions and the same frame count** as the source, so the two are
-1:1 and timestamp-aligned, with none of the geometry mismatch the upscaler's windows exist
-to handle. `VideoPlaybackWindow` (side by side, real time, with audio) should carry it.
-
-**On whether a frame comparison is useful: yes, but for a different question, and it must
-not be the default view.** Steadiness is a temporal artifact, so only motion answers "is it
-steadier" - a paused pair mostly shows that the frame has *moved*, which reads as a
-difference rather than as an improvement. What a frozen pair *does* answer is what
-`crop=keep` did at the **edges**: the border pixels filled in from previous frames, which
-is the documented cost of choosing coverage over steadiness and the one thing a user might
-genuinely want to inspect closely. That makes the still wipe worth keeping as the secondary
-view, where the **lens (#14) is the useful part** for peering at a border. So: playback
-first, frame wipe available, not the other way round.
-
-### 5. Lineage recording
-
-**The trap, and it is a data-loss one.** `db.lineage` is not a provenance log, it is what
-**Conciliation matches on** - and video conciliation is **lineage-ONLY** (#5 deliberately
-gave it no name fallback). So recording a stabilised output as its source's lineage child
-makes Conciliation offer to **archive or delete the original** and move the stabilised copy
-into its place.
-
-That collides head-on with #20's decision 2: stabilisation is opt-in per video precisely
-because *"its failure mode is silent and permanent"* and *"shakiness is not a defect the way
-interlacing is"*. Replacing originals with stabilised copies across a collection is that
-failure mode at scale, and unlike an upscale it is not even arguably a strict improvement.
-
-So this splits into two decisions that must not be taken as one:
-
-- **(a) Record provenance so the pair can be found later.** Clearly useful, and it is what
-  makes item 4 work outside the session that produced the file - the same gap #22 closed
-  for images.
-- **(b) Whether Conciliation may ACT on it.** Default **no**. Either give the lineage row a
-  kind/discriminator that conciliation ignores, or keep stabilisation out of the lineage
-  table entirely and pair by name. Whichever, decide it explicitly and test it, because the
-  failure is a destructive tool quietly gaining a new class of target.
-
-### 6. "Save as Default" buttons
-
-Trivial, and the only reason it is listed: every other tool tab has them, so their absence
-here reads as an oversight. `set_default_folder` + `app.sync_settings_defaults()`, writing
-the `stabilize_source` / `stabilize_output` keys that already exist in Settings. Note the
-source button saves the file's **folder**, since the field itself holds one file.
-
-### Sequencing within the milestone
-
-**6 -> 1 -> 4 -> 2+3 -> 5.** Item 6 is minutes. Item 1 is small and immediately useful.
-Item 4 makes the tool judgeable at all, which is what tells you whether the defaults are
-right on real footage (#20 was validated on synthetic clips only). Items 2+3 are the bulk
-and want item 4 already there, because a batch you cannot review is a batch you cannot
-trust. Item 5 is last, not because it is hard, but because its Conciliation interaction
-deserves a deliberate decision rather than a convenient one.
-
-**Risks:** low for 1/4/6, medium for 2+3 (a scan that re-offers its own outputs is the
-likely bug, and a queue makes it repeat at scale), and **the only real risk is item 5**,
-where getting it wrong points the app's one destructive tool at files it was never meant
-to replace.
+A GitHub **issue template** would improve the other side, and the repo has none today
+(`.github/` holds only workflows). The trap: GitHub's structured **issue forms** (YAML) and a
+`?body=` pre-filled URL do not compose the way you would expect, and the app's whole
+auto-filled body depends on `?body=`. Check how a form's fields are pre-filled by query
+parameter before committing to one, or the enrichment above quietly stops arriving the day a
+template lands.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
-## 21. Denoising before upscaling: Medium (gated on a measurement)
+## 21. Denoising before upscaling: Medium (gated on a measurement, deferred)
 
 Optionally denoise a source before it reaches the model, as a **checkbox** in the Batch
 Upscaler (images) and the Video Upscaler (videos).
 
+> **Deferred, 2026-08-19.** RunPod API changes take priority: they affect a shipped,
+> money-spending feature, while this one is still unproven. Deferred, not dropped, and
+> nothing here expires.
+>
 > **Do not build this before the A/B harness reports.** Unlike everything else on this list,
 > the *value* here is unknown rather than the cost. SeedVR2 is already a restoration model
 > trained on degraded inputs, so denoising first may add nothing, or may remove detail the
-> model would have used as evidence. See `docs/manual-todos.md` item 1 (untracked). If the
-> answer is "no visible benefit", this milestone moves to `dropped-ideas.md` and nothing is
-> built.
+> model would have used as evidence. If the answer is "no visible benefit", this milestone
+> moves to `dropped-ideas.md` and nothing is built. **That is a successful outcome, not a
+> wasted afternoon.**
+>
+> The harness is written out in full below, in this tracked file, so the procedure survives
+> whatever happens to the untracked scratch notes it used to live in.
+
+### The measurement that gates this: the A/B harness
+
+Nothing here can be done from code. It is downloading sample files, producing comparison
+sets, and looking at results. It needs no development time and does **not** have to wait for
+the work this milestone is deferred behind.
+
+**What does not exist yet is the third leg.** Originals and their upscaled results already
+exist; **denoised-then-upscaled** does not, because the denoise stage is not built. The
+script below writes the denoised copies as ordinary files, so the shipped Batch Upscaler can
+be pointed at them with no code change at all.
+
+#### Read this first: the seed confound
+
+`upscale_engine.upscale()` draws a **fresh random seed for every image**
+(`self.args.seed = random.randint(0, 2**31 - 1)`), and there is no setting to pin it. Two
+upscales of the same file therefore differ from each other. Consequences:
+
+- **Do not reuse upscaled files from an earlier run** as the "original" leg. They carry a
+  different seed lottery than the denoised leg, and the comparison would measure seed
+  variation as much as denoising. Re-upscale the originals in the same session, same
+  Resolution Target, same model.
+- **Judge across the whole set, not per image.** With 20 images a systematic effect separates
+  from per-image seed noise; with 3 it does not. If mild denoising helps, it should help on
+  *most* of the set, not spectacularly on one.
+- Video does not have this problem: the Video Upscaler uses one fixed seed per source video.
+
+#### Step 1: build the test set
+
+About **20 images** in one folder, chosen deliberately across the three degradation types,
+because they are unrelated problems and will not have one answer:
+
+| Pick roughly | Type | What it looks like |
+|---|---|---|
+| 7 | **Sensor noise** | old digicam or high-ISO shots: random speckle, worst in shadows and flat sky |
+| 7 | **JPEG artifacts** | heavily compressed or resaved files: blocking in gradients, ringing around edges |
+| 6 | **Scan defects** | scanned prints: dust, scratches, paper grain |
+
+The third group is the **control**. No denoiser touches dust and scratches, so if those come
+out looking identical across all three legs, the test is working. If they come out
+*different*, something else changed and the run is suspect.
+
+Keep the originals outside any folder the app scans, so nothing is picked up by accident.
+
+#### Step 2: produce the denoised copies
+
+Run with the app's venv: `\.venv\Scripts\python.exe make_denoised.py <originals folder>`.
+It writes sibling folders `<src>_denoised-mild` and `<src>_denoised-strong` and never
+modifies the sources.
+
+```python
+"""Denoised copies of a folder of images at two strengths, for the #21 A/B harness."""
+import os, sys, time
+import cv2
+import numpy as np
+from PIL import Image, ImageOps
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+# (label, h_luma, h_colour) for cv2.fastNlMeansDenoisingColored.
+# MILD is what a shipped feature would plausibly default to: enough to lift speckle, not
+# enough to erase fine texture. STRONG exists to show the failure mode, so the amount of
+# detail at stake is visible if the default were ever set too high.
+STRENGTHS = [("mild", 3, 3), ("strong", 10, 10)]
+
+def main(src_root):
+    src_root = os.path.abspath(src_root)
+    files = [f for f in sorted(os.listdir(src_root))
+             if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
+    if not files:
+        print(f"No images found in {src_root}")
+        return
+    print(f"{len(files)} image(s) in {src_root}\n")
+    for label, h, hc in STRENGTHS:
+        out_root = f"{src_root}_denoised-{label}"
+        os.makedirs(out_root, exist_ok=True)
+        t0 = time.time()
+        for i, name in enumerate(files, 1):
+            src = os.path.join(src_root, name)
+            # Match the upscaler's own loader (EXIF orientation applied, RGB) so the only
+            # difference between the legs is the denoising itself.
+            with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im).convert("RGB")
+                arr = np.asarray(im)
+            den = cv2.fastNlMeansDenoisingColored(arr, None, h, hc, 7, 21)
+            dst = os.path.join(out_root, os.path.splitext(name)[0] + ".jpg")
+            Image.fromarray(den).save(dst, "jpeg", quality=98, subsampling=0)
+            print(f"  [{label}] {i}/{len(files)}  {name}")
+        print(f"  -> {out_root}   ({time.time() - t0:.1f}s)\n")
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else ".")
+```
+
+**One caveat to carry into the judging:** the script writes JPEGs, so the denoised leg takes
+one extra encode the original leg does not. At q=98 with no chroma subsampling that is far
+below what denoising changes, but it is not *nothing*, and the real implementation would keep
+the image in memory and never write it (decision 2, the #19 prepare pipeline). If a
+difference looks marginal, this is one reason to distrust it.
+
+#### Step 3: upscale all three folders
+
+Three Batch Upscaler runs, **in the same session with identical settings** (same Resolution
+Target, same SeedVR2 model, same skip-cutoff, auto-straighten in the same state): the
+originals, the mild copies, the strong copies.
+
+#### Step 4: judge, and write it down
+
+Open each pair in the app's own comparison window, so the images are seen the way a user sees
+them. Four questions:
+
+- **Does the denoised leg lose fine texture** the original leg kept (fabric, hair, foliage,
+  skin)? That is the cost.
+- **Does the original leg show invented texture** where there was only noise? Flat sky, walls,
+  shadow. That is what denoising is supposed to prevent, and the reason for decision 1.
+- **Is strong distinguishable from mild?** If not, the effect is small and the feature is
+  probably not worth building.
+- **Do the scanned prints look the same across all three?** If not, the test is broken.
+
+The deliverable is a CSV in the style of `docs/tag-rename-benchmarks.csv`, e.g.
+`docs/denoise-benchmarks.csv`:
+`file, degradation_type, best_leg(original|mild|strong), texture_lost(0-3),
+invented_noise_texture(0-3), notes`.
+
+That file decides this milestone either way, and if the answer is "no", it is also what stops
+the idea coming back in six months.
+
+#### The video half
+
+Same shape, cheaper to judge because the video seed is fixed per source. Two or three
+genuinely noisy old clips, one mild `hqdn3d` copy of each:
+
+```
+ffmpeg -i "in.avi" -vf "hqdn3d=2:1.5:3:2.25" -c:v hevc_nvenc -preset p5 -rc vbr -cq 16 -pix_fmt p010le -c:a copy "in_denoised.mkv"
+```
+
+Then run the Video Upscaler on the originals and on the denoised copies, same target and
+engine, and compare in the playback window. Do the post-upscale temporal experiment described
+at the end of this milestone in the same sitting: it uses the same clips.
 
 ### Settled decisions (conditional on the measurement)
 
@@ -376,34 +460,42 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18 and #22 are complete** (remote
-  upscaling + funds-floor; RunPod video; video conciliation; self-healing remote runs; local
-  video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples;
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #22 and #23 are complete**
+  (remote upscaling + funds-floor; RunPod video; video conciliation; self-healing remote runs;
+  local video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard samples;
   Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
-  already-upscaled images), so the remaining sequencing is only among the open milestones below.
-- **Open milestones: #23, #21, #12, #15, #3, #4.**
+  already-upscaled images; the Video Stabilization workflow), so the remaining sequencing is
+  only among the open milestones below.
+- **Open milestones: #24, #21, #12, #15, #3, #4.**
+- **#24 (richer bug reports) is independent of everything else and is the cheapest
+  item on this list.** It touches one function (`gui.common._issue_url`) plus wherever the
+  last-run summaries end up coming from, and it pays off on the NEXT bad report rather
+  than at some later milestone. It is also the only entry here whose value grows with the
+  number of users, so it is worth doing before a release rather than after one.
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
   lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,
   `orientation.analyse_image`). Denoise slots in as a stage on that array, before the temp.
   The rule that matters is already enforced there and must not be relaxed: **no JPEG temp**,
   because it would spend a generation of quality before SeedVR2 sees a pixel.
-- **#21 (denoise) is gated on the A/B harness and may never be built at all.** It is the only
-  open milestone whose *value* is unknown rather than its cost. Do not start it before the
+- **#21 (denoise) is gated on the A/B harness and may never be built at all**, and is
+  **deferred** behind the RunPod API work either way (2026-08-19). It is the only open
+  milestone whose *value* is unknown rather than its cost. Do not start it before the
   measurement; a "no visible benefit" result moves it to `dropped-ideas.md`, which is a
-  successful outcome.
+  successful outcome. The harness itself needs no development time and does not need to wait
+  for the RunPod work: it is an afternoon at the keyboard, and running it early is what keeps
+  the deferral from turning into a re-litigation later.
 - **#20 (Video Stabilization) shipped in 0.6.0** and cost one thing nobody predicted: it
   forced the app-wide **ffmpeg pin off the 8.1 release branch onto master**, because every
   8.1.x corrupts memory in `vidstabtransform`. Anything else built on a less-travelled ffmpeg
   filter should assume the same risk and measure the filter's *determinism* early, not just
   whether it runs.
-- **#23 (Video Stabilization improvements) has no blockers and no measurement gate**, which
-  makes it the most startable open milestone. It is workflow around a shipped foundation
-  rather than new processing, and it splits cleanly: three of its six items are small and
-  independent. Only item 5 (lineage) needs a decision before code, because `db.lineage` is
-  what Conciliation matches on, so recording a stabilised output there points the app's one
-  destructive tool at a new class of file.
+- **#23 (Video Stabilization workflow) shipped in 0.6.0** and settled the one question it
+  had been holding open: a stabilised output is **not** recorded as lineage, so Conciliation
+  can never act on it. That precedent generalises - **a new pairing is not automatically a
+  lineage row**, and any future "record what came from what" should ask whether the app's
+  one destructive tool should be allowed to see it before choosing where it lives.
 - **#12 (mixed local+remote queue)** is a medium, self-contained Video Upscaler feature that
   builds on the shipped `(engine, gpu)` grouping; #3 and #4 are lower priority and larger,
   each introducing a new process model, networking, or packaging. With Home Assistant already
@@ -440,8 +532,8 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20 and #22**
-are done and live. **This section is a pointer list, not a record.** Each entry says what the
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22 and
+#23** are done and live. **This section is a pointer list, not a record.** Each entry says what the
 number meant and where the design of record actually lives; nothing is described in full
 here. The numbers survive because code and other docs cite the roadmap by them (`remote
 #1`, `Video Upscaler #2`, `local #7`), so deleting the entries outright would strand those
@@ -527,6 +619,19 @@ kept in two places drifts, and the stale copy is the one that gets read.
   pairs an output tree back to its originals long after the run ended, by inverting the
   upscaler's own mirror. See `CLAUDE.md` (Browse upscaled) and
   `tests/test_browse_upscaled.py`.
+- **#23: Video Stabilization tab improvements.** Shipped 0.6.0, all six items. The workflow
+  around #20's foundation: a folder loader and a queue of whole-file jobs, a hand-off from
+  the Video Upscaler's scan list, playback-first comparison, "Save as Default" on both
+  folder fields, and a pair record. Two decisions are worth knowing before touching it.
+  **The queue does not reverse #20's "not a batch tool" finding** - that finding is about
+  the ALGORITHM being whole-file, and N independent whole-file jobs preserve it exactly, so
+  nobody should later "simplify" the queue into segmenting one video. And the pair record
+  **is deliberately not a lineage row**: `db.lineage` is what Conciliation matches on, and
+  video conciliation is lineage-only, so a row there would make the app's one destructive
+  tool offer to replace originals with stabilised copies. It lives in `db.stab_pairs`,
+  which no conciliation query reads. The item-5 sub-decision that was left open ("may
+  Conciliation ACT on it") was answered **no**, explicitly and with a test. See `CLAUDE.md`
+  (Video Stabilization) and `tests/test_video_stabilize.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

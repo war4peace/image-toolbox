@@ -165,7 +165,7 @@ The rest are per tool:
 | Tag & Rename | `rotated`, `skipped`, `stop_reason` |
 | Conciliation | `done`, `conflicts`, `errors`, `removed_dirs`, `stopped_by_user` |
 | Video Upscaler | `total`, `files`, `stop_reason`, `stopped_by_user`, `cost`, `source` |
-| Video Stabilization | `source`, `output`, `frames`, `smoothing`, `optzoom`, `crop`, `deinterlaced`, `size_bytes`, `stopped_by_user`, `stop_reason` |
+| Video Stabilization | `queued`, `skipped`, `results`, `failures`, `stopped_by_user`, `stop_reason`, plus (single-video runs only) `source`, `output`, `frames`, `smoothing`, `optzoom`, `crop`, `deinterlaced`, `size_bytes` |
 
 Notes worth knowing before writing a template:
 
@@ -182,6 +182,12 @@ Notes worth knowing before writing a template:
   detail list into a count: that list belongs in the notification body, not in a retained
   MQTT payload. A billed pod's per-file costs are summed into `cost` (null on a local run,
   which bills nothing, rather than a misleading `0.00`).
+- **Video Stabilization counts VIDEOS, not frames.** #20 took one file and published its
+  frame count under the shared `processed` key; #23's queue made that ambiguous, so
+  `processed`/`failed` are now videos, like every other tool's items, and the frame count
+  stays available as `frames` on a single-video run. A single-video run still carries all
+  of #20's per-file keys, so an existing template keeps working - the queue's counts are
+  layered over them, never the other way round.
 - **Exactly one `DONE` per video run.** It is emitted from a single seam,
   `batch_video_upscale._run_finished`, which also sends the completion notification. The
   grouped multi-pod (18) and Auto-resume (#6) paths already suppressed their per-pass

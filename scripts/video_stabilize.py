@@ -41,6 +41,22 @@ The shape, and why:
     happens at source resolution and the box-fit target still fills the frame),
     and the user's own sequencing preserves it.
 
+  * A QUEUE OF WHOLE FILES (#23 items 2+3), which does NOT reverse the "not a
+    batch tool" decision above - that decision is about the ALGORITHM being
+    whole-file, and N independent whole-file jobs preserve it exactly. Nobody
+    should later "simplify" the queue into segmenting one video. The preflight
+    (capability + health) runs ONCE for the whole queue; a file that fails is
+    logged and the queue continues, because one unreadable video in fifty must
+    not cost the other forty-nine.
+
+  * RESUME IS "THE OUTPUT ALREADY EXISTS", not a database. #20 has no resume by
+    design (one file finishes in well under its own duration, so Stop discards
+    the .part). A queue of fifty needs file-level resume, and the cheapest
+    correct form of it is the one the Batch Upscaler already uses: re-scan, and
+    skip what is already there. It needs no schema, it is retroactive, and it
+    works on a tree produced by another install. `db.stab_pairs` records the pair
+    on top of that for the COMPARISON (#23 item 5), never as the resume state.
+
 THE HEALTH CHECK is not optional (see `vidstab_health`). Every ffmpeg 8.1.x
 release CORRUPTS MEMORY in vidstabtransform: libvidstab's vsTransformPrepare()
 keeps a stale shallow copy of the source frame when it alternates between its
@@ -58,8 +74,11 @@ sound before it will process a real video.
 Usage:
     python video_stabilize.py <input> <output> [--smoothing N] [--shakiness N]
                               [--accuracy N] [--optzoom 0|1] [--crop keep|black]
+    python video_stabilize.py <folder> --outdir <dir> [--no-recursive] [--redo]
+    python video_stabilize.py --queue <jobs.json>        (the GUI's path)
 
-GUI control lines (stdin):  q   (stop; the partial output is discarded)
+GUI control lines (stdin):  q   (stop; the partial output is discarded, and any
+                                 files not yet started stay unprocessed)
 """
 
 import os
@@ -120,6 +139,22 @@ DEFAULT_CROP      = "keep"
 
 CROP_MODES = ("keep", "black")
 
+# The suffix every result carries. It is load-bearing rather than cosmetic: an
+# output defaults to sitting BESIDE its source, which is not a derived directory,
+# so DerivedPruner (#16) cannot keep a second scan of the same folder from
+# re-offering every result as fresh input. The suffix is what does (see
+# is_stabilized_name), and it is the reason the batch setup RECOMMENDS a separate
+# output folder rather than relying on the name alone.
+STAB_SUFFIX = "_stabilized"
+STAB_EXT    = ".mp4"
+
+# Containers the folder walk offers. Mirrors batch_video_upscale.VIDEO_EXTS,
+# defined locally for the same reason conciliate.py does: importing that module
+# would drag the whole Video Upscaler orchestrator (and its torch-adjacent
+# imports) into a torch-free ffmpeg tool.
+VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg",
+              ".flv", ".webm", ".3gp", ".ts", ".mts", ".m2ts", ".vob"}
+
 # The health check's sample. Long enough that vidstabtransform alternates its
 # in-place and separate-buffer paths (which is what detonates the 8.1 bug) and short
 # enough to cost about a second. Validated against a known-broken n8.1.2 and the
@@ -137,17 +172,21 @@ class StabilizeError(RuntimeError):
 # ─────────────────────────────────────────────
 
 class Logger:
-    """Writes to both the terminal and logs/stab_<hash of source path>.log."""
+    """Writes to both the terminal and logs/stab_<hash of the run's key>.log.
 
-    def __init__(self, source):
-        digest  = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+    The key is the source path for a single file and the common root for a queue,
+    so re-running the same thing appends to the same log (a stabilise is judged by
+    comparing settings across attempts) instead of scattering one file per run."""
+
+    def __init__(self, key, header=None):
+        digest  = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
         log_dir = os.path.join(APP_ROOT, "logs")
         os.makedirs(log_dir, exist_ok=True)
         self.path = os.path.join(log_dir, f"stab_{digest}.log")
         self._fh  = open(self.path, "a", encoding="utf-8", buffering=1)
         ts = datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
         self._fh.write(f"\n{'=' * 64}\nStabilization session: {ts}\n"
-                       f"Source: {source}\n{'=' * 64}\n")
+                       f"{header or f'Source: {key}'}\n{'=' * 64}\n")
 
     def _ts(self):
         return datetime.datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
@@ -180,13 +219,20 @@ def send_notification(title, description, color, fields=None):
                          username="Stabilize Bot")
 
 
-def completion_notice(ok, stopped, reason=""):
+def completion_notice(ok, stopped, reason="", failed=0):
     """(title, color) for the end-of-run notification. Pure, so it is unit-tested.
-    Colours are notifications.COLOR_* constants."""
+    Colours are notifications.COLOR_* constants.
+
+    A queue (#23) adds one state #20 could not have: some videos done, some not.
+    That is ORANGE rather than RED - the run delivered, and calling it "Failed"
+    would send the user hunting for a disaster that is one unreadable file."""
     if stopped:
         return "Video Stabilization -- Stopped by User", notifications.COLOR_YELLOW
     if not ok:
         return "Video Stabilization -- Failed", notifications.COLOR_RED
+    if failed:
+        return ("Video Stabilization -- Finished with errors",
+                notifications.COLOR_ORANGE)
     return "Video Stabilization -- Finished", notifications.COLOR_GREEN
 
 
@@ -285,20 +331,99 @@ def parse_progress_frame(text):
         return None
 
 
-def suggest_output_path(src, suffix="_stabilized", ext=".mp4"):
-    """Default output beside the source: `<stem>_stabilized.mp4`. Never returns the
-    source path itself, and never an existing file - a stabilise that silently ate
-    its own input, or someone else's output, is not recoverable."""
+def canonical_output_path(src, folder=None, suffix=STAB_SUFFIX, ext=STAB_EXT):
+    """`<stem>_stabilized.mp4`, in `folder` (default: beside the source), with NO
+    uniquifying suffix. This is the name a result is looked for under, so it must be
+    derivable from the source alone - that is what makes "already stabilised"
+    answerable without a database, on a tree produced by another install."""
     src = os.path.abspath(src)
-    folder = os.path.dirname(src)
+    folder = os.path.abspath(folder) if folder else os.path.dirname(src)
     stem = os.path.splitext(os.path.basename(src))[0]
-    candidate = os.path.join(folder, f"{stem}{suffix}{ext}")
+    return os.path.join(folder, f"{stem}{suffix}{ext}")
+
+
+def suggest_output_path(src, suffix=STAB_SUFFIX, ext=STAB_EXT, folder=None,
+                        taken=None):
+    """A free output path for `src`: the canonical name, or `_2`, `_3` … until one is
+    free. Never returns the source path itself, and never a file that already exists
+    - a stabilise that silently ate its own input, or someone else's output, is not
+    recoverable.
+
+    `taken` is a set of normcase'd paths already CLAIMED by other jobs in the same
+    queue. Existence on disk is not enough there: two sources with the same stem in
+    different folders both want one name in a shared output folder, and neither of
+    their outputs exists yet when the queue is planned, so without this the second
+    would overwrite the first at the moment it finished."""
+    src = os.path.abspath(src)
+    claimed = taken if taken is not None else set()
+    candidate = canonical_output_path(src, folder, suffix, ext)
     n = 2
     while (os.path.exists(candidate)
+           or os.path.normcase(candidate) in claimed
            or os.path.normcase(candidate) == os.path.normcase(src)):
-        candidate = os.path.join(folder, f"{stem}{suffix}_{n}{ext}")
+        base = canonical_output_path(src, folder, suffix, ext)
+        stem, e = os.path.splitext(base)
+        candidate = f"{stem}_{n}{e}"
         n += 1
     return candidate
+
+
+def is_stabilized_name(path):
+    """Does this filename look like one of OUR results? Used to keep a folder scan
+    from offering its own previous outputs back as fresh input - which the derived-
+    directory rule (#16) cannot catch, because the default output sits beside the
+    source rather than in a folder of ours.
+
+    Matches the plain suffix and the uniquified `_stabilized_2` form."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.lower().endswith(STAB_SUFFIX):
+        return True
+    head, _, tail = stem.rpartition("_")
+    return bool(tail.isdigit() and head.lower().endswith(STAB_SUFFIX))
+
+
+def iter_videos(root, recursive=True, cfg=None):
+    """Every video under `root`, sorted, skipping the app's own derived directories
+    (#16) and our own previous results. Returns (paths, pruner) so the caller can
+    print the one-line prune summary the other walkers print."""
+    pruner = runner_common.DerivedPruner(cfg)
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        pruner.prune(dirnames)
+        if not recursive:
+            dirnames[:] = []
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+                continue
+            if is_stabilized_name(name):
+                continue
+            found.append(os.path.join(dirpath, name))
+    found.sort(key=lambda p: p.lower())
+    return found, pruner
+
+
+def plan_jobs(sources, outdir=None, redo=False):
+    """Turn a list of source videos into (jobs, skipped).
+
+    `jobs` are {"source", "output"} dicts with collision-free outputs; `skipped` are
+    {"source", "output"} for sources whose canonical result is ALREADY THERE. That
+    split is the whole resume story: re-running a folder does the files that are
+    missing a result and reports the rest, exactly as the Batch Upscaler reports
+    "already upscaled".
+
+    `redo=True` stabilises them anyway, into `_2`, `_3` … - never over the previous
+    result, since the user may still be judging it."""
+    jobs, skipped, taken = [], [], set()
+    for src in sources:
+        src = os.path.abspath(src)
+        canonical = canonical_output_path(src, outdir)
+        if os.path.exists(canonical) and not redo:
+            skipped.append({"source": src, "output": canonical})
+            continue
+        out = suggest_output_path(src, folder=outdir, taken=taken)
+        taken.add(os.path.normcase(out))
+        jobs.append({"source": src, "output": out})
+    return jobs, skipped
 
 
 # ─────────────────────────────────────────────
@@ -509,19 +634,16 @@ def run_pass(args, cwd, total_frames, on_progress=None, stall_timeout=None):
 #  The stabilisation
 # ─────────────────────────────────────────────
 
-def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
-              shakiness=DEFAULT_SHAKINESS, accuracy=DEFAULT_ACCURACY,
-              optzoom=DEFAULT_OPTZOOM, crop=DEFAULT_CROP, skip_health=False):
-    """Stabilise `src` into `dest`. Returns a summary dict. Raises StabilizeError on a
-    refusal or an ffmpeg failure, KeyboardInterrupt when the user stopped it."""
-    ffmpeg, _ffprobe = vp.find_ffmpeg()
-    src = os.path.abspath(src)
-    dest = os.path.abspath(dest)
-    if os.path.normcase(src) == os.path.normcase(dest):
-        raise StabilizeError("The output file must be different from the source.")
-    if not os.path.isfile(src):
-        raise StabilizeError(f"Source video not found: {src}")
+def preflight(log, skip_health=False):
+    """Prove this ffmpeg can stabilise correctly, ONCE per run. Raises StabilizeError
+    with a user-facing explanation if it cannot.
 
+    Hoisted out of `stabilize` for the queue (#23 item 3): the health check costs
+    about half a second, which is nothing for one video and fifty times nothing for
+    fifty. It is also the right shape for a refusal - a broken build is a property of
+    the RUN, so it must stop the whole queue before any file is touched, not fail
+    each of fifty files in turn with the same paragraph."""
+    ffmpeg, _ffprobe = vp.find_ffmpeg()
     version = ffmpeg_version_line(ffmpeg)
     log.tee(f"  ffmpeg: {version}")
     if not vidstab_available(ffmpeg):
@@ -537,6 +659,30 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
         log.tee(f"  Filter health: {detail}")
         if not ok:
             raise StabilizeError(BROKEN_VIDSTAB_HELP + f"\n\n({version})")
+    return ffmpeg
+
+
+def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
+              shakiness=DEFAULT_SHAKINESS, accuracy=DEFAULT_ACCURACY,
+              optzoom=DEFAULT_OPTZOOM, crop=DEFAULT_CROP, skip_health=False,
+              ffmpeg=None, progress=None):
+    """Stabilise `src` into `dest`. Returns a summary dict. Raises StabilizeError on a
+    refusal or an ffmpeg failure, KeyboardInterrupt when the user stopped it.
+
+    `ffmpeg` skips the preflight (the caller already ran it, see `preflight`);
+    `progress` is the queue-wide QueueProgress that turns this file's frame counts
+    into a bar for the whole run."""
+    src = os.path.abspath(src)
+    dest = os.path.abspath(dest)
+    if os.path.normcase(src) == os.path.normcase(dest):
+        raise StabilizeError("The output file must be different from the source.")
+    if not os.path.isfile(src):
+        raise StabilizeError(f"Source video not found: {src}")
+
+    if ffmpeg is None:
+        ffmpeg = preflight(log, skip_health)
+    if progress is None:
+        progress = QueueProgress()
 
     info = vp.probe(src)
     total = info.nb_frames or 0
@@ -554,6 +700,7 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
 
     work = tempfile.mkdtemp(prefix="imgtbx_stab_")
     started = time.time()
+    progress.begin_file(total)
     tmp_dest = dest + ".part" + (os.path.splitext(dest)[1] or ".mp4")
     try:
         # ── Pass 1: measure ────────────────────────────────────────────────
@@ -564,12 +711,13 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
         log.log_only(f"    -vf {vf1}")
         counted = run_pass(
             detect_command(ffmpeg, src, vf1), work, total,
-            on_progress=lambda f, t: _report(1, f, t, started),
+            on_progress=lambda f, _t: progress.report(1, f),
             stall_timeout=vp._ENCODE_STALL_S)
         # Pass 1 has now counted the frames exactly; the header count that seeded the
         # first bar can be an estimate, so pass 2 gets the measured number.
         if counted > 0:
             total = counted
+            progress.correct_file(counted)
         trf = os.path.join(work, TRF_NAME)
         if not os.path.exists(trf) or os.path.getsize(trf) == 0:
             raise StabilizeError("Pass 1 produced no motion data; nothing was written.")
@@ -593,7 +741,7 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
             transform_command(ffmpeg, src, tmp_dest, vf2, codec, enc_args,
                               pix_fmt, audio_args),
             work, total,
-            on_progress=lambda f, t: _report(2, f, t, started),
+            on_progress=lambda f, _t: progress.report(2, f),
             stall_timeout=vp._ENCODE_STALL_S)
 
         # Write to a `.part` sibling and rename on success, so a killed or failed pass 2
@@ -616,6 +764,8 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
                 log.tee(f"  ! Duration drift: source {info.duration:.3f}s vs "
                         f"output {out_info.duration:.3f}s")
         log.tee(f"  Done in {fmt_duration(elapsed)} -> {dest}")
+        progress.end_file()
+        record_pair(src, dest, smoothing, optzoom, total, log)
         return {"tool": "stabilize", "source": src, "output": dest,
                 "processed": total, "failed": 0, "frames": total,
                 "elapsed_seconds": round(elapsed, 1),
@@ -632,30 +782,221 @@ def stabilize(src, dest, log, smoothing=DEFAULT_SMOOTHING,
         shutil.rmtree(work, ignore_errors=True)
 
 
-_last_report = [0.0]
+class QueueProgress:
+    """One progress bar and one ETA for the WHOLE run, however many files it holds.
+
+    Everything is counted in PASS-FRAMES: one frame of one pass. A file of N frames
+    contributes 2N, because both passes read every frame. Two consequences, both
+    deliberate:
+
+      * Progress is reported in WHOLE-JOB units, not per-pass ones. Two passes of
+        comparable length, so pass 1 fills the first half of a file's share and
+        pass 2 the second. A per-pass bar would reach 100% halfway through and then
+        start again, which is worse than no bar. Pass 2 is the slower of the two
+        (measured 2.4x realtime against 3.8x), so the estimate runs a little
+        optimistic during pass 1 and corrects itself as pass 2 gets going.
+
+      * A QUEUE gets a real bar rather than a file counter, because the budget is
+        known up front: `main` probes every source before starting (which is also
+        where an unreadable file is caught, before any GPU-free hour is spent on
+        the rest). The doc asked for a `[i/N]` file index alongside the bar; that
+        rides on the FILE event instead, so the bar can stay proportional - fifty
+        files of wildly different lengths make `[i/N]` a poor progress signal.
+
+    A header frame count can be an estimate, so `correct_file` folds pass 1's exact
+    count back into the queue budget when it differs.
+    """
+
+    def __init__(self, total_frames=0):
+        self.budget   = max(0, int(total_frames)) * 2   # pass-frames for the queue
+        self.done     = 0                               # completed by FINISHED files
+        self.cur_pass_frames = 0                        # this file's 2N
+        self.started  = time.time()
+        self._last    = 0.0
+
+    # ── queue bookkeeping ────────────────────────────────────────────────────
+
+    def begin_file(self, frames):
+        self.cur_pass_frames = max(0, int(frames)) * 2
+        if not self.budget:
+            # No up-front probe (a single headless file): the budget IS this file.
+            self.budget = self.cur_pass_frames
+
+    def correct_file(self, counted):
+        """Pass 1 measured the frames exactly; shift the queue budget by the delta."""
+        exact = max(0, int(counted)) * 2
+        self.budget = max(0, self.budget - self.cur_pass_frames + exact)
+        self.cur_pass_frames = exact
+
+    def end_file(self):
+        self.done += self.cur_pass_frames
+        self.cur_pass_frames = 0
+
+    # ── reporting ────────────────────────────────────────────────────────────
+
+    def report(self, which, frame, force=False):
+        """Emit PROG + ETA for the whole run. Throttled: ffmpeg emits a -progress
+        block per frame, and forwarding thousands of marker lines would flood the
+        GUI's pipe."""
+        now = time.time()
+        if not force and now - self._last < 0.25:
+            return
+        self._last = now
+        if self.budget <= 0:
+            return
+        in_file = int(frame) + (self.cur_pass_frames // 2 if which == 2 else 0)
+        done = min(self.done + max(0, in_file), self.budget)
+        _gui_event("PROG", f"{done}|{self.budget}")
+        elapsed = now - self.started
+        _gui_event("ETA", f"{elapsed:.1f}|{done}|{done}|{self.budget}")
 
 
-def _report(which, frame, total, started):
-    """Progress + ETA for one pass. Throttled: ffmpeg emits a -progress block per
-    frame, and forwarding thousands of marker lines would flood the GUI's pipe.
+# ─────────────────────────────────────────────
+#  The pair record  (#23 item 5)
+# ─────────────────────────────────────────────
+#
+# WHAT THIS IS NOT: a lineage row. `db.lineage` is what Conciliation matches on,
+# and video conciliation is lineage-ONLY (#5 deliberately gave it no name
+# fallback), so recording a stabilised output there would make the app's one
+# destructive tool offer to archive or DELETE the original and move the stabilised
+# copy into its place. That is #20's own stated failure mode ("silent and
+# permanent") applied to a whole collection, for a transformation that is opt-in
+# per video precisely because it is not arguably an improvement the way an upscale
+# is. So the pair goes in its own table (db.stab_pairs) that no conciliation query
+# reads - see the schema comment there for why a discriminator column was refused.
 
-    Both events are reported in WHOLE-JOB units (frames across both passes), not
-    per-pass ones: two passes of comparable length, so pass 1 fills the first half
-    and pass 2 the second. A per-pass ETA would count down to zero twice, and a bar
-    that reaches 100% halfway through is worse than no bar. Pass 2 is the slower of
-    the two (measured 2.4x realtime against 3.8x), so the estimate runs a little
-    optimistic during pass 1 and corrects itself as pass 2 gets going."""
-    now = time.time()
-    if now - _last_report[0] < 0.25 and frame != total:
-        return
-    _last_report[0] = now
-    if not total or total <= 0:
-        return
-    whole = total * 2
-    done = min(frame + (total if which == 2 else 0), whole)
-    _gui_event("PROG", f"{done}|{whole}")
-    elapsed = now - started
-    _gui_event("ETA", f"{elapsed:.1f}|{done}|{done}|{whole}")
+def record_pair(src, dest, smoothing, optzoom, frames, log=None):
+    """Remember source -> result so the pair can still be compared in a later
+    session. Fail-safe and entirely optional: a run that cannot reach the cache is a
+    successful run with one convenience missing, never a failed one."""
+    try:
+        import db
+        db.record_stabilized(db.get_conn(), src, dest, smoothing=smoothing,
+                             optzoom=optzoom, frames=frames)
+    except Exception as exc:                         # noqa: BLE001
+        if log:
+            log.log_only(f"    (pair not recorded: {exc})")
+
+
+# ─────────────────────────────────────────────
+#  The queue  (#23 items 2+3)
+# ─────────────────────────────────────────────
+
+def probe_queue(jobs, log):
+    """Measure the whole queue before starting it, returning (total_frames, bad).
+
+    Two things this buys, and both are why it is worth an ffprobe per file up front:
+    the run gets ONE proportional progress bar instead of a file counter (see
+    QueueProgress), and an unreadable file is reported NOW rather than after the
+    forty-nine good ones have been processed around it. A file whose header carries
+    no frame count is not "bad" - it simply contributes an estimate from its
+    duration, and pass 1 corrects the budget when it gets there."""
+    total, bad = 0, []
+    for job in jobs:
+        try:
+            info = vp.probe(job["source"])
+        except Exception as exc:                     # noqa: BLE001
+            bad.append((job, f"{type(exc).__name__}: {exc}"))
+            continue
+        frames = info.nb_frames or 0
+        if not frames and info.duration and info.fps:
+            frames = int(float(info.duration) * float(info.fps))
+        job["frames"] = frames
+        total += frames
+    if bad:
+        for job, why in bad:
+            log.tee(f"  ! Cannot read {os.path.basename(job['source'])}: {why}")
+    return total, bad
+
+
+def run_queue(jobs, log, opts, ffmpeg):
+    """Stabilise every job in order. Returns a summary dict.
+
+    A single file's failure does NOT end the queue: it is logged, reported as a
+    RESULT, and the next file starts. A user Stop does, and so does a refusal
+    (which `preflight` has already ruled out before this is called). Files never
+    started stay untouched, and the next run picks them up because their result is
+    missing - which is the whole of the resume story (see the module docstring)."""
+    total_frames, bad = probe_queue(jobs, log)
+    unreadable = {id(j) for j, _why in bad}
+    runnable = [j for j in jobs if id(j) not in unreadable]
+    progress = QueueProgress(total_frames)
+    results, failures = [], []
+    stopped = False
+
+    for job, why in bad:
+        failures.append({"source": job["source"], "reason": why})
+        _gui_event("RESULT", json.dumps({"source": job["source"], "ok": False,
+                                         "reason": why}))
+
+    n = len(runnable)
+    for i, job in enumerate(runnable, 1):
+        src, dest = job["source"], job["output"]
+        _gui_event("FILE", json.dumps({"index": i, "total": n, "source": src,
+                                       "output": dest,
+                                       "name": os.path.basename(src)}))
+        prefix = f"[{i}/{n}] " if n > 1 else ""
+        log.tee(f"{prefix}{src}")
+        log.tee(f"  Output:  {dest}")
+        try:
+            res = stabilize(src, dest, log,
+                            smoothing=opts["smoothing"], shakiness=opts["shakiness"],
+                            accuracy=opts["accuracy"], optzoom=opts["optzoom"],
+                            crop=opts["crop"], ffmpeg=ffmpeg, progress=progress)
+        except KeyboardInterrupt:
+            stopped = True
+            log.tee("  Stopped by user - nothing was written for this video.")
+            break
+        except Exception as exc:                     # noqa: BLE001
+            # A StabilizeError already carries a user-facing sentence; anything else
+            # is a bug or an environment failure and gets its type named.
+            why = str(exc) if isinstance(exc, StabilizeError) \
+                else f"{type(exc).__name__}: {exc}"
+            log.tee(f"  Failed: {why.splitlines()[0]}")
+            failures.append({"source": src, "reason": why})
+            _gui_event("RESULT", json.dumps({"source": src, "output": dest,
+                                             "ok": False,
+                                             "reason": why.splitlines()[0]}))
+            # The budget still has to move on, or the bar would stall at whatever
+            # fraction the failed file reached and every later ETA would be wrong.
+            progress.end_file()
+            continue
+        results.append(res)
+        _gui_event("RESULT", json.dumps({"source": src, "output": dest, "ok": True,
+                                         "frames": res.get("frames", 0),
+                                         "size_bytes": res.get("size_bytes", 0)}))
+
+    elapsed = time.time() - progress.started
+    # A single-video run keeps every per-file key #20 published (source, output,
+    # frames, smoothing, optzoom, crop, deinterlaced, size_bytes), so an existing
+    # Home Assistant template still reads it. The QUEUE's counts are layered ON TOP,
+    # deliberately: the shared `processed` key means "items finished", and a video's
+    # own summary counts FRAMES under that name - merged the other way round, a
+    # 50-frame clip reported "50 processed" for one video.
+    summary = dict(results[0]) if (len(results) == 1 and len(jobs) == 1) else {}
+    summary.update({"tool": "stabilize", "queued": len(jobs),
+                    "processed": len(results), "failed": len(failures),
+                    "stopped_by_user": stopped,
+                    "results": results, "failures": failures,
+                    "elapsed_seconds": round(elapsed, 1)})
+    return summary
+
+
+def load_queue_file(path):
+    """Read the GUI's queue: a JSON list of {"source", "output"} objects (or an
+    object with a "jobs" key). The GUI hands the queue over in a FILE rather than on
+    the command line because a folder of a few hundred videos would blow past
+    Windows' command-line length limit, and because the GUI is the authority on each
+    output name (it has shown them to the user in the list already)."""
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    out = []
+    for j in jobs:
+        src = os.path.abspath(j["source"])
+        dest = j.get("output") or suggest_output_path(src)
+        out.append({"source": src, "output": os.path.abspath(dest)})
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -664,10 +1005,22 @@ def _report(which, frame, total, started):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Stabilise one shaky video into a new file (future-features #20).")
-    p.add_argument("source", help="the video to stabilise (never modified)")
+        description="Stabilise shaky video into new files (future-features #20/#23).")
+    p.add_argument("source", nargs="?", default=None,
+                   help="the video to stabilise, or a FOLDER of videos "
+                        "(never modified)")
     p.add_argument("output", nargs="?", default=None,
                    help="output file (default: <stem>_stabilized.mp4 beside the source)")
+    p.add_argument("--queue", default=None,
+                   help="JSON file of {source, output} jobs (the GUI's path)")
+    p.add_argument("--outdir", default=None,
+                   help="write every result into this folder instead of beside "
+                        "each source (recommended for a folder run)")
+    p.add_argument("--no-recursive", action="store_true",
+                   help="with a folder source, do not descend into subfolders")
+    p.add_argument("--redo", action="store_true",
+                   help="stabilise videos that already have a result, into a new "
+                        "file (never over the existing one)")
     p.add_argument("--smoothing", type=int, default=DEFAULT_SMOOTHING,
                    help=f"how hard to smooth the camera path (default {DEFAULT_SMOOTHING})")
     p.add_argument("--shakiness", type=int, default=DEFAULT_SHAKINESS,
@@ -699,13 +1052,27 @@ def main(argv=None):
         print(f"vidstab: {'OK' if ok else 'BROKEN'} - {detail}")
         return 0 if ok else 3
 
-    src = os.path.abspath(args.source)
-    dest = os.path.abspath(args.output) if args.output else suggest_output_path(src)
+    jobs, skipped, key, header = _jobs_from_args(args)
+    if jobs is None:                                 # nothing to do; message printed
+        return 2
 
-    log = Logger(src)
+    log = Logger(key, header)
     _gui_event("LOG", log.path)
-    log.tee(f"Stabilising: {src}")
-    log.tee(f"  Output:  {dest}")
+    log.tee(header)
+    for job in skipped:
+        log.tee(f"  Already stabilised, skipped: {os.path.basename(job['source'])} "
+                f"-> {os.path.basename(job['output'])}")
+    if skipped:
+        log.tee(f"  {len(skipped)} video(s) already have a result and were skipped "
+                f"(use --redo to stabilise them again).")
+    if not jobs:
+        _gui_event("STATUS", "Nothing to do - every video already has a result.")
+        _gui_event("DONE", json.dumps({"tool": "stabilize", "queued": 0,
+                                       "processed": 0, "failed": 0,
+                                       "skipped": len(skipped),
+                                       "elapsed_seconds": 0}))
+        log.close()
+        return 0
     log.tee(f"  Settings: smoothing={args.smoothing}, optzoom={args.optzoom}, "
             f"crop={args.crop}, shakiness={args.shakiness}, accuracy={args.accuracy}")
     if args.optzoom:
@@ -715,55 +1082,131 @@ def main(argv=None):
     if GUI_MODE:
         threading.Thread(target=_watch_stdin, daemon=True).start()
 
-    stopped = False
-    result = None
+    opts = {"smoothing": args.smoothing, "shakiness": args.shakiness,
+            "accuracy": args.accuracy, "optzoom": args.optzoom, "crop": args.crop}
+    summary = None
     error = ""
     try:
-        result = stabilize(src, dest, log,
-                           smoothing=args.smoothing, shakiness=args.shakiness,
-                           accuracy=args.accuracy, optzoom=args.optzoom,
-                           crop=args.crop, skip_health=args.skip_health)
-    except KeyboardInterrupt:
-        stopped = True
-        log.tee("  Stopped by user - nothing was written.")
-        _gui_event("STATUS", "Stopped - nothing was written.")
+        # ONE preflight for the whole run: a broken vidstab is a property of the
+        # build, so it must refuse before any file is touched rather than fail each
+        # of fifty files with the same paragraph.
+        ffmpeg = preflight(log, args.skip_health)
+        summary = run_queue(jobs, log, opts, ffmpeg)
     except StabilizeError as exc:
         error = str(exc)
         log.tee(f"  Refused: {error}")
         _gui_event("STATUS", error.splitlines()[0] if error else "Failed.")
         _gui_event("REFUSED", json.dumps({"reason": error}))
+    except KeyboardInterrupt:
+        error = "Stopped by user."
+        log.tee("  Stopped by user - nothing was written.")
+        _gui_event("STATUS", "Stopped - nothing was written.")
     except Exception as exc:                         # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         log.tee(f"  Failed: {error}")
         _gui_event("STATUS", f"Failed - {error}")
 
-    ok = result is not None
-    title, color = completion_notice(ok, stopped, error)
-    if ok:
-        _gui_event("DONE", json.dumps(result))
-        _gui_event("STATUS", f"Done - {os.path.basename(dest)}")
-        send_notification(title, f"Stabilised **{os.path.basename(src)}**", color,
-                          fields=[{"name": "Output", "value": os.path.basename(dest)},
-                                  {"name": "Frames", "value": str(result.get("frames", "?"))},
-                                  {"name": "Time",
-                                   "value": fmt_duration(result.get("elapsed_seconds", 0))}])
-    elif stopped:
-        _gui_event("DONE", json.dumps({"tool": "stabilize", "source": src,
-                                       "processed": 0, "failed": 0,
-                                       "stopped_by_user": True,
-                                       "elapsed_seconds": 0}))
-        send_notification(title, f"Stopped while stabilising "
-                                 f"**{os.path.basename(src)}**", color)
-    else:
-        _gui_event("DONE", json.dumps({"tool": "stabilize", "source": src,
-                                       "processed": 0, "failed": 1,
-                                       "stop_reason": error.splitlines()[0] if error else "",
-                                       "elapsed_seconds": 0}))
-        send_notification(title, f"Could not stabilise **{os.path.basename(src)}**",
-                          color, fields=[{"name": "Reason",
-                                          "value": (error.splitlines() or [""])[0]}])
+    if summary is None:                              # the run never started
+        summary = {"tool": "stabilize", "queued": len(jobs), "processed": 0,
+                   "failed": 0 if error.startswith("Stopped") else 1,
+                   "stopped_by_user": error.startswith("Stopped"),
+                   "stop_reason": error.splitlines()[0] if error else "",
+                   "elapsed_seconds": 0}
+    summary["skipped"] = len(skipped)
+
+    done   = summary.get("processed", 0)
+    failed = summary.get("failed", 0)
+    _report_completion(summary, done, failed, error, log)
     log.close()
-    return 0 if ok else 1
+    return 0 if done and not failed else (0 if done else 1)
+
+
+def _jobs_from_args(args):
+    """(jobs, skipped, log_key, header) from the command line, or (None, …) when
+    there is nothing to run. Three shapes reach here: the GUI's --queue file, a
+    FOLDER source, and #20's original single file + optional output."""
+    if args.queue:
+        try:
+            jobs = load_queue_file(args.queue)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"Could not read the queue file: {exc}")
+            return None, [], "", ""
+        key = jobs[0]["source"] if jobs else args.queue
+        return jobs, [], key, f"Stabilising {len(jobs)} video(s)"
+
+    if not args.source:
+        print("Nothing to stabilise: give a video, a folder, or --queue.")
+        return None, [], "", ""
+
+    src = os.path.abspath(args.source)
+    if os.path.isdir(src):
+        found, pruner = iter_videos(src, recursive=not args.no_recursive, cfg=_CFG)
+        line = pruner.summary()
+        if line:
+            print(f"  {line}")
+        jobs, skipped = plan_jobs(found, args.outdir, redo=args.redo)
+        return (jobs, skipped, src,
+                f"Stabilising {len(jobs)} video(s) under: {src}")
+
+    # Single file - #20's shape, unchanged. An explicit output wins; otherwise the
+    # canonical name in --outdir (or beside the source), uniquified rather than
+    # overwritten, because a re-run of one chosen file is a deliberate second
+    # attempt whose predecessor the user may still be judging.
+    dest = (os.path.abspath(args.output) if args.output
+            else suggest_output_path(src, folder=args.outdir))
+    return ([{"source": src, "output": dest}], [], src, f"Stabilising: {src}")
+
+
+def _report_completion(summary, done, failed, error, log):
+    """The end-of-run GUI event + notification, for one file or fifty."""
+    stopped = bool(summary.get("stopped_by_user"))
+    title, color = completion_notice(bool(done), stopped, error, failed=failed)
+    # ONE end-of-run line in the log, written before the GUI event and before any
+    # notification is attempted. Nothing else here writes to the log, so without it a
+    # run that finished and a run that died mid-loop end their log file identically -
+    # which is exactly the ambiguity that made a stuck run undiagnosable on 2026-08-19
+    # (docs/known-defects.md D3). Its PRESENCE now means the loop completed.
+    bits = [f"{done} stabilised"]
+    if failed:                       bits.append(f"{failed} failed")
+    if summary.get("skipped"):       bits.append(f"{summary['skipped']} already done")
+    log.tee(f"  Run ended: {', '.join(bits)} in "
+            f"{fmt_duration(summary.get('elapsed_seconds', 0))}"
+            + (" (stopped by user)" if stopped else ""))
+    _gui_event("DONE", json.dumps(summary))
+
+    results = summary.get("results") or []
+    one = results[0] if len(results) == 1 and summary.get("queued") == 1 else None
+    if one:
+        _gui_event("STATUS", f"Done - {os.path.basename(one['output'])}")
+        send_notification(
+            title, f"Stabilised **{os.path.basename(one['source'])}**", color,
+            fields=[{"name": "Output", "value": os.path.basename(one["output"])},
+                    {"name": "Frames", "value": str(one.get("frames", "?"))},
+                    {"name": "Time",
+                     "value": fmt_duration(one.get("elapsed_seconds", 0))}])
+        return
+
+    if not done and not failed and not stopped:
+        _gui_event("STATUS", error.splitlines()[0] if error else "Nothing was done.")
+        send_notification(title, "Could not stabilise anything.", color,
+                          fields=[{"name": "Reason",
+                                   "value": (error.splitlines() or ["unknown"])[0]}])
+        return
+
+    bits = [f"{done} stabilised"]
+    if failed:
+        bits.append(f"{failed} failed")
+    if summary.get("skipped"):
+        bits.append(f"{summary['skipped']} already done")
+    line = ", ".join(bits)
+    _gui_event("STATUS", ("Stopped - " if stopped else "Done - ") + line)
+    fields = [{"name": "Videos", "value": line},
+              {"name": "Time",
+               "value": fmt_duration(summary.get("elapsed_seconds", 0))}]
+    for f in (summary.get("failures") or [])[:5]:
+        fields.append({"name": os.path.basename(f["source"]),
+                       "value": (f["reason"].splitlines() or [""])[0][:200]})
+    send_notification(title, line, color, fields=fields)
 
 
 if __name__ == "__main__":

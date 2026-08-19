@@ -42,6 +42,10 @@ def _make(running_tab=None):
         conciliate_tab=tool["conciliate"], video_tab=tool["video"],
         stabilize_tab=tool["stabilize"],
         nb=_FakeNb(mapping))
+    # The real App resolves "is anything running" through ONE helper, which the
+    # hand-off to Video Stabilization (#23 item 1) also consults - a hand-off must
+    # not target a tab exclusivity has just made unreachable.
+    app.active_tool_tab = lambda: App.active_tool_tab(app)
     return app
 
 
@@ -76,3 +80,36 @@ def test_a_stabilization_run_disables_every_other_tab():
     assert app.nb.states["b"] == "normal"
     assert all(app.nb.states[k] == "disabled"
                for k in ("u", "t", "c", "v", "s", "r"))
+
+
+# ─────────────────────────────────────────────
+#  The hand-off obeys the same lock  (#23 item 1)
+# ─────────────────────────────────────────────
+
+
+def test_active_tool_tab_names_the_running_tab():
+    assert App.active_tool_tab(_make(running_tab=None)) is None
+    app = _make(running_tab="conciliate")
+    assert App.active_tool_tab(app) is app.conciliate_tab
+
+
+def test_a_handoff_is_refused_while_anything_is_running(monkeypatch):
+    """Exclusivity has already greyed the Stabilization tab out, so a hand-off would
+    land on a tab the user cannot reach. It must say so, not queue the intent."""
+    import gui.app as ga
+
+    said = []
+    monkeypatch.setattr(ga.messagebox, "showinfo", lambda *a, **k: said.append(a))
+    app = _make(running_tab="video")
+    app.stabilize_tab.add_sources = lambda *a, **k: 1 / 0     # must never be called
+    assert App.send_to_stabilize(app, [r"C:\clips\shaky.mp4"]) is False
+    assert said
+
+
+def test_a_handoff_reaches_the_tab_when_nothing_is_running():
+    app = _make(running_tab=None)
+    handed = []
+    app.stabilize_tab.add_sources = lambda paths, select_tab=False: (
+        handed.append((paths, select_tab)) or len(paths))
+    assert App.send_to_stabilize(app, [r"C:\clips\shaky.mp4"]) is True
+    assert handed == [([r"C:\clips\shaky.mp4"], True)]
