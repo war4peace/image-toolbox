@@ -11,8 +11,8 @@ in `CLAUDE.md` where the feature is documented.
 ## Contents
 
 - [D1: the app will not start after the system Python is uninstalled or reinstalled](#d1-the-app-will-not-start-after-the-system-python-is-uninstalled-or-reinstalled)
-- [D2: NVENC is chosen because the build lists it, not because the machine has it](#d2-nvenc-is-chosen-because-the-build-lists-it-not-because-the-machine-has-it)
 - [D4: a local GPU below the 8 GB minimum is offered with no warning](#d4-a-local-gpu-below-the-8-gb-minimum-is-offered-with-no-warning)
+- [D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it](#d2-fixed-nvenc-was-chosen-because-the-build-lists-it-not-because-the-machine-has-it)
 - [D3 (fixed): a finished-but-failed Stabilization run looked like a hung one](#d3-fixed-a-finished-but-failed-stabilization-run-looked-like-a-hung-one)
 
 ---
@@ -95,54 +95,6 @@ Nothing in `config.json`, `db\cache.db` or the logs is affected.
 
 ---
 
-## D2: NVENC is chosen because the build lists it, not because the machine has it
-
-**Found:** 2026-08-19, on a Remote-only 0.6.0 install on a VM with a virtual GPU. Video
-Stabilization pass 2 died instantly with `ffmpeg failed (exit 4294967295)` and an empty stderr
-tail. **Severity: high on any machine without an NVIDIA GPU**, which on a Remote-only install
-is the normal case rather than an edge case.
-
-### Root cause
-
-`video_pipeline.pick_encoder` decides like this:
-
-```powershell
-encoders = ffmpeg -hide_banner -encoders
-if ("hevc_nvenc" in encoders) { return "hevc_nvenc", ... }
-```
-
-`hevc_nvenc` is **compiled into every GPL ffmpeg build**, whether or not the machine has an
-NVIDIA card, so the string is always there. The function's own docstring says it picks NVENC
-"when the bundled ffmpeg exposes it **and a CUDA GPU is present**"; the second half was never
-implemented. Docstring and code have disagreed since the function was written.
-
-**Why it took until now to bite.** Every previous caller runs where a CUDA GPU is a
-precondition: the local Video Upscaler path only runs on a card, and a remote run encodes on
-the pod. **Video Stabilization is the app's first deliberately GPU-free feature**, so it is
-the first code to call `pick_encoder` on a machine with no NVIDIA hardware. The feature is
-not wrong to exist on such a machine: `vidstab` is CPU work and a Remote-only user can
-legitimately want it. Only the encoder choice is wrong.
-
-This is the same shape as D1 and as the ffmpeg pin before it: **listed is not available, and
-present is not working.** Three for three now.
-
-### Shape of the fix
-
-- **Probe, do not parse.** Attempt a one-frame encode and cache the answer for the process:
-  `ffmpeg -f lavfi -i nullsrc=s=64x64:d=1 -c:v hevc_nvenc -f null -`, non-zero exit means no
-  NVENC. Roughly 200 ms once, and it is behavioural, exactly like `vidstab_health`. Checking
-  `nvidia-smi` instead would answer a different question (a card exists) than the one that
-  matters (this ffmpeg can drive it).
-- **Fall through to `libx265`/`libx264`, which already exist** in the function. Nothing else
-  changes: `_DELIVERY_PIX_FMT` already maps libx265 to `yuv420p10le`, so a CPU fallback still
-  delivers 10-bit.
-- Fix it **in `pick_encoder`**, not in `video_stabilize.py`. Every caller benefits, and a
-  second copy of the probe would drift.
-
----
-
----
-
 ## D4: a local GPU below the 8 GB minimum is offered with no warning
 
 **Found:** 2026-08-19, while looking into a user report that turned out to say nothing about
@@ -218,6 +170,61 @@ report, without a round trip.
 ## Fixed
 
 Kept because the code comments and tests reference these ids.
+
+### D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it
+
+**Found:** 2026-08-19, on a Remote-only 0.6.0 install on a VM with a virtual GPU. Video
+Stabilization pass 2 died instantly with `ffmpeg failed (exit 4294967295)` and an empty stderr
+tail. **Severity: high on any machine without an NVIDIA GPU**, which on a Remote-only install
+is the normal case rather than an edge case.
+
+#### Root cause
+
+`video_pipeline.pick_encoder` decides like this:
+
+```powershell
+encoders = ffmpeg -hide_banner -encoders
+if ("hevc_nvenc" in encoders) { return "hevc_nvenc", ... }
+```
+
+`hevc_nvenc` is **compiled into every GPL ffmpeg build**, whether or not the machine has an
+NVIDIA card, so the string is always there. The function's own docstring says it picks NVENC
+"when the bundled ffmpeg exposes it **and a CUDA GPU is present**"; the second half was never
+implemented. Docstring and code have disagreed since the function was written.
+
+**Why it took until now to bite.** Every previous caller runs where a CUDA GPU is a
+precondition: the local Video Upscaler path only runs on a card, and a remote run encodes on
+the pod. **Video Stabilization is the app's first deliberately GPU-free feature**, so it is
+the first code to call `pick_encoder` on a machine with no NVIDIA hardware. The feature is
+not wrong to exist on such a machine: `vidstab` is CPU work and a Remote-only user can
+legitimately want it. Only the encoder choice is wrong.
+
+This is the same shape as D1 and as the ffmpeg pin before it: **listed is not available, and
+present is not working.** Three for three now.
+
+#### The fix
+
+- **Probe, do not parse.** Attempt a one-frame encode and cache the answer for the process:
+  `ffmpeg -f lavfi -i nullsrc=s=64x64:d=1 -c:v hevc_nvenc -f null -`, non-zero exit means no
+  NVENC. Roughly 200 ms once, and it is behavioural, exactly like `vidstab_health`. Checking
+  `nvidia-smi` instead would answer a different question (a card exists) than the one that
+  matters (this ffmpeg can drive it).
+- **Fall through to `libx265`/`libx264`, which already exist** in the function. Nothing else
+  changes: `_DELIVERY_PIX_FMT` already maps libx265 to `yuv420p10le`, so a CPU fallback still
+  delivers 10-bit.
+- Fix it **in `pick_encoder`**, not in `video_stabilize.py`. Every caller benefits, and a
+  second copy of the probe would drift.
+
+---
+
+**Fixed** by `video_pipeline.nvenc_usable`: a one-frame encode to a null sink, cached per
+codec per process, asked before NVENC is returned. One thing the fix had to learn the hard
+way, and it is why a behavioural probe needs its own verification: **the probe frame must be
+at least 256x256.** NVENC refuses smaller dimensions outright (`InitializeEncoder failed:
+Frame dimensions are less than the minimum supported value`), so the first attempt, at 64x64,
+reported NO NVENC on a machine with a working 3090. A probe that fails closed on good hardware
+is worse than no probe: it would have quietly moved every user to the CPU encoder. Five tests
+pin the behaviour, including the minimum frame size and the once-per-process caching.
 
 ### D3 (fixed): a finished-but-failed Stabilization run looked like a hung one
 

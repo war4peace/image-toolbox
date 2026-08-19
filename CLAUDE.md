@@ -550,7 +550,12 @@ interlacing is. An **interlaced** source is deinterlaced (`bwdif`) in BOTH passe
 because pass 1 would otherwise measure the motion of two instants woven into one
 frame. Output is a deliverable, not the split pipeline's intermediate, so it takes
 `vp.delivery_pix_fmt` (10-bit where the codec allows) rather than `pick_encoder`'s
-8-bit default; audio is carried in the same pass-2 command.
+8-bit default; audio is carried in the same pass-2 command. It is also the first caller to
+run where there may be **no NVIDIA card at all**, which is what exposed `pick_encoder`
+trusting `ffmpeg -encoders` (hevc_nvenc is compiled into every GPL build, present or not):
+`video_pipeline.nvenc_usable` now probes with a real one-frame encode, cached per process,
+and its probe frame must stay at least 256x256 or NVENC refuses it and the probe reports no
+NVENC on a working card.
 
 **The #23 workflow** (0.6.0, all six items) is a **source folder + an output folder +
 a list**. Scan folder walks the tree (`DerivedPruner`, off the UI thread) and each row
@@ -1279,7 +1284,7 @@ Engine, packaging & CI:
   branch/fold mechanics.
 - `docs/` — `known-defects.md` (confirmed shipped bugs not yet fixed, with root cause and
   the shape of the fix; currently D1, the app not starting after the system Python is
-  uninstalled/reinstalled), `future-features.md` (roadmap: open milestones #21,
+  uninstalled/reinstalled, and D4, no VRAM floor on the local GPU picker), `future-features.md` (roadmap: open milestones #21,
   #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;

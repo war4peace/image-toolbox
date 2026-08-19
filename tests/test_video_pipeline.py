@@ -10,6 +10,7 @@ gap) is left to the live round-trip in video_pipeline's own CLI.
 """
 
 import subprocess
+import types
 from fractions import Fraction
 
 import video_pipeline as vp
@@ -261,3 +262,78 @@ def test_reencode_split_uses_fps_mode_not_the_removed_vsync(tmp_path, monkeypatc
     assert "-fps_mode" in args, "the CFR-normalising split must set a frame-rate mode"
     assert args[args.index("-fps_mode") + 1] == "cfr"
     assert "-vsync" not in args, "-vsync was removed upstream; ffmpeg refuses to start"
+
+
+# ── NVENC availability (docs/known-defects.md D2) ───────────────────────────
+
+
+def test_nvenc_is_probed_not_parsed(monkeypatch):
+    """`ffmpeg -encoders` lists hevc_nvenc on every GPL build whether or not the
+    machine has an NVIDIA card, so the string is always there. A machine without one
+    must fall through to the CPU encoder instead of dying at the first frame."""
+    vp._NVENC_PROBE.clear()
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+
+    calls = []
+
+    def fake_run(args, **_kw):
+        calls.append(args)
+        if "-encoders" in args:
+            return types.SimpleNamespace(
+                returncode=0, stdout="V....D hevc_nvenc\nV....D h264_nvenc\n"
+                                     "V....D libx265\nV....D libx264\n")
+        # The encode probe: no NVIDIA hardware here.
+        return types.SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(vp, "_run", fake_run)
+    codec, _args, is_hw = vp.pick_encoder(prefer_hw=True)
+    assert codec == "libx265"
+    assert is_hw is False
+    assert any("nullsrc" in " ".join(a) for a in calls), "no probe was attempted"
+
+
+def test_nvenc_is_used_when_the_probe_succeeds(monkeypatch):
+    vp._NVENC_PROBE.clear()
+    monkeypatch.setattr(vp, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(vp, "_run", lambda args, **_kw: types.SimpleNamespace(
+        returncode=0, stdout="V....D hevc_nvenc\nV....D libx265\n"))
+    codec, _args, is_hw = vp.pick_encoder(prefer_hw=True)
+    assert codec == "hevc_nvenc"
+    assert is_hw is True
+
+
+def test_the_probe_frame_is_big_enough_for_nvenc(monkeypatch):
+    """NVENC refuses anything under its minimum dimensions, so a small probe frame
+    reports "no NVENC" on a machine with a working card (measured: 64x64 and 128x128
+    both fail on a 3090, 256x256 passes). A probe that fails closed on good hardware
+    would silently move every user to the CPU encoder."""
+    vp._NVENC_PROBE.clear()
+    seen = []
+    monkeypatch.setattr(vp, "_run", lambda args, **_kw: seen.append(args) or
+                        types.SimpleNamespace(returncode=0, stdout=""))
+    vp.nvenc_usable("hevc_nvenc", ffmpeg="ffmpeg")
+    src = [a for a in " ".join(seen[0]).split() if a.startswith("nullsrc")][0]
+    w, h = src.split("s=")[1].split(":")[0].split("x")
+    assert int(w) >= 256 and int(h) >= 256
+
+
+def test_the_probe_is_asked_once_per_process(monkeypatch):
+    """It is called per segment; the hardware does not appear mid-run."""
+    vp._NVENC_PROBE.clear()
+    n = []
+    monkeypatch.setattr(vp, "_run", lambda args, **_kw: n.append(1) or
+                        types.SimpleNamespace(returncode=0, stdout=""))
+    for _ in range(5):
+        vp.nvenc_usable("hevc_nvenc", ffmpeg="ffmpeg")
+    assert len(n) == 1
+
+
+def test_a_probe_that_explodes_reads_as_unusable(monkeypatch):
+    """Unusable is the safe answer: the CPU encoder always works."""
+    vp._NVENC_PROBE.clear()
+
+    def boom(*_a, **_k):
+        raise OSError("no ffmpeg")
+
+    monkeypatch.setattr(vp, "_run", boom)
+    assert vp.nvenc_usable("hevc_nvenc", ffmpeg="ffmpeg") is False

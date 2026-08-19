@@ -536,13 +536,60 @@ class SplitPlan:
     deinterlace: bool = False  # apply bwdif in the re-encode (interlaced source)
 
 
+# Answers of the NVENC probe below, per codec, for the life of the process. The
+# hardware does not appear or vanish mid-run, and pick_encoder is called per segment.
+_NVENC_PROBE = {}
+
+
+def nvenc_usable(codec, ffmpeg=None):
+    """Can this ffmpeg actually ENCODE with `codec` on this machine?
+
+    Behavioural, because the obvious check is wrong: `ffmpeg -encoders` lists
+    hevc_nvenc on every GPL build whether or not the machine has an NVIDIA card, so
+    the string is always there. That cost a user a run that died at the first frame
+    with `exit 4294967295` and an EMPTY stderr (the process never got past the
+    loader, nvcuda.dll not being there to load) - see docs/known-defects.md D2.
+
+    It surfaced with Video Stabilization because that is the app's first deliberately
+    GPU-FREE feature: every earlier caller runs where a CUDA GPU is a precondition, so
+    the missing half of the check could not show. Encoding one frame of nullsrc to a
+    null sink costs ~200 ms and is asked once per codec per process.
+
+    Only whether the codec runs AT ALL. The 10-bit question is separate and already
+    answered per codec by _DELIVERY_PIX_FMT (h264_nvenc has no 10-bit path).
+
+    The 256x256 probe frame is NOT arbitrary and must not be shrunk to "save time":
+    NVENC refuses anything under its minimum dimensions with `InitializeEncoder
+    failed: Frame dimensions are less than the minimum supported value`, so a 64x64
+    or 128x128 probe reports NO NVENC on a machine with a perfectly good 3090
+    (measured on both). A probe that fails closed on working hardware is worse than
+    no probe at all: it would silently move every user to the CPU encoder."""
+    if codec in _NVENC_PROBE:
+        return _NVENC_PROBE[codec]
+    ok = False
+    try:
+        if ffmpeg is None:
+            ffmpeg, _ = find_ffmpeg()
+        proc = _run([ffmpeg, "-hide_banner", "-loglevel", "error",
+                     "-f", "lavfi", "-i", "nullsrc=s=256x256:d=1",
+                     "-c:v", codec, "-f", "null", "-"],
+                    check=False, hard_timeout=60)
+        ok = proc.returncode == 0
+    except Exception:                                # noqa: BLE001
+        ok = False                                   # unusable is the safe answer
+    _NVENC_PROBE[codec] = ok
+    return ok
+
+
 def pick_encoder(prefer_hw=True):
     """
     Choose the local re-encode video codec by capability (6.4): NVENC (hevc, else
-    h264) when the bundled ffmpeg exposes it and a CUDA GPU is present; otherwise
-    a CPU libx265/libx264 fallback. Quality barely matters here (SeedVR2
+    h264) when the bundled ffmpeg both EXPOSES it and can actually run it here;
+    otherwise a CPU libx265/libx264 fallback. Quality barely matters here (SeedVR2
     hallucinates detail downstream), so the settings favour a fast, near-lossless
     intermediate. Returns (codec, [extra ffmpeg args], is_hardware).
+
+    "Exposes it" is not "can run it": see nvenc_usable, and D2 in known-defects.
     """
     ffmpeg, _ = find_ffmpeg()
     encoders = ""
@@ -552,9 +599,9 @@ def pick_encoder(prefer_hw=True):
     except Exception:
         encoders = ""
     if prefer_hw:
-        if "hevc_nvenc" in encoders:
+        if "hevc_nvenc" in encoders and nvenc_usable("hevc_nvenc", ffmpeg):
             return "hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "19"], True
-        if "h264_nvenc" in encoders:
+        if "h264_nvenc" in encoders and nvenc_usable("h264_nvenc", ffmpeg):
             return "h264_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", "19"], True
     if "libx265" in encoders:
         return "libx265", ["-preset", "medium", "-crf", "18"], False
