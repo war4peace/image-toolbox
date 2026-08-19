@@ -1292,9 +1292,9 @@ Engine, packaging & CI:
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
 - `docs/` — `known-defects.md` (confirmed shipped bugs not yet fixed, with root cause and
-  the shape of the fix; currently D4, no VRAM floor on the local GPU picker. D1/D2/D3 are
-  kept there as FIXED, because code comments cite them by id and their diagnoses are the
-  record of one repeated mistake: **present is not working**), `future-features.md` (roadmap: open milestones #24, #21,
+  what was done about it; **nothing open as of 0.6.0** - D1 to D4 were all found while testing
+  it and all fixed before it shipped. Kept because code comments cite them by id and because
+  three of the four are one mistake in different clothes: **present is not working**), `future-features.md` (roadmap: open milestones #24, #21,
   #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;

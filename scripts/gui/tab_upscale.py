@@ -365,6 +365,8 @@ class UpscaleTab(ToolTab):
                 # Warn about local GPU contention. (No local GPU is used in remote
                 # mode, so that check is skipped above.)
                 return
+            if not self.confirm_small_gpu():
+                return
             # Multi-GPU machine: pin the run to the card picked next to 'Run on'.
             extra_env = self._local_gpu_env()
 

@@ -58,6 +58,33 @@ GUI_MARKER = "@@TBX@@"
 RUN_ON_LOCAL  = "Local GPU"
 RUN_ON_REMOTE = "Remote: RunPod"
 
+# The documented minimum for a local card (README, and the wizard's lowest tier).
+# The local GPU picker used to say nothing about it while the REMOTE picker had
+# always refused cards under a task's floor, so the app was careful about a card the
+# user rents by the hour and silent about the one they own (known-defects.md D4).
+LOCAL_VRAM_MIN_GB = 8
+
+
+def small_gpu_note(memory_gb):
+    """A short "below the minimum" note for a local card, or None.
+
+    WARN, NEVER FORBID, and that is a decision rather than laziness. SeedVR2 offloads,
+    so a small card is SLOWER, not incapable, and the first-start wizard already treats
+    its VRAM tiers as suggestions with every option left selectable. There are also
+    combinations that genuinely work below the floor - Tag & Rename with the smallest
+    vision model is the obvious one - and blanket-refusing them would deny a user a
+    feature that would have run. Greying out the only GPU somebody owns is the app
+    refusing to try; saying what to expect is not.
+
+    Pure, so the wording is testable without a display."""
+    try:
+        gb = float(memory_gb)
+    except (TypeError, ValueError):
+        return None
+    if gb <= 0 or gb >= LOCAL_VRAM_MIN_GB:
+        return None
+    return f"below the {LOCAL_VRAM_MIN_GB} GB minimum"
+
 # Optional support link, shown ONLY as a label in the main window's bottom status
 # bar next to "Report an issue" (deliberately nowhere else: no Settings entry, no
 # wizard step, no installer checkbox). Opening it is a plain browser call - the app

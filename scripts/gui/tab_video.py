@@ -16,7 +16,7 @@ from tkinter import ttk, filedialog, messagebox
 import runpod_client
 import ssh_setup
 import taskbar_progress
-from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE
+from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE, small_gpu_note
 from gui.widgets import (ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip,
                          use_window_button_style)
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
@@ -2596,7 +2596,13 @@ class VideoTab(MqttTaskState, ttk.Frame):
         # estimate read this card's own measured history back.
         self._gpu_choices = [{"id": name, "name": name, "memory_gb": vram_gb,
                               "price": None, "stock": "local"}]
-        self.gpu_combo.configure(values=[f"{name}, {vram_gb} GB"])
+        # Same "below the minimum" note as the image tabs' picker (D4). The Video
+        # Upscaler needs no Start-time warning of its own: it already REFUSES a card
+        # whose every target exceeds its VRAM, which is the stronger, per-target
+        # check, and this label is what explains a short target list.
+        note = small_gpu_note(vram_gb)
+        self.gpu_combo.configure(
+            values=[f"{name}, {vram_gb} GB" + (f" ({note})" if note else "")])
         self.gpu_combo.current(0)
         self._on_gpu_change()
 

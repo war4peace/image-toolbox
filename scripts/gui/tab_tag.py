@@ -326,6 +326,8 @@ class TagTab(ToolTab):
                 return
             if not self.confirm_gpu_overlap():
                 return
+            if not self.confirm_small_gpu():
+                return
             # Multi-GPU machine: pin the run to the card picked next to 'Run on'.
             # This binds the auto-straighten CNN, which runs in the runner; Ollama
             # is a separate server process and picks its own device.

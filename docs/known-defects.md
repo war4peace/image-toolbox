@@ -1,29 +1,40 @@
 # Known defects
 
-Shipped bugs that are **confirmed and not yet fixed**, with the root cause and the shape of
-the fix, followed by a short **Fixed** section for ones whose diagnosis is worth keeping (the
-code comments point back at these ids). Design questions live in `docs/future-features.md`; ideas that were rejected live in
-`docs/dropped-ideas.md`. A defect leaves this file when it is fixed, and the fix is described
-in `CLAUDE.md` where the feature is documented.
+Confirmed bugs, each with its root cause and what was done about it. Open ones come first;
+**Fixed** entries are kept because code comments cite them by id and because the diagnoses are
+worth more than the patches. Design questions live in `docs/future-features.md`; ideas that
+were rejected live in `docs/dropped-ideas.md`.
+
+> **Nothing is open as of 2026-08-19.** D1 to D4 were all found while testing 0.6.0 and all
+> fixed before it shipped. Three of the four are the same mistake in different clothes, which
+> is the reason to read them together: **present is not working.** An ffmpeg binary that is
+> there and corrupts memory, an encoder the build lists that the hardware cannot run, a
+> `python.exe` that exists and cannot start. Every one of them was a check asking whether
+> something EXISTED when the question was whether it WORKED, and every one was invisible to
+> the test suite because a healthy developer machine answers both the same way.
 
 ---
 
 ## Contents
 
-- [D4: a local GPU below the 8 GB minimum is offered with no warning](#d4-a-local-gpu-below-the-8-gb-minimum-is-offered-with-no-warning)
+- [D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning](#d4-fixed-a-local-gpu-below-the-8-gb-minimum-was-offered-with-no-warning)
 - [D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled](#d1-fixed-the-app-would-not-start-after-the-system-python-was-uninstalled-or-reinstalled)
 - [D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it](#d2-fixed-nvenc-was-chosen-because-the-build-lists-it-not-because-the-machine-has-it)
 - [D3 (fixed): a finished-but-failed Stabilization run looked like a hung one](#d3-fixed-a-finished-but-failed-stabilization-run-looked-like-a-hung-one)
 
 ---
 
-## D4: a local GPU below the 8 GB minimum is offered with no warning
+## Fixed
+
+Kept because the code comments and tests reference these ids.
+
+### D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning
 
 **Found:** 2026-08-19, while looking into a user report that turned out to say nothing about
 VRAM (see below). **Severity: low.** Not urgent, and there is a decision to make before coding
 it.
 
-### What was actually observed, and why it does not evidence this defect
+#### What was actually observed, and why it does not evidence this defect
 
 The whole report: title **"not working"**, body **"the output folders seem empty"**, plus
 `GPU: NVIDIA GeForce RTX 2060`. That is not enough to act on, and the VRAM reading of it is
@@ -50,7 +61,7 @@ already carries the answer ("0 upscaled, 240 skipped"); it is evidently not land
 zero-output run state its reason **in the place the user is looking** would close more real
 confusion than any VRAM gate, and it applies to every card.
 
-### The gap
+#### The gap
 
 The remote GPU picker gates by VRAM and always has: it offers only cards clearing the task's
 floor (32 GB upscale, 16 GB tag), so a user renting a pod cannot pick something that will not
@@ -65,7 +76,7 @@ Two halves of the original suggestion are worth separating:
   machine already lists nothing and the picker says "no NVIDIA GPU detected".
 - **"under 8 GB" is the real gap**, and the data to close it is already in hand.
 
-### The decision to make first: warn, or forbid?
+#### The decision, taken 2026-08-19: WARN
 
 Greying the card out conflicts with a stance the app already took deliberately. The
 first-start wizard recommends a model tier by VRAM but keeps **every** option selectable,
@@ -81,7 +92,7 @@ Remote, or a smaller Resolution Target. Reserve an actual gate for combinations 
 certain to fail rather than merely slow, which is a per-target question the video path already
 knows how to ask (`video_estimate` drops cards below a target's floor).
 
-### The other half of this, now its own milestone
+#### The other half of this, now its own milestone
 
 The report was terse because nothing invited detail, and the app knew the answer at the time
 and threw it away. That is **`future-features.md` #24** (make a bug report actionable without
@@ -89,9 +100,36 @@ asking): auto-fill the last run's summary, the VRAM total rather than just the c
 install mode and the ffmpeg build stamp. Item 2 there is what would settle THIS defect from a
 report, without a round trip.
 
-## Fixed
+#### As fixed
 
-Kept because the code comments and tests reference these ids.
+**Warn, and only warn**, decided on three grounds worth keeping: 0.6.0 already carries a
+great deal of change and this is not the place to add risk; a 6 GB card genuinely works for
+some jobs (Tag & Rename with the smallest vision model is the clear one), and blanket-refusing
+would deny a user a feature that would have run on their machine; and until reports actually
+accumulate - and #24 makes them worth reading - gating potential users buys nothing.
+
+- `gui.common.small_gpu_note(memory_gb)` is the whole rule, pure and tested: a short
+  "below the 8 GB minimum" or None. `LOCAL_VRAM_MIN_GB` is the one place the number lives,
+  and a test pins that the message quotes it, so the two cannot drift.
+- **Both local pickers label the card** (`ToolTab._populate_local_gpus` and the Video
+  Upscaler's synthetic local choice): `NVIDIA GeForce RTX 2060, 6 GB (below the 8 GB
+  minimum)`. Passive, always visible, no friction.
+- **One dialog before the first local run**, `ToolTab.confirm_small_gpu`, shown **once per
+  session across every tab** rather than per run: the card does not change between runs, and
+  a dialog on every Start trains the user to click through it, which is how a warning stops
+  being one. It says what to expect (slow rather than failed, offloading to system memory),
+  where it is most likely to break (large images, the higher targets), and the three ways out
+  (smaller model, lower target, or rent a card).
+- **An unknown size is never labelled.** `nvidia-smi` can answer `[N/A]` per field, and a card
+  we know nothing about must not be described as if we had measured it.
+- The **Video Upscaler gets the label but no dialog**: it already refuses a card whose every
+  target exceeds its VRAM, which is a stronger per-target check, and the label is what
+  explains a short target list.
+
+The counterfactual is still worth remembering: the report that prompted this said nothing
+about VRAM, and an RTX 2060 might have had 12 GB. This closes a real asymmetry, not that
+report.
+
 
 ### D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled
 

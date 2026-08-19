@@ -33,7 +33,7 @@ from gui.common import (
     CREATE_NO_WINDOW, CFG, save_config, load_settings, save_settings,
     get_default_folder, set_default_folder, get_install_mode, mqtt_enabled,
     funds_color, config_funds_floor, fmt_funds, _FUNDS_GREY,
-    RUN_ON_LOCAL, RUN_ON_REMOTE, now_stamp,
+    RUN_ON_LOCAL, RUN_ON_REMOTE, now_stamp, small_gpu_note,
 )
 from gui.widgets import (
     sanitize, _fmt_eta, ProgressBar, TelemetryRow, LogPane, LogViewer,
@@ -480,7 +480,13 @@ class ToolTab(MqttTaskState, ttk.Frame):
             self.gpu_combo.configure(values=[])
             self.gpu_pick_var.set("no NVIDIA GPU detected")
             return
-        labels = [f"{g['name']}, {g['memory_gb']} GB" for g in self._gpu_choices]
+        # A card under the documented minimum says so in its own label (D4). It stays
+        # selectable: warn, never forbid - see gui.common.small_gpu_note.
+        labels = []
+        for g in self._gpu_choices:
+            note = small_gpu_note(g["memory_gb"])
+            labels.append(f"{g['name']}, {g['memory_gb']} GB"
+                          + (f" ({note})" if note else ""))
         self.gpu_combo.configure(values=labels)
         # Keep the card the user had picked when ↻ re-detects the same machine.
         self.gpu_combo.current(labels.index(prev) if prev in labels else 0)
@@ -1030,6 +1036,37 @@ class ToolTab(MqttTaskState, ttk.Frame):
                 "Running both at the same time will be very slow and may run "
                 "out of video memory.\n\nStart anyway?")
         return True
+
+    # Warned once per session, across every tab, rather than per run: the card does
+    # not change between runs, and a dialog on every Start would train the user to
+    # click through it - which is exactly how a warning stops being one.
+    _small_gpu_warned = False
+
+    def confirm_small_gpu(self):
+        """For a LOCAL run on a card under the documented minimum: say what to expect,
+        once, and let the user proceed. Returns True to go ahead.
+
+        Deliberately NOT a gate (D4). SeedVR2 offloads, so a small card is slower
+        rather than incapable, and some combinations genuinely work down there - Tag &
+        Rename with the smallest vision model most obviously. Refusing them would deny
+        a user a feature that would have run on their machine."""
+        g = self._selected_gpu() or {}
+        note = small_gpu_note(g.get("memory_gb"))
+        if not note or ToolTab._small_gpu_warned:
+            return True
+        ToolTab._small_gpu_warned = True
+        return messagebox.askyesno(
+            APP_TITLE,
+            f"{g.get('name', 'This GPU')} has about {g.get('memory_gb', '?')} GB of "
+            f"video memory, which is {note}.\n\n"
+            "It can still work: the engine moves what does not fit to system memory, "
+            "so the usual result is a SLOW run rather than a failed one, and the "
+            "smaller models are much easier on it. Large images and the higher "
+            "Resolution Targets are where it is most likely to run out.\n\n"
+            "If it turns out to be too slow, the two things that help are a smaller "
+            "model (Settings) or a lower Resolution Target - or set 'Run on' to "
+            "'Remote: RunPod' and rent a card by the hour.\n\n"
+            "Start anyway?")
 
     def confirm_deadman_safety(self):
         """For a remote run: warn if BOTH dead-man's-switch limits are 0, which
