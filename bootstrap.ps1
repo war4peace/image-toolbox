@@ -128,6 +128,58 @@ function Find-Python312 {
     return $null
 }
 
+function Test-VenvWorks {
+    # Does .venv actually RUN? Not "is python.exe there" - defect D1 is precisely the
+    # case where it is there and cannot run. A venv is bound to the base Python named
+    # in pyvenv.cfg; uninstall or move that (for an unrelated tool) and the stub exits
+    # 103 with "No Python at ...". Same lesson as the ffmpeg pin and the NVENC probe:
+    # present is not working, listed is not available. Ask it.
+    if (-not (Test-Path ".venv\Scripts\python.exe")) { return $false }
+    $out = & ".venv\Scripts\python.exe" -c "import sys; print(sys.version.split()[0])"
+    return ($LASTEXITCODE -eq 0 -and "$out".Trim() -ne "")
+}
+
+function Repair-VenvHome($python) {
+    # The CHEAP repair, tried before rebuilding: rewrite the two lines in pyvenv.cfg
+    # that name the base Python. The installed packages were built against the same
+    # ABI and stay valid, so this turns an hour of re-downloading PyTorch into a file
+    # edit. Returns $true only if the venv RUNS afterwards.
+    #
+    # Guarded by MINOR version, which is the ABI boundary: 3.12 packages do not load
+    # on 3.13, so repointing a 3.12 venv at a 3.13 would produce a venv that starts
+    # and then fails on every import - worse than the honest failure it replaced.
+    $cfg = ".venv\pyvenv.cfg"
+    if (-not $python -or -not (Test-Path $cfg)) { return $false }
+    $ver = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $ver = "$ver".Trim()
+    $lines = Get-Content $cfg
+    $want = ($lines | Where-Object { $_ -match '^\s*version\s*=' } | Select-Object -First 1)
+    if ($want) {
+        $wantVer = ($want -replace '.*=\s*', '').Trim()
+        $wantMinor = ($wantVer -split '\.')[0..1] -join '.'
+        if ($wantMinor -ne $ver) {
+            Write-Host "  The Python now installed is $ver, this environment was built on $wantMinor." -ForegroundColor Yellow
+            return $false
+        }
+    }
+    $baseDir = Split-Path $python -Parent
+    $new = foreach ($l in $lines) {
+        if     ($l -match '^\s*home\s*=')       { "home = $baseDir" }
+        elseif ($l -match '^\s*executable\s*=') { "executable = $python" }
+        else                                     { $l }
+    }
+    # UTF-8 with NO BOM: the stub parses this file line by line, and a BOM would ride
+    # on the first key. (Set-Content -Encoding utf8 writes one in Windows PowerShell.)
+    try {
+        [System.IO.File]::WriteAllLines(
+            (Resolve-Path $cfg), $new, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        return $false
+    }
+    return (Test-VenvWorks)
+}
+
 function Invoke-Pip {
     param([string[]]$PipArgs)
     & ".venv\Scripts\python.exe" -m pip @PipArgs
@@ -423,8 +475,31 @@ try {
 
     # -- 3. Virtual environment ---------------------------------------------
     Step "Creating the Python environment (.venv)"
-    if (Test-Path ".venv\Scripts\python.exe") {
+    if (Test-VenvWorks) {
         Write-Host "  Already exists - keeping it."
+    } elseif (Test-Path ".venv\Scripts\python.exe") {
+        # There, but it does not run: the Python it was built on has been moved or
+        # uninstalled (defect D1). Repair rather than fail, and try the cheap repair
+        # first - a rebuild costs the whole package download again.
+        Write-Host "  The environment is there but does not run." -ForegroundColor Yellow
+        Write-Host "    (This happens when the Python it was built on is uninstalled,"
+        Write-Host "     upgraded or moved - often while installing something else.)"
+        if (Repair-VenvHome $python) {
+            Write-Host "  Repaired: repointed it at $python" -ForegroundColor Green
+        } else {
+            Write-Host "  Could not repoint it - rebuilding from scratch." -ForegroundColor Yellow
+            Write-Host "    The Python packages will be downloaded again. On a Local or Both"
+            Write-Host "    install that includes PyTorch, so expect this to take a while."
+            try {
+                Remove-Item ".venv" -Recurse -Force -ErrorAction Stop
+            } catch {
+                throw ("could not remove the old .venv - close Image Toolbox (and any " +
+                       "window using it) and run this again. [$($_.Exception.Message)]")
+            }
+            & $python -m venv .venv
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the virtual environment." }
+            if (-not (Test-VenvWorks)) { throw "The rebuilt environment still does not run." }
+        }
     } else {
         & $python -m venv .venv
         if ($LASTEXITCODE -ne 0) { throw "Could not create the virtual environment." }

@@ -10,88 +10,10 @@ in `CLAUDE.md` where the feature is documented.
 
 ## Contents
 
-- [D1: the app will not start after the system Python is uninstalled or reinstalled](#d1-the-app-will-not-start-after-the-system-python-is-uninstalled-or-reinstalled)
 - [D4: a local GPU below the 8 GB minimum is offered with no warning](#d4-a-local-gpu-below-the-8-gb-minimum-is-offered-with-no-warning)
+- [D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled](#d1-fixed-the-app-would-not-start-after-the-system-python-was-uninstalled-or-reinstalled)
 - [D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it](#d2-fixed-nvenc-was-chosen-because-the-build-lists-it-not-because-the-machine-has-it)
 - [D3 (fixed): a finished-but-failed Stabilization run looked like a hung one](#d3-fixed-a-finished-but-failed-stabilization-run-looked-like-a-hung-one)
-
----
-
-## D1: the app will not start after the system Python is uninstalled or reinstalled
-
-**Found:** 2026-08-19, on a VM running 0.5.5, after Python was uninstalled and reinstalled for
-an unrelated tool. **Severity: high.** The app does not start, shows nothing at all, writes no
-log, and the documented recovery path does not recover it.
-
-### What the user sees
-
-Double-click, and **nothing happens**. No window, no error, no crash log. The app is simply
-gone as far as the desktop is concerned.
-
-### Root cause: three layers, each of which alone would be survivable
-
-1. **A venv is not self-contained on Windows.** `.venv\Scripts\python.exe` is a stub; the
-   real interpreter DLL and the standard library live at the base installation named by
-   `home =` in `.venv\pyvenv.cfg`. Uninstalling that base Python removes them, and
-   reinstalling to a different path or a different minor version does not restore them, so
-   every executable in `.venv\Scripts` stops working. The app's own files are untouched and
-   look perfectly healthy.
-
-2. **The launcher never re-runs the bootstrapper.** `Image Toolbox.cmd` branches on
-   `.setup_complete` existing, and that marker is still there, so it goes straight to
-   `start "" .venv\Scripts\pythonw.exe`. The process fails at the OS level, **before any of
-   our code runs**, which is why `crash_logger` cannot help: it is armed at the top of
-   `toolbox_gui.py`, and `toolbox_gui.py` is never reached. Under `pythonw.exe` there is no
-   console for the loader error to be printed to either, so the failure is completely
-   invisible. `start` returns success regardless.
-
-3. **The bootstrapper would not repair it even if it did run.** Step 3 is
-   `if (Test-Path ".venv\Scripts\python.exe") { "Already exists - keeping it." }`. The file
-   does exist. It just cannot run. Bootstrap keeps the broken venv and then fails later, in
-   step 5, with a pip error that names neither Python nor the venv.
-
-**This is the same class of bug as the ffmpeg pin**, and the second time it has cost us: the
-old `if (Test-Path ffmpeg.exe)` check would have kept a memory-corrupting ffmpeg build
-forever, and it was fixed with a stamp file plus a *behavioural* health check
-(`vidstab_health`). **An existence check cannot detect a broken artifact.** Anywhere the
-bootstrapper decides "already done" from a path existing is a candidate for the same failure.
-
-### Shape of the fix
-
-- **Bootstrap step 3 must run the interpreter, not stat it.** Replace the `Test-Path` with an
-  actual `& ".venv\Scripts\python.exe" -c "import sys"` and treat a non-zero exit (or no
-  output) as "broken", exactly as `vidstab_health` treats non-determinism.
-- **Repair cheaply first, recreate only if that fails.** If a compatible Python 3.12 is
-  present (`Find-Python312` already answers this) and `pyvenv.cfg`'s `home =` points
-  somewhere else, rewriting that one line is enough, because the installed packages were
-  built against the same ABI. Re-verify by running the interpreter again. Only if that still
-  fails should `.venv` be deleted and recreated, and the user should be **told what that
-  costs** (a Local/Both install re-downloads PyTorch CUDA and the rest, which is the long
-  part of a first run). Silently spending an hour of downloads is not an improvement on
-  silently doing nothing.
-- **The launcher must not fail invisibly.** `Image Toolbox.cmd` should verify that the venv
-  interpreter runs before starting `pythonw.exe`, and fall back to `bootstrap.ps1` (which now
-  repairs) when it does not. This is the layer that turns the bug from "an error message" into
-  "nothing happens", and it is three lines of batch.
-- **Consider making `.setup_complete` a stamp rather than a marker**, recording the base
-  Python path and version the venv was built against, the same way `ffmpeg/build.txt` records
-  the ffmpeg build. Useful for diagnosis, but it is not the fix on its own: a stamp still
-  cannot tell you the interpreter is broken, only that something changed. Run it.
-
-### Manual workaround for an install that is already broken
-
-Delete `.venv` **and** `.setup_complete` from the app folder, then launch normally. The
-launcher will re-run the bootstrapper, which rebuilds the environment from scratch. On a
-Local or Both install this re-downloads the whole GPU stack, so expect a long first run.
-Nothing in `config.json`, `db\cache.db` or the logs is affected.
-
-### Not yet known
-
-- Whether a **same-path, same-version repair** (uninstall then reinstall 3.12.9 to the
-  identical location) leaves the venv working. It probably does, which would mean the trigger
-  is narrower than "Python was reinstalled", but it does not change the fix.
-- Whether the installer's own upgrade path can land in this state on its own. There is no
-  reason to think so: the installer never touches Python or `.venv`.
 
 ---
 
@@ -170,6 +92,111 @@ report, without a round trip.
 ## Fixed
 
 Kept because the code comments and tests reference these ids.
+
+### D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled
+
+**Found:** 2026-08-19, on a VM running 0.5.5. **Fixed the same day, before 0.6.0**, after Python was uninstalled and reinstalled for
+an unrelated tool. **Severity: high.** The app does not start, shows nothing at all, writes no
+log, and the documented recovery path does not recover it.
+
+#### What the user sees
+
+Double-click, and **nothing happens**. No window, no error, no crash log. The app is simply
+gone as far as the desktop is concerned.
+
+#### Root cause: three layers, each of which alone would be survivable
+
+1. **A venv is not self-contained on Windows.** `.venv\Scripts\python.exe` is a stub; the
+   real interpreter DLL and the standard library live at the base installation named by
+   `home =` in `.venv\pyvenv.cfg`. Uninstalling that base Python removes them, and
+   reinstalling to a different path or a different minor version does not restore them, so
+   every executable in `.venv\Scripts` stops working. The app's own files are untouched and
+   look perfectly healthy.
+
+2. **The launcher never re-runs the bootstrapper.** `Image Toolbox.cmd` branches on
+   `.setup_complete` existing, and that marker is still there, so it goes straight to
+   `start "" .venv\Scripts\pythonw.exe`. The process fails at the OS level, **before any of
+   our code runs**, which is why `crash_logger` cannot help: it is armed at the top of
+   `toolbox_gui.py`, and `toolbox_gui.py` is never reached. Under `pythonw.exe` there is no
+   console for the loader error to be printed to either, so the failure is completely
+   invisible. `start` returns success regardless.
+
+3. **The bootstrapper would not repair it even if it did run.** Step 3 is
+   `if (Test-Path ".venv\Scripts\python.exe") { "Already exists - keeping it." }`. The file
+   does exist. It just cannot run. Bootstrap keeps the broken venv and then fails later, in
+   step 5, with a pip error that names neither Python nor the venv.
+
+**This is the same class of bug as the ffmpeg pin**, and the second time it has cost us: the
+old `if (Test-Path ffmpeg.exe)` check would have kept a memory-corrupting ffmpeg build
+forever, and it was fixed with a stamp file plus a *behavioural* health check
+(`vidstab_health`). **An existence check cannot detect a broken artifact.** Anywhere the
+bootstrapper decides "already done" from a path existing is a candidate for the same failure.
+
+#### Shape of the fix
+
+- **Bootstrap step 3 must run the interpreter, not stat it.** Replace the `Test-Path` with an
+  actual `& ".venv\Scripts\python.exe" -c "import sys"` and treat a non-zero exit (or no
+  output) as "broken", exactly as `vidstab_health` treats non-determinism.
+- **Repair cheaply first, recreate only if that fails.** If a compatible Python 3.12 is
+  present (`Find-Python312` already answers this) and `pyvenv.cfg`'s `home =` points
+  somewhere else, rewriting that one line is enough, because the installed packages were
+  built against the same ABI. Re-verify by running the interpreter again. Only if that still
+  fails should `.venv` be deleted and recreated, and the user should be **told what that
+  costs** (a Local/Both install re-downloads PyTorch CUDA and the rest, which is the long
+  part of a first run). Silently spending an hour of downloads is not an improvement on
+  silently doing nothing.
+- **The launcher must not fail invisibly.** `Image Toolbox.cmd` should verify that the venv
+  interpreter runs before starting `pythonw.exe`, and fall back to `bootstrap.ps1` (which now
+  repairs) when it does not. This is the layer that turns the bug from "an error message" into
+  "nothing happens", and it is three lines of batch.
+- **Consider making `.setup_complete` a stamp rather than a marker**, recording the base
+  Python path and version the venv was built against, the same way `ffmpeg/build.txt` records
+  the ffmpeg build. Useful for diagnosis, but it is not the fix on its own: a stamp still
+  cannot tell you the interpreter is broken, only that something changed. Run it.
+
+#### Manual workaround for an install that is already broken
+
+Delete `.venv` **and** `.setup_complete` from the app folder, then launch normally. The
+launcher will re-run the bootstrapper, which rebuilds the environment from scratch. On a
+Local or Both install this re-downloads the whole GPU stack, so expect a long first run.
+Nothing in `config.json`, `db\cache.db` or the logs is affected.
+
+#### Not yet known
+
+- Whether a **same-path, same-version repair** (uninstall then reinstall 3.12.9 to the
+  identical location) leaves the venv working. It probably does, which would mean the trigger
+  is narrower than "Python was reinstalled", but it does not change the fix.
+- Whether the installer's own upgrade path can land in this state on its own. There is no
+  reason to think so: the installer never touches Python or `.venv`.
+
+#### As fixed
+
+Both halves, exactly as sketched above:
+
+- **`Image Toolbox.cmd` runs the interpreter** (`python.exe -c "import sys"`, measured 36 ms)
+  before starting `pythonw.exe`, and sends a failure to the bootstrapper instead of launching
+  into nothing. This is the layer that turns "nothing happens" into a repair.
+- **`bootstrap.ps1` step 3 asks `Test-VenvWorks`** instead of `Test-Path`, and when the venv
+  is there but dead it tries `Repair-VenvHome` first: rewriting `home` and `executable` in
+  `pyvenv.cfg` is the entire repair when a compatible Python is present again, because the
+  installed packages were built against the same ABI. Only if that fails is `.venv` deleted
+  and rebuilt, and the user is told what that costs before it happens.
+
+Three details that are load-bearing rather than tidy:
+
+1. **The ABI guard.** The repair is refused across a minor version. Repointing a 3.12 venv at
+   a 3.13 would produce an environment that starts and then fails on every import, which is
+   worse than the honest failure it replaced.
+2. **No BOM.** `pyvenv.cfg` is parsed line by line by the stub, and Windows PowerShell's
+   `Set-Content -Encoding utf8` writes a BOM that would ride on the first key, so the rewrite
+   goes through `WriteAllLines` with an explicit no-BOM encoding.
+3. **The venv stub fails cleanly** (exit 103, a printed message, no modal dialog), which is
+   what makes probing it safe from a launcher that must not block. Verified.
+
+Verified against a real broken venv: healthy -> break `home` -> detected as broken -> repaired
+-> healthy again, with no BOM written and a cross-minor repair correctly refused.
+`tests/test_venv_health.py` pins the invariants, the strongest being that neither half may go
+back to deciding from a path existing.
 
 ### D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it
 
