@@ -1264,6 +1264,15 @@ Engine, packaging & CI:
   backported 8.1.3). `Image Toolbox.cmd` launches
   it + the app (it launches `scripts\toolbox_gui.py`). The final "starting"
   window auto-closes on a 10-second countdown (press any key to close early).
+  The launcher **runs the venv interpreter before starting the GUI** (36 ms) and falls
+  back to the bootstrapper when that fails, and bootstrap's venv step asks
+  `Test-VenvWorks` rather than `Test-Path`, repairing `pyvenv.cfg`'s `home`/`executable`
+  when a compatible Python moved and rebuilding only if that fails: a venv is NOT
+  self-contained, so uninstalling the base Python left the app starting into nothing with
+  no window, no error and no crash log (`known-defects.md` D1). **The three-for-three
+  lesson of 0.6.0 is that present is not working**: the same shape bit the ffmpeg pin (an
+  existence check would have kept a memory-corrupting build) and NVENC (`-encoders` lists
+  what the hardware cannot run).
 - `installer/ImageToolbox.iss` — Inno Setup script; ships only the scripts +
   bootstrap (heavy components download on first launch). It packages every app
   module via a `..\scripts\*.py` glob into `{app}\scripts` (not a hand-maintained
@@ -1283,8 +1292,9 @@ Engine, packaging & CI:
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
 - `docs/` — `known-defects.md` (confirmed shipped bugs not yet fixed, with root cause and
-  the shape of the fix; currently D1, the app not starting after the system Python is
-  uninstalled/reinstalled, and D4, no VRAM floor on the local GPU picker), `future-features.md` (roadmap: open milestones #21,
+  the shape of the fix; currently D4, no VRAM floor on the local GPU picker. D1/D2/D3 are
+  kept there as FIXED, because code comments cite them by id and their diagnoses are the
+  record of one repeated mistake: **present is not working**), `future-features.md` (roadmap: open milestones #24, #21,
   #12/#15, #3/#4; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
