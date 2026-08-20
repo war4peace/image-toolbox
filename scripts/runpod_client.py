@@ -18,14 +18,24 @@ Design notes:
   * The API key is a credential. It lives in config.json's `runpod` section
     (blank in the tracked template, exactly like the mqtt block) and is passed in
     by the caller — this module never reads config or persists anything.
+    `configure(cfg)` is not an exception: it takes an already-loaded dict from
+    whoever owns the file, and only picks the REST version out of it.
 
-API surface (verified against rest.runpod.io/v1 OpenAPI, 2026-06):
-    GET    /pods                 list_pods
-    GET    /pods/{id}            get_pod          (status in `desiredStatus`)
-    POST   /pods                 create_pod
-    POST   /pods/{id}/start      start_pod
-    POST   /pods/{id}/stop       stop_pod
-    DELETE /pods/{id}            terminate_pod
+API surface, both REST versions (v1 verified 2026-06, v2 verified 2026-08 against
+a real pod). The v2 column is what runs by default; see "which REST API to talk
+to" below and docs/future-features.md #25.
+
+                        v1                        v2
+    list_pods           GET    /pods              GET    /pods
+    get_pod             GET    /pods/{id}         GET    /pods/{id}
+    create_pod          POST   /pods              POST   /pods        (new body)
+    start_pod           POST   /pods/{id}/start   POST   /pods/{id}/action
+    stop_pod            POST   /pods/{id}/stop    POST   /pods/{id}/action
+    terminate_pod       DELETE /pods/{id}         POST   /pods/{id}/action
+    network volumes            /networkvolumes           /network-volumes
+
+The pod's state is in `desiredStatus` on v1 and `status` on v2; nothing outside
+this module knows that, because every read goes through the normalisation seam.
 """
 
 import re
@@ -37,8 +47,87 @@ import urllib.error
 
 from net_ssl import ssl_context
 
-BASE_URL    = "https://rest.runpod.io/v1"
 _USER_AGENT = "ImageToolbox-RunPod"
+
+# ── which REST API to talk to ────────────────────────────────────────────────
+#
+# RunPod runs two REST APIs, and v1 stops serving on 2026-11-15 (410 Gone).
+# **v2 is the default and v1 is the escape hatch, not the reverse**: installs do
+# not update in lockstep, so a version shipped with v1 as its default would still
+# be running on someone's machine after the shutoff, and a fallback path that
+# nobody exercises is not a fallback but a hope. The reasoning in full is in
+# docs/future-features.md #25 under "Which way the switch points".
+#
+# The switch is config-only (`runpod.api_version`, "v2" or "v1"), on purpose: it
+# exists for the day beta churn bites, not as a thing to browse past in Settings.
+# It is deliberately NOT automatic per call. Retrying a failed pod CREATE on the
+# other transport can leave two billed pods behind when the first call actually
+# succeeded and only its response was lost, so the app tells the user to flip the
+# switch (probe_api_version) rather than flipping it silently.
+#
+# Everything a RESPONSE carries is read through the normalisation seam further
+# down and needs no switch at all; this only decides which URL to call and which
+# shape to SEND.
+
+API_V1 = "v1"
+API_V2 = "v2"
+
+BASE_URLS = {
+    API_V1: "https://rest.runpod.io/v1",
+    API_V2: "https://api.runpod.io/v2",
+}
+
+# Kept as the name older code imported; it is v1's base and no longer the one in
+# use by default. Prefer base_url().
+BASE_URL = BASE_URLS[API_V1]
+
+_API_VERSION = API_V2
+
+
+def api_version():
+    """The REST API version this process talks to ("v2" by default)."""
+    return _API_VERSION
+
+
+def set_api_version(value):
+    """Point the client at "v1" or "v2". Anything unrecognised is IGNORED and the
+    current version kept, never silently downgraded: a typo in config must not be
+    able to route a run onto a transport the user did not choose (the same rule
+    the GUI applies to its Run-on labels, tests/test_display_text_is_not_state)."""
+    global _API_VERSION
+    name = str(value or "").strip().lower()
+    if name in BASE_URLS:
+        _API_VERSION = name
+    return _API_VERSION
+
+
+def configure(cfg):
+    """Apply `runpod.api_version` out of a loaded config dict. Called once per
+    process by the two config loaders (runner_common.load_config for the runners,
+    gui.common for the GUI) so no individual caller has to remember; this module
+    still reads no file of its own."""
+    if isinstance(cfg, dict):
+        section = cfg.get("runpod")
+        if isinstance(section, dict):
+            return set_api_version(section.get("api_version"))
+    return _API_VERSION
+
+
+def base_url():
+    return BASE_URLS[_API_VERSION]
+
+
+# Endpoint paths that differ between the two. Everything else is spelled the same
+# on both, so the table holds only what actually moved.
+_PATHS = {
+    "volumes": {API_V1: "/networkvolumes", API_V2: "/network-volumes"},
+}
+
+
+def _path(name, suffix=""):
+    table = _PATHS.get(name)
+    base = table[_API_VERSION] if table else name
+    return base + suffix
 
 # The REST control plane can't list GPU types / prices / availability, but the
 # GraphQL endpoint can (see available_gpus). Cloudflare in front of it rejects a
@@ -198,7 +287,7 @@ def _request(method, path, api_key, body=None, params=None, timeout=30):
     if not api_key:
         raise RunPodError("No RunPod API key is set (Settings → Remote upscaling).")
 
-    url = BASE_URL + path
+    url = base_url() + path
     if params:
         # Drop None/empty params so callers can pass them unconditionally.
         clean = {k: v for k, v in params.items() if v not in (None, "")}
@@ -244,29 +333,258 @@ def _http_error_message(exc):
         return "Not found (404) — the pod may have been terminated."
     if exc.code == 429:
         return "RunPod is rate-limiting requests (429) — try again shortly."
-    # Try to surface the API's own error text, if any.
-    detail = ""
+    if exc.code == 410:
+        # The retirement itself. It is the only failure here a user cannot
+        # diagnose and the app can name exactly, so say the actual thing to do
+        # instead of reporting a status code. RunPod announced Sunset headers but
+        # does not serve them (measured), so a 410 is the real signal.
+        return (f"RunPod has retired the API this version of Image Toolbox uses "
+                f"(410 Gone on {base_url()}). Update the app.")
+    # Surface the API's own error text. Two body shapes, read tolerantly for the
+    # same reason as every other field (see the normalisation seam below): v1
+    # answers {"error"|"message": "..."} while v2 answers an RFC 9457 problem
+    # object, {"title","status","detail","errors":[...]}. Measured v2 bodies:
+    #   400 {"title":"Bad Request","status":400,
+    #        "detail":"There are no longer any instances available ..."}
+    #   422 {"title":"Unprocessable Entity","status":422,
+    #        "detail":"Request validation failed.",
+    #        "errors":["$.action: value must be one of 'start', 'stop', ..."]}
+    # Reading only `error`/`message` against v2 throws the reason away and leaves
+    # the user with a bare "HTTP 400 Bad Request", which is precisely the message
+    # that tells them nothing about a sold-out card.
+    detail = _error_detail(exc)
+    detail = f": {detail}" if detail else ""
+    return f"RunPod returned HTTP {exc.code} {exc.reason}{detail}."
+
+
+def _error_detail(exc):
+    """The human-readable reason out of an error body, or "" if there is none."""
     try:
         body = json.loads(exc.read().decode("utf-8", "replace"))
-        detail = body.get("error") or body.get("message") or ""
     except Exception:                                    # noqa: BLE001
-        pass
-    detail = f" — {detail}" if detail else ""
-    return f"RunPod returned HTTP {exc.code} {exc.reason}{detail}."
+        return ""
+    return error_detail(body)
+
+
+def error_detail(body):
+    """The reason out of a parsed error body (v1 flat, or an RFC 9457 problem
+    object). The field-level `errors` list is appended when present: it is the
+    part that names WHICH field v2 rejected, which is the whole point of a 422."""
+    if not isinstance(body, dict):
+        return ""
+    text = body.get("error") or body.get("message") or body.get("detail") or ""
+    if not isinstance(text, str):
+        text = str(text)
+    fields = body.get("errors")
+    if isinstance(fields, list) and fields:
+        joined = "; ".join(str(f) for f in fields if f)
+        if joined:
+            text = f"{text} ({joined})" if text else joined
+    return text.strip()
+
+
+# ── response normalisation: the one place that knows a field's spelling ──────
+#
+# The app talks to three transports that describe the SAME pod in three ways, and
+# they stop serving on different dates (docs/future-features.md #25): REST v1
+# (410 Gone on 2026-11-15), GraphQL (410 Gone in early 2027) and REST v2. The
+# table below was measured by reading ONE real pod through all three, not read off
+# a spec (tests/test_runpod_client.py holds those recorded payloads):
+#
+#     what           v1                     GraphQL                 v2
+#     status         desiredStatus          desiredStatus           status
+#     cost / hour    costPerHr              costPerHr               cost
+#     data center    dataCenterId*          machine.dataCenterId    dataCenterId
+#     ssh endpoint   publicIp+portMappings  (absent)                ssh.direct{host,port}
+#     volume id      networkVolumeId        (absent)                mounts.network[].volumeId
+#     gpu label      (absent)*              machine.gpuDisplayName  gpu.id
+#     volume's DC    dataCenterId           n/a                     dataCenter
+#     list envelope  bare list              data.myself.pods        {"pods": [...]}
+#
+#   * v1 returned `machine: {}` and no GPU field at all on the measured pod, which
+#     is exactly why list_pods_detailed prefers GraphQL today.
+#
+# EVERY read goes through these accessors. A rename is then one line here instead
+# of a silent None somewhere, and silent is the whole danger: this module's
+# callers treat None as a decision rather than as an absence, and all three known
+# cases fail toward SPENDING MONEY. A status that never reads RUNNING makes
+# remote_run deploy a SECOND billed pod beside the one it already owns; a cost
+# that reads None makes funds_guard's session cap accrue zero and never trip; a
+# status that reads None makes runner_common.remote_pod_stopped return True
+# unconditionally, so the auto-resume supervisor ends exactly the runs it exists
+# to rescue.
+#
+# They accept every shape AT ONCE instead of switching on a configured API
+# version, deliberately: a tolerant reader needs no switch to get right, so the
+# version switch (when it lands) only has to decide which URL to call. The cost
+# is that a genuinely absent field and a renamed one look alike here, which is
+# what the recorded-payload tests exist to catch.
+
+def unwrap_list(result, *keys):
+    """Return a list from a response that may be bare or enveloped.
+
+    v1 answers `GET /pods` with a bare JSON list; v2 answers `{"pods": [...]}`
+    and `{"networkVolumes": [...]}`. Both are handled so a caller never cares."""
+    if isinstance(result, dict):
+        for k in keys:
+            v = result.get(k)
+            if isinstance(v, list):
+                return v
+        v = result.get("data")
+        return v if isinstance(v, list) else []
+    return result if isinstance(result, list) else []
+
+
+def pod_state(pod):
+    """A pod's lifecycle state (RUNNING / EXITED / TERMINATED / ...), or None.
+
+    None means "could not be read", never "stopped" | callers that conflate the
+    two are the auto-resume bug described above."""
+    if not isinstance(pod, dict):
+        return None
+    return pod.get("desiredStatus") or pod.get("status")
+
+
+def pod_cost(pod):
+    """A pod's real billed $/hour, or None if the payload does not carry it.
+
+    This is what funds_guard's session cap accrues against, so a None here is a
+    cap that never trips: prefer reporting the absence to defaulting to 0."""
+    if not isinstance(pod, dict):
+        return None
+    cost = pod.get("costPerHr")
+    return pod.get("cost") if cost is None else cost
+
+
+def pod_data_center(pod):
+    """The data center id a pod runs in, or None."""
+    if not isinstance(pod, dict):
+        return None
+    machine = pod.get("machine") if isinstance(pod.get("machine"), dict) else {}
+    return (pod.get("dataCenterId") or machine.get("dataCenterId")
+            or machine.get("location") or None)
+
+
+def pod_gpu(pod):
+    """A human-readable GPU label for a pod, or None.
+
+    The label is TRANSPORT-DEPENDENT and the tests assert that rather than
+    pretending otherwise: for one measured pod, GraphQL said "RTX PRO 4500" while
+    v2 said "NVIDIA RTX PRO 4500 Blackwell". Both name the same card, neither is
+    an id to match on, and only v2's happens to be the value a deploy expects."""
+    if not isinstance(pod, dict):
+        return None
+    gpu = pod.get("gpu")
+    if isinstance(gpu, dict) and gpu.get("id"):
+        return gpu.get("id")
+    if isinstance(gpu, str) and gpu:
+        return gpu
+    machine = pod.get("machine") if isinstance(pod.get("machine"), dict) else {}
+    gpu_obj = gpu if isinstance(gpu, dict) else {}
+    return (pod.get("gpuTypeId") or machine.get("gpuDisplayName")
+            or gpu_obj.get("displayName") or None)
+
+
+def pod_gpu_count(pod):
+    """How many GPUs a pod has, or None."""
+    if not isinstance(pod, dict):
+        return None
+    gpu = pod.get("gpu")
+    if isinstance(gpu, dict) and gpu.get("count") is not None:
+        return gpu.get("count")
+    return pod.get("gpuCount")
+
+
+def pod_ssh(pod):
+    """Return (host, port) for DIRECT-TCP SSH into a pod, or (None, None).
+
+    Direct TCP only, on purpose: the app pushes files and tunnels ports with its
+    own key, and v2's other option (`ssh.proxy`, via ssh.runpod.io) is a different
+    host and username with its own routing. A pod that has not published its
+    port-22 mapping yet answers (None, None) and the caller keeps polling."""
+    if not isinstance(pod, dict):
+        return None, None
+    ssh = pod.get("ssh")
+    if isinstance(ssh, dict):
+        direct = ssh.get("direct")
+        if isinstance(direct, dict):
+            host, port = direct.get("host"), direct.get("port")
+            if host and port:
+                return host, port
+    ip = pod.get("publicIp")
+    mappings = pod.get("portMappings") or {}
+    port = mappings.get("22") or mappings.get(22)
+    return (ip, port) if (ip and port) else (None, None)
+
+
+def pod_volume_id(pod):
+    """The network volume id a pod has attached, or None.
+
+    Three spellings so far: flat `networkVolumeId` (v1), nested
+    `networkVolume.id` (an older v1) and `mounts.network[].volumeId` (v2)."""
+    if not isinstance(pod, dict):
+        return None
+    v = pod.get("networkVolumeId")
+    if v:
+        return v
+    nv = pod.get("networkVolume")
+    if isinstance(nv, dict) and nv.get("id"):
+        return nv.get("id")
+    mounts = pod.get("mounts")
+    if isinstance(mounts, dict):
+        for m in mounts.get("network") or []:
+            if isinstance(m, dict) and m.get("volumeId"):
+                return m.get("volumeId")
+    return None
+
+
+def pod_record(pod):
+    """One pod as the transport-independent record the GUI and the tests use:
+        {id, name, status, gpu, gpu_count, data_center, region, cost,
+         ssh_host, ssh_port}
+    `region` is derived locally from the data center id, never from the API."""
+    if not isinstance(pod, dict):
+        pod = {}
+    dc = pod_data_center(pod)
+    host, port = pod_ssh(pod)
+    return {
+        "id":          pod.get("id", ""),
+        "name":        pod.get("name") or pod.get("id", ""),
+        "status":      pod_state(pod) or "?",
+        "gpu":         pod_gpu(pod) or "?",
+        "gpu_count":   pod_gpu_count(pod),
+        "data_center": dc or "?",
+        "region":      region_of(dc or "") or "?",
+        "cost":        pod_cost(pod),
+        "ssh_host":    host,
+        "ssh_port":    port,
+    }
+
+
+def volume_data_center(vol):
+    """A network volume's data center id, or None. v1 spells it `dataCenterId`,
+    v2 spells it `dataCenter` (measured on the same volume through both)."""
+    if not isinstance(vol, dict):
+        return None
+    return vol.get("dataCenterId") or vol.get("dataCenter")
 
 
 # ── pod lifecycle ────────────────────────────────────────────────────────────
 
-def list_pods(api_key, timeout=30, **filters):
-    """Return the list of pods (optionally filtered, e.g. desiredStatus=RUNNING).
+def list_pods(api_key, timeout=30):
+    """Return the account's pods as a list.
 
-    The API has returned both a bare list and a {"pods": [...]}-style envelope
-    across versions; normalise to a list either way.
-    """
-    result = _request("GET", "/pods", api_key, params=filters or None, timeout=timeout)
-    if isinstance(result, dict):
-        return result.get("pods") or result.get("data") or []
-    return result or []
+    Both a bare list (v1) and a {"pods": [...]} envelope (v2) come back;
+    unwrap_list handles either.
+
+    Server-side FILTERING was removed rather than ported, and that is the safer
+    direction. v2 takes no status filter, and an unknown query parameter there is
+    IGNORED rather than rejected (measured: `?desiredStatus=RUNNING` answers 200
+    with the FULL list), so a filter that quietly stopped applying is
+    indistinguishable from one that matched everything. No caller ever passed one;
+    filter the returned list with pod_state instead."""
+    result = _request("GET", "/pods", api_key, timeout=timeout)
+    return unwrap_list(result, "pods")
 
 
 def get_pod(api_key, pod_id, timeout=30):
@@ -274,16 +592,64 @@ def get_pod(api_key, pod_id, timeout=30):
     return _request("GET", f"/pods/{pod_id}", api_key, timeout=timeout)
 
 
+def v2_pod_body(spec):
+    """Translate the v1-REST-shaped `spec` every caller writes into a v2 create
+    body, and return it.
+
+    Rebuilt key by key rather than copied and patched, because v2 sets
+    `unevaluatedProperties: false` and rejects an unknown property with a 422:
+    there is no "leftover keys are harmless" any more, which is exactly what the
+    old pass-through dict relied on. Verified by deploying a real pod with this
+    body on 2026-08-20.
+
+    `startSsh` is deliberately NOT set. It injects PUBLIC_KEY from the ACCOUNT's
+    registered keys, and this app injects its own managed key through `env`
+    instead, precisely so it never depends on (or touches) account-wide state.
+    Measured: `env.PUBLIC_KEY` with startSsh omitted logs in fine."""
+    spec = spec or {}
+    gpu_ids = spec.get("gpuTypeIds") or []
+    body = {
+        "name":  spec.get("name", "image-toolbox"),
+        "cloud": spec.get("cloudType", "SECURE"),
+        "disk":  int(spec.get("containerDiskInGb", 30)),
+        "ports": list(spec.get("ports") or ["22/tcp"]),
+    }
+    if spec.get("imageName"):
+        body["image"] = spec["imageName"]
+    if spec.get("templateId"):
+        body["templateId"] = spec["templateId"]
+    if gpu_ids:
+        body["gpu"] = {"id": gpu_ids[0], "count": int(spec.get("gpuCount", 1))}
+    if spec.get("dataCenterIds"):
+        body["dataCenterIds"] = list(spec["dataCenterIds"])
+    if spec.get("env"):
+        body["env"] = dict(spec["env"])
+    if spec.get("networkVolumeId"):
+        # `path` is required, the same trap GraphQL had under the name
+        # volumeMountPath: without it the container never starts.
+        body["mounts"] = {"network": [{
+            "volumeId": spec["networkVolumeId"],
+            "path":     spec.get("volumeMountPath", "/workspace"),
+        }]}
+    cuda = spec.get("allowedCudaVersions")
+    if cuda:
+        body["gpu"] = dict(body.get("gpu") or {}, allowedCudaVersions=list(cuda))
+    return body
+
+
 def create_pod(api_key, spec, timeout=60):
     """Create a pod from `spec` (gpuTypeIds, imageName/templateId, ports, …) and
     return the created pod (including its new `id`). Creating a pod starts the
     billing clock — callers must own a guaranteed stop path.
 
-    NOTE: the REST create endpoint only accepts a CURATED GPU enum
-    (CREATABLE_GPU_IDS) — it 400s on newer cards (Blackwell PRO 4000/4500) that
-    the GraphQL deploy path (deploy_pod) handles. New code should prefer
-    deploy_pod; this is kept for reference / the REST-only path."""
-    return _request("POST", "/pods", api_key, body=spec, timeout=timeout)
+    `spec` stays v1-shaped whichever transport is active; v2_pod_body translates
+    it. The v1 create endpoint accepts only a CURATED GPU enum (CREATABLE_GPU_IDS)
+    and 400s on newer cards (Blackwell PRO 4000/4500), which is the whole reason
+    deploy_pod exists. **v2 has no such limitation** (measured: an RTX PRO 4500
+    Blackwell deployed straight through POST /v2/pods), so once GraphQL goes,
+    deploy_pod folds into this."""
+    body = v2_pod_body(spec) if _API_VERSION == API_V2 else spec
+    return _request("POST", "/pods", api_key, body=body, timeout=timeout)
 
 
 # RunPod machines report a host driver CUDA version; the deploy filter
@@ -428,32 +794,54 @@ def deploy_pod(api_key, spec, timeout=90):
     return pod
 
 
+# v1 spells each transition as its own endpoint; v2 collapses all of them into
+# one action endpoint whose value is a checked enum (a wrong one is a 422 naming
+# the field, measured). v2 also still has DELETE /pods/{id}, but routing every
+# transition through one call keeps this to a single code path.
+_V1_LIFECYCLE = {
+    "start":     ("POST",   "/pods/{id}/start"),
+    "stop":      ("POST",   "/pods/{id}/stop"),
+    "terminate": ("DELETE", "/pods/{id}"),
+}
+
+
+def _pod_action(api_key, pod_id, action, timeout=60):
+    """Perform one lifecycle transition on a pod, on whichever transport is
+    active. Raises RunPodError on failure, like every other call here: teardown
+    must be able to REPORT that it failed (ensure_stopped turns that into a
+    message telling the user to stop the pod by hand), never swallow it."""
+    if _API_VERSION == API_V2:
+        return _request("POST", f"/pods/{pod_id}/action", api_key,
+                        body={"action": action}, timeout=timeout)
+    method, path = _V1_LIFECYCLE[action]
+    return _request(method, path.format(id=pod_id), api_key, timeout=timeout)
+
+
 def start_pod(api_key, pod_id, timeout=60):
     """Start or resume a stopped pod."""
-    return _request("POST", f"/pods/{pod_id}/start", api_key, timeout=timeout)
+    return _pod_action(api_key, pod_id, "start", timeout=timeout)
 
 
 def stop_pod(api_key, pod_id, timeout=60):
     """Stop a running pod (it can later be started again; storage is still billed
     while stopped). For the dead-man's-switch teardown use terminate_pod."""
-    return _request("POST", f"/pods/{pod_id}/stop", api_key, timeout=timeout)
+    return _pod_action(api_key, pod_id, "stop", timeout=timeout)
 
 
 def terminate_pod(api_key, pod_id, timeout=60):
     """Terminate (delete) a pod — frees all billing. The disposable-pod teardown."""
-    return _request("DELETE", f"/pods/{pod_id}", api_key, timeout=timeout)
+    return _pod_action(api_key, pod_id, "terminate", timeout=timeout)
 
 
 def pod_status(api_key, pod_id, timeout=30):
-    """Return a pod's `desiredStatus` (RUNNING/EXITED/TERMINATED), or None if the
-    pod is gone / unreadable. Never raises — for safe polling."""
+    """Return a pod's lifecycle state (RUNNING/EXITED/TERMINATED), or None if the
+    pod is gone / unreadable. Never raises, for safe polling. Reads through
+    pod_state, so it is spelled correctly on every transport."""
     try:
         pod = get_pod(api_key, pod_id, timeout=timeout)
     except RunPodError:
         return None
-    if not isinstance(pod, dict):
-        return None
-    return pod.get("desiredStatus")
+    return pod_state(pod)
 
 
 # ── provisioning helpers (poll for ready, read SSH endpoint) ─────────────────
@@ -461,25 +849,26 @@ def pod_status(api_key, pod_id, timeout=30):
 def ssh_endpoint(pod):
     """Return (host, port) for direct-TCP SSH into a pod, or (None, None) if the
     pod hasn't published its port-22 mapping yet. Requires the pod to have been
-    created with "22/tcp" in its ports."""
-    if not isinstance(pod, dict):
-        return None, None
-    ip = pod.get("publicIp")
-    mappings = pod.get("portMappings") or {}
-    port = mappings.get("22") or mappings.get(22)
-    return (ip, port) if (ip and port) else (None, None)
+    created with "22/tcp" in its ports. Kept as the name the callers use; the
+    field-spelling lives in pod_ssh."""
+    return pod_ssh(pod)
 
 
 def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
     """Poll a pod until it is RUNNING with a reachable SSH endpoint, and return
     the pod dict. Raises RunPodError on timeout or if the pod ends up
     EXITED/TERMINATED first. `on_status(status, host, port)` is called on each
-    poll for UI feedback."""
+    poll for UI feedback.
+
+    Requiring BOTH is load-bearing, not belt and braces: v2 reports
+    `status: "RUNNING"` in the CREATE response itself, measured ~50 s before
+    `ssh.direct` was anything but null. A caller that trusted the status alone
+    would be handed a host of None and fail somewhere far less obvious."""
     deadline = time.time() + timeout
     while True:
         pod = get_pod(api_key, pod_id)
-        status = pod.get("desiredStatus") if isinstance(pod, dict) else None
-        host, port = ssh_endpoint(pod)
+        status = pod_state(pod)
+        host, port = pod_ssh(pod)
         if on_status:
             try:
                 on_status(status, host, port)
@@ -574,20 +963,7 @@ def volume_region(api_key, vol_id, timeout=30):
         vol = get_network_volume(api_key, vol_id, timeout=timeout)
     except RunPodError:
         return None
-    return vol.get("dataCenterId") if isinstance(vol, dict) else None
-
-
-def _pod_volume_id(pod):
-    """The network volume id a pod has attached, or None. The REST pod object has
-    exposed it both flat (`networkVolumeId`) and nested (`networkVolume.id`) across
-    API versions, so check both."""
-    if not isinstance(pod, dict):
-        return None
-    v = pod.get("networkVolumeId")
-    if v:
-        return v
-    nv = pod.get("networkVolume")
-    return nv.get("id") if isinstance(nv, dict) else None
+    return volume_data_center(vol)
 
 
 def pods_using_volume(api_key, vol_id, timeout=30):
@@ -608,25 +984,24 @@ def pods_using_volume(api_key, vol_id, timeout=30):
         return []
     out = []
     for p in pods:
-        if _pod_volume_id(p) == vol_id:
+        if pod_volume_id(p) == vol_id:
             out.append({"id": p.get("id"), "name": p.get("name"),
-                        "status": p.get("desiredStatus")})
+                        "status": pod_state(p)})
     return out
 
 
 # ── network volumes (the persistent model store) ─────────────────────────────
 
 def list_network_volumes(api_key, timeout=30):
-    """Return the account's network volumes (each has id, name, size, dataCenterId)."""
-    result = _request("GET", "/networkvolumes", api_key, timeout=timeout)
-    if isinstance(result, dict):
-        return result.get("networkVolumes") or result.get("data") or []
-    return result or []
+    """Return the account's network volumes (id, name, size, and a data center
+    read via volume_data_center: v1 spells it dataCenterId, v2 dataCenter)."""
+    result = _request("GET", _path("volumes"), api_key, timeout=timeout)
+    return unwrap_list(result, "networkVolumes")
 
 
 def get_network_volume(api_key, vol_id, timeout=30):
     """Return one network volume's details."""
-    return _request("GET", f"/networkvolumes/{vol_id}", api_key, timeout=timeout)
+    return _request("GET", _path("volumes", f"/{vol_id}"), api_key, timeout=timeout)
 
 
 def create_network_volume(api_key, name, size_gb, data_center_id, timeout=60):
@@ -635,17 +1010,25 @@ def create_network_volume(api_key, name, size_gb, data_center_id, timeout=60):
     The data center is fixed at creation and locks every pod that mounts the
     volume to that region — pass an EU id for a Europe-based user."""
     size = int(size_gb)
-    if not 1 <= size <= 4000:
-        raise RunPodError("Network volume size must be between 1 and 4000 GB.")
+    # The two versions disagree on the bounds (v1 1-4000, v2 10-4096), so check
+    # against the one actually being called rather than an intersection: a
+    # refusal a user cannot act on is worse than one that quotes the real limit.
+    low, high = (10, 4096) if _API_VERSION == API_V2 else (1, 4000)
+    if not low <= size <= high:
+        raise RunPodError(
+            f"Network volume size must be between {low} and {high} GB.")
     if not data_center_id:
         raise RunPodError("A data center id is required to create a network volume.")
-    body = {"name": name, "size": size, "dataCenterId": data_center_id}
-    return _request("POST", "/networkvolumes", api_key, body=body, timeout=timeout)
+    body = {"name": name, "size": size}
+    # The one renamed field in a request BODY, which is why it cannot go through
+    # the read seam: v1 wants dataCenterId, v2 wants dataCenter.
+    body["dataCenter" if _API_VERSION == API_V2 else "dataCenterId"] = data_center_id
+    return _request("POST", _path("volumes"), api_key, body=body, timeout=timeout)
 
 
 def delete_network_volume(api_key, vol_id, timeout=60):
     """Delete a network volume (frees its monthly storage charge)."""
-    return _request("DELETE", f"/networkvolumes/{vol_id}", api_key, timeout=timeout)
+    return _request("DELETE", _path("volumes", f"/{vol_id}"), api_key, timeout=timeout)
 
 
 # ── GPU availability + pricing (GraphQL) ─────────────────────────────────────
@@ -835,46 +1218,16 @@ def _pods_query(machine_sel):
             "gpuCount machine { " + machine_sel + " } } } }")
 
 
-def _normalize_gql_pod(p):
-    m = p.get("machine") if isinstance(p.get("machine"), dict) else {}
-    dc = m.get("dataCenterId") or m.get("location") or "?"
-    return {
-        "id":           p.get("id", ""),
-        "name":         p.get("name") or p.get("id", ""),
-        "status":       p.get("desiredStatus") or "?",
-        "gpu":          m.get("gpuDisplayName") or "?",
-        "gpu_count":    p.get("gpuCount"),
-        "data_center":  dc,
-        "region":       region_of(dc) or "?",      # derived locally from the id
-        "cost":         p.get("costPerHr"),
-    }
-
-
-def _normalize_rest_pod(p):
-    machine = p.get("machine") if isinstance(p.get("machine"), dict) else {}
-    gpu_obj = p.get("gpu") if isinstance(p.get("gpu"), dict) else {}
-    dc = (p.get("dataCenterId") or machine.get("dataCenterId")
-          or machine.get("location") or "?")
-    return {
-        "id":           p.get("id", ""),
-        "name":         p.get("name") or p.get("id", ""),
-        "status":       p.get("desiredStatus") or p.get("status") or "?",
-        "gpu":          (p.get("gpuTypeId") or machine.get("gpuDisplayName")
-                         or gpu_obj.get("displayName") or gpu_obj.get("id") or "?"),
-        "gpu_count":    p.get("gpuCount"),
-        "data_center":  dc,
-        "region":       region_of(dc) or "?",      # derived locally from the id
-        "cost":         p.get("costPerHr"),
-    }
-
-
 def list_pods_detailed(api_key, timeout=30):
-    """Return the account's pods with clean, typed fields, each:
-        {id, name, status, gpu, gpu_count, data_center, cost}
+    """Return the account's pods as pod_record dicts.
 
-    Prefers GraphQL (`myself.pods`) because the REST pod object omits the GPU type
-    and data center; falls back to REST /pods if every GraphQL attempt fails (so
-    the list still works, just with '?' for the missing fields)."""
+    Prefers GraphQL (`myself.pods`) because the v1 pod object omits the GPU type
+    and data center (a measured v1 pod carried `machine: {}` and no GPU field at
+    all); falls back to REST /pods if every GraphQL attempt fails, so the list
+    still works with '?' for the missing fields. Both branches go through the SAME
+    pod_record, which is what the recorded-payload tests pin. Under v2 this whole
+    double path collapses: `GET /v2/pods` carries gpu.id, dataCenterId and cost
+    directly (docs/future-features.md #25, P2)."""
     global _pods_machine_sel
     selections = ([_pods_machine_sel] if _pods_machine_sel
                   else list(_PODS_MACHINE_SELECTIONS))
@@ -887,10 +1240,10 @@ def list_pods_detailed(api_key, timeout=30):
             continue
         _pods_machine_sel = sel        # remember the field set the API accepted
         pods = ((data.get("myself") or {}).get("pods")) or []
-        return [_normalize_gql_pod(p) for p in pods if isinstance(p, dict)]
+        return [pod_record(p) for p in pods if isinstance(p, dict)]
     # Every GraphQL attempt failed → REST fallback (id/name/status/cost at least).
     try:
-        return [_normalize_rest_pod(p) for p in list_pods(api_key, timeout=timeout)
+        return [pod_record(p) for p in list_pods(api_key, timeout=timeout)
                 if isinstance(p, dict)]
     except RunPodError:
         raise last_err or RunPodError("Could not list pods.")
@@ -898,21 +1251,61 @@ def list_pods_detailed(api_key, timeout=30):
 
 # ── UI-facing helpers (return (ok, message), never raise) ────────────────────
 
+def probe_api_version(api_key, timeout=15):
+    """Ask both REST versions whether they answer, and return (ok, message).
+
+    This is the escape hatch's discovery half. The app does NOT switch versions
+    on its own: an automatic cross-transport retry around pod creation can leave
+    two billed pods behind when the first call really succeeded and only its
+    reply was lost. So when the configured version is unreachable and the other
+    one answers, this says so and names the setting to change, and a human makes
+    the call. Read-only (one GET each), so running it costs nothing."""
+    if not api_key:
+        return False, "Enter a RunPod API key first."
+    current = api_version()
+    results = {}
+    for name in (API_V1, API_V2):
+        before = set_api_version(name)
+        try:
+            list_pods(api_key, timeout=timeout)
+            results[name] = None
+        except RunPodError as exc:
+            results[name] = str(exc)
+        finally:
+            set_api_version(before if before != name else current)
+    set_api_version(current)
+    other = API_V1 if current == API_V2 else API_V2
+    if results[current] is None:
+        extra = "" if results[other] is None else f" ({other} is not answering.)"
+        return True, f"Connected on REST {current}.{extra}"
+    if results[other] is None:
+        return False, (
+            f"REST {current} is not answering: {results[current]} "
+            f"REST {other} does answer. Set \"api_version\": \"{other}\" in the "
+            f"runpod section of config.json to use it.")
+    return False, f"Neither REST version answered. {current}: {results[current]}"
+
+
 def test_connection(api_key, timeout=15):
     """Verify the API key by listing pods. Returns (ok, message) for the
-    Settings 'Test' button — mirrors mqtt_publisher.test_connection."""
+    Settings 'Test' button — mirrors mqtt_publisher.test_connection.
+
+    The message names the REST version it used, so a user reporting a problem
+    says which transport they were on without being asked (and so a run on an
+    unexpected version is visible before it costs anything)."""
     if not api_key:
         return False, "Enter a RunPod API key first."
     try:
         pods = list_pods(api_key, timeout=timeout)
     except RunPodError as exc:
         return False, str(exc)
-    running = sum(1 for p in pods if isinstance(p, dict)
-                  and p.get("desiredStatus") == STATUS_RUNNING)
+    running = sum(1 for p in pods if pod_state(p) == STATUS_RUNNING)
     n = len(pods)
+    where = f"REST {api_version()}"
     if n == 0:
-        return True, "Connected — API key is valid (no pods currently on the account)."
-    return True, f"Connected — {n} pod(s) on the account, {running} running."
+        return True, (f"Connected on {where}: API key is valid "
+                      f"(no pods currently on the account).")
+    return True, f"Connected on {where}: {n} pod(s) on the account, {running} running."
 
 
 def ensure_stopped(api_key, pod_id, terminate=False, timeout=60):

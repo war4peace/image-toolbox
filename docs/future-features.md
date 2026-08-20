@@ -6,18 +6,21 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 **dropped**, and the standing constraints (AMD/ROCm, provider choice), live in
 `docs/dropped-ideas.md`.
 
-One open milestone is small (#24, enriching what a bug report auto-fills). The rest are
-medium or larger: one measurement-gated processing capability
-(#21 denoising, deferred behind RunPod API work and gated on a measurement that has not been
-run), a Video Upscaler feature (#12 mixed local+remote queue) and a remote-side
-one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones
-each introduce a new process model, networking, or packaging (HTTP interface #3, Unraid #4).
-The **shipped** milestones are kept below as a numbering legend, after the open work.
+One open milestone has a **date on it** and is listed first for that reason alone (#25, the
+RunPod API v2 migration: REST v1 returns 410 Gone on **2026-11-15** and GraphQL in **early
+2027**, and the app uses both). One is small (#24, enriching what a bug report auto-fills). The
+rest are medium or larger: one measurement-gated processing capability (#21 denoising, deferred
+behind #25 and gated on a measurement that has not been run), a Video Upscaler feature (#12 mixed
+local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second GPU
+provider). Two lower-priority ones each introduce a new process model, networking, or packaging
+(HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a numbering legend,
+after the open work.
 
 ---
 
 ## Contents
 
+- [25. RunPod API v2 migration](#25-runpod-api-v2-migration-medium-dated-money-adjacent)
 - [24. Make a bug report actionable without asking](#24-make-a-bug-report-actionable-without-asking-small-medium)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
@@ -27,6 +30,401 @@ The **shipped** milestones are kept below as a numbering legend, after the open 
 - [Sequencing & dependencies](#sequencing--dependencies)
 - [Shipped milestones (numbering legend)](#shipped-milestones-numbering-legend)
 - [Decided against / constraints](#decided-against--constraints)
+
+---
+
+## 25. RunPod API v2 migration: Medium (dated, money-adjacent)
+
+Move the RunPod integration off **two** transports RunPod has now dated for shutdown, onto the
+single `https://api.runpod.io/v2`. This entry sits first despite the file's easiest-first order,
+because it is the only milestone here with a **date on it**: everything else can slip, this one
+turns into a broken shipped feature on a calendar day. It is also what #21 is deferred behind
+(2026-08-19).
+
+**The announcement, as it applies here:** REST v1 stops serving traffic and returns **410 Gone on
+2026-11-15**; the GraphQL API returns 410 in **early 2027**. Both are supposed to carry a `Sunset`
+header from now on. Measured 2026-08-19 against this account: **neither actually sends one**
+(`rest.runpod.io/v1/pods` and `api.runpod.io/graphql` both answer 200 with no `Sunset`,
+`Deprecation` or `Link` header). So the dates belong in the code as constants, and the real
+detection signal is a **410**, not a header that may never arrive.
+
+### The two deadlines, and what each one takes with it
+
+The app is unusual here in that it uses **both** doomed transports at once, for different calls,
+and the halves die five months apart.
+
+| Transport | What the app does on it | Dies |
+|---|---|---|
+| REST v1 (`rest.runpod.io/v1`) | `list_pods`, `get_pod`, `create_pod`, `start_pod`, `stop_pod`, `terminate_pod`, `pods_using_volume`, and all four network-volume calls | **2026-11-15** |
+| GraphQL (`api.runpod.io/graphql`) | `deploy_pod` (every pod the app actually creates), `available_gpus` (all three live GPU pickers), `data_centers` (the Settings region picker), `list_pods_detailed` (the RunPod tab), `account_balance` (the funds guard) | **early 2027** |
+
+Losing REST v1 breaks teardown, volume management and status polling. Losing GraphQL breaks **pod
+creation**, which is the remote feature entirely. Neither half is optional.
+
+**The good news is structural and was decided years ago:** `runpod_client.py` is a real seam.
+Outside it the app touches RunPod through named functions plus exactly **10 raw field reads**,
+and those 10 are the whole leak list:
+
+| Where | Reads | v2 name |
+|---|---|---|
+| `remote_run.py:326`, `batch_video_upscale.py:2590`, `runpod_provision.py:242,312`, plus `pod_status` / `wait_until_running` inside the client | `desiredStatus` | `status` |
+| `remote_run.py:417,427` | `costPerHr` | `cost` |
+| `runpod_client.ssh_endpoint` | `publicIp` + `portMappings["22"]` | `ssh.direct{host,port}`, or `runtime.ports[]` where `private == 22` |
+| `gui/tab_runpod.py:770,782,796` | a volume's `dataCenterId` | `dataCenter` |
+
+### What v2 gives back, measured rather than assumed
+
+Priced by calling v2 with the app's own key: read-only GETs, plus two create calls made
+deliberately invalid so they could not deploy anything.
+
+- **The GPU picker is a drop-in, and parity is confirmed.**
+  `GET /v2/catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE` against EU-RO-1 returned
+  **the same 9 cards, at the same prices, at the same stock levels** as today's GraphQL
+  `gpuTypes { lowestPrice }` query (RTX 2000 Ada $0.24 LOW, A4500 $0.25 LOW, L4 $0.49 LOW, A6000
+  $0.53 LOW, PRO 4000 Blackwell $0.57 MEDIUM, PRO 4500 Blackwell $0.72 HIGH, 4090 $0.74 MEDIUM,
+  5090 $0.99 LOW, A100-SXM4-80GB $1.59 LOW), plus the MI300X that `is_amd_gpu` already drops. The
+  stock enum is the same three levels in upper case (`LOW/MEDIUM/HIGH`, plus an explicit `NONE`),
+  so `available_gpus`' returned shape survives unchanged.
+- **One call now covers every data center.** Each GPU carries a `dataCenters[]` array of per-DC
+  availability, so the per-region call the pickers make today collapses to one, and the UI can
+  finally answer the question a sold-out card raises: *where is it in stock?*
+- **`cudaVersions` per GPU, each flagged available or full.** This retires the app's most
+  embarrassing workaround: `KNOWN_CUDA_VERSIONS` enumerates every CUDA version by hand because
+  `allowedCudaVersions` is exact-match set membership, and `deploy_pod` then applies the floor
+  **only to consumer cards** as a heuristic. v2 has `gpu.minCudaVersion` (a real numeric floor,
+  compared numerically so 12.11 is above 12.2) and the catalog says which versions have free
+  capacity, so "the card is in stock but every machine on a new enough driver is full" becomes a
+  **pre-flight check** instead of a burned deploy attempt.
+- **A richer pod status enum**: `PROVISIONING / STARTING / RUNNING / EXITED / ERROR / TERMINATED`.
+  `wait_until_running` currently waits out the full `deploy_timeout` on a pod that is never coming
+  up, because it only knows to fail on `EXITED`/`TERMINATED`. `ERROR` lets it fail fast.
+- **`runtime`** (per-GPU util, memory, CPU, uptime, live port mappings) **without SSH**, and
+  **`GET /v2/pods/{id}/logs`**. Both are diagnostics the app currently gets only through its own
+  tunnel and worker, which is exactly what is unavailable when something has gone wrong.
+- **Typed 422s.** A bad create answers `{"title","status","detail","errors":[...]}` with the
+  offending field named. Measured: `{"detail":"Unknown GPU type: __invalid__"}` and
+  `{"errors":["$: additional properties 'supportPublicIp' not allowed"]}`. That is a status-line
+  message worth showing verbatim.
+- **Published rate limits**, in `RateLimit` / `RateLimit-Policy` headers on every response:
+  measured 180/minute, 7200/hour, 86400/day. The 5-8 s status polling is nowhere near it, so
+  nothing has to change; it is recorded so a future poll loop is not designed blind.
+- **The v1 create enum problem is gone.** v1 REST `create_pod` 400s on cards the catalog lists
+  (Blackwell PRO 4000/4500), which is the entire reason `deploy_pod` exists on GraphQL. v2
+  validates against the catalog itself ("Unknown GPU type: …" for a bogus id), so `deploy_pod`'s
+  reason to exist disappears and pod creation returns to being one ordinary POST. **Unconfirmed
+  until a live deploy** (see Verification): a rejected invalid id proves the validator is not a
+  curated enum, not that a Blackwell card deploys.
+
+### The one thing v2 does not have: the account balance
+
+There is **no account or balance endpoint in v2**. The full OpenAPI document
+(`https://api.runpod.io/v2/openapi.json`, read 2026-08-19) has exactly one `/v2/account/*` path
+and it is SSH keys; the only match for "balance" anywhere in the spec is "load balancer". The
+balance lives solely in GraphQL's `myself { clientBalance currentSpendPerHr }`, which is the half
+that dies in early 2027.
+
+That matters because it is not a readout, it is a **safety net**: `funds_guard`'s start floor
+refuses a run whose estimate would push the account below a configured floor, and the poller's
+floor half stops a live run when the balance falls to it.
+
+**What survives and what does not**, if nothing replaces it:
+
+- **The session cap survives intact.** `session_cost(cost_per_hr, elapsed)` needs no balance, and
+  v2 reports `cost` on the pod itself, which is the *real* billed rate rather than the picker's
+  list price. The cap is arguably the better half of the guard anyway: it bounds *this run*.
+- **The start floor and the balance floor die**, and they die *quietly and correctly*:
+  `account_balance` returns None on any failure by contract, and `start_blocked` / `evaluate` both
+  fail open on a None balance, so a 410 degrades to "the floor checks are skipped" rather than a
+  crash or a blocked run. That is the right behaviour, but it is silent, so it has to become
+  **visible**: the Settings floor field and the GUI funds readout must say the balance is no
+  longer available, or a user keeps a floor configured that is not being enforced.
+- **`GET /v2/billing?lastN=…` is spend, not balance**, so it cannot answer "will this run take me
+  below $X". It can answer "what did the last N days cost", which is a more useful thing to show
+  than a bare balance, and is worth adding regardless.
+
+**Asked upstream, 2026-08-19:** [runpod/docs#807, "APIv2 and GraphQL account
+balance"](https://github.com/runpod/docs/issues/807) puts the question to RunPod directly, naming
+the overspending guard as the use case. **Check it before starting P3**, and do not wait on it:
+an unanswered issue is itself an answer by the time GraphQL stops serving. What each outcome
+means here:
+
+| Answer | What P3 becomes |
+|---|---|
+| An account endpoint is coming | Keep the floor, repoint `account_balance` at it, done |
+| No endpoint, ever | The floor is retired deliberately: remove the setting, say so in the release notes, and lean on the session cap plus `/v2/billing` spend |
+| Silence | Same as "no endpoint", but the code keeps the GraphQL island until it 410s, since it costs nothing to leave working |
+
+**Recommendation:** keep the GraphQL balance call alive as an isolated, already-fail-safe island
+until it 410s (it is one query and one function), and design the UI now for the case where the
+balance is unknown. Do **not** hold the rest of the migration on this question: it is the only
+piece with no v2 answer, and it is already the piece built to work without one.
+
+### v2's own maturity is contradictory, so build the seam and keep the escape hatch
+
+**RunPod says both things, and the difference is not resolvable from outside.** The deprecation
+e-mail of 2026-08-19 opens with "The new REST API v2 is **generally available** today". The launch
+blog post, published 2026-07-29 and last edited 2026-08-14, still reads "now in **public beta**"
+and carries "one honest caveat: v2 is in beta, which means endpoints and behavior may still change
+before general availability" (both verified against the live page, 2026-08-19). The
+`api-reference-v2` docs pages claim neither, and the OpenAPI document says only
+`version: 2.0.0`. The likeliest reading is that v2 went GA with that e-mail and the blog post was
+never updated, but a stale marketing page is a guess, not evidence.
+
+**It does not change the decision, which is the useful part.** GA or beta, the API is **three
+weeks old** and is being introduced alongside the retirement of the two things it replaces, so the
+shape of the work is the same either way: assume it will move under us, and make that survivable
+rather than betting on which label is current. The app has three months of overlap on the v1 half
+and five on the GraphQL half: enough to migrate calmly, not enough to migrate twice. So **one
+transport module, one config switch** (`runpod.api_version`, defaulting to v2, with v1/GraphQL
+retained until the deadlines pass: see the switch direction below), and every response normalised
+into the shapes the app already consumes, so the rest of the codebase changes in ten places
+rather than everywhere.
+
+Worth re-checking when the migration actually starts: if the blog still says beta then, that is a
+second data point about how current RunPod's own documentation is, which matters more here than
+the label does, because this plan is built on their spec.
+
+**Which way the switch points: v2 is the default and v1 is the escape hatch, not the reverse.**
+The tempting shape is "keep running v1, fall back to v2 when v1 stops answering", and it is wrong
+for four reasons, the first of which is decisive on its own.
+
+- **Installs do not update in lockstep.** A version shipped today with v1 as its default is still
+  running on someone's machine on 2026-11-15, and that is the day it breaks, with no one at the
+  keyboard. Ship v2 as the default now and those same installs pass the date untouched. The
+  in-app updater helps but does not settle it: "Skip this version" exists.
+- **The fallback path is the untested path.** Whichever transport is the default is the one every
+  real run exercises; the other one runs for the first time on the day it is needed. v1-default
+  means v2's first real execution is in November, unattended, on every install at once, spending
+  money. v2-default inverts that: beta churn is discovered now, while v1 still exists and there
+  are three months of runway. This is the same lesson as D1 and the ffmpeg pin: code that has
+  never run is not a fallback, it is a hope.
+- **A fallback should point at the more durable transport, and v1 dies first.** v1 also cannot
+  stand alone: `deploy_pod` lives on GraphQL precisely because v1's create enum rejects the
+  Blackwell cards the picker offers. So "default to v1" really means keeping v1 **and** GraphQL,
+  and the app carries three transports instead of one plus a balance island.
+- **Automatic cross-transport retry is unsafe exactly where the money is.** "v1 failed, try v2"
+  around pod creation can deploy **two billed pods** when the first call succeeded and only its
+  response was lost. Deploy is not idempotent, so it must never auto-fall-back. The same money
+  argument runs the other way for **teardown**, where failing to stop a pod bills until the
+  dead-man's switch fires: there, trying the other transport is right. One rule for both is what
+  would be wrong.
+
+So: `runpod.api_version` defaults to `v2`, `v1` is a documented escape hatch a user can set when
+beta churn bites, a capability probe (one `GET /v2/pods`) **tells the user to flip the switch**
+rather than flipping it silently, and automatic retry on the other transport is allowed only for
+idempotent calls. v1 and the GraphQL island are then deleted on their own deadlines, not before:
+the v1 half after 2026-11-15, the balance query when it 410s.
+
+### The failure mode this migration actually has
+
+Not the loud one. A wrong **request body** is a hard 422 that names the field, and unknown body
+properties are rejected outright (`unevaluatedProperties: false`), so the create path fails
+noisily and legibly. Two other things fail silently, both toward spending money:
+
+1. **A renamed response field reads as None**, and the app's checks treat None as a decision
+   rather than as an absence. Three worked examples straight off the leak table:
+   - `remote_run._find_existing_pod` compares `desiredStatus` to `RUNNING`. Under v2 that is
+     always None, so the app **never recognises its own running pod** and deploys a second one
+     beside it. Two pods, both billing.
+   - `runner_common.remote_pod_stopped` returns True for `status in (None, EXITED, TERMINATED)`.
+     Under v2 it returns **True unconditionally**, so every transient network blip reads as "the
+     pod is gone" and the auto-resume supervisor (#6) ends exactly the runs it exists to rescue.
+   - `remote_run` reads `costPerHr` into `funds_guard`'s `cost_per_hr`. Under v2 that is None, so
+     accrued session cost computes as zero and **the session cap never trips**: the one guard
+     that was going to survive losing the balance.
+2. **An unknown query parameter is ignored, not rejected.** Measured:
+   `GET /v2/pods?desiredStatus=RUNNING` answers **200 with the full list**. A filter that stopped
+   being applied looks exactly like a filter that matched everything.
+
+This is the same shape the project has hit four times already (`known-defects.md` D1, the ffmpeg
+pin, NVENC, the BtbN month-end URL): **present is not working, and accepted is not applied.** The
+countermeasure is the one that would have caught those: assert on **behaviour**, not on the call
+returning 200.
+
+### Plan, in priority order
+
+**P0. The normalisation seam and its tests. DONE, 2026-08-20.** There was no
+`tests/test_runpod_client.py` at all, so nothing anywhere pinned the response shapes. What
+shipped: a `# response normalisation` section in `runpod_client.py` holding ten pure accessors
+(`unwrap_list`, `pod_state`, `pod_cost`, `pod_data_center`, `pod_gpu`, `pod_gpu_count`, `pod_ssh`,
+`pod_volume_id`, `pod_record`, `volume_data_center`) plus `error_detail`, and all **ten raw field
+reads outside the client routed through them** (`remote_run` x3, `batch_video_upscale` x1,
+`runpod_provision` x2, `gui/tab_runpod` x3, and the client's own internals). The accessors read
+**every shape at once** rather than switching on a configured version: a tolerant reader needs no
+switch to get right, so the switch, when it lands, only decides which URL to call. Two
+consequences worth recording. `_normalize_gql_pod` and `_normalize_rest_pod` collapsed into one
+`pod_record`, and `_http_error_message` now reads the RFC 9457 body as well as the v1 flat one,
+which was listed under P1 but belongs here: it is a read whose field moved, exactly like the
+others. `tests/test_runpod_client.py` pins it with **recorded** payloads from the deploy below (a
+spec-derived fixture would assert what the spec says, which is the mistake this project has made
+four times), and names its money tests after the consequence rather than the field: a running pod
+must be recognised so no second pod is deployed, the billed rate must be readable so the session
+cap can trip, a running pod must never read as stopped. 27 tests, offline, 1455 in the suite still
+green.
+
+The last of those tests sweeps every module for `x.get("desiredStatus")`-shaped reads outside the
+client, and **it was itself broken on the first attempt**, which is worth writing down because it
+is this project's recurring failure in miniature. The first version was a regex over source text
+with comments stripped; the comment-stripper returns TOKENS joined by newlines, so `.get(` was
+never contiguous, the regex matched nothing, and the test passed. It passed with a violation
+deliberately planted in `runner_common.py`. It is now a token scanner that reports `file:line`,
+and it has its own test that plants a read and requires the scanner to find it. **A guard that has
+never failed is not evidence that there is nothing to find.**
+
+**P1. REST v1 to v2. DONE, 2026-08-20 (deadline was 2026-11-15).** `runpod_client` now speaks
+both, and **v2 is what runs**. The switch is `runpod.api_version` ("v2" default, "v1" the escape
+hatch), applied once per process by the two config loaders that every path already goes through
+(`runner_common.load_config` for the runner subprocesses, `gui.common` for the GUI) rather than at
+each call site, because a call site that forgot would talk to the wrong transport and the symptom
+would be a renamed field silently reading None. It is **config-only, with no Settings control**,
+like `ntfy_token` and `watchdog_min_samples`: it exists for the day beta churn bites, and
+`probe_api_version` names the exact key and value to set when the configured version stops
+answering, which is better discoverability than a line in a template nobody reads.
+
+What moved: the base URL; `/networkvolumes` to `/network-volumes`; the volume create body's
+`dataCenterId` to `dataCenter` (**the only renamed field in a REQUEST, which is why it cannot go
+through the read seam**); the volume size bounds, checked against whichever version is live (v1
+1-4000, v2 10-4096) so a refusal quotes a limit the user can act on; the three lifecycle verbs
+collapsing into `POST /pods/{id}/action`; and `create_pod` gaining `v2_pod_body`, which **rebuilds**
+the body key by key rather than patching a copy, because `unevaluatedProperties: false` turns a
+single leftover v1 key into a 422. A **410 now says the actual thing to do** ("RunPod has retired
+the API this version of Image Toolbox uses. Update the app.") instead of reporting a status code,
+which matters because the promised `Sunset` headers are still not served and a 410 is the only
+warning anyone gets. `test_connection` names the transport it used, so a user reporting a problem
+says which one they were on without being asked.
+
+Two things were deleted rather than ported. `list_pods`' `**filters` is gone: v2 takes no status
+filter and **ignores** unknown query parameters (measured, 200 with the full list), so a filter
+that quietly stopped applying would be indistinguishable from one that matched everything. No
+caller ever passed one. And the pass-through spec dict is gone with it, for the same reason in the
+other direction.
+
+**Verified live on a second pod**, since the shape of a request is not evidence that it works.
+Through the app's own `create_pod`: a pod deployed on v2, **stopped through the action endpoint**,
+read back, and terminated. Two findings, one of which was a real open question. A pod stopped on
+v2 reports **`EXITED`**, the same value v1 uses, so `ensure_stopped`'s idempotence and
+`runner_common.remote_pod_stopped` are both correct on v2 (v2's `PodStatus` enum is richer, so
+this was worth measuring rather than assuming), and it keeps a populated `cost` while stopped,
+which is right: a stopped pod still bills its disk. `ensure_stopped` correctly answered "already
+stopped" without calling out again.
+
+**`start_pod` is the one call P1 could not prove.** RunPod answered `400 Bad Request: Failed to
+resume pod.` The request SHAPE was accepted (a malformed one is a 422 naming the field, measured),
+so this is RunPod declining to resume that particular stopped pod, which it does when the machine
+no longer has room, not a defect in the call. It is recorded rather than chased because **the app
+never calls it**: runs deploy fresh disposable pods and only ever stop or terminate them. Worth
+knowing before someone builds a feature on resume. Incidentally that error is itself the new error
+reader working: the reason came through at all only because `_http_error_message` now reads the
+RFC 9457 body, where before it would have printed a bare "HTTP 400 Bad Request".
+
+What is deliberately still on the old transports after P1: pod **creation** (`deploy_pod`), every
+live GPU and data-center picker, and the account balance. Those are GraphQL, they have until early
+2027, and they are P2 and P3.
+
+**P2. GraphQL to v2 (before early 2027), `deploy_pod` first.** It is the load-bearing call: no
+deploy, no remote feature. Its body is rebuilt rather than translated, and the shape named here is
+no longer a reading of the spec: it is what actually deployed a Blackwell card on 2026-08-20
+(Verification): `gpu:{id,count}`, `mounts.network:[{volumeId,path}]`, `disk`, `ports`, `env` as a
+dict rather than a key/value list, and **no** `supportPublicIp`, which v2 rejects by name. Then
+`available_gpus` and `data_centers` onto `/v2/catalog/*`, and `list_pods_detailed` onto plain `GET
+/v2/pods`, which now carries `gpu.id`, `dataCenterId` and `cost` directly: **the
+GraphQL-with-REST-fallback double path in `list_pods_detailed` deletes entirely**, along with its
+memoised `_PODS_MACHINE_SELECTIONS` probing.
+
+**P3. Decide the balance question** (above), starting by re-reading
+[runpod/docs#807](https://github.com/runpod/docs/issues/807) for a reply. Independent of P1 and
+P2, and the only part that may end in "this can no longer be done" rather than in code.
+
+**P4. The opportunities, opt-in and afterwards**, once the migration is proven: per-DC stock in
+the picker, `minCudaVersion` plus catalog `cudaVersions` replacing `KNOWN_CUDA_VERSIONS` and the
+consumer-card heuristic, fail-fast on `ERROR` in `wait_until_running`, `runtime` metrics as a
+fallback for the pod telemetry row when the tunnel is down, `/logs` for diagnosing a pod that
+never came up, and last-N-days spend from `/v2/billing`. Each is small on its own; none of them
+belong in the same change as the transport swap.
+
+**Deletions the migration earns**, worth counting since the module is 943 lines: `deploy_pod`'s
+GraphQL translation and `_DEPLOY_MUTATION`, `_graphql` with its browser-User-Agent workaround and
+three query constants, `CREATABLE_GPU_IDS` (48 hand-copied ids kept only to document a v1 bug),
+`KNOWN_CUDA_VERSIONS` with `allowed_cuda_versions` and probably `is_consumer_gpu`, the
+`list_pods_detailed` fallback ladder and both pod normalisers. The net line count should go
+**down**.
+
+### Verification: answered on real hardware, 2026-08-20
+
+Everything else in this entry was verified read-only or with deliberately invalid writes. Four
+questions needed a real deploy, and one pod answered all four: an **RTX PRO 4500 Blackwell** in
+EU-RO-1, created through **`POST /v2/pods`**, read back through v1, GraphQL and v2 inside the same
+minute, and terminated immediately. Two cents.
+
+1. **`env.PUBLIC_KEY` still gets SSH into the pod. Yes.** The create body set `env.PUBLIC_KEY` to
+   the app's managed key and omitted `startSsh` entirely; `ssh -i` with that key logged in as root
+   and ran `nvidia-smi`. So the app's zero-config SSH survives untouched and **nothing needs to be
+   registered on the account** (see Traps for why that matters).
+2. **`ports: ["22/tcp"]` alone still publishes a direct-TCP endpoint. Yes**, with no
+   `supportPublicIp` anywhere: `ssh.direct` filled in with `{host, port, username: "root",
+   command}`, matching v1's `publicIp` + `portMappings["22"]` byte for byte on the same pod.
+3. **A Blackwell card deploys through v2's POST. Yes**, which closes the question `deploy_pod` was
+   created to answer: the v1 create enum's rejection of newer cards is a v1 problem, and v2 needs
+   no GraphQL workaround for it.
+4. **`mounts.network` mounts the model volume. Yes**, at the `path` given, with the provisioned
+   tree (`venv`, `models`, `seedvr2`, `ollama`, `ffmpeg`) present. `path` is required, exactly as
+   GraphQL's `volumeMountPath` was.
+
+Four further findings came out of the same hour, and three of them change the plan:
+
+- **v2 reports `status: "RUNNING"` at creation**, in the create response itself, eight polls (about
+  50 s) before `ssh.direct` was anything but null and `runtime` anything but null. The richer
+  `PodStatus` enum does NOT mean the app can trust the status alone: `wait_until_running` must keep
+  requiring an SSH endpoint. A port that only checked `status == "RUNNING"` would hand the run a
+  host of `None` and fail somewhere much less obvious.
+- **The v1 pod object is worse than assumed**: on the measured pod `machine` came back `{}` and
+  there was **no GPU field at all**, so v1 alone cannot even name the card it is billing for. This
+  is why `list_pods_detailed` prefers GraphQL, and it is an argument for P2 rather than against it:
+  v2 carries `gpu.id`, `dataCenterId` and `cost` in one plain GET.
+- **The GPU label is transport-dependent.** The same card was `"RTX PRO 4500"` on GraphQL and
+  `"NVIDIA RTX PRO 4500 Blackwell"` on v2, and only the latter is the string a deploy accepts. So
+  the label is display-only and must never be matched on. The seam's tests pin this rather than
+  pretending the records are identical.
+- **RFC 9457 is live and its `errors[]` array is the valuable half.** Measured verbatim: a
+  sold-out card is `{"title": "Bad Request", "status": 400, "detail": "There are no longer any
+  instances available with the requested specifications. Please refresh and try again."}` and a
+  bad enum value is `{"title": "Unprocessable Entity", "status": 422, "detail": "Request
+  validation failed.", "errors": ["$.action: value must be one of 'start', 'stop', 'restart',
+  'terminate'"]}`. Reading only `error`/`message`, as the client did, would have thrown both away
+  and shown the user a bare "HTTP 400 Bad Request" for a card that is simply sold out.
+
+### Traps
+
+- **Never call `PUT /v2/account/ssh-keys`.** It **replaces** the account's registered public keys.
+  The app owns a managed key and injects it per pod precisely so it never touches account-wide
+  state; writing there would silently clobber the user's own keys and lock them out of every pod
+  they own, including ones this app knows nothing about. It is the most destructive call in the
+  new API and it is one line away from looking like the tidy solution to Verification #1.
+- **Keep sending a `User-Agent`.** Measured: `api.runpod.io/v2` behind Cloudflare answers **403
+  Error 1010** to urllib's default `Python-urllib/3.12`, and 200 to the app's own
+  `ImageToolbox-RunPod`. The app already sets one on REST and a browser string on GraphQL; the
+  point is that the v2 host **is** the GraphQL host, so its Cloudflare rules now apply to calls
+  that used to go to `rest.runpod.io`, where they did not.
+- **The pass-through spec dict dies.** `deploy_pod` takes a v1-REST-shaped dict and translates it,
+  so callers never had to change. v2 rejects unknown properties outright, so that dict must be
+  built for v2 or explicitly translated: there is no "extra keys are harmless" any more.
+- **Catalog prices are list prices**, and the spec states negotiated account discounts are not
+  reflected. Today's `lowestPrice.uninterruptablePrice` behaves the same way, and the pod's own
+  `cost` is the authoritative billed rate, so prefer it wherever a real number matters (estimates,
+  the funds cap) and treat the catalog as the shopping view.
+- **Data-center display names get worse.** GraphQL returns a human `location`; v2 returned
+  `name == id` for several DCs on this account ("AP-IN-1"). The Settings picker labels come from
+  that, so keep the curated `DATACENTERS` labels as the display layer and use the API for
+  membership and capability only. Note also that `storageSupport` and `listed` are gone: storage
+  capability is now `networkVolumeTypes` being non-empty, and there is no `listed` equivalent at
+  all, so a DC the console hides may now appear in the picker.
+- **`reset` has no v2 equivalent.** The app does not use it. Recorded so nobody goes looking.
+- **Sunset headers are announced but not served** (measured, above). Hard-code the dates, treat a
+  410 as the signal, and make that 410 reach the user, because it is the one failure a user cannot
+  diagnose and the app can name exactly: "RunPod retired the API this version of Image Toolbox
+  uses; update the app."
+
+<div align="right"><a href="#future-features">↑ Back to top</a></div>
 
 ---
 
@@ -98,8 +496,8 @@ template lands.
 Optionally denoise a source before it reaches the model, as a **checkbox** in the Batch
 Upscaler (images) and the Video Upscaler (videos).
 
-> **Deferred, 2026-08-19.** RunPod API changes take priority: they affect a shipped,
-> money-spending feature, while this one is still unproven. Deferred, not dropped, and
+> **Deferred, 2026-08-19.** The RunPod API v2 migration (#25) takes priority: it has a deadline
+> and it affects a shipped, money-spending feature, while this one is still unproven. Deferred, not dropped, and
 > nothing here expires.
 >
 > **Do not build this before the A/B harness reports.** Unlike everything else on this list,
@@ -467,7 +865,20 @@ The user installs and runs the application on their Unraid server.
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; browsing
   already-upscaled images; the Video Stabilization workflow), so the remaining sequencing is
   only among the open milestones below.
-- **Open milestones: #24, #21, #12, #15, #3, #4.**
+- **Open milestones: #25, #24, #21, #12, #15, #3, #4.**
+- **#25 (RunPod API v2) is the only milestone with a deadline, and it comes in two.** REST v1
+  returns 410 on **2026-11-15** and GraphQL in **early 2027**, and the app ran on both at once:
+  pod lifecycle and volumes on v1, pod *creation* plus every live GPU/DC picker on GraphQL. Its
+  **P0 landed on 2026-08-20**: a normalisation seam in `runpod_client` plus the first
+  `tests/test_runpod_client.py`, pinned with payloads recorded off a real pod read through all
+  three transports. It had no deadline and went first anyway, because the migration's real hazard
+  is renamed response fields reading as None and failing **silently, toward spending money** (a
+  second billed pod, an auto-resume supervisor that quits on every blip, a session cap that never
+  trips). **P1 landed the same day**, well ahead of its November date: v2 is now the default
+  transport, v1 is a config-only escape hatch (`runpod.api_version`), and pod creation plus the
+  live pickers stay on GraphQL until P2. One piece has no v2 answer at all: the **account
+  balance** the funds-guard floor is built on is not in v2, so decide its degradation deliberately
+  rather than discovering it on the day GraphQL stops.
 - **#24 (richer bug reports) is independent of everything else and is the cheapest
   item on this list.** It touches one function (`gui.common._issue_url`) plus wherever the
   last-run summaries end up coming from, and it pays off on the NEXT bad report rather
@@ -480,7 +891,7 @@ The user installs and runs the application on their Unraid server.
   The rule that matters is already enforced there and must not be relaxed: **no JPEG temp**,
   because it would spend a generation of quality before SeedVR2 sees a pixel.
 - **#21 (denoise) is gated on the A/B harness and may never be built at all**, and is
-  **deferred** behind the RunPod API work either way (2026-08-19). It is the only open
+  **deferred** behind the RunPod API work (#25) either way (2026-08-19). It is the only open
   milestone whose *value* is unknown rather than its cost. Do not start it before the
   measurement; a "no visible benefit" result moves it to `dropped-ideas.md`, which is a
   successful outcome. The harness itself needs no development time and does not need to wait

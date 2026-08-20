@@ -323,7 +323,7 @@ class RemoteSession:
         except rp.RunPodError:
             return None
         for p in pods:
-            if not isinstance(p, dict) or p.get("desiredStatus") != rp.STATUS_RUNNING:
+            if rp.pod_state(p) != rp.STATUS_RUNNING:
                 continue
             if not str(p.get("name", "")).startswith(self.pod_name_prefix):
                 continue
@@ -411,10 +411,13 @@ class RemoteSession:
                                       deploy_timeout=240, poll=8, on_event=ev)
         self.pod_id = pod.get("id")
         self.host, self.ssh_port = rp.ssh_endpoint(pod)
-        # The deploy/running pod dict carries costPerHr — the REAL billed rate of
-        # whichever GPU in the fallback chain actually deployed, so the live cost
-        # readout reflects the bill, not the picked card.
-        self.cost_per_hr = pod.get("costPerHr")
+        # The deploy/running pod dict carries the REAL billed rate of whichever
+        # GPU in the fallback chain actually deployed, so the live cost readout
+        # reflects the bill, not the picked card. Read through rp.pod_cost: the
+        # field is `costPerHr` on v1/GraphQL and `cost` on v2, and reading the
+        # wrong one yields None, which makes funds_guard's session cap accrue
+        # nothing and never trip (docs/future-features.md #25).
+        self.cost_per_hr = rp.pod_cost(pod)
         if self.cost_per_hr is None:
             self.cost_per_hr = self._read_pod_cost(self.pod_id)
 
@@ -424,7 +427,7 @@ class RemoteSession:
         if not pod_id:
             return None
         try:
-            return rp.get_pod(self.api_key, pod_id).get("costPerHr")
+            return rp.pod_cost(rp.get_pod(self.api_key, pod_id))
         except Exception:                                # noqa: BLE001 (best-effort)
             return None
 

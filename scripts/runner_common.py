@@ -38,6 +38,12 @@ import os
 import sys
 import struct
 
+try:                                        # optional, never fatal
+    from debug_log import debug_log
+except Exception:                           # noqa: BLE001 (older install)
+    def debug_log(*_a, **_k):
+        pass
+
 # App root = parent of scripts/. config.json, seedvr2/, models/, logs/ and the
 # .venv all live at the app root, not beside these modules. Anchored off this
 # file so it is correct regardless of the current working directory.
@@ -62,7 +68,25 @@ def load_config():
     if cfg is None:                 # present but malformed
         print(f"\nERROR: could not parse config.json at: {config_path}\n")
         sys.exit(1)
+    _apply_runpod_api_version(cfg)
     return cfg
+
+
+def _apply_runpod_api_version(cfg):
+    """Point runpod_client at the configured REST version (`runpod.api_version`,
+    default v2; REST v1 returns 410 Gone on 2026-11-15).
+
+    Hooked HERE, in the one loader every runner subprocess already calls, rather
+    than at each call site: a caller that forgot would talk to the wrong
+    transport, and that failure is a renamed response field silently reading None
+    (see the normalisation seam in runpod_client). Guarded and best-effort, so a
+    runner with nothing to do with RunPod is never blocked by it.
+    """
+    try:
+        import runpod_client
+        runpod_client.configure(cfg)
+    except Exception as exc:                             # noqa: BLE001 (fail-safe)
+        debug_log("could not apply runpod.api_version", exc)
 
 
 def harden_stdout():

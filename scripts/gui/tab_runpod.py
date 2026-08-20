@@ -766,8 +766,11 @@ class RunPodTab(ttk.Frame):
         threading.Thread(target=work, daemon=True).start()
 
     def _volume_label(self, v):
+        # The data center goes through runpod_client.volume_data_center: v1 spells it
+        # `dataCenterId`, v2 `dataCenter`. Reading it raw would print '?' for
+        # every volume and, worse, match none of them to the picked DC below.
         return (f"{v.get('id','')} | {v.get('name','?')} | "
-                f"{v.get('size','?')} GB | {v.get('dataCenterId','?')}")
+                f"{v.get('size','?')} GB | {runpod_client.volume_data_center(v) or '?'}")
 
     def _apply_volume_filter(self, select_id=None):
         """Populate the Model volume combobox with ALL of the account's volumes (so
@@ -779,7 +782,8 @@ class RunPodTab(ttk.Frame):
             return (0, 0)
         dc = self._selected_dc_id()
         all_labels = [self._volume_label(v) for v in self._all_volumes]
-        in_dc = [v for v in self._all_volumes if v.get("dataCenterId") == dc] if dc else []
+        in_dc = [v for v in self._all_volumes
+                 if runpod_client.volume_data_center(v) == dc] if dc else []
         # A DC with no volume still needs a readable selection: prepend a
         # 'None | <dc>' placeholder (kept first so it's easy to spot in the list).
         values = list(all_labels)
@@ -793,7 +797,8 @@ class RunPodTab(ttk.Frame):
         # belongs to this DC; else the DC's own volume; else the placeholder. So a
         # DC change follows the DC, while a Refresh keeps a still-valid selection.
         cur = self._selected_volume_id()
-        want = select_id or (cur if any(v.get("id") == cur and v.get("dataCenterId") == dc
+        want = select_id or (cur if any(v.get("id") == cur
+                                        and runpod_client.volume_data_center(v) == dc
                                         for v in self._all_volumes) else None)
         sel = (next((l for l in all_labels if l.split("|", 1)[0].strip() == want), None)
                if want else None)

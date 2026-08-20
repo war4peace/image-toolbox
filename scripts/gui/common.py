@@ -100,7 +100,25 @@ def _load_config():
     # Merged view of the tracked config.json plus the untracked config.local.json
     # secrets overlay (config_store). The rest of the GUI reads CFG exactly as
     # before; it never needs to know secrets live in a separate file.
-    return config_store.load(APP_ROOT) or {}
+    cfg = config_store.load(APP_ROOT) or {}
+    _apply_runpod_api_version(cfg)
+    return cfg
+
+
+def _apply_runpod_api_version(cfg):
+    """Point runpod_client at the configured REST version (`runpod.api_version`,
+    default v2; REST v1 returns 410 Gone on 2026-11-15).
+
+    The GUI's half of the same hook runner_common.load_config installs for the
+    runner subprocesses. One place per process, rather than one per call site:
+    a caller that forgot would talk to the wrong transport, and that failure is
+    a renamed response field silently reading None. Best-effort, so it can never
+    stop the app from starting."""
+    try:
+        import runpod_client
+        runpod_client.configure(cfg)
+    except Exception:                            # noqa: BLE001 (fail-safe)
+        pass
 
 CFG = _load_config()
 

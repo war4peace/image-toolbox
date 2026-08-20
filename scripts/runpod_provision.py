@@ -239,7 +239,7 @@ def _endpoint_or_die(rpc):
     host, port = rp.ssh_endpoint(pod)
     if not host:
         sys.exit(f"Pod {pod_id} has no SSH endpoint yet (status: "
-                 f"{pod.get('desiredStatus') if isinstance(pod, dict) else '?'}).")
+                 f"{rp.pod_state(pod) or '?'}).")
     return pod_id, host, port
 
 
@@ -309,7 +309,7 @@ def cmd_status(rpc, args):
         print("No pod recorded.")
         return
     pod = rp.get_pod(rpc["api_key"], pod_id)
-    status = pod.get("desiredStatus") if isinstance(pod, dict) else "?"
+    status = rp.pod_state(pod) or "?"
     host, port = rp.ssh_endpoint(pod)
     print(f"pod_id   : {pod_id}")
     print(f"status   : {status}")

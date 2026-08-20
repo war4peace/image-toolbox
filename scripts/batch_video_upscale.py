@@ -2584,10 +2584,14 @@ def _pod_still_running(list_pods, pod_id, name_prefix):
         pods = list_pods()
     except Exception:                                  # noqa: BLE001 (can't confirm -> gone)
         return False
+    import runpod_client as rp                      # stdlib-only, cheap
     for p in pods or []:
         if not isinstance(p, dict) or p.get("id") != pod_id:
             continue
-        if p.get("desiredStatus") != "RUNNING":
+        # rp.pod_state, not a raw field: `desiredStatus` (v1/GraphQL) is spelled
+        # `status` on v2, and reading the wrong one makes every pod look stopped,
+        # so the supervisor would give up on exactly the runs it exists to rescue.
+        if rp.pod_state(p) != "RUNNING":
             return False
         if name_prefix and not str(p.get("name", "")).startswith(name_prefix):
             return False
