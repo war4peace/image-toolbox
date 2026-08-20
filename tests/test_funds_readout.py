@@ -60,3 +60,18 @@ def test_fmt_funds_unknown_cases():
     assert gui.fmt_funds({}) == ("Unknown", None)
     assert gui.fmt_funds({"balance": None}) == ("Unknown", None)
     assert gui.fmt_funds("nonsense") == ("Unknown", None)
+
+
+def test_a_retired_balance_reads_differently_from_an_unknown_one():
+    """#25 P3. "Unknown" invites the user to wait for a number that is never
+    coming back, while a funds floor they configured sits unenforced. The two
+    states are one word apart on screen and the tooltip explains each."""
+    assert gui.fmt_funds({"balance": None, "status": "retired"}) == (
+        gui.FUNDS_RETIRED, None)
+    assert gui.fmt_funds({"balance": None, "status": "error"}) == (
+        gui.FUNDS_UNKNOWN, None)
+    assert gui.FUNDS_RETIRED != gui.FUNDS_UNKNOWN
+
+
+def test_a_readable_balance_ignores_the_status():
+    assert gui.fmt_funds({"balance": 12.3, "status": "ok"}) == ("$12.30", 12.3)

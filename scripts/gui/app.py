@@ -40,7 +40,7 @@ from tkinter import ttk, messagebox
 from gui.common import (
     APP_ROOT, APP_TITLE, APP_VERSION, CFG, save_config,
     update_auto_check_enabled, update_skipped_version, report_issue, open_donate,
-    _FUNDS_GREY, funds_color, config_funds_floor, fmt_funds,
+    _FUNDS_GREY, funds_color, config_funds_floor, fmt_funds, FUNDS_RETIRED,
     mqtt_config, mqtt_enabled, load_settings, save_settings, _geometry_on_screen,
     now_stamp, DEFAULT_WINDOW_GEOMETRY,
 )
@@ -276,10 +276,7 @@ class App(tk.Tk):
                                     font=("Consolas", 9))
         self.funds_value.pack(side="left", padx=(4, 0))
         self._funds_shown = True     # tracks whether the two labels are packed
-        Tooltip(self.funds_value,
-                "Your RunPod account balance, coloured by how far it sits above the "
-                "funds floor (Settings -> RunPod). Active only when the current tab "
-                "runs on a remote pod. 'Unknown' if it can't be read.")
+        self.funds_tip = Tooltip(self.funds_value, self._FUNDS_TIP_OK)
 
     # ── RunPod funds readout (bottom bar) ────────────────────────────────────
 
@@ -348,11 +345,40 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    # The readout's hint follows what the readout is actually showing. A grey
+    # "Unknown" with a floor configured in Settings means that floor is NOT being
+    # applied, which is the one state worth spelling out: the guard is fail-open
+    # by contract, so it never blocks and never complains (#25 P3).
+    _FUNDS_TIP_OK = ("Your RunPod account balance, coloured by how far it sits "
+                     "above the funds floor (Settings -> RunPod). Active only "
+                     "when the current tab runs on a remote pod.")
+    _FUNDS_TIP_UNKNOWN = ("The RunPod account balance could not be read just now. "
+                          "While it cannot be read, a funds floor set in Settings "
+                          "is NOT enforced (runs are never blocked on a balance "
+                          "the app is unsure of). The per-run cost cap is "
+                          "unaffected.")
+    _FUNDS_TIP_RETIRED = ("RunPod no longer publishes the account balance, so a "
+                          "funds floor set in Settings can no longer be enforced. "
+                          "Use the per-run cost cap instead (Settings -> RunPod): "
+                          "it is derived from the pod's own billed rate and needs "
+                          "no balance.")
+
     def _render_funds(self):
-        """Paint the funds value from the cache, coloured against the saved floor."""
+        """Paint the funds value from the cache, coloured against the saved floor,
+        and retarget the hint at whichever of the three states it is showing."""
         text, bal = fmt_funds(self._funds_cache)
         self.funds_caption.configure(fg=_FUNDS_GREY)
         self.funds_value.configure(text=text, fg=funds_color(bal, config_funds_floor()))
+        if bal is not None:
+            tip = self._FUNDS_TIP_OK
+        elif text == FUNDS_RETIRED:
+            tip = self._FUNDS_TIP_RETIRED
+        else:
+            tip = self._FUNDS_TIP_UNKNOWN
+        try:
+            self.funds_tip.set_text(tip)
+        except Exception:                      # noqa: BLE001 (cosmetic, fail-safe)
+            pass
 
     def _fetch_funds_async(self):
         """Fetch the balance off the UI thread (cached ~30 s to avoid hammering the
@@ -369,7 +395,9 @@ class App(tk.Tk):
         self._funds_fetching = True
 
         def work():
-            info = runpod_client.account_balance(key)   # fail-safe (None on failure)
+            # _detail, not account_balance: the readout has to SAY which kind of
+            # failure it is, and the plain call throws that away (#25 P3).
+            info = runpod_client.account_balance_detail(key)   # never raises
 
             def apply():
                 self._funds_fetching = False

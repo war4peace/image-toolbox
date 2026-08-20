@@ -5,6 +5,8 @@ funds_guard — the remote-run money safety net (recommendations item 3 / roadma
 that contract down, plus the session-cost math and a single poller iteration.
 """
 
+import pytest
+
 import funds_guard as fg
 
 
@@ -122,3 +124,73 @@ def test_guard_check_once_floor_uses_passed_balance():
                       floor=5.0, clock=lambda: 0.0, started_at=0.0)
     assert g.check_once(balance=2.0)[0] is True
     assert g.check_once(balance=9.0)[0] is False
+
+
+# ── floor_unenforced (#25 P3: the silence, not the behaviour) ───────────────
+#
+# The fail-open contract above is correct and stays. What changes is that it no
+# longer happens quietly: a floor the app cannot check is a protection the user
+# believes is on.
+
+def test_a_configured_floor_that_cannot_be_checked_says_so():
+    msg = fg.floor_unenforced(floor=5.0, balance=None)
+    assert msg and "5.00" in msg and "not being enforced" in msg
+
+
+def test_a_retired_balance_and_a_blip_are_worded_differently():
+    """A blip fixes itself and needs no action. A retired balance never comes
+    back, and the user has to move to the per-run cap or lose the guard."""
+    gone = fg.floor_unenforced(5.0, None, fg.BALANCE_RETIRED)
+    blip = fg.floor_unenforced(5.0, None, "error")
+    assert gone != blip
+    assert "no longer" in gone and "cap" in gone
+    assert "right now" in blip
+
+
+def test_nothing_is_said_when_there_is_nothing_to_say():
+    assert fg.floor_unenforced(0, None, fg.BALANCE_RETIRED) is None   # no floor
+    assert fg.floor_unenforced(None, None) is None
+    assert fg.floor_unenforced(5.0, 12.0) is None      # readable: it IS enforced
+    assert fg.floor_unenforced(5.0, 0.0) is None       # a $0 balance is a NUMBER
+
+
+def test_the_retired_token_matches_the_control_plane():
+    """funds_guard deliberately does not import runpod_client, so the token is
+    spelled out in both. Pinned here because a drift would silently downgrade
+    every retired balance to the 'try again shortly' wording."""
+    pytest.importorskip("runpod_client")
+    import runpod_client as rp
+    assert fg.BALANCE_RETIRED == rp.BALANCE_RETIRED
+
+
+def test_the_poller_warns_once_when_the_floor_cannot_be_enforced():
+    """`on_warn` was accepted, stored and never fired by anything before 0.6.1,
+    so a run guarded by an unreadable floor looked exactly like a guarded one."""
+    warnings, polls = [], []
+
+    def fetch():
+        polls.append(1)
+        return {"balance": None, "status": fg.BALANCE_RETIRED}
+
+    guard = fg.FundsGuard(fetch_balance=fetch, cost_per_hr=1.0, floor=5.0,
+                          on_warn=warnings.append)
+    # Drive the loop synchronously for exactly three polls, then break it.
+    guard._stop.wait = lambda _seconds: len(polls) >= 3
+    guard._run()
+    assert len(polls) == 3                 # it really did poll more than once
+    assert len(warnings) == 1              # and said it once, not once per poll
+    assert "not being enforced" in warnings[0].lower()
+
+
+def test_the_poller_stays_quiet_when_the_balance_reads():
+    warnings, polls = [], []
+
+    def fetch():
+        polls.append(1)
+        return {"balance": 50.0}
+
+    guard = fg.FundsGuard(fetch_balance=fetch, cost_per_hr=1.0, floor=5.0,
+                          on_warn=warnings.append)
+    guard._stop.wait = lambda _seconds: len(polls) >= 2
+    guard._run()
+    assert polls and warnings == []

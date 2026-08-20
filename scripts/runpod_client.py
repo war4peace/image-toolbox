@@ -275,7 +275,18 @@ EU_DATACENTERS = [(lbl, dcid) for lbl, dcid in DATACENTERS
 
 
 class RunPodError(Exception):
-    """A RunPod REST call failed (network, auth, HTTP, or parse error)."""
+    """A RunPod REST call failed (network, auth, HTTP, or parse error).
+
+    `status` carries the HTTP status when there was one, so a caller can tell a
+    PERMANENT failure from a transient one without matching on message text. The
+    balance readout is why it exists: a configured funds floor is fail-OPEN by
+    contract, so an unreadable balance silently disables a guard the user asked
+    for, and "gone for good" and "try again in a minute" need different words in
+    front of them (see account_balance_detail)."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def _request(method, path, api_key, body=None, params=None, timeout=30):
@@ -309,7 +320,7 @@ def _request(method, path, api_key, body=None, params=None, timeout=30):
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        raise RunPodError(_http_error_message(exc)) from exc
+        raise RunPodError(_http_error_message(exc), status=exc.code) from exc
     except urllib.error.URLError as exc:
         raise RunPodError(f"Could not reach RunPod: {exc.reason}") from exc
     except Exception as exc:                              # noqa: BLE001 (fail-safe)
@@ -330,7 +341,11 @@ def _http_error_message(exc):
     if exc.code == 403:
         return "RunPod denied access (403 Forbidden) — the key may lack permission."
     if exc.code == 404:
-        return "Not found (404) — the pod may have been terminated."
+        # Usually a pod that went away, but a volume, a template or a route this
+        # API version does not serve answers identically, and blaming a pod
+        # sends the reader looking in the wrong place.
+        return ("Not found (404). The pod or volume may be gone, or this API "
+                "version may not offer that route.")
     if exc.code == 429:
         return "RunPod is rate-limiting requests (429) — try again shortly."
     if exc.code == 410:
@@ -369,7 +384,13 @@ def _error_detail(exc):
 def error_detail(body):
     """The reason out of a parsed error body (v1 flat, or an RFC 9457 problem
     object). The field-level `errors` list is appended when present: it is the
-    part that names WHICH field v2 rejected, which is the whole point of a 422."""
+    part that names WHICH field v2 rejected, which is the whole point of a 422.
+
+    The list holds plain strings on v2 and OBJECTS on GraphQL, whose 400 body is
+    {"errors": [{"message": ..., "locations": [...], "extensions": {...}}]}
+    (measured 2026-08-20 by asking for a field that does not exist). Stringifying
+    those verbatim puts a Python dict repr in front of the user with the actual
+    sentence buried in it, so an object is read for its own message first."""
     if not isinstance(body, dict):
         return ""
     text = body.get("error") or body.get("message") or body.get("detail") or ""
@@ -377,10 +398,20 @@ def error_detail(body):
         text = str(text)
     fields = body.get("errors")
     if isinstance(fields, list) and fields:
-        joined = "; ".join(str(f) for f in fields if f)
+        joined = "; ".join(_error_item(f) for f in fields if f)
         if joined:
             text = f"{text} ({joined})" if text else joined
     return text.strip()
+
+
+def _error_item(item):
+    """One entry of an `errors` list: a v2 string, or a GraphQL error object."""
+    if isinstance(item, dict):
+        for key in ("message", "detail", "error"):
+            val = item.get(key)
+            if isinstance(val, str) and val:
+                return val
+    return str(item)
 
 
 # ── response normalisation: the one place that knows a field's spelling ──────
@@ -1082,7 +1113,7 @@ def _graphql(api_key, query, variables=None, timeout=30):
         with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        raise RunPodError(_http_error_message(exc)) from exc
+        raise RunPodError(_http_error_message(exc), status=exc.code) from exc
     except urllib.error.URLError as exc:
         raise RunPodError(f"Could not reach RunPod: {exc.reason}") from exc
     except Exception as exc:                              # noqa: BLE001 (fail-safe)
@@ -1235,29 +1266,104 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
 
 _BALANCE_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
 
+# How a balance lookup came back. The distinction is not cosmetic, and it is the
+# whole of #25 P3: the account balance is the ONE thing v2 has no successor for
+# (verified 2026-08-20 against the live OpenAPI document: 34 paths, one
+# /v2/account/* and it is ssh-keys; /account, /account/balance, /account/credits,
+# /user and /me all 404 on the real account). It lives only in GraphQL, which
+# RunPod retires in early 2027.
+#
+# Losing it is quiet, because funds_guard is fail-OPEN by contract: an unknown
+# balance skips the start floor and the in-run balance floor rather than blocking
+# a run. That is the right behaviour and the wrong silence. A user who configured
+# a floor would keep a floor that is no longer enforced, and never be told, which
+# is the same family as every other bug this migration has produced: it fails
+# toward SPENDING MONEY and looks like a normal run.
+#
+# So a failed lookup says which kind it is. RETIRED and ERROR both mean "the
+# floor is not being enforced right now"; only one of them will ever start
+# working again, and only one of them is worth telling the user to act on.
+BALANCE_OK = "ok"
+BALANCE_NO_KEY = "no_key"
+BALANCE_RETIRED = "retired"
+BALANCE_ERROR = "error"
+
+
+def _balance_failure(exc):
+    """Classify a failed balance lookup as RETIRED (gone for good) or ERROR."""
+    if getattr(exc, "status", None) in (404, 410):
+        return BALANCE_RETIRED
+    # A field leaving the schema is the LIKELIER first symptom: the endpoint
+    # keeps serving and only `clientBalance` disappears. Measured 2026-08-20 by
+    # asking for a field that does not exist, GraphQL answers that with HTTP 400
+    # and 'Cannot query field "…" on type "User".', so the status code says only
+    # "bad request" and the body is the part that carries the meaning. Naming the
+    # field is what separates it from a transient auth or rate-limit error, both
+    # of which are also 4xx.
+    if "clientBalance" in str(exc):
+        return BALANCE_RETIRED
+    return BALANCE_ERROR
+
+
+def account_balance_detail(api_key, timeout=15):
+    """The balance lookup WITH its failure reason, for the callers that have to
+    say something when it is unreadable (the funds guard, the GUI readout).
+
+    Always returns a dict, never raises:
+      success  {"status": BALANCE_OK, "balance": float, "spend_per_hr": float}
+      failure  {"status": BALANCE_NO_KEY|BALANCE_RETIRED|BALANCE_ERROR,
+                "balance": None, "spend_per_hr": None, "detail": str}
+    A failure dict still answers `.get("balance")` as None, so anything that only
+    wants the number keeps working unchanged."""
+    def fail(status, detail):
+        return {"status": status, "balance": None, "spend_per_hr": None,
+                "detail": detail}
+
+    if not api_key:
+        return fail(BALANCE_NO_KEY, "No RunPod API key is set.")
+    try:
+        data = _graphql(api_key, _BALANCE_QUERY, timeout=timeout)
+    except RunPodError as exc:
+        return fail(_balance_failure(exc), str(exc))
+    except Exception as exc:                             # noqa: BLE001 (fail-safe)
+        return fail(BALANCE_ERROR, f"Balance lookup failed: {exc}")
+
+    me = (data or {}).get("myself") or {}
+    if not me:
+        # No account object at all reads as a transport/permission problem, not
+        # as the field having been removed.
+        return fail(BALANCE_ERROR, "RunPod answered without any account data.")
+    bal = me.get("clientBalance")
+    if bal is None:
+        return fail(BALANCE_RETIRED,
+                    "RunPod answered without a clientBalance field.")
+    try:
+        return {"status": BALANCE_OK, "balance": float(bal),
+                "spend_per_hr": float(me.get("currentSpendPerHr") or 0.0)}
+    except (TypeError, ValueError):
+        return fail(BALANCE_ERROR, "RunPod returned an unreadable balance.")
+
 
 def account_balance(api_key, timeout=15):
     """Live account balance for the money safety-net (funds_guard, roadmap #1).
 
     Returns {"balance": float (USD), "spend_per_hr": float (USD/h)} or None on ANY
-    failure — no key, unreachable, unparseable. Fail-safe by contract: the funds
-    guard skips its checks when the balance is unknown and never blocks a run on
-    it. The balance is not in the REST API; only the legacy GraphQL `myself` query
-    exposes it (which _graphql already reaches with the browser User-Agent
-    Cloudflare requires)."""
-    try:
-        data = _graphql(api_key, _BALANCE_QUERY, timeout=timeout)
-    except Exception:                                    # noqa: BLE001 (fail-safe)
+    failure. Fail-safe by contract: the funds guard skips its checks when the
+    balance is unknown and never blocks a run on it. Kept as the plain-number half
+    of account_balance_detail for callers that have nothing to say about a
+    failure.
+
+    The balance is not in the REST API at all, in either version, and v2 has no
+    successor for it (#25 P3); only the legacy GraphQL `myself` query exposes it
+    (which _graphql already reaches with the browser User-Agent Cloudflare
+    requires). `spend_per_hr` has no naive successor either: measured with ZERO
+    pods running it reported $0.005/h, which is the network volume's standing
+    storage charge, so summing pod_cost() over the running pods would report
+    $0.00/h for an account that is genuinely spending."""
+    info = account_balance_detail(api_key, timeout=timeout)
+    if info.get("status") != BALANCE_OK:
         return None
-    me = (data or {}).get("myself") or {}
-    bal = me.get("clientBalance")
-    if bal is None:
-        return None
-    try:
-        return {"balance": float(bal),
-                "spend_per_hr": float(me.get("currentSpendPerHr") or 0.0)}
-    except (TypeError, ValueError):
-        return None
+    return {"balance": info["balance"], "spend_per_hr": info["spend_per_hr"]}
 
 
 _DC_QUERY = "{ dataCenters { id name location storageSupport listed } }"

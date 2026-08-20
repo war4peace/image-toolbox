@@ -341,16 +341,28 @@ def config_funds_floor():
         return 0.0
 
 
+# What the readout says when there is no number. Two words, because the two
+# cases are not the same thing: "Unknown" is a blip and will fix itself, while
+# "Not published" means RunPod stopped serving the balance and any funds floor
+# configured in Settings can never be enforced again (#25 P3). Keeping one word
+# for both would hide exactly the transition the user has to act on.
+FUNDS_UNKNOWN = "Unknown"
+FUNDS_RETIRED = "Not published"
+
+
 def fmt_funds(info):
-    """(display text, balance-or-None) for a runpod_client.account_balance result.
-    A missing/failed lookup reads as 'Unknown'."""
+    """(display text, balance-or-None) for a runpod_client.account_balance or
+    account_balance_detail result. A missing/failed lookup reads as 'Unknown',
+    except a RETIRED one, which says so."""
     bal = info.get("balance") if isinstance(info, dict) else None
+    miss = (FUNDS_RETIRED if isinstance(info, dict) and info.get("status") == "retired"
+            else FUNDS_UNKNOWN)
     if bal is None:
-        return "Unknown", None
+        return miss, None
     try:
         bal = float(bal)
     except (TypeError, ValueError):
-        return "Unknown", None
+        return miss, None
     return f"${bal:.2f}", bal
 
 

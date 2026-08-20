@@ -638,7 +638,7 @@ class RunPodTab(ttk.Frame):
                 err = None
             except runpod_client.RunPodError as exc:
                 dcs, err = [], str(exc)
-            funds = runpod_client.account_balance(key)      # fail-safe (None on failure)
+            funds = runpod_client.account_balance_detail(key)   # never raises
 
             def apply():
                 # Push the fetched balance to the shared bottom-bar Funds readout.

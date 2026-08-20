@@ -892,6 +892,155 @@ def test_list_pods_detailed_is_one_get_on_v2(catalog, monkeypatch):
     assert rows[0]["cost"] == 0.72
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  The account balance (#25 P3): the one thing v2 has no successor for
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Measured 2026-08-20 against the live spec and the live account: 34 paths, one
+# /v2/account/* and it is ssh-keys, and /account, /account/balance,
+# /account/credits, /user and /me all 404. The balance is GraphQL-only and
+# GraphQL retires in early 2027.
+#
+# Losing it is SILENT, which is the whole point of these tests. funds_guard is
+# fail-open by contract: an unknown balance skips the floor rather than blocking
+# a run, so a user who set a floor keeps a floor that is no longer applied, with
+# nothing on screen and nothing in the log to say so. Same family as every other
+# bug this migration produced: it fails toward spending money and looks normal.
+
+
+def _raising_graphql(exc):
+    def fake(api_key, query, variables=None, timeout=30):
+        raise exc
+    return fake
+
+
+def test_a_retired_balance_says_retired_not_unknown(monkeypatch):
+    """The consequence: 'Unknown' invites the user to wait for it to come back.
+    A retired balance never comes back, and the floor they configured is dead."""
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(rp.GRAPHQL_URL, 410, "Gone", {}, io.BytesIO(b""))
+    monkeypatch.setattr(rp.urllib.request, "urlopen", fake_urlopen)
+    info = rp.account_balance_detail("k")
+    assert info["status"] == rp.BALANCE_RETIRED
+    assert info["balance"] is None
+    assert "retired" in info["detail"].lower()
+
+
+# GraphQL's answer to a field that is not in the schema, recorded 2026-08-20 by
+# asking the live endpoint for one. It is a 400, NOT the 200-with-errors the
+# GraphQL spec suggests, so the status code says only "bad request" and the body
+# is the part that carries the meaning. The `errors` list holds OBJECTS here,
+# where v2's RFC 9457 list holds plain strings.
+GQL_UNKNOWN_FIELD = json.loads(r"""
+{
+ "errors": [
+  {
+   "message": "Cannot query field \"clientBalance2\" on type \"User\".",
+   "locations": [{"line": 1, "column": 18}],
+   "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}
+  }
+ ]
+}
+""")
+
+
+def test_a_field_dropped_from_the_schema_also_reads_as_retired(monkeypatch):
+    """The LIKELIER first symptom: the endpoint keeps serving and only
+    `clientBalance` disappears. Driven through the real HTTP path with the
+    recorded body, because the classification rests on the message reaching the
+    caller intact."""
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(
+            rp.GRAPHQL_URL, 400, "Bad Request", {},
+            io.BytesIO(json.dumps(GQL_UNKNOWN_FIELD).replace(
+                "clientBalance2", "clientBalance").encode("utf-8")))
+    monkeypatch.setattr(rp.urllib.request, "urlopen", fake_urlopen)
+    assert rp.account_balance_detail("k")["status"] == rp.BALANCE_RETIRED
+
+    # And the same thing one layer up, where the query succeeds but the field is
+    # simply absent from the account object.
+    monkeypatch.setattr(rp, "_graphql",
+                        lambda *a, **k: {"myself": {"currentSpendPerHr": 0.5}})
+    assert rp.account_balance_detail("k")["status"] == rp.BALANCE_RETIRED
+
+
+def test_a_blip_is_not_reported_as_retired(monkeypatch):
+    """The opposite error, and it is not harmless either: telling a user the
+    balance is gone for good would have them remove a floor that still works."""
+    for exc in (rp.RunPodError("Could not reach RunPod: timed out"),
+                rp.RunPodError("RunPod returned HTTP 502 Bad Gateway.", status=502),
+                rp.RunPodError("RunPod is rate-limiting requests (429).", status=429)):
+        monkeypatch.setattr(rp, "_graphql", _raising_graphql(exc))
+        assert rp.account_balance_detail("k")["status"] == rp.BALANCE_ERROR
+    # An answer with no account object at all is a permission/transport problem,
+    # not evidence that the field was removed.
+    monkeypatch.setattr(rp, "_graphql", lambda *a, **k: {"myself": None})
+    assert rp.account_balance_detail("k")["status"] == rp.BALANCE_ERROR
+
+
+def test_no_key_is_its_own_case_and_costs_no_request(monkeypatch):
+    """A fresh install has no key. That is not an outage and must not read as
+    one, and it must not put a request on the wire to find out."""
+    def boom(*a, **k):
+        raise AssertionError("no request should be made without a key")
+    monkeypatch.setattr(rp.urllib.request, "urlopen", boom)
+    assert rp.account_balance_detail("")["status"] == rp.BALANCE_NO_KEY
+    assert rp.account_balance("") is None
+
+
+def test_account_balance_keeps_its_none_on_any_failure_contract(monkeypatch):
+    """Every caller of the plain function treats None as 'skip the check'. The
+    detail wrapper must not have turned a failure into a truthy dict there."""
+    for exc in (rp.RunPodError("gone", status=410),
+                rp.RunPodError("timed out"),
+                ValueError("something else entirely")):
+        monkeypatch.setattr(rp, "_graphql", _raising_graphql(exc))
+        assert rp.account_balance("k") is None
+    monkeypatch.setattr(rp, "_graphql", lambda *a, **k: {"myself": {}})
+    assert rp.account_balance("k") is None
+
+
+def test_a_readable_balance_is_unchanged(monkeypatch):
+    """Recorded off the live account, 2026-08-20."""
+    monkeypatch.setattr(rp, "_graphql", lambda *a, **k: {
+        "myself": {"clientBalance": 17.0630444381, "currentSpendPerHr": 0.005}})
+    assert rp.account_balance("k") == {"balance": 17.0630444381,
+                                       "spend_per_hr": 0.005}
+    info = rp.account_balance_detail("k")
+    assert info["status"] == rp.BALANCE_OK and info["balance"] == 17.0630444381
+
+
+def test_an_http_error_carries_its_status_so_permanence_is_readable(monkeypatch):
+    """`status` is what lets a caller tell 410 from 502 without matching on the
+    message text, which is the mechanism the whole classification rests on."""
+    def fake_urlopen(req, timeout=None, context=None):
+        raise urllib.error.HTTPError(rp.GRAPHQL_URL, 429, "Too Many Requests",
+                                     {}, io.BytesIO(b""))
+    monkeypatch.setattr(rp.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(rp.RunPodError) as caught:
+        rp._graphql("k", "{ myself { clientBalance } }")
+    assert caught.value.status == 429
+
+
+def test_a_graphql_error_object_is_read_for_its_message(monkeypatch):
+    """v2's `errors` list holds strings and GraphQL's holds objects. Stringifying
+    an object verbatim put a Python dict repr in front of the user with the
+    sentence buried inside it (measured), which is the opposite of what surfacing
+    the API's own reason is for."""
+    detail = rp.error_detail(GQL_UNKNOWN_FIELD)
+    assert detail == 'Cannot query field "clientBalance2" on type "User".'
+    assert "{" not in detail and "locations" not in detail
+
+
+def test_a_404_does_not_blame_a_pod_for_every_route(monkeypatch):
+    """It reads a 404 on a volume, a template or a route this API version does
+    not serve, and sending the reader to look for a terminated pod wastes them."""
+    exc = urllib.error.HTTPError("https://api.runpod.io/v2/account/balance", 404,
+                                 "Not Found", {}, io.BytesIO(b""))
+    msg = rp._http_error_message(exc)
+    assert "404" in msg and "volume" in msg.lower()
+
+
 # ── the pin: no raw field reads outside the client ───────────────────────────
 
 # Read-side spellings that are transport-specific. Request BODY keys are absent

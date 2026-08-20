@@ -126,6 +126,10 @@ deliberately invalid so they could not deploy anything.
 
 ### The one thing v2 does not have: the account balance
 
+**Settled in P3 below, 2026-08-20:** it is genuinely not there, it is not coming, the GraphQL
+island stays until it 410s, and the code now SAYS when a configured floor is not being enforced.
+The analysis that got there is kept as written.
+
 There is **no account or balance endpoint in v2**. The full OpenAPI document
 (`https://api.runpod.io/v2/openapi.json`, read 2026-08-19) has exactly one `/v2/account/*` path
 and it is SSH keys; the only match for "balance" anywhere in the spec is "load balancer". The
@@ -384,12 +388,77 @@ LONGER rather than shorter. `_DEPLOY_MUTATION`, `_GPU_AVAIL_QUERY`, `_DC_QUERY`,
 `_PODS_MACHINE_SELECTIONS` and `CREATABLE_GPU_IDS` are all still reachable on the v1 branch, which
 is the escape hatch, and an escape hatch that has had half its code removed is not one. They go on
 their own deadlines, as the switch section says: the v1 half after 2026-11-15, `_graphql` itself
-once the balance question (P3) is settled, since `_BALANCE_QUERY` is the one GraphQL call with no
-v2 successor and it runs on both stacks today.
+when `_BALANCE_QUERY` stops answering. P3 settled that one below: the balance has no v2 successor
+at all, so the island stays until it 410s and takes `_graphql` with it.
 
-**P3. Decide the balance question** (above), starting by re-reading
-[runpod/docs#807](https://github.com/runpod/docs/issues/807) for a reply. Independent of P1 and
-P2, and the only part that may end in "this can no longer be done" rather than in code.
+**P3. The balance question. DECIDED, 2026-08-20** (GraphQL's deadline is early 2027). The answer
+is that it is **not coming back, the floor is kept anyway, and its silence is what got fixed**.
+
+**Re-verified rather than assumed**, against the live OpenAPI document and the live account on the
+day of the decision. The spec has 34 paths and exactly one `/v2/account/*`, which is `ssh-keys`.
+`/v2/account`, `/v2/account/balance`, `/v2/account/credits`, `/v2/user` and `/v2/me` all **404** on
+a real account, so this is absent rather than undocumented. The words "credit", "funds" and
+"wallet" do not appear anywhere in the spec, and all eight matches for "balance" are "load
+balancer". [runpod/docs#807](https://github.com/runpod/docs/issues/807) is still open with zero
+comments, which is the "Silence" row of the table above: it resolves the same way as "no
+endpoint", while costing nothing to leave working.
+
+**`/v2/billing` is real, and it is spend, not balance.** Measured over 7 days on this account:
+$0.7632 total, of which $0.7389 is `storageStandardAmount` (the standing 50 GB model volume) and
+$0.0243 is `podGpuAmount`, which is the **entire** live-verification bill for P0 to P2. Buckets are
+`hour` or `day`, `lastN` resolves to a window, and a **zero-spend bucket is omitted rather than
+padded** (measured: `lastN=3&bucketSize=hour` returned 2 records), so anything plotting it must not
+assume N records for `lastN=N`. It answers "what did I spend", never "what is left", so it cannot
+replace the floor. Worth showing anyway, and still P4.
+
+**`spend_per_hr` has no naive successor either, and this is the measurement that kills the obvious
+idea.** The plausible replacement is summing `pod_cost()` over the running pods. Measured with
+**zero** pods running, GraphQL reported `currentSpendPerHr: 0.005`: the network volume's standing
+storage charge, which no pod query can see. The pod sum would have reported $0.00/h for an account
+that is genuinely being drained, which is the wrong direction to be wrong in. (Noticed while
+checking: `spend_per_hr` is fetched today and read by nothing. `hours_until_depleted` is called
+with the pod's own `cost_per_hr`.)
+
+**So the decision is to keep the island and remove the silence**, and the silence is the whole of
+P3's code. `funds_guard` is fail-**open** by contract: an unknown balance skips the start floor and
+the in-run balance floor rather than blocking a run. That is right, and it is invisible. A user who
+set a floor keeps a floor that is no longer applied, with nothing on screen and nothing in the log
+to say so, which is the same family as every other bug this migration produced: **it fails toward
+spending money and looks like a normal run**. What shipped:
+
+- **`account_balance_detail()`** classifies a lookup as `BALANCE_OK` / `NO_KEY` / `RETIRED` /
+  `ERROR` and never raises. `account_balance()` stays exactly what it was, a wrapper returning the
+  plain pair or None, so every existing caller keeps its fail-safe contract byte for byte.
+- **`RunPodError.status`** carries the HTTP status, so permanence is readable without matching on
+  message text.
+- **`funds_guard.floor_unenforced()`**, pure and unit-tested, is the one place that words it, and
+  it words RETIRED and ERROR differently: a blip fixes itself and needs no action, while a retired
+  balance never comes back and the user has to move to the per-run cap or lose the guard.
+- **`on_warn` is finally fired.** It had been accepted, stored and called by nothing since the
+  guard was written, so a run guarded by an unreadable floor looked exactly like a guarded one. It
+  now fires once per run, edge-triggered like the trip.
+- **The readout says which.** `Funds: Unknown` for a blip, `Funds: Not published` for a retirement,
+  each with its own tooltip; `_preflight_funds` and the "Funds guard armed" line say it too, since
+  the log is where a user looks afterwards.
+
+**One assumption in this entry was wrong and was measured out of it.** It said GraphQL would answer
+a removed field with a 200 carrying an `errors` array, "so there is no status code to read". Asking
+the live endpoint for a field that does not exist answers **HTTP 400** with `Cannot query field "…"
+on type "User".`, and the `errors` list holds **objects** where v2's RFC 9457 list holds plain
+strings. Both matter: the classification reads the message rather than the code, and `error_detail`
+had been stringifying those objects verbatim, putting a Python dict repr in front of the user with
+the actual sentence buried inside it. Fixed, with the recorded body in the tests.
+
+**A probing trap worth knowing:** `api.runpod.io` sits behind Cloudflare, which answers a plain
+`urllib` User-Agent with **403 "error code: 1010"** on the v2 REST paths too, not just GraphQL. The
+app is unaffected (it always sends its own `_USER_AGENT`), but a probe script written with bare
+urllib reads that as "the endpoint rejects my key" and sends you chasing the wrong thing.
+
+**What this leaves on a clock.** `_graphql` and `_BALANCE_QUERY` are now the ONLY GraphQL the v2
+stack still uses, and they are also the only part of the escape hatch that is not shared with v1.
+When they 410, the floor retires by itself: `floor_unenforced` starts saying the retired wording,
+the readout starts saying "Not published", and nothing breaks. The one thing left to do on that day
+is remove the floor field from Settings so it stops being offered.
 
 **P4. The opportunities, opt-in and afterwards**, once the migration is proven: per-DC stock in
 the picker, `minCudaVersion` plus catalog `cudaVersions` replacing `KNOWN_CUDA_VERSIONS` and the

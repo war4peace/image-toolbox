@@ -15,11 +15,16 @@ check), both fail-safe (balance unreadable → the check is skipped, never block
                    accumulated cost crosses a configured cap, OR the live balance
                    falls below the floor.
 
-Account balance is not in the REST API; it comes from the legacy GraphQL
-`myself { clientBalance currentSpendPerHr }` query (see
-runpod_client.account_balance). This module keeps only the DECISION logic (pure,
-unit-tested) plus a small background poller; the network fetch is injected so it
-stays testable off-line and never imports the control plane itself.
+Account balance is not in the REST API, in EITHER version, and API v2 has no
+successor for it (#25 P3, verified against the live spec and the live account on
+2026-08-20). It comes from the legacy GraphQL `myself { clientBalance
+currentSpendPerHr }` query, which RunPod retires in early 2027 (see
+runpod_client.account_balance_detail). The cap half survives that; the two floor
+halves do not, and `floor_unenforced` below is what stops them dying quietly.
+
+This module keeps only the DECISION logic (pure, unit-tested) plus a small
+background poller; the network fetch is injected so it stays testable off-line
+and never imports the control plane itself.
 
 Design: docs/future-features.md #1 ("Funds-floor safety-net + auto-stop").
 Stdlib only, fail-safe, isolated.
@@ -85,6 +90,39 @@ def evaluate(balance, floor, run_cost, cap):
     return False, None
 
 
+# The token runpod_client.BALANCE_RETIRED uses for "the balance is gone for
+# good". Spelled out here rather than imported: this module deliberately does not
+# import the control plane (see the header), and the pair is pinned equal by
+# tests/test_funds_guard.py so the two cannot drift apart.
+BALANCE_RETIRED = "retired"
+
+
+def floor_unenforced(floor, balance, status=None):
+    """The line to say when a CONFIGURED floor cannot be checked, or None when
+    there is nothing to say. Pure.
+
+    This exists because the guard's fail-open contract is silent. A floor with an
+    unreadable balance does not block, does not warn and does not appear anywhere:
+    the run simply proceeds with a protection the user believes is on. That is
+    correct behaviour (a floor that blocked every run because an API changed would
+    be far worse) and the wrong silence, so the silence is what this fixes.
+
+    `status` is a runpod_client BALANCE_* token when the caller has one. The two
+    cases need different words: a retired balance will never come back and the
+    user should act on it, while an unreadable one is probably a blip."""
+    if not floor or floor <= 0:
+        return None                       # nothing configured, nothing to enforce
+    if balance is not None:
+        return None                       # readable, so the floor IS enforced
+    if status == BALANCE_RETIRED:
+        return (f"The ${floor:.2f} balance floor is NOT being enforced: RunPod no "
+                f"longer publishes the account balance, so it cannot be checked. "
+                f"The per-run cost cap still works; consider using that instead.")
+    return (f"The ${floor:.2f} balance floor is not being enforced right now: the "
+            f"account balance could not be read. The per-run cost cap is "
+            f"unaffected.")
+
+
 # ─────────────────────────────────────────────
 #  Background poller (wraps evaluate on a cadence)
 # ─────────────────────────────────────────────
@@ -96,8 +134,9 @@ class FundsGuard:
     error in a poll is swallowed so the guard can never crash or stop a run
     spuriously.
 
-    `fetch_balance()` returns {"balance", "spend_per_hr"} or None (injected so this
-    is testable and free of a control-plane import). `cost_per_hr` is the pod's
+    `fetch_balance()` returns {"balance", "spend_per_hr"} (optionally with the
+    "status" token runpod_client.account_balance_detail adds) or None, injected so
+    this is testable and free of a control-plane import. `cost_per_hr` is the pod's
     real billed rate; `started_at` defaults to now. A guard with neither a cap nor
     a floor set is inert (start() is a no-op), so wiring it in costs nothing when
     the user hasn't opted in."""
@@ -117,6 +156,7 @@ class FundsGuard:
         self._stop = threading.Event()
         self._thread = None
         self._tripped = False
+        self._warned = False
 
     @property
     def active(self):
@@ -150,6 +190,15 @@ class FundsGuard:
             try:
                 info = self.fetch_balance() or {}
                 balance = info.get("balance")
+                # Say ONCE, at the first poll that comes back without a balance,
+                # that the floor half is inert. Until 0.6.1 `on_warn` was accepted,
+                # stored and never called by anything, so a run guarded by a floor
+                # that could not be read looked exactly like a guarded one.
+                if balance is None and not self._warned:
+                    msg = floor_unenforced(self.floor, None, info.get("status"))
+                    if msg:
+                        self._warned = True
+                        self.on_warn(msg)
                 should, reason = self.check_once(balance)
                 if should and not self._tripped:
                     self._tripped = True

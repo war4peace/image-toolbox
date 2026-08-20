@@ -756,8 +756,14 @@ class RemoteSession:
         balance never blocks (the in-run guard is the backstop)."""
         if not self.balance_floor or self.balance_floor <= 0:
             return
-        info = rp.account_balance(self.api_key)
-        bal = (info or {}).get("balance")
+        info = rp.account_balance_detail(self.api_key) or {}
+        bal = info.get("balance")
+        # An unreadable balance skips the check by contract. SAY so: the user
+        # configured a floor and it is not being applied to this run (#25 P3).
+        unenforced = funds_guard.floor_unenforced(self.balance_floor, bal,
+                                                  info.get("status"))
+        if unenforced:
+            self._emit("Funds guard: " + unenforced)
         est = _to_float(os.environ.get("IMGTBX_RUN_ESTIMATE"), 0.0)
         blocked, reason = funds_guard.start_blocked(bal, est, self.balance_floor)
         if blocked:
@@ -774,18 +780,19 @@ class RemoteSession:
         problem arming it just leaves the run unguarded, never blocks it."""
         try:
             guard = funds_guard.FundsGuard(
-                fetch_balance=lambda: rp.account_balance(self.api_key),
+                fetch_balance=lambda: rp.account_balance_detail(self.api_key),
                 cost_per_hr=self.cost_per_hr,
                 floor=self.balance_floor,
                 cap=self.session_cost_cap,
                 poll_seconds=self.funds_poll_seconds,
-                on_trip=self._on_funds_trip)
+                on_trip=self._on_funds_trip,
+                on_warn=lambda msg: self._emit("Funds guard: " + msg))
             self._funds_guard = guard
             if not guard.active:
                 return
             # One up-front runway line so the user sees the guard is watching.
-            info = rp.account_balance(self.api_key)
-            bal = (info or {}).get("balance")
+            info = rp.account_balance_detail(self.api_key) or {}
+            bal = info.get("balance")
             limits = []
             if self.session_cost_cap > 0:
                 limits.append(f"cap ${self.session_cost_cap:.2f}/run")
@@ -797,6 +804,12 @@ class RemoteSession:
                 runway = (f"; balance ${bal:.2f}"
                           + (f", ~{hrs:.1f}h at ${self.cost_per_hr:.2f}/h" if hrs else ""))
             self._emit(f"Funds guard armed ({', '.join(limits)}){runway}.")
+            # The poller says this too, one poll later, but a run whose floor is
+            # inert should read as inert from the line that says it is armed.
+            unenforced = funds_guard.floor_unenforced(self.balance_floor, bal,
+                                                      info.get("status"))
+            if unenforced:
+                self._emit("Funds guard: " + unenforced)
             guard.start()
         except Exception as exc:                         # noqa: BLE001 (fail-safe)
             self._emit(f"Funds guard could not start (continuing unguarded): {exc}")

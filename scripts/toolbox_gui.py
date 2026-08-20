@@ -1,4 +1,4 @@
-"""
+r"""
 toolbox_gui.py
 --------------
 Entry point for the Image Toolbox GUI. The GUI itself now lives in the gui/
@@ -48,6 +48,7 @@ except Exception:
 from gui.app import App, main
 from gui.common import (
     APP_VERSION, APP_TITLE, GUI_MARKER, CFG, funds_color, fmt_funds,
+    FUNDS_UNKNOWN, FUNDS_RETIRED,
     config_funds_floor, report_issue, save_config, load_settings, save_settings,
 )
 from gui.tooltab import ToolTab
@@ -58,6 +59,7 @@ if crash_logger:
 # Public API preserved for `import toolbox_gui` callers (and the test suite).
 __all__ = ["App", "main", "APP_VERSION", "APP_TITLE", "GUI_MARKER", "ToolTab",
            "CFG", "funds_color", "fmt_funds", "config_funds_floor",
+           "FUNDS_UNKNOWN", "FUNDS_RETIRED",
            "report_issue", "save_config", "load_settings", "save_settings"]
 
 
