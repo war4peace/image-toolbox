@@ -85,10 +85,19 @@ deliberately invalid so they could not deploy anything.
   5090 $0.99 LOW, A100-SXM4-80GB $1.59 LOW), plus the MI300X that `is_amd_gpu` already drops. The
   stock enum is the same three levels in upper case (`LOW/MEDIUM/HIGH`, plus an explicit `NONE`),
   so `available_gpus`' returned shape survives unchanged.
-- **One call now covers every data center.** Each GPU carries a `dataCenters[]` array of per-DC
-  availability, so the per-region call the pickers make today collapses to one, and the UI can
-  finally answer the question a sold-out card raises: *where is it in stock?*
-- **`cudaVersions` per GPU, each flagged available or full.** This retires the app's most
+- **One call now covers every data center, but only if you ask for it.** Each GPU carries a
+  `dataCenters[]` array of per-DC availability, so the per-region call the pickers make today
+  collapses to one, and the UI can finally answer the question a sold-out card raises: *where is it
+  in stock?* **Correction, measured while building P2:** none of that is in the catalog by
+  default. A plain `GET /v2/catalog/gpus` is a price list, with no `availability`, no
+  `dataCenters`, no `cudaVersions`, and `GET /v2/catalog/gpus/{id}` returns exactly the same
+  fields. They appear only under `include=AVAILABILITY`, which additionally **requires**
+  `product=POD` (no default, because a card can be scarce for pods and plentiful for serverless)
+  and takes `cloud`, defaulting to SECURE upstream. This entry originally stated the fields as
+  though they were always present, because it was read off the migration guide rather than off a
+  response. That is the same mistake the entry itself is about, committed inside the entry.
+- **`cudaVersions` per GPU, each flagged available or full** (under the same expansion). This
+  retires the app's most
   embarrassing workaround: `KNOWN_CUDA_VERSIONS` enumerates every CUDA version by hand because
   `allowedCudaVersions` is exact-match set membership, and `deploy_pod` then applies the floor
   **only to consumer cards** as a heuristic. v2 has `gpu.minCudaVersion` (a real numeric floor,
@@ -321,15 +330,62 @@ What is deliberately still on the old transports after P1: pod **creation** (`de
 live GPU and data-center picker, and the account balance. Those are GraphQL, they have until early
 2027, and they are P2 and P3.
 
-**P2. GraphQL to v2 (before early 2027), `deploy_pod` first.** It is the load-bearing call: no
-deploy, no remote feature. Its body is rebuilt rather than translated, and the shape named here is
-no longer a reading of the spec: it is what actually deployed a Blackwell card on 2026-08-20
-(Verification): `gpu:{id,count}`, `mounts.network:[{volumeId,path}]`, `disk`, `ports`, `env` as a
-dict rather than a key/value list, and **no** `supportPublicIp`, which v2 rejects by name. Then
-`available_gpus` and `data_centers` onto `/v2/catalog/*`, and `list_pods_detailed` onto plain `GET
-/v2/pods`, which now carries `gpu.id`, `dataCenterId` and `cost` directly: **the
-GraphQL-with-REST-fallback double path in `list_pods_detailed` deletes entirely**, along with its
-memoised `_PODS_MACHINE_SELECTIONS` probing.
+**P2. GraphQL to v2. DONE, 2026-08-20 (deadline was early 2027).** All four GraphQL calls now
+have a v2 path, selected by the same `runpod.api_version` switch, so the setting picks a whole
+stack (v2 REST + v2 catalog, or v1 REST + GraphQL) rather than just a base URL.
+
+**`deploy_pod` was the load-bearing one** and it turned into a wrapper. The GraphQL mutation
+exists only because v1's REST create enum 400s on newer cards; v2 has no such limit, so on v2
+`deploy_pod` applies the CUDA policy and calls `create_pod`. It returns the whole pod object
+instead of the mutation's three fields, a superset, so `create_pod_resilient` is untouched. v2
+also needs neither of the two things GraphQL had to be told: `mounts.network[].path` carries what
+`volumeMountPath` did, and `ports: ["22/tcp"]` alone publishes the endpoint, while sending
+`supportPublicIp` is a 422. The CUDA floor was **hoisted** into `deploy_cuda_versions` so both
+paths apply the identical policy: a transport swap must not quietly change which HOSTS a run can
+land on. v2 offers `gpu.minCudaVersion`, a real numeric floor and exactly what
+`KNOWN_CUDA_VERSIONS` enumerates around, and it was deliberately NOT adopted here. Changing the
+transport and the host-selection policy in one step would make a bad landing impossible to
+attribute. That swap stays P4.
+
+**`available_gpus` and `data_centers` moved onto `/v2/catalog/*`**, and both were checked by
+running the two implementations side by side against the live account rather than by reading the
+schema. The GPU lists came back **byte-identical**: the same 7 NVIDIA cards for EU-RO-1, same
+prices, same stock levels, same VRAM, same display names. The data-center lists came back
+identical too, 18 storage-capable on both, same order. The only real difference anywhere was the
+spelling of the stock level (`HIGH` against `High`), which the picker prints straight into a
+combobox label, so `_stock_label` settles it in one place and maps `NONE` to None so the existing
+`if not stock` filters keep working untouched.
+
+One caveat on how to reproduce that, learned by tripping over it: **live stock moves fast enough
+to fake a discrepancy.** A later run of the same comparison returned 7 cards from one transport
+and 6 from the other, purely because a card sold out in the seconds between two sequential HTTP
+calls; a third run agreed again at 7. Over about twenty minutes the EU-RO-1 list turned over
+almost completely (the RTX 2000 Ada and B200 left, a 5090, an A4500 and a PRO 6000 SE arrived).
+So compare the two within seconds, expect churn, and treat the recorded-payload tests rather than
+a live run as the thing that actually pins parity.
+
+**`list_pods_detailed` collapsed to a single GET on v2.** `GET /v2/pods` carries `gpu.id`,
+`dataCenterId` and `cost`, so there is nothing to enrich and no second source to fall back to. The
+GraphQL ladder with its memoised `_PODS_MACHINE_SELECTIONS` probing (which exists only because
+GraphQL 400s the whole query on one unknown field) survives on the v1 branch and dies with it.
+
+**Verified live on the production path**, with a **consumer** card on purpose: `is_consumer_gpu`
+is what gates the CUDA floor, and the app's shipped default `gpu_type_id` is a GeForce, so that is
+the path a default install takes. An RTX 4090 went through `create_pod_resilient` to `deploy_pod`
+to `create_pod` to `POST /v2/pods` carrying `gpu.allowedCudaVersions`, landed, published its SSH
+endpoint after about 84 s of reporting RUNNING (the early-RUNNING finding again, and again the
+reason `wait_until_running` must require an endpoint), and answered correctly through
+`pod_record`, `list_pods_detailed` and `pods_using_volume`, the last of which reads v2's
+`mounts.network[].volumeId` and had until then only been unit-tested. Then terminated, verified
+gone.
+
+**The deletions this milestone "earns" are deliberately NOT taken yet**, and the module got
+LONGER rather than shorter. `_DEPLOY_MUTATION`, `_GPU_AVAIL_QUERY`, `_DC_QUERY`,
+`_PODS_MACHINE_SELECTIONS` and `CREATABLE_GPU_IDS` are all still reachable on the v1 branch, which
+is the escape hatch, and an escape hatch that has had half its code removed is not one. They go on
+their own deadlines, as the switch section says: the v1 half after 2026-11-15, `_graphql` itself
+once the balance question (P3) is settled, since `_BALANCE_QUERY` is the one GraphQL call with no
+v2 successor and it runs on both stacks today.
 
 **P3. Decide the balance question** (above), starting by re-reading
 [runpod/docs#807](https://github.com/runpod/docs/issues/807) for a reply. Independent of P1 and
@@ -412,12 +468,17 @@ Four further findings came out of the same hour, and three of them change the pl
   reflected. Today's `lowestPrice.uninterruptablePrice` behaves the same way, and the pod's own
   `cost` is the authoritative billed rate, so prefer it wherever a real number matters (estimates,
   the funds cap) and treat the catalog as the shopping view.
-- **Data-center display names get worse.** GraphQL returns a human `location`; v2 returned
-  `name == id` for several DCs on this account ("AP-IN-1"). The Settings picker labels come from
-  that, so keep the curated `DATACENTERS` labels as the display layer and use the API for
-  membership and capability only. Note also that `storageSupport` and `listed` are gone: storage
-  capability is now `networkVolumeTypes` being non-empty, and there is no `listed` equivalent at
-  all, so a DC the console hides may now appear in the picker.
+- **Data-center display names get worse.** GraphQL returns a human `location`; v2 has no such
+  field at all and returns `name == id`. The Settings picker labels come from that, so the curated
+  `DATACENTERS` labels became the display layer and the API answers membership and capability only
+  (`curated_location`). Done in P2, and it turned out to be an IMPROVEMENT rather than a
+  workaround: GraphQL called EU-RO-1, EU-NL-1 and EUR-IS-1 all "Europe", where the curated list
+  says Romania, Netherlands and Iceland. `storageSupport` is gone too, succeeded by
+  `networkVolumeTypes` being non-empty. **The `listed` half of this trap was wrong**: there is
+  indeed no `listed` field, but v2 does not need one. Measured 2026-08-20: v2 returns 32 data
+  centers to GraphQL's 50, the storage-capable sets are **identical, 18 for 18**, and not one of
+  GraphQL's 18 unlisted data centers appears in v2 as storage-capable. v2's catalog is already
+  effectively the listed view.
 - **`reset` has no v2 equivalent.** The app does not use it. Recorded so nobody goes looking.
 - **Sunset headers are announced but not served** (measured, above). Hard-code the dates, treat a
   410 as the signal, and make that 410 reach the user, because it is the one failure a user cannot
@@ -874,11 +935,13 @@ The user installs and runs the application on their Unraid server.
   three transports. It had no deadline and went first anyway, because the migration's real hazard
   is renamed response fields reading as None and failing **silently, toward spending money** (a
   second billed pod, an auto-resume supervisor that quits on every blip, a session cap that never
-  trips). **P1 landed the same day**, well ahead of its November date: v2 is now the default
-  transport, v1 is a config-only escape hatch (`runpod.api_version`), and pod creation plus the
-  live pickers stay on GraphQL until P2. One piece has no v2 answer at all: the **account
-  balance** the funds-guard floor is built on is not in v2, so decide its degradation deliberately
-  rather than discovering it on the day GraphQL stops.
+  trips). **P1 and P2 landed the same day**, well ahead of both dates: `runpod.api_version` now
+  selects a whole stack (v2 REST + v2 catalog by default, or v1 REST + GraphQL as a config-only
+  escape hatch), and the GPU and data-center lists came back byte-identical from both. The
+  GraphQL code is still reachable on the v1 branch and is deleted on its own deadline, not now, an
+  escape hatch missing half its code being no escape hatch. What is LEFT has no v2 answer at all:
+  the **account balance** the funds-guard floor is built on, so decide its degradation
+  deliberately rather than discovering it on the day GraphQL stops.
 - **#24 (richer bug reports) is independent of everything else and is the cheapest
   item on this list.** It touches one function (`gui.common._issue_url`) plus wherever the
   last-run summaries end up coming from, and it pays off on the NEXT bad report rather

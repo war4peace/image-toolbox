@@ -722,6 +722,37 @@ def is_amd_gpu(gpu_id):
     return bool(_AMD_GPU_RE.search(gpu_id or ""))
 
 
+def deploy_cuda_versions(spec):
+    """The CUDA driver floor for a deploy, or None for no constraint.
+
+    Applied ONLY to consumer GeForce cards. A GeForce card has no CUDA
+    forward-compat, so a cu128 image won't START on a host driver below 12.8 (an
+    RTX 4090 @ 12.7 failed exactly this, which is why the floor exists).
+    Datacenter/pro cards DO forward-compat and run the image on older drivers, so
+    a floor only hurts them: it excludes every in-stock host whose driver is older
+    than the image (e.g. A100 PCIe @ 12.4-12.7 in EU-RO-1, which run cu128 fine)
+    and surfaces as "no instances available" even when the console shows the card
+    available. Omit it for them, matching the website deploy that works. An
+    explicit spec override always wins.
+
+    Hoisted out of deploy_pod so BOTH create paths apply the same policy: a
+    transport swap must not quietly change which hosts a run can land on. v2
+    offers a `gpu.minCudaVersion` that expresses ">= X" directly, which is what
+    KNOWN_CUDA_VERSIONS is enumerating around, but this keeps the enumeration on
+    both: identical semantics is the conservative choice for a transport change,
+    and swapping the policy at the same time would make a bad landing impossible
+    to attribute. That swap is #25 P4.
+    """
+    spec = spec or {}
+    explicit = spec.get("allowedCudaVersions")
+    if explicit:
+        return list(explicit)
+    gpu_ids = spec.get("gpuTypeIds") or []
+    if is_consumer_gpu(gpu_ids[0] if gpu_ids else ""):
+        return allowed_cuda_versions(spec.get("imageName", ""))
+    return None
+
+
 _DEPLOY_MUTATION = """
 mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
   podFindAndDeployOnDemand(input: $input) { id machineId costPerHr }
@@ -730,22 +761,37 @@ mutation Deploy($input: PodFindAndDeployOnDemandInput!) {
 
 
 def deploy_pod(api_key, spec, timeout=90):
-    """Create a pod via the GraphQL deploy path (`podFindAndDeployOnDemand`) and
-    return {"id": …} for the new pod. This is the SAME path the RunPod console
-    uses, so it accepts the FULL GPU catalog — including cards the REST
-    create_pod enum rejects with HTTP 400 (e.g. Blackwell PRO 4000/4500).
+    """Create a pod and return a dict carrying at least its `id`.
 
-    `spec` is the REST-style dict create_pod takes (so callers don't change); it
-    is translated to the GraphQL input here. Two things the REST API does for free
-    that GraphQL needs spelled out: a mounted network volume needs an explicit
-    `volumeMountPath` (without it the container fails with "field Target must not
-    be empty" and never starts — hence no public IP), and `supportPublicIp` must
-    be set so the pod gets the direct-TCP SSH endpoint the app relies on.
+    **On v2 this is just POST /v2/pods**, which accepts the full GPU catalog.
+    Measured 2026-08-20: an RTX PRO 4500 Blackwell, one of the exact cards that
+    made this function necessary, deployed straight through it. So on v2 the
+    GraphQL mutation below is dead weight and this is a thin wrapper over
+    create_pod, returning the whole pod object rather than the mutation's three
+    fields (a superset, so callers reading `id` are unaffected).
+
+    On v1 it uses the GraphQL deploy path (`podFindAndDeployOnDemand`), the SAME
+    path the RunPod console uses, because the v1 REST create enum 400s on newer
+    cards (Blackwell PRO 4000/4500) that the GraphQL catalog can deploy. Two
+    things v1 REST does for free that GraphQL needs spelled out: a mounted network
+    volume needs an explicit `volumeMountPath` (without it the container fails
+    with "field Target must not be empty" and never starts, hence no public IP),
+    and `supportPublicIp` must be set so the pod gets the direct-TCP SSH endpoint
+    the app relies on. v2 needs neither: `mounts.network[].path` carries the first
+    and `ports: ["22/tcp"]` alone publishes the endpoint (both measured), and
+    sending `supportPublicIp` there is a 422.
+
+    `spec` stays the v1-REST-shaped dict every caller writes, on both paths.
 
     Like create_pod, this STARTS BILLING — callers must own a guaranteed stop
     path. The pod's SSH endpoint appears a bit later (poll via wait_until_running).
     Raises RunPodError on capacity / validation / transport failure.
     """
+    if _API_VERSION == API_V2:
+        cuda = deploy_cuda_versions(spec)
+        if cuda:
+            spec = {**spec, "allowedCudaVersions": cuda}
+        return create_pod(api_key, spec, timeout=timeout)
     gpu_ids = spec.get("gpuTypeIds") or []
     dcs = spec.get("dataCenterIds") or []
     vol = spec.get("networkVolumeId") or ""
@@ -768,23 +814,7 @@ def deploy_pod(api_key, spec, timeout=90):
         inp["networkVolumeId"] = vol
         # REST defaults this; GraphQL requires it or the bind-mount fails.
         inp["volumeMountPath"] = spec.get("volumeMountPath", "/workspace")
-    # CUDA driver floor — applied ONLY to consumer GeForce cards. A GeForce card
-    # has no CUDA forward-compat, so a cu128 image won't START on a host driver
-    # below 12.8 (an RTX 4090 @ 12.7 failed exactly this, which is why the floor
-    # exists). Datacenter/pro cards DO forward-compat and run the image on older
-    # drivers, so a floor only hurts them: it excludes every in-stock host whose
-    # driver is older than the image (e.g. A100 PCIe @ 12.4–12.7 in EU-RO-1, which
-    # run cu128 fine) and surfaces as "no instances available" even when the
-    # console shows the card available. Omit it for them, matching the website
-    # deploy that works. An explicit spec override always wins.
-    explicit = spec.get("allowedCudaVersions")
-    gpu0 = gpu_ids[0] if gpu_ids else ""
-    if explicit:
-        cuda = explicit
-    elif is_consumer_gpu(gpu0):
-        cuda = allowed_cuda_versions(inp["imageName"])
-    else:
-        cuda = None
+    cuda = deploy_cuda_versions(spec)
     if cuda:
         inp["allowedCudaVersions"] = cuda
     data = _graphql(api_key, _DEPLOY_MUTATION, {"input": inp}, timeout=timeout)
@@ -1082,17 +1112,93 @@ query GpuTypes($dc: String) {
 """
 
 
+def _stock_label(value):
+    """One spelling for a stock level whichever transport reported it.
+
+    GraphQL says "Low"/"Medium"/"High"; v2's AvailabilityLevel enum says
+    "LOW"/"MEDIUM"/"HIGH"/"NONE". The picker prints this string straight into a
+    combobox label, so without normalising, switching transport turns the list
+    shouty. NONE is an ABSENCE of stock, not a level, and becomes None so the
+    existing `if not stock` filters keep working unchanged."""
+    text = str(value or "").strip()
+    if not text or text.upper() == "NONE":
+        return None
+    return text.capitalize()
+
+
+def _gpus_via_graphql(api_key, data_center_id, timeout):
+    """The v1-era GPU catalog: one GraphQL query with a per-DC lowestPrice."""
+    data = _graphql(api_key, _GPU_AVAIL_QUERY, {"dc": data_center_id or None},
+                    timeout=timeout)
+    out = []
+    for g in data.get("gpuTypes") or []:
+        lp = g.get("lowestPrice") or {}
+        out.append({
+            "id":        g.get("id") or "",
+            "name":      g.get("displayName") or g.get("id") or "",
+            "memory_gb": g.get("memoryInGb") or 0,
+            "price":     lp.get("uninterruptablePrice"),
+            "stock":     _stock_label(lp.get("stockStatus")),
+        })
+    return out
+
+
+def _gpus_via_catalog(api_key, data_center_id, timeout):
+    """The v2 catalog: GET /catalog/gpus with the AVAILABILITY expansion.
+
+    Three query parameters are load-bearing and none of them default usefully.
+    `include=AVAILABILITY` is what adds the availability fields at all (without
+    it the catalog is a price list: measured, no `dataCenters`, no `availability`,
+    no `cudaVersions`, which is NOT what the migration guide describes).
+    `product=POD` is REQUIRED alongside it and has no default, deliberately, since
+    the same card can be scarce for pods and plentiful for serverless. `cloud`
+    defaults to SECURE upstream but is sent explicitly, because every pod this app
+    deploys is Secure Cloud and a silently changed default would quote community
+    prices for capacity the app never uses.
+
+    Availability is per data center. A card with no entry for `data_center_id`
+    simply is not offered there, which reads as no stock, exactly as GraphQL's
+    empty stockStatus did."""
+    items = unwrap_list(_request("GET", "/catalog/gpus", api_key, params={
+        "include": "AVAILABILITY", "product": "POD", "cloud": "SECURE",
+    }, timeout=timeout), "gpus")
+    out = []
+    for g in items:
+        if not isinstance(g, dict):
+            continue
+        if data_center_id:
+            here = next((d for d in g.get("dataCenters") or []
+                         if isinstance(d, dict) and d.get("id") == data_center_id), None)
+            stock = here.get("availability") if here else None
+        else:
+            stock = g.get("availability")
+        out.append({
+            "id":        g.get("id") or "",
+            "name":      g.get("name") or g.get("id") or "",
+            "memory_gb": g.get("memory") or 0,
+            "price":     (g.get("price") or {}).get("secure"),
+            "stock":     _stock_label(stock),
+        })
+    return out
+
+
 def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
                    include_out_of_stock=False):
     """Return the secure-cloud GPUs that are DEPLOYABLE RIGHT NOW, newest data.
 
-    Queries GraphQL for every GPU type's live price + stock in `data_center_id`
-    (None = RunPod's global view), keeps only those with stock (`stockStatus`
-    set) and at least `min_memory_gb` of VRAM, and returns them sorted by hourly
-    price ascending. Each item is a dict:
+    Asks whichever catalog the active transport owns (v2's `/catalog/gpus` with
+    the AVAILABILITY expansion, or GraphQL's `gpuTypes` on v1) for every GPU
+    type's live price and stock in `data_center_id` (None = RunPod's global
+    view), keeps only those with stock and at least `min_memory_gb` of VRAM, and
+    returns them sorted by hourly price ascending. Each item is a dict:
         {"id", "name", "memory_gb", "price", "stock"}
-    where `id` is the value create_pod's `gpuTypeIds` expects. Raises RunPodError
-    on failure (callers run this off a background thread and show the message).
+    where `id` is the value a deploy's GPU field expects. Raises RunPodError on
+    failure (callers run this off a background thread and show the message).
+
+    The two sources were compared side by side on EU-RO-1 (2026-08-20) and agreed
+    exactly: the same 7 NVIDIA cards, the same prices, the same stock levels and
+    the same display names. The only difference was the spelling of the level,
+    which `_stock_label` settles.
 
     Unlike the curated GPU_TYPES / TAG_GPU_TYPES picklists, this reflects reality
     — a card the account can't actually rent in this region never appears, so the
@@ -1101,38 +1207,27 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
     AMD GPUs (Instinct MI-series, Radeon) are dropped here regardless of stock or
     price: the pipeline is CUDA-only (see `is_amd_gpu`), so an AMD card could only
     fail at run time. They're cheap enough to be tempting in some data centers, so
-    filtering them at the source keeps them out of every picker.
+    filtering them at the source keeps them out of every picker. (v2's catalog is
+    the more insistent of the two about offering them: it listed an MI300X for
+    EU-RO-1 that GraphQL did not.)
 
     `include_out_of_stock=True` keeps cards with no current stock (their `stock`
     is None) — for the Settings GPU *preference* lists, which should still offer a
     card that's only momentarily sold out. The live per-run pickers leave it False.
     """
-    data = _graphql(api_key, _GPU_AVAIL_QUERY, {"dc": data_center_id or None},
-                    timeout=timeout)
+    if _API_VERSION == API_V2:
+        rows = _gpus_via_catalog(api_key, data_center_id, timeout)
+    else:
+        rows = _gpus_via_graphql(api_key, data_center_id, timeout)
     out = []
-    for g in data.get("gpuTypes") or []:
-        gid = g.get("id") or ""
-        name = g.get("displayName") or gid
-        lp = g.get("lowestPrice") or {}
-        stock = lp.get("stockStatus")
-        price = lp.get("uninterruptablePrice")
-        mem = g.get("memoryInGb") or 0
-        if is_amd_gpu(gid) or is_amd_gpu(name):       # CUDA-only app → never offer AMD
+    for r in rows:
+        if is_amd_gpu(r["id"]) or is_amd_gpu(r["name"]):   # CUDA-only app
             continue
-        if not stock and not include_out_of_stock:   # out of stock here → skip
+        if not r["stock"] and not include_out_of_stock:    # out of stock here
             continue
-        if mem < min_memory_gb:
+        if (r["memory_gb"] or 0) < min_memory_gb:
             continue
-        # No REST-enum filter here: pods are created via the GraphQL deploy path
-        # (deploy_pod), which accepts the full catalog — so every in-stock card is
-        # genuinely deployable, matching what the RunPod console offers.
-        out.append({
-            "id":        gid,
-            "name":      name,
-            "memory_gb": mem,
-            "price":     price,
-            "stock":     stock,
-        })
+        out.append(r)
     # Cheapest first; a missing price sorts last so a real quote always wins.
     out.sort(key=lambda r: (r["price"] is None, r["price"] or 0.0))
     return out
@@ -1168,15 +1263,22 @@ def account_balance(api_key, timeout=15):
 _DC_QUERY = "{ dataCenters { id name location storageSupport listed } }"
 
 
-def data_centers(api_key, storage_only=True, listed_only=True, timeout=30):
-    """Live list of RunPod data centers via GraphQL (the same source the GPU
-    picker uses). Each item:
-        {"id", "location", "region", "storage", "listed"}
-    With `storage_only` (default) only data centers that support network volumes
-    are returned — a model volume can only live where storage exists, so this is
-    exactly what the Settings picker should offer. Sorted by region (UI order)
-    then id. Raises RunPodError on failure (callers run it off a thread and fall
-    back to the curated DATACENTERS list)."""
+def curated_location(dc_id):
+    """The human place-name for a data center id out of the curated DATACENTERS
+    labels ("Romania (EU-RO-1)" -> "Romania"), or "" for one not in the list.
+
+    v2's catalog dropped the `location` field and returns `name == id`, so
+    without this the Settings picker degrades from "Romania (EU-RO-1)" to a bare
+    list of codes. The API is used for MEMBERSHIP and CAPABILITY, the curated
+    list for DISPLAY. A data center RunPod adds later is simply shown by its id
+    until the list is regenerated, which is what an unknown one already did."""
+    for label, did in DATACENTERS:
+        if did == dc_id:
+            return label.split(" (")[0].strip() if " (" in label else label
+    return ""
+
+
+def _dcs_via_graphql(api_key, storage_only, listed_only, timeout):
     data = _graphql(api_key, _DC_QUERY, {}, timeout=timeout)
     out = []
     for d in data.get("dataCenters") or []:
@@ -1189,11 +1291,64 @@ def data_centers(api_key, storage_only=True, listed_only=True, timeout=30):
         did = d.get("id") or ""
         out.append({
             "id":       did,
-            "location": d.get("location") or "",
+            "location": d.get("location") or curated_location(did),
             "region":   region_of(did),
             "storage":  bool(d.get("storageSupport")),
             "listed":   bool(d.get("listed")),
         })
+    return out
+
+
+def _dcs_via_catalog(api_key, storage_only, timeout):
+    """The v2 catalog. Two fields the GraphQL version had are gone, and only one
+    of them mattered.
+
+    `storageSupport` became `networkVolumeTypes`, a list of the tiers offered, so
+    "supports network volumes" is "that list is non-empty".
+
+    `listed` has NO equivalent, and measuring settled what to do about it: v2
+    returns 32 data centers where GraphQL returns 50, and **not one** of
+    GraphQL's 18 unlisted data centers appears in v2 as storage-capable. The two
+    storage-capable sets are identical, 18 for 18, so v2's catalog is already
+    effectively the listed view and there is nothing to re-filter. `listed` is
+    reported True rather than dropped, so the record shape stays the same for
+    both transports."""
+    items = unwrap_list(_request("GET", "/catalog/datacenters", api_key,
+                                 timeout=timeout), "dataCenters")
+    out = []
+    for d in items:
+        if not isinstance(d, dict):
+            continue
+        storage = bool(d.get("networkVolumeTypes"))
+        if storage_only and not storage:
+            continue
+        did = d.get("id") or ""
+        out.append({
+            "id":       did,
+            "location": curated_location(did),
+            "region":   region_of(did),
+            "storage":  storage,
+            "listed":   True,
+        })
+    return out
+
+
+def data_centers(api_key, storage_only=True, listed_only=True, timeout=30):
+    """Live list of RunPod data centers. Each item:
+        {"id", "location", "region", "storage", "listed"}
+    With `storage_only` (default) only data centers that support network volumes
+    are returned — a model volume can only live where storage exists, so this is
+    exactly what the Settings picker should offer. Sorted by region (UI order)
+    then id. Raises RunPodError on failure (callers run it off a thread and fall
+    back to the curated DATACENTERS list).
+
+    `region` is derived LOCALLY from the id in both cases (region_of), never read
+    from the API, so the grouping cannot change under the app. `listed_only` only
+    does anything on v1: see _dcs_via_catalog for why v2 needs no equivalent."""
+    if _API_VERSION == API_V2:
+        out = _dcs_via_catalog(api_key, storage_only, timeout)
+    else:
+        out = _dcs_via_graphql(api_key, storage_only, listed_only, timeout)
     order = {r: i for i, r in enumerate(REGIONS)}
     out.sort(key=lambda x: (order.get(x["region"], 99), x["id"]))
     return out
@@ -1221,13 +1376,22 @@ def _pods_query(machine_sel):
 def list_pods_detailed(api_key, timeout=30):
     """Return the account's pods as pod_record dicts.
 
-    Prefers GraphQL (`myself.pods`) because the v1 pod object omits the GPU type
-    and data center (a measured v1 pod carried `machine: {}` and no GPU field at
-    all); falls back to REST /pods if every GraphQL attempt fails, so the list
-    still works with '?' for the missing fields. Both branches go through the SAME
-    pod_record, which is what the recorded-payload tests pin. Under v2 this whole
-    double path collapses: `GET /v2/pods` carries gpu.id, dataCenterId and cost
-    directly (docs/future-features.md #25, P2)."""
+    On **v2 this is one plain GET**: `/v2/pods` already carries gpu.id,
+    dataCenterId and cost, so there is nothing to enrich and no second source to
+    fall back to.
+
+    On v1 it prefers GraphQL (`myself.pods`), because the v1 pod object omits the
+    GPU type and data center entirely (a measured v1 pod carried `machine: {}`
+    and no GPU field at all), and falls back to REST /pods when every GraphQL
+    attempt fails, so the list still works with '?' for the missing fields. Both
+    of those go through the same pod_record as the v2 path, which is what the
+    recorded-payload tests pin.
+
+    The ladder below exists only because GraphQL 400s the WHOLE query on one
+    unknown field. It dies with v1."""
+    if _API_VERSION == API_V2:
+        return [pod_record(p) for p in list_pods(api_key, timeout=timeout)
+                if isinstance(p, dict)]
     global _pods_machine_sel
     selections = ([_pods_machine_sel] if _pods_machine_sel
                   else list(_PODS_MACHINE_SELECTIONS))

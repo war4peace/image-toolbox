@@ -638,6 +638,260 @@ def test_ensure_stopped_is_idempotent_on_a_stopped_pod(monkeypatch):
     assert called == []                      # and it did not call out again
 
 
+# ── P2: the catalogs, the pod list and the deploy ────────────────────────────
+#
+# Recorded from the live catalogs on 2026-08-20, trimmed to five cards that each
+# make a point: two ordinary NVIDIA cards, a Blackwell (the card class that made
+# deploy_pod necessary), an AMD card the app must never offer, and an H100 NVL
+# that is available GLOBALLY but absent from EU-RO-1.
+
+V2_CATALOG_GPUS = json.loads(r"""
+{"gpus": [
+ {"id": "NVIDIA RTX 2000 Ada Generation", "name": "RTX 2000 Ada",
+  "manufacturer": "NVIDIA", "memory": 16, "price": {"community": 0.16, "secure": 0.24},
+  "availability": "LOW", "dataCenters": [{"availability": "LOW", "id": "EU-RO-1", "name": "EU-RO-1"}]},
+ {"id": "NVIDIA GeForce RTX 4090", "name": "RTX 4090",
+  "manufacturer": "NVIDIA", "memory": 24, "price": {"community": 0.34, "secure": 0.74},
+  "availability": "HIGH", "dataCenters": [{"availability": "HIGH", "id": "EU-RO-1", "name": "EU-RO-1"}],
+  "cudaVersions": [{"available": true, "version": "12.4"}, {"available": true, "version": "12.8"}]},
+ {"id": "NVIDIA RTX PRO 4500 Blackwell", "name": "RTX PRO 4500",
+  "manufacturer": "NVIDIA", "memory": 32, "price": {"community": 0.34, "secure": 0.72},
+  "availability": "HIGH", "dataCenters": [{"availability": "HIGH", "id": "EU-RO-1", "name": "EU-RO-1"}],
+  "cudaVersions": [{"available": true, "version": "13.0"}]},
+ {"id": "AMD Instinct MI300X OAM", "name": "MI300X",
+  "manufacturer": "AMD", "memory": 192, "price": {"community": 0.5, "secure": 2.39},
+  "availability": "LOW", "dataCenters": [{"availability": "LOW", "id": "EU-RO-1", "name": "EU-RO-1"}]},
+ {"id": "NVIDIA H100 NVL", "name": "H100 NVL",
+  "manufacturer": "NVIDIA", "memory": 94, "price": {"community": 1.39, "secure": 2.59},
+  "availability": "LOW", "dataCenters": []}
+]}
+""")
+
+# The same five cards, from the GraphQL query, scoped to EU-RO-1.
+GQL_GPUS = json.loads(r"""
+{"gpuTypes": [
+ {"id": "AMD Instinct MI300X OAM", "displayName": "MI300X", "memoryInGb": 192,
+  "lowestPrice": {"uninterruptablePrice": null, "stockStatus": null}},
+ {"id": "NVIDIA GeForce RTX 4090", "displayName": "RTX 4090", "memoryInGb": 24,
+  "lowestPrice": {"uninterruptablePrice": 0.74, "stockStatus": "High"}},
+ {"id": "NVIDIA H100 NVL", "displayName": "H100 NVL", "memoryInGb": 94,
+  "lowestPrice": {"uninterruptablePrice": null, "stockStatus": null}},
+ {"id": "NVIDIA RTX 2000 Ada Generation", "displayName": "RTX 2000 Ada", "memoryInGb": 16,
+  "lowestPrice": {"uninterruptablePrice": 0.24, "stockStatus": "Low"}},
+ {"id": "NVIDIA RTX PRO 4500 Blackwell", "displayName": "RTX PRO 4500", "memoryInGb": 32,
+  "lowestPrice": {"uninterruptablePrice": 0.72, "stockStatus": "High"}}
+]}
+""")
+
+V2_CATALOG_DCS = json.loads(r"""
+{"dataCenters": [
+ {"id": "EU-RO-1", "name": "EU-RO-1", "region": "EUROPE",
+  "networkVolumeTypes": ["STANDARD"], "compliance": [], "globalNetwork": false},
+ {"id": "EU-FR-1", "name": "EU-FR-1", "region": "EUROPE",
+  "networkVolumeTypes": ["HIGH_PERFORMANCE"], "compliance": [], "globalNetwork": false},
+ {"id": "AP-IN-1", "name": "AP-IN-1", "region": "ASIA",
+  "networkVolumeTypes": [], "compliance": [], "globalNetwork": false}
+]}
+""")
+
+
+@pytest.fixture
+def catalog(monkeypatch):
+    """Answer REST GETs from the recorded catalogs, GraphQL from the recorded
+    gpuTypes payload, and record what was asked for."""
+    asked = []
+
+    def fake_request(method, path, api_key, body=None, params=None, timeout=30):
+        asked.append(("REST", method, path, params, body))
+        if path == "/catalog/gpus":
+            return V2_CATALOG_GPUS
+        if path == "/catalog/datacenters":
+            return V2_CATALOG_DCS
+        if path == "/pods":
+            return {"pods": [V2_POD]}
+        return {}
+
+    def fake_graphql(api_key, query, variables=None, timeout=30):
+        asked.append(("GQL", query, variables, None, None))
+        if "gpuTypes" in query:
+            return GQL_GPUS
+        raise AssertionError("unexpected GraphQL query: " + query[:60])
+
+    monkeypatch.setattr(rp, "_request", fake_request)
+    monkeypatch.setattr(rp, "_graphql", fake_graphql)
+    return asked
+
+
+def test_stock_levels_are_spelled_the_same_on_both_transports():
+    """GraphQL says "High", v2's enum says "HIGH", and the picker prints this
+    string straight into a combobox label, so an unnormalised swap turns the list
+    shouty. NONE is an ABSENCE, not a level, so it becomes None and the existing
+    `if not stock` filters keep working."""
+    assert rp._stock_label("HIGH") == "High"
+    assert rp._stock_label("High") == "High"
+    assert rp._stock_label("MEDIUM") == "Medium"
+    for empty in ("NONE", "None", "", None):
+        assert rp._stock_label(empty) is None
+
+
+def test_the_two_gpu_catalogs_agree_card_for_card(catalog, monkeypatch):
+    """The parity that makes the swap safe, pinned offline. Measured live on the
+    full EU-RO-1 catalog the same day: identical ids, prices, stock levels, VRAM
+    and display names, seven cards for seven."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    from_v2 = rp.available_gpus("k", data_center_id="EU-RO-1")
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V1)
+    from_gql = rp.available_gpus("k", data_center_id="EU-RO-1")
+    assert from_v2 == from_gql
+    assert [g["id"] for g in from_v2] == [
+        "NVIDIA RTX 2000 Ada Generation",     # 0.24, cheapest first
+        "NVIDIA RTX PRO 4500 Blackwell",      # 0.72
+        "NVIDIA GeForce RTX 4090",            # 0.74
+    ]
+
+
+def test_a_card_absent_from_the_data_center_is_not_offered(catalog, monkeypatch):
+    """v2 lists availability per data center and simply omits a data center that
+    has none, where GraphQL returned the card with a null stockStatus. Both must
+    read as "not available here". The H100 NVL is exactly that case: available
+    globally, absent from EU-RO-1."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    assert "NVIDIA H100 NVL" not in [g["id"] for g in
+                                     rp.available_gpus("k", data_center_id="EU-RO-1")]
+    # ... but the global view (no data center) still knows about it.
+    assert "NVIDIA H100 NVL" in [g["id"] for g in rp.available_gpus("k")]
+
+
+def test_amd_is_dropped_from_the_v2_catalog_too(catalog, monkeypatch):
+    """The pipeline is CUDA-only, so an AMD card could only fail at run time.
+    v2's catalog is the more insistent of the two about offering them: it listed
+    an in-stock MI300X for EU-RO-1 that GraphQL did not price at all."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    for g in rp.available_gpus("k", data_center_id="EU-RO-1",
+                               include_out_of_stock=True):
+        assert "MI300X" not in g["id"] and "MI300X" not in g["name"]
+
+
+def test_the_vram_floor_and_out_of_stock_flag_still_work_on_v2(catalog, monkeypatch):
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    ids = [g["id"] for g in rp.available_gpus("k", data_center_id="EU-RO-1",
+                                              min_memory_gb=32)]
+    assert ids == ["NVIDIA RTX PRO 4500 Blackwell"]
+    with_none = [g["id"] for g in rp.available_gpus("k", data_center_id="EU-RO-1",
+                                                    include_out_of_stock=True)]
+    assert "NVIDIA H100 NVL" in with_none          # kept, with stock None
+
+
+def test_the_gpu_catalog_asks_for_the_expansion_it_needs(catalog, monkeypatch):
+    """Three query parameters, none of which default usefully. Without
+    include=AVAILABILITY the catalog is a bare price list (measured: no
+    dataCenters, no availability, no cudaVersions, which is NOT what the
+    migration guide describes). product is required alongside it and has no
+    default, because a card can be scarce for pods and plentiful for serverless.
+    cloud is sent explicitly because every pod here is Secure Cloud."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    rp.available_gpus("k", data_center_id="EU-RO-1")
+    params = catalog[0][3]
+    assert params["include"] == "AVAILABILITY"
+    assert params["product"] == "POD"
+    assert params["cloud"] == "SECURE"
+
+
+def test_storage_capable_data_centers_come_from_the_volume_types(catalog, monkeypatch):
+    """v2 dropped `storageSupport`; the successor is a non-empty
+    networkVolumeTypes. Measured the same day: 18 storage-capable on both
+    transports, zero difference either way."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    dcs = rp.data_centers("k")
+    assert [d["id"] for d in dcs] == ["EU-FR-1", "EU-RO-1"]     # AP-IN-1 has none
+    assert all(d["storage"] for d in dcs)
+
+
+def test_data_centers_keep_a_human_label_without_the_api_field(catalog, monkeypatch):
+    """v2 has no `location` and returns name == id, so the picker would degrade
+    to a list of codes. The curated DATACENTERS list is the display layer; the
+    API answers membership and capability only. It is also BETTER than what
+    GraphQL returned, which called EU-RO-1 and EU-NL-1 both "Europe"."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    by_id = {d["id"]: d for d in rp.data_centers("k")}
+    assert by_id["EU-RO-1"]["location"] == "Romania"
+    assert by_id["EU-FR-1"]["location"] == "France"
+    assert by_id["EU-RO-1"]["region"] == "Europe"     # derived locally, not read
+    assert rp.curated_location("XX-ZZ-9") == ""       # unknown stays blank
+
+
+def test_region_is_derived_locally_not_read_from_the_api(catalog, monkeypatch):
+    """v2 has its own `region` field ("EUROPE"), deliberately unused: the app's
+    region grouping is its own UI concept and must not change under it."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    assert {d["region"] for d in rp.data_centers("k")} == {"Europe"}
+
+
+# ── the deploy ───────────────────────────────────────────────────────────────
+
+def test_the_cuda_floor_applies_only_to_consumer_cards():
+    """A GeForce card has no CUDA forward-compat, so a cu128 image will not START
+    on an older host driver. Datacenter and pro cards DO forward-compat, so a
+    floor only excludes hosts that would have worked, and shows up as "no
+    instances available" while the console shows the card in stock."""
+    image = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
+    consumer = rp.deploy_cuda_versions(
+        {"gpuTypeIds": ["NVIDIA GeForce RTX 4090"], "imageName": image})
+    assert consumer and consumer[0] == "12.8"
+    assert rp.deploy_cuda_versions(
+        {"gpuTypeIds": ["NVIDIA RTX PRO 4500 Blackwell"], "imageName": image}) is None
+    assert rp.deploy_cuda_versions(
+        {"gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
+         "allowedCudaVersions": ["13.0"]}) == ["13.0"]
+    assert rp.deploy_cuda_versions({}) is None
+
+
+def test_the_cuda_floor_is_identical_on_both_transports(sent, monkeypatch):
+    """A transport swap must not quietly change which HOSTS a run can land on.
+    Verified live too: an RTX 4090 deployed through the v2 path with this exact
+    list and landed on a compliant host."""
+    spec = dict(V1_SPEC, gpuTypeIds=["NVIDIA GeForce RTX 4090"])
+    expected = rp.deploy_cuda_versions(spec)
+
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    rp.deploy_pod("k", spec)
+    v2_sent = sent[-1]
+
+    gql = {}
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V1)
+    monkeypatch.setattr(rp, "_graphql",
+                        lambda key, q, v=None, timeout=30: gql.update(v or {})
+                        or {"podFindAndDeployOnDemand": {"id": "x"}})
+    rp.deploy_pod("k", spec)
+
+    assert v2_sent["body"]["gpu"]["allowedCudaVersions"] == expected
+    assert gql["input"]["allowedCudaVersions"] == expected
+
+
+def test_deploy_pod_is_a_plain_post_on_v2(sent, on_v2):
+    """The GraphQL mutation exists because v1's create enum 400s on newer cards.
+    v2 has no such limit: measured, an RTX PRO 4500 Blackwell deployed straight
+    through POST /v2/pods, so on v2 the mutation is dead weight."""
+    rp.deploy_pod("k", V1_SPEC)
+    assert sent[-1]["method"] == "POST"
+    assert sent[-1]["url"] == "https://api.runpod.io/v2/pods"
+    assert sent[-1]["body"]["gpu"]["id"] == "NVIDIA RTX PRO 4500 Blackwell"
+    assert "supportPublicIp" not in sent[-1]["body"]     # v2 422s on it by name
+
+
+def test_list_pods_detailed_is_one_get_on_v2(catalog, monkeypatch):
+    """`GET /v2/pods` already carries gpu.id, dataCenterId and cost, so there is
+    nothing to enrich and no second source to fall back to. The GraphQL ladder
+    (and its memoised field-set probing) exists only because GraphQL 400s the
+    whole query on one unknown field; it dies with v1."""
+    monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
+    rows = rp.list_pods_detailed("k")
+    assert [c[0] for c in catalog] == ["REST"]          # no GraphQL at all
+    assert rows[0]["gpu"] == "NVIDIA RTX PRO 4500 Blackwell"
+    assert rows[0]["data_center"] == "EU-RO-1"
+    assert rows[0]["cost"] == 0.72
+
+
 # ── the pin: no raw field reads outside the client ───────────────────────────
 
 # Read-side spellings that are transport-specific. Request BODY keys are absent
