@@ -17,9 +17,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import runpod_client
 import ssh_setup
-import runpod_provision
+# runpod_provision is deliberately NOT imported: this tab RUNS it, as a subprocess
+# (_stream_provision), and importing it would only add a module-level sys.path
+# insert at GUI startup plus one more file whose absence could stop this tab from
+# building. LogPane likewise: _stream_provision hand-rolls its Text widget because
+# a model download's carriage-return progress needs terminal emulation LogPane has
+# no reason to have.
 from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, CFG, save_config, PYTHON_EXE
-from gui.widgets import Tooltip, LogPane, _ScrollFrame, use_window_button_style
+from gui.widgets import Tooltip, _ScrollFrame, use_window_button_style
 
 
 def _fmt_spend(spend):

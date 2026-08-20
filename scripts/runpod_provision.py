@@ -1,19 +1,27 @@
 """
-runpod_provision.py — standalone DEV driver for remote-pod provisioning (#1).
+runpod_provision.py — remote-pod provisioning driver (#1): the GUI's one-click
+"Provision models…", plus the command-line tools it grew out of.
 
-NOT wired into the GUI. A command-line tool used during development to create a
-RunPod pod, SSH in, build the model network volume, and tear the pod down — so
-the whole flow can be validated live before any of it is wired into the app.
+Started as a dev-only driver for validating the flow live before any of it was
+wired into the app. It is wired in now, but only ever as a SUBPROCESS: the
+RunPod tab runs `setup-volume` with PYTHON_EXE and streams its output into a
+window (gui/tab_runpod.py `_stream_provision`). Nothing imports this module, and
+nothing should — it inserts its own directory at sys.path[0] at import time,
+which is right for a script run directly and pointless anywhere else.
 
 Reads config.json (api_key, the `runpod` section, ssh_key_path) from the app
 root. Uses runpod_client for the REST control plane and the Windows OpenSSH
 client (ssh.exe/scp.exe) for the pod side.
 
-    python scripts/runpod_provision.py create       # create a pod (STARTS BILLING)
+    python scripts/runpod_provision.py setup-volume  # THE GUI'S COMMAND: create a
+                                                     # pod, fill the model volume,
+                                                     # terminate it in a finally
+    python scripts/runpod_provision.py create        # create a pod (STARTS BILLING)
     python scripts/runpod_provision.py status        # status + SSH endpoint + cost
     python scripts/runpod_provision.py probe         # nvidia-smi over SSH
     python scripts/runpod_provision.py provision     # run pod/provision.sh on the pod
-    python scripts/runpod_provision.py ssh "<cmd>"  # run an arbitrary command
+    python scripts/runpod_provision.py smoke         # end-to-end check on a live pod
+    python scripts/runpod_provision.py ssh "<cmd>"   # run an arbitrary command
     python scripts/runpod_provision.py terminate     # delete the pod (frees billing)
 
 The pod id is remembered in logs/runpod_dev_state.json between calls.
