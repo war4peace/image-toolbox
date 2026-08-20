@@ -145,6 +145,26 @@ V2_POD_NOT_READY = json.loads(r"""
 }
 """)
 
+# The same pod's `runtime` block with work going through it. **Constructed, not
+# recorded**, and the one payload in this file that is: a pod reports zeros until
+# something actually runs on it, and a fixture of zeros cannot tell an absent
+# field from an idle GPU, which is precisely what pod_runtime_sample has to get
+# right. The SHAPE is the recorded one (V2_POD above, read off a real pod); only
+# the four utilisation figures are filled in.
+V2_POD_BUSY = json.loads(r"""
+{
+ "id": "5xpma5eg46tqjq",
+ "status": "RUNNING",
+ "runtime": {
+  "cpu": {"util": 41},
+  "gpus": [{"memoryUtil": 87, "util": 98}],
+  "memory": {"util": 63},
+  "ports": [{"ip": "213.173.104.74", "private": 22, "public": 35558, "type": "tcp"}],
+  "uptime": 1841
+ }
+}
+""")
+
 # The account's model volume, read through both REST versions.
 V1_VOLUMES = json.loads(r"""
 [{"dataCenterId": "EU-RO-1", "id": "grvtso8ftn",
@@ -346,6 +366,26 @@ class _FakeResponse:
 
     def __exit__(self, *exc):
         return False
+
+
+class _FakeStream:
+    """An SSE response: line-oriented, and it never ends -- which is the whole
+    point. The endpoint backfills and then holds the connection open, so the
+    reader has to decide for itself when the backfill is over. Here that is
+    modelled by raising the socket timeout a real one would raise."""
+
+    def __init__(self, payload):
+        self._lines = payload.splitlines(keepends=True)
+        self._i = 0
+
+    def readline(self):
+        if self._i >= len(self._lines):
+            raise TimeoutError("timed out")     # what socket.timeout is, since 3.10
+        self._i += 1
+        return self._lines[self._i - 1]
+
+    def close(self):
+        pass
 
 
 @pytest.fixture
@@ -640,10 +680,13 @@ def test_ensure_stopped_is_idempotent_on_a_stopped_pod(monkeypatch):
 
 # ── P2: the catalogs, the pod list and the deploy ────────────────────────────
 #
-# Recorded from the live catalogs on 2026-08-20, trimmed to five cards that each
+# Recorded from the live catalogs on 2026-08-20, trimmed to six cards that each
 # make a point: two ordinary NVIDIA cards, a Blackwell (the card class that made
-# deploy_pod necessary), an AMD card the app must never offer, and an H100 NVL
-# that is available GLOBALLY but absent from EU-RO-1.
+# deploy_pod necessary), an AMD card the app must never offer, an H100 NVL that is
+# available GLOBALLY but absent from EU-RO-1, and (re-recorded for #25 P4) an A100
+# SXM in stock ONLY in other data centers. The 4090's per-DC and CUDA lists are
+# the real ones too, which is where the 13.2 that KNOWN_CUDA_VERSIONS misses came
+# from -- a fixture trimmed for brevity would have hidden exactly that.
 
 V2_CATALOG_GPUS = json.loads(r"""
 {"gpus": [
@@ -652,8 +695,12 @@ V2_CATALOG_GPUS = json.loads(r"""
   "availability": "LOW", "dataCenters": [{"availability": "LOW", "id": "EU-RO-1", "name": "EU-RO-1"}]},
  {"id": "NVIDIA GeForce RTX 4090", "name": "RTX 4090",
   "manufacturer": "NVIDIA", "memory": 24, "price": {"community": 0.34, "secure": 0.74},
-  "availability": "HIGH", "dataCenters": [{"availability": "HIGH", "id": "EU-RO-1", "name": "EU-RO-1"}],
-  "cudaVersions": [{"available": true, "version": "12.4"}, {"available": true, "version": "12.8"}]},
+  "availability": "HIGH",
+  "dataCenters": [{"availability": "HIGH", "id": "EU-RO-1", "name": "EU-RO-1"},
+                  {"availability": "LOW", "id": "EU-CZ-1", "name": "EU-CZ-1"},
+                  {"availability": "LOW", "id": "US-TX-3", "name": "US-TX-3"}],
+  "cudaVersions": [{"available": true, "version": "12.4"}, {"available": true, "version": "12.8"},
+                   {"available": true, "version": "13.0"}, {"available": false, "version": "13.2"}]},
  {"id": "NVIDIA RTX PRO 4500 Blackwell", "name": "RTX PRO 4500",
   "manufacturer": "NVIDIA", "memory": 32, "price": {"community": 0.34, "secure": 0.72},
   "availability": "HIGH", "dataCenters": [{"availability": "HIGH", "id": "EU-RO-1", "name": "EU-RO-1"}],
@@ -663,7 +710,14 @@ V2_CATALOG_GPUS = json.loads(r"""
   "availability": "LOW", "dataCenters": [{"availability": "LOW", "id": "EU-RO-1", "name": "EU-RO-1"}]},
  {"id": "NVIDIA H100 NVL", "name": "H100 NVL",
   "manufacturer": "NVIDIA", "memory": 94, "price": {"community": 1.39, "secure": 2.59},
-  "availability": "LOW", "dataCenters": []}
+  "availability": "LOW", "dataCenters": []},
+ {"id": "NVIDIA A100-SXM4-80GB", "name": "A100 SXM",
+  "manufacturer": "NVIDIA", "memory": 80, "price": {"community": 1.39, "secure": 1.59},
+  "availability": "LOW",
+  "dataCenters": [{"availability": "LOW", "id": "US-KS-2", "name": "US-KS-2"},
+                  {"availability": "LOW", "id": "US-MO-1", "name": "US-MO-1"}],
+  "cudaVersions": [{"available": false, "version": "12.4"}, {"available": true, "version": "12.8"},
+                   {"available": true, "version": "13.0"}]}
 ]}
 """)
 
@@ -679,7 +733,9 @@ GQL_GPUS = json.loads(r"""
  {"id": "NVIDIA RTX 2000 Ada Generation", "displayName": "RTX 2000 Ada", "memoryInGb": 16,
   "lowestPrice": {"uninterruptablePrice": 0.24, "stockStatus": "Low"}},
  {"id": "NVIDIA RTX PRO 4500 Blackwell", "displayName": "RTX PRO 4500", "memoryInGb": 32,
-  "lowestPrice": {"uninterruptablePrice": 0.72, "stockStatus": "High"}}
+  "lowestPrice": {"uninterruptablePrice": 0.72, "stockStatus": "High"}},
+ {"id": "NVIDIA A100-SXM4-80GB", "displayName": "A100 SXM", "memoryInGb": 80,
+  "lowestPrice": {"uninterruptablePrice": null, "stockStatus": null}}
 ]}
 """)
 
@@ -734,6 +790,13 @@ def test_stock_levels_are_spelled_the_same_on_both_transports():
         assert rp._stock_label(empty) is None
 
 
+# What the GPU picker actually reads off a row. The parity test compares THESE,
+# not the whole dict: since #25 P4 a v2 row also carries what only v2 knows (per-
+# data-center stock, host CUDA versions), and demanding a byte-equal dict would
+# force that extra knowledge to be thrown away to keep a test green.
+PICKER_FIELDS = ("id", "name", "memory_gb", "price", "stock")
+
+
 def test_the_two_gpu_catalogs_agree_card_for_card(catalog, monkeypatch):
     """The parity that makes the swap safe, pinned offline. Measured live on the
     full EU-RO-1 catalog the same day: identical ids, prices, stock levels, VRAM
@@ -742,7 +805,8 @@ def test_the_two_gpu_catalogs_agree_card_for_card(catalog, monkeypatch):
     from_v2 = rp.available_gpus("k", data_center_id="EU-RO-1")
     monkeypatch.setattr(rp, "_API_VERSION", rp.API_V1)
     from_gql = rp.available_gpus("k", data_center_id="EU-RO-1")
-    assert from_v2 == from_gql
+    assert ([{k: g[k] for k in PICKER_FIELDS} for g in from_v2]
+            == [{k: g[k] for k in PICKER_FIELDS} for g in from_gql])
     assert [g["id"] for g in from_v2] == [
         "NVIDIA RTX 2000 Ada Generation",     # 0.24, cheapest first
         "NVIDIA RTX PRO 4500 Blackwell",      # 0.72
@@ -846,16 +910,21 @@ def test_the_cuda_floor_applies_only_to_consumer_cards():
     assert rp.deploy_cuda_versions({}) is None
 
 
-def test_the_cuda_floor_is_identical_on_both_transports(sent, monkeypatch):
+def test_the_cuda_policy_is_identical_on_both_transports(sent, monkeypatch):
     """A transport swap must not quietly change which HOSTS a run can land on.
-    Verified live too: an RTX 4090 deployed through the v2 path with this exact
-    list and landed on a compliant host."""
+
+    Since #25 P4 the two spell it differently -- v1 enumerates every acceptable
+    version, v2 states the floor those versions were approximating -- so what is
+    pinned here is that they mean the SAME thing: the same requirement, applied
+    to the same card, and never both fields at once (a non-empty
+    allowedCudaVersions together with minCudaVersion is a documented 400)."""
     spec = dict(V1_SPEC, gpuTypeIds=["NVIDIA GeForce RTX 4090"])
-    expected = rp.deploy_cuda_versions(spec)
+    enumerated = rp.deploy_cuda_versions(spec)          # v1's spelling
+    floor      = rp.deploy_cuda_floor(spec)             # v2's
 
     monkeypatch.setattr(rp, "_API_VERSION", rp.API_V2)
     rp.deploy_pod("k", spec)
-    v2_sent = sent[-1]
+    v2_gpu = sent[-1]["body"]["gpu"]
 
     gql = {}
     monkeypatch.setattr(rp, "_API_VERSION", rp.API_V1)
@@ -864,8 +933,27 @@ def test_the_cuda_floor_is_identical_on_both_transports(sent, monkeypatch):
                         or {"podFindAndDeployOnDemand": {"id": "x"}})
     rp.deploy_pod("k", spec)
 
-    assert v2_sent["body"]["gpu"]["allowedCudaVersions"] == expected
-    assert gql["input"]["allowedCudaVersions"] == expected
+    assert v2_gpu["minCudaVersion"] == floor == "12.8"
+    assert "allowedCudaVersions" not in v2_gpu          # mutually exclusive: 400
+    assert gql["input"]["allowedCudaVersions"] == enumerated
+    # The same intent: every version v1 lists clears the floor v2 sends.
+    assert enumerated and all(float(v) >= float(floor) for v in enumerated)
+
+
+def test_the_enumeration_had_already_gone_stale_and_the_floor_cannot(catalog, on_v2):
+    """Why the spelling changed at all, in one assertion.
+
+    Measured 2026-08-20: the catalog offers an RTX 4090 on CUDA **13.2**, past
+    the end of KNOWN_CUDA_VERSIONS -- so v1's hand-written list silently excludes
+    every host on the newest driver, which is the exact failure the constraint
+    exists to prevent, in the other direction. A numeric floor cannot go stale
+    that way."""
+    newest = max(float(v) for v, _a in
+                 next(g for g in rp._gpus_via_catalog("k", "EU-RO-1", 30)
+                      if g["id"] == "NVIDIA GeForce RTX 4090")["cuda"])
+    assert newest > max(float(v) for v in rp.KNOWN_CUDA_VERSIONS)
+    assert newest >= float(rp.deploy_cuda_floor(
+        dict(V1_SPEC, gpuTypeIds=["NVIDIA GeForce RTX 4090"])))
 
 
 def test_deploy_pod_is_a_plain_post_on_v2(sent, on_v2):
@@ -1041,6 +1129,262 @@ def test_a_404_does_not_blame_a_pod_for_every_route(monkeypatch):
     assert "404" in msg and "volume" in msg.lower()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  What v2 knows that v1 never did (#25 P4)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Six small opportunities, each deliberately kept out of the transport swap
+# itself so that a bad landing could still be attributed. Every one of them is
+# advisory: none may turn a working deploy, run or readout into a failed one,
+# which is why the "unknown" case is asserted as loudly as the useful case.
+
+
+def test_a_pod_that_will_never_come_up_is_not_waited_out(monkeypatch):
+    """v2 says ERROR as soon as it knows. Without reading it, wait_until_running
+    polls out the full deploy_timeout -- four minutes of a caller's retry budget,
+    on a billed pod that is already dead."""
+    monkeypatch.setattr(rp, "get_pod", lambda *a, **k: {"status": "ERROR"})
+    monkeypatch.setattr(rp.time, "sleep", lambda _s: pytest.fail("it waited"))
+    with pytest.raises(rp.RunPodError) as err:
+        rp.wait_until_running("k", "pod", timeout=600, poll=5)
+    assert "ERROR" in str(err.value)
+
+
+def test_the_states_a_pod_never_returns_from_are_one_list():
+    """EXITED and TERMINATED were checked inline before ERROR joined them. One
+    list, so the next state RunPod adds is added in one place."""
+    assert set(rp.TERMINAL_STATUSES) == {"EXITED", "TERMINATED", "ERROR"}
+    assert rp.STATUS_RUNNING not in rp.TERMINAL_STATUSES
+
+
+def test_an_empty_picker_can_say_whether_it_is_runpod_or_this_data_center(catalog, on_v2):
+    """"No GPU available in EU-RO-1" and "RunPod is out of GPUs" look identical
+    in the picker and are fixed completely differently: one is waited out, the
+    other means putting the model volume somewhere else. The A100 SXM in the
+    recorded catalog is exactly that case, in stock only in US data centers."""
+    rows = rp.available_gpus("k", None, include_out_of_stock=True)
+    elsewhere = dict(rp.stock_elsewhere(rows, "EU-RO-1"))
+    assert elsewhere["A100 SXM"] == ["US-KS-2", "US-MO-1"]
+    # The data center being asked about is never named back at the asker...
+    assert "EU-RO-1" not in elsewhere.get("RTX 4090", [])
+    # ... but a card in stock here AND elsewhere still reports the elsewhere.
+    assert elsewhere["RTX 4090"] == ["EU-CZ-1", "US-TX-3"]
+
+
+def test_the_hint_says_nothing_rather_than_something_wrong_on_v1(catalog, on_v1):
+    """GraphQL asks one data center at a time, so there is no per-DC knowledge to
+    report. Saying nothing is correct; a hint that quietly stops appearing when
+    the transport is flipped is worse than one that never appeared."""
+    rows = rp.available_gpus("k", None, include_out_of_stock=True)
+    assert all(r["dc_stock"] == {} for r in rows)
+    assert rp.stock_elsewhere(rows, "EU-RO-1") == []
+
+
+def test_an_unknown_cuda_capacity_never_reads_as_a_refusal():
+    """None, not False, is the answer for "no data" -- on v1, or for a card the
+    catalog says nothing about. The only thing worse than a burned deploy attempt
+    is refusing one that would have worked."""
+    assert rp.cuda_floor_reachable([], "12.8") is None
+    assert rp.cuda_floor_reachable(None, "12.8") is None
+    assert rp.cuda_floor_reachable([("12.8", True)], None) is None
+    assert rp.cuda_floor_reachable([("bogus", True)], "12.8") is None
+
+
+def test_the_cuda_floor_is_compared_as_a_number_not_a_string():
+    """13.2 is above 12.8; "13.2" sorts below "9.0". v2 compares minCudaVersion
+    numerically and so must anything reasoning about it locally."""
+    assert rp.cuda_floor_reachable([("13.2", True)], "12.8") is True
+    assert rp.cuda_floor_reachable([("9.0", True)], "12.8") is False
+    assert rp.cuda_floor_reachable([("12.4", True), ("13.0", False)], "12.8") is False
+
+
+def test_a_card_whose_new_enough_hosts_are_all_full_is_not_deployed_onto(
+        catalog, on_v2, monkeypatch):
+    """The pre-flight. "In stock, but every machine on a new enough driver is
+    full" answers a create with "no instances available" -- the SAME words a
+    sold-out card gives -- so the user refreshes, still sees the card listed with
+    stock, and tries again. Caught before the create instead."""
+    deployed = []
+    monkeypatch.setattr(rp, "create_pod",
+                        lambda *a, **k: deployed.append(a) or {"id": "x"})
+    spec = {"gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
+            "imageName": "runpod/pytorch:1.0.7-cu1321-torch291-ubuntu2204",
+            "dataCenterIds": ["EU-RO-1"]}
+    events = []
+    with pytest.raises(rp.RunPodError):
+        rp.create_pod_resilient("k", spec, attempts=3,
+                                on_event=lambda *a: events.append(a))
+    assert not deployed, "it deployed onto a card it had been told was full"
+    assert any("13.2" in str(e[3]) for e in events if e[0] == "bad")
+
+
+def test_the_preflight_lets_a_deploy_through_whenever_it_is_unsure(
+        catalog, on_v2, monkeypatch):
+    """Advisory, in the safe direction: a catalog that errors, or that has never
+    heard of this card, must not be able to stop a run."""
+    def down(*_a, **_k):
+        raise rp.RunPodError("catalog unreachable")
+    monkeypatch.setattr(rp, "_gpus_via_catalog", down)
+    assert rp.cuda_capacity_problem("k", "NVIDIA GeForce RTX 4090", "13.2") is None
+    monkeypatch.setattr(rp, "_gpus_via_catalog", lambda *a, **k: [])
+    assert rp.cuda_capacity_problem("k", "NVIDIA GeForce RTX 4090", "13.2") is None
+
+
+def test_the_two_cuda_fields_are_never_sent_together():
+    """A non-empty allowedCudaVersions alongside minCudaVersion is a documented
+    400. The body builder picks one; nothing upstream has to remember."""
+    body = rp.v2_pod_body({"gpuTypeIds": ["g"], "minCudaVersion": "12.8",
+                           "allowedCudaVersions": ["12.8", "12.9"]})
+    assert body["gpu"]["minCudaVersion"] == "12.8"
+    assert "allowedCudaVersions" not in body["gpu"]
+
+
+def test_an_exact_cuda_set_asked_for_by_name_still_wins():
+    """deploy_cuda_floor stands down when a caller named an exact set, so the two
+    can never both be computed for the same deploy."""
+    spec = {"gpuTypeIds": ["NVIDIA GeForce RTX 4090"], "imageName": "x-cu128",
+            "allowedCudaVersions": ["12.8"]}
+    assert rp.deploy_cuda_floor(spec) is None
+    assert rp.v2_pod_body(spec)["gpu"]["allowedCudaVersions"] == ["12.8"]
+
+
+def test_the_cuda_constraint_still_applies_to_consumer_cards_only():
+    """P4 changed the SPELLING, not the policy. A datacenter card forward-compats
+    and runs a newer image on an older driver, so a floor there only excludes
+    hosts that would have worked -- a hardware fact a better API does not
+    change."""
+    img = "runpod/pytorch:1.0.7-cu1281-torch291-ubuntu2204"
+    assert rp.deploy_cuda_floor({"gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
+                                 "imageName": img}) == "12.8"
+    assert rp.deploy_cuda_floor({"gpuTypeIds": ["NVIDIA A100 80GB PCIe"],
+                                 "imageName": img}) is None
+
+
+def test_a_pods_own_log_is_read_without_the_tunnel_that_just_failed(monkeypatch, on_v2):
+    """The one thing the app can learn about a pod that never came up: its own
+    log, from the control plane, in the moment before it is terminated."""
+    stream = (b'id: 2026-06-01T12:02:03Z/1\n'
+              b'data: {"ts":"t","source":"container","line":"Model loaded."}\n'
+              b'\n'
+              b': keep-alive comment\n'
+              b'data: {"ts":"t","source":"system","line":"start container"}\n')
+    monkeypatch.setattr(rp.urllib.request, "urlopen",
+                        lambda *a, **k: _FakeStream(stream))
+    assert rp.pod_logs("k", "pod") == ["[container] Model loaded.",
+                                       "[system] start container"]
+
+
+def test_a_log_that_cannot_be_read_is_simply_absent(monkeypatch, on_v2):
+    """It is a diagnostic printed beside a failure that has already happened, so
+    it must never be able to add a second one."""
+    def boom(*_a, **_k):
+        raise OSError("connection reset")
+    monkeypatch.setattr(rp.urllib.request, "urlopen", boom)
+    assert rp.pod_logs("k", "pod") == []
+
+
+def test_a_half_received_final_event_is_dropped_not_guessed_at():
+    """SSE is read until the backfill goes quiet, so the last event can be cut in
+    half. Skipped, never reconstructed."""
+    assert rp._sse_lines('data: {"line":"good"}\ndata: {"line":"tru') == ["good"]
+    assert rp._sse_lines("") == []
+    assert rp._sse_lines('data: {"line":"   "}') == []          # a blank log line
+
+
+def test_the_pod_log_is_v2_only(on_v1):
+    """v1 has no log route. The escape hatch returns nothing rather than
+    pretending it asked."""
+    assert rp.pod_logs("k", "pod") == []
+
+
+def test_the_control_plane_can_answer_when_the_tunnel_cannot():
+    """The telemetry row going blank was the app's only sign that the tunnel had
+    stopped answering, and it looked exactly like a card that had gone quiet."""
+    sample = rp.pod_runtime_sample(V2_POD_BUSY)
+    assert sample["cpu"] == 41
+    assert sample["ram_pct"] == 63
+    assert sample["gpu_util_pct"] == 98
+    assert sample["gpu_mem_pct"] == 87
+    assert sample["via"] == "api"
+
+
+def test_the_fallback_sample_does_not_invent_the_numbers_it_lacks():
+    """`runtime` reports percentages with no capacities. Filling in a plausible
+    total to keep the familiar "12.3/24.0 GB" shape would put a fabricated number
+    on screen beside real ones."""
+    sample = rp.pod_runtime_sample(V2_POD_BUSY)
+    for invented in ("ram_used_mb", "ram_total_mb", "gpu_used_mb",
+                     "gpu_total_mb", "gpu_temp_c", "gpu_power_w"):
+        assert invented not in sample
+
+
+def test_a_pod_with_nothing_to_report_reports_nothing():
+    """A v1 pod has no `runtime` at all (measured: its `machine` came back an
+    empty dict), and a v2 pod has `runtime: null` until the container starts.
+    Both must read as "no sample", not as a pod sitting at 0%."""
+    assert rp.pod_runtime_sample(V1_POD) is None
+    assert rp.pod_runtime_sample(V2_POD_NOT_READY) is None
+    assert rp.pod_runtime_sample(None) is None
+    assert rp.pod_runtime_sample({"runtime": {"gpus": [], "cpu": {}}}) is None
+
+
+def test_an_idle_pod_reports_zeros_and_zeros_are_readings():
+    """Recorded off the live probe pod: with nothing running, all four figures
+    come back 0 while `uptime` counts up. So the "nothing to report" test has to
+    be `is None` per field -- a truth test would throw away a real reading and
+    make an idle pod indistinguishable from an unreachable one."""
+    idle = {"runtime": {"cpu": {"util": 0}, "gpus": [{"memoryUtil": 0, "util": 0}],
+                        "memory": {"util": 0}, "uptime": 34}}
+    assert rp.pod_runtime_sample(idle) == {
+        "cpu": 0, "ram_pct": 0, "gpu_util_pct": 0, "gpu_mem_pct": 0,
+        "uptime_s": 34, "via": "api"}
+
+
+def test_a_true_is_not_a_utilisation_of_one():
+    """bool is an int in Python, so an unexpected `true` would render as 1%."""
+    assert rp.pod_runtime_sample({"runtime": {"cpu": {"util": True}}}) is None
+
+
+def test_spend_is_read_from_the_windows_own_total(monkeypatch, on_v2):
+    """One call: metadata.totals already sums the window. The per-bucket records
+    are deliberately not walked -- a bucket with no spend is omitted rather than
+    zero-padded (measured), so lastN=N does not promise N records."""
+    asked = {}
+
+    def fake(method, path, api_key, body=None, params=None, timeout=30):
+        asked.update({"path": path, "params": params})
+        return {"records": [], "metadata": {"totals": {
+            "totalAmount": 4.262959975167178,
+            "podGpuAmount": 0.7785848499042913,
+            "podDiskAmount": 0.008680555038154125,
+            "storageStandardAmount": 3.475694570224732}}}
+
+    monkeypatch.setattr(rp, "_request", fake)
+    spend = rp.account_spend("k", days=30)
+    assert asked == {"path": "/billing", "params": {"lastN": 30, "bucketSize": "day"}}
+    assert round(spend["total"], 2) == 4.26
+    assert round(spend["gpu"], 2) == 0.79           # GPU time plus its pod disk
+    assert round(spend["storage"], 2) == 3.48       # the standing model volume
+
+
+def test_spend_is_not_a_balance_and_never_blocks_anything(monkeypatch, on_v2):
+    """It exists because it is the only money figure left when the balance goes,
+    and because it says where the money went. It is a readout: every failure is
+    None, and no caller may treat None as zero."""
+    def boom(*_a, **_k):
+        raise rp.RunPodError("down", status=500)
+    monkeypatch.setattr(rp, "_request", boom)
+    assert rp.account_spend("k") is None
+    monkeypatch.setattr(rp, "_request", lambda *a, **k: {"metadata": {}})
+    assert rp.account_spend("k") is None
+
+
+def test_spend_has_no_v1_route(on_v1):
+    """Billing is a v2 endpoint. On the escape hatch the readout is simply
+    empty."""
+    assert rp.account_spend("k") is None
+
+
 # ── the pin: no raw field reads outside the client ───────────────────────────
 
 # Read-side spellings that are transport-specific. Request BODY keys are absent
@@ -1050,6 +1394,10 @@ def test_a_404_does_not_blame_a_pod_for_every_route(monkeypatch):
 _TRANSPORT_FIELDS = frozenset((
     "desiredStatus", "costPerHr", "dataCenterId", "publicIp", "portMappings",
     "gpuDisplayName",
+    # v2-only, added with the reader that uses it (#25 P4). A pod on the escape
+    # hatch has no `runtime` at all, so a read outside the seam is a None that
+    # looks like an idle GPU rather than a missing field.
+    "runtime",
 ))
 
 _QUOTES = ('"', "'")

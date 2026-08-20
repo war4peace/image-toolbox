@@ -35,6 +35,13 @@ after the open work.
 
 ## 25. RunPod API v2 migration: Medium (dated, money-adjacent)
 
+> **Status: the migration is DONE (P0 through P4, 2026-08-20).** The entry stays here rather
+> than moving to the numbering legend because it still owns two **dated deletions**: the whole v1
+> half after **2026-11-15**, and the GraphQL island (`_graphql` + `_BALANCE_QUERY`) when the
+> account balance starts answering 410 in **early 2027**, which also retires the funds floor and
+> its Settings field. Those dates are the reason this entry was written; losing sight of them by
+> filing it as shipped would be the one way to fail after succeeding.
+
 Move the RunPod integration off **two** transports RunPod has now dated for shutdown, onto the
 single `https://api.runpod.io/v2`. This entry sits first despite the file's easiest-first order,
 because it is the only milestone here with a **date on it**: everything else can slip, this one
@@ -349,7 +356,8 @@ paths apply the identical policy: a transport swap must not quietly change which
 land on. v2 offers `gpu.minCudaVersion`, a real numeric floor and exactly what
 `KNOWN_CUDA_VERSIONS` enumerates around, and it was deliberately NOT adopted here. Changing the
 transport and the host-selection policy in one step would make a bad landing impossible to
-attribute. That swap stays P4.
+attribute. That swap is P4 below, where it turned out the enumeration had already
+gone stale.
 
 **`available_gpus` and `data_centers` moved onto `/v2/catalog/*`**, and both were checked by
 running the two implementations side by side against the live account rather than by reading the
@@ -409,7 +417,7 @@ $0.0243 is `podGpuAmount`, which is the **entire** live-verification bill for P0
 `hour` or `day`, `lastN` resolves to a window, and a **zero-spend bucket is omitted rather than
 padded** (measured: `lastN=3&bucketSize=hour` returned 2 records), so anything plotting it must not
 assume N records for `lastN=N`. It answers "what did I spend", never "what is left", so it cannot
-replace the floor. Worth showing anyway, and still P4.
+replace the floor. Worth showing anyway, and shipped in P4 below.
 
 **`spend_per_hr` has no naive successor either, and this is the measurement that kills the obvious
 idea.** The plausible replacement is summing `pod_cost()` over the running pods. Measured with
@@ -460,12 +468,99 @@ When they 410, the floor retires by itself: `floor_unenforced` starts saying the
 the readout starts saying "Not published", and nothing breaks. The one thing left to do on that day
 is remove the floor field from Settings so it stops being offered.
 
-**P4. The opportunities, opt-in and afterwards**, once the migration is proven: per-DC stock in
-the picker, `minCudaVersion` plus catalog `cudaVersions` replacing `KNOWN_CUDA_VERSIONS` and the
-consumer-card heuristic, fail-fast on `ERROR` in `wait_until_running`, `runtime` metrics as a
-fallback for the pod telemetry row when the tunnel is down, `/logs` for diagnosing a pod that
-never came up, and last-N-days spend from `/v2/billing`. Each is small on its own; none of them
-belong in the same change as the transport swap.
+**P4. The opportunities. DONE, 2026-08-20.** All six shipped, and what they have in common is
+worth stating first: **every one of them is advisory**. None may turn a working deploy, run or
+readout into a failed one, so each is written so that "I do not know" is answered as loudly as
+the useful case. That is the same fail-open discipline P3 applied to the funds floor, applied
+here to knowledge the app did not have before.
+
+**The CUDA floor was the one with a live bug already in it.** `KNOWN_CUDA_VERSIONS` enumerates
+every acceptable version by hand because v1's `allowedCudaVersions` is exact-match set
+membership, with a comment warning to keep the table ahead of RunPod's maximum. Measured while
+building this: the catalog now offers an **RTX 4090 on CUDA 13.2**, past the end of the table, so
+the app has been silently excluding every host on the newest driver, from exactly the deploys the
+constraint exists to protect. v2's `gpu.minCudaVersion` is a numeric floor and **cannot go
+stale**, which is the real argument for it, not tidiness. The policy did NOT change with the
+spelling: `is_consumer_gpu` stays, because CUDA forward compatibility is a property of the
+hardware (a GeForce card has none, a datacenter card has it) and a better API does not repeal it.
+The table stays too, on the v1 branch, and dies with it. One trap the spec names and a live
+deploy would not have: a non-empty `allowedCudaVersions` sent **together with** `minCudaVersion`
+is a 400, so `v2_pod_body` picks one and nothing upstream has to remember.
+
+**`cudaVersions` then makes a burned deploy attempt into a pre-flight.** "The card is in stock,
+but every machine on a new enough driver is full" answers a create with *no instances available*,
+which is the same sentence a sold-out card produces: the user refreshes the picker, still sees
+the card listed with stock, and tries again. `cuda_capacity_problem` asks the catalog once before
+the create and skips that card in the chain with a reason. It is advisory in the safe direction:
+no data, an unreachable catalog or an unknown card all return None, and `cuda_floor_reachable`
+answers **None rather than False** for "unknown", because the only thing worse than a wasted
+deploy is refusing one that would have worked.
+
+**Per-DC stock answers the question an empty picker used to raise and could not settle.** "No GPU
+available in EU-RO-1 right now" reads as *RunPod is out*, when it often means *this data center is
+out* -- two situations fixed completely differently, one by waiting and one by putting the model
+volume somewhere else. The catalog knows both, in the response the picker was already fetching
+and throwing away. Only asked when the list comes back **empty**, so the normal path still costs
+one call; the count goes in the combobox and the detail in the log, with the note that pods run
+where the volume lives. Empty on v1, where GraphQL asks one data center at a time: saying nothing
+is correct, and a hint that quietly stops appearing when the transport is flipped would be worse
+than one that never appeared. Deliberately NOT wired into the Video Upscaler's picker, whose list
+can also be empty because of the SeedVR2 feasibility gate, where "in stock elsewhere" would be
+answering a question nobody asked.
+
+**`ERROR` is four minutes.** v2 reports it as soon as it knows, and `wait_until_running` only knew
+to stop on `EXITED`/`TERMINATED`, so a pod that was never coming up burned the full
+`deploy_timeout` out of the caller's retry budget while billing. Now one `TERMINAL_STATUSES` list,
+so the next state RunPod adds is added in one place.
+
+**`/v2/pods/{id}/logs` is the diagnostic that does not need the thing that broke.** Everything the
+app knows about a pod comes through its own ssh tunnel and worker, which is precisely what is
+missing when a pod never came up. `create_pod_resilient` now reads the last 40 lines **before it
+terminates the pod**, the only moment they exist, and `remote_run` prints them prefixed `pod log |`
+so they are obviously the container talking. It is **SSE, not JSON**: the endpoint backfills and
+then holds the connection open forever, so a read timeout is the normal exit rather than an error,
+and it always costs its full timeout. Measured live: 40 lines in 8.8 s, `[system]` for the image
+pull and `[container]` for the start script, ending on "Pod is ready to use". Stopping early once
+`tail` lines had arrived would usually save those 8 s and was **rejected**: it is correct only if
+the server honoured `tail`, and if it ever replayed the whole log instead, an early stop would hand
+back the OLDEST lines while looking identical. Two smaller things it forced: `readline`, not
+`read(n)`, because a fixed-size read discards everything it had buffered when the socket times out
+(which on a short backfill is the entire log), and a truncated final event is dropped rather than
+reconstructed.
+
+**`runtime` gives the telemetry row a second source.** The remote row going blank was the only
+sign that the tunnel had stopped answering, and it looks exactly like a card that has gone quiet.
+The control plane can say all along. It is **not** a drop-in equal and must not pretend to be:
+`runtime` publishes utilisation percentages with no capacities, so the sample fills
+`ram_pct`/`gpu_mem_pct`, leaves the `*_used_mb` pairs alone, and the row renders the bare
+percentage. Inventing a total to keep the familiar "12.3/24.0 GB" shape would put a fabricated
+number on screen beside real ones. It marks itself `via="api"` and the row says "via API (tunnel
+down)", or the drop in detail reads as the pod having gone quiet. Measured on the live pod: an
+idle pod reports **0** on all four while `uptime` counts up, so "nothing to report" has to be
+tested per field with `is None` -- a truth test would make an idle pod indistinguishable from an
+unreachable one. `runtime` joined the seam's forbidden-field sweep for the same reason every other
+entry is there: a v1 pod has no such field, so a read outside the seam is a None that looks like
+an idle GPU.
+
+**Spend is the last money figure, and it says where the money went.** `/v2/billing` cannot replace
+the balance (P3 settled that) but it is what remains when the balance retires, and it answers
+something the balance never could. One call: `metadata.totals` already sums the window, so the
+per-bucket records are not walked and must not be counted on. It sits beside the funds floor and
+the per-run cap on the RunPod tab, filled by Refresh, reading e.g. *spent in the last 30 days:
+$4.26 ($0.79 pods, $3.48 storage)* -- and that split is the point, because a network volume bills
+around the clock whether or not anything is running, which no other readout in the app reveals.
+None on any failure and on v1, shown as an empty label rather than a "$0.00" that would read as
+"nothing was charged".
+
+**Verified live, one consumer card on purpose** (an RTX 4090 in EU-RO-1, the only GeForce it
+offers, and `is_consumer_gpu` is what gates the whole CUDA policy). Through `create_pod_resilient`
+with the request bodies recorded off the wire: the create carried
+`{"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "12.8"}` and **no**
+`allowedCudaVersions`, the pod reached RUNNING in 72 s with an SSH endpoint (the early-RUNNING
+finding again), landed on a host reporting **CUDA 13.0**, answered `pod_record`, three `runtime`
+reads and a 40-line log fetch, and was terminated with nothing left on the account. Total bill for
+the run: about four cents. The pre-flight was exercised on the real catalog too and correctly said
+nothing, since 12.8 and 13.0 both had capacity for that card while 13.2 was full.
 
 **Deletions the migration earns**, worth counting since the module is 943 lines: `deploy_pod`'s
 GraphQL translation and `_DEPLOY_MUTATION`, `_graphql` with its browser-User-Agent workaround and

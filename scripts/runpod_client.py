@@ -144,6 +144,16 @@ DOCS_API_KEYS_URL    = "https://docs.runpod.io/get-started/api-keys"
 STATUS_RUNNING    = "RUNNING"
 STATUS_EXITED     = "EXITED"
 STATUS_TERMINATED = "TERMINATED"
+# v2 reports a richer lifecycle (PROVISIONING / STARTING / RUNNING / EXITED /
+# ERROR / TERMINATED) where v1's `desiredStatus` only ever said what was WANTED.
+# ERROR is the one that pays: a pod that failed to come up used to sit unread
+# until the full deploy timeout ran out, because nothing recognised the state it
+# was already reporting (#25 P4). Harmless on v1, which simply never says it.
+STATUS_ERROR      = "ERROR"
+
+# The states a pod never comes back from, so a wait must stop on them rather than
+# poll out its deadline.
+TERMINAL_STATUSES = (STATUS_EXITED, STATUS_TERMINATED, STATUS_ERROR)
 
 # The REST API exposes NO endpoint to list GPU types or data centers (they are
 # fixed enums) — so these are curated picklists for the Settings UI. Edit
@@ -592,6 +602,55 @@ def pod_record(pod):
     }
 
 
+def pod_runtime_sample(pod):
+    """A pod's `runtime` block as the telemetry sample dict the GUI already
+    renders, or None when there is nothing to report.
+
+    The FALLBACK source for the remote telemetry row (#25 P4). The real one is
+    the on-pod worker's /telemetry over the app's own ssh tunnel, which is richer
+    (absolute MB, temperature, power, clock) and is also the first thing to go
+    when a run is in trouble -- so the moment the row goes blank is the moment its
+    numbers would be worth having. This asks the control plane instead, over
+    ordinary HTTPS, and gets back what the hypervisor sees.
+
+    It is deliberately NOT a drop-in equal: `runtime` reports utilisation
+    PERCENTAGES with no capacities, so `ram_pct`/`gpu_mem_pct` are filled and the
+    `*_used_mb`/`*_total_mb` pairs are not. The row renders the percentage alone
+    in that case, which is the honest reading; inventing a total to keep the
+    familiar "12.3/24.0 GB" shape would put a fabricated number on screen.
+
+    A ZERO is a reading, not an absence, which is why the "nothing to report"
+    test is `is None` on every field rather than a truth test: measured on a live
+    pod with nothing running, all four came back 0 while `uptime` counted up.
+
+    v2 only: a v1 pod carries no `runtime` at all (measured -- its `machine` came
+    back as an empty dict), so this simply returns None there."""
+    rt = (pod or {}).get("runtime") if isinstance(pod, dict) else None
+    if not isinstance(rt, dict):
+        return None
+    gpus = [g for g in (rt.get("gpus") or []) if isinstance(g, dict)]
+    gpu = gpus[0] if gpus else {}
+    sample = {
+        "cpu":          _num_or_none((rt.get("cpu") or {}).get("util")),
+        "ram_pct":      _num_or_none((rt.get("memory") or {}).get("util")),
+        "gpu_util_pct": _num_or_none(gpu.get("util")),
+        "gpu_mem_pct":  _num_or_none(gpu.get("memoryUtil")),
+        "uptime_s":     _num_or_none(rt.get("uptime")),
+        "via":          "api",       # the row says so: this is the thinner source
+    }
+    if all(sample[k] is None for k in ("cpu", "ram_pct", "gpu_util_pct", "gpu_mem_pct")):
+        return None
+    return sample
+
+
+def _num_or_none(value):
+    """A number, or None for anything that is not one (including a bool, which is
+    an int in Python and would render as 0%/1%)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
 def volume_data_center(vol):
     """A network volume's data center id, or None. v1 spells it `dataCenterId`,
     v2 spells it `dataCenter` (measured on the same volume through both)."""
@@ -662,8 +721,16 @@ def v2_pod_body(spec):
             "volumeId": spec["networkVolumeId"],
             "path":     spec.get("volumeMountPath", "/workspace"),
         }]}
-    cuda = spec.get("allowedCudaVersions")
-    if cuda:
+    # The CUDA host constraint, in whichever of the two forms v2 offers. They are
+    # MUTUALLY EXCLUSIVE: sending a non-empty `allowedCudaVersions` together with
+    # `minCudaVersion` is a documented 400, so this picks one. The floor wins,
+    # because it is what deploy_pod computes; an explicit exact set only reaches
+    # here when a caller asked for one by name (and then no floor is computed).
+    floor = spec.get("minCudaVersion")
+    cuda  = spec.get("allowedCudaVersions")
+    if floor:
+        body["gpu"] = dict(body.get("gpu") or {}, minCudaVersion=str(floor))
+    elif cuda:
         body["gpu"] = dict(body.get("gpu") or {}, allowedCudaVersions=list(cuda))
     return body
 
@@ -692,6 +759,11 @@ def create_pod(api_key, spec, timeout=60):
 # Listing a few not-yet-existing future versions is harmless (they just match
 # nothing); the risk is the other way — omitting a real high version excludes a
 # capable machine, so keep this ahead of RunPod's current max.
+#
+# **v1 only since #25 P4**, and a live example of why: the catalog now offers an
+# RTX 4090 on CUDA 13.2, past the end of this table, so this list silently
+# excludes the newest hosts. v2 sends a numeric floor instead and cannot go
+# stale (deploy_cuda_floor); this goes when the v1 branch does.
 KNOWN_CUDA_VERSIONS = (
     "12.0", "12.1", "12.2", "12.3", "12.4", "12.5", "12.6", "12.7", "12.8",
     "12.9", "13.0", "13.1",
@@ -767,21 +839,50 @@ def deploy_cuda_versions(spec):
     explicit spec override always wins.
 
     Hoisted out of deploy_pod so BOTH create paths apply the same policy: a
-    transport swap must not quietly change which hosts a run can land on. v2
-    offers a `gpu.minCudaVersion` that expresses ">= X" directly, which is what
-    KNOWN_CUDA_VERSIONS is enumerating around, but this keeps the enumeration on
-    both: identical semantics is the conservative choice for a transport change,
-    and swapping the policy at the same time would make a bad landing impossible
-    to attribute. That swap is #25 P4.
+    transport swap must not quietly change which hosts a run can land on. Since
+    #25 P4 this is the **v1** spelling only -- v2 says the same thing as a real
+    floor, see deploy_cuda_floor -- and it dies with the v1 branch.
     """
     spec = spec or {}
     explicit = spec.get("allowedCudaVersions")
     if explicit:
         return list(explicit)
-    gpu_ids = spec.get("gpuTypeIds") or []
-    if is_consumer_gpu(gpu_ids[0] if gpu_ids else ""):
+    if _needs_cuda_floor(spec):
         return allowed_cuda_versions(spec.get("imageName", ""))
     return None
+
+
+def _needs_cuda_floor(spec):
+    """Whether THIS deploy should constrain the host's CUDA version at all.
+
+    The policy, unchanged since 0.3.3 and unchanged by #25 P4: consumer GeForce
+    cards only. It is a hardware fact, not an API artifact -- a GeForce card has
+    no CUDA forward-compat, a datacenter card does -- so a newer API expressing
+    the constraint better does not make the exception go away."""
+    gpu_ids = (spec or {}).get("gpuTypeIds") or []
+    return is_consumer_gpu(gpu_ids[0] if gpu_ids else "")
+
+
+def deploy_cuda_floor(spec):
+    """The `gpu.minCudaVersion` for a v2 deploy, or None for no constraint.
+
+    v2 says ">= X" in one field, compared NUMERICALLY, which is what
+    KNOWN_CUDA_VERSIONS spent twelve hand-written strings approximating. The
+    approximation had already gone stale by the time it was replaced: measured
+    2026-08-20, the catalog offers an RTX 4090 on CUDA **13.2**, which the table
+    stops short of, so every host on the newest driver was being excluded from
+    exactly the deploys the constraint exists to help. A floor cannot go stale
+    that way, which is the real reason to prefer it over a longer table.
+
+    Same policy as deploy_cuda_versions (consumer cards only, an explicit exact
+    set wins), so a transport swap does not change which hosts a run can land
+    on -- only how the same intent is spelled."""
+    spec = spec or {}
+    if spec.get("allowedCudaVersions"):     # caller asked for an exact set
+        return None
+    if not _needs_cuda_floor(spec):
+        return None
+    return _cuda_from_image(spec.get("imageName", ""))
 
 
 _DEPLOY_MUTATION = """
@@ -819,9 +920,9 @@ def deploy_pod(api_key, spec, timeout=90):
     Raises RunPodError on capacity / validation / transport failure.
     """
     if _API_VERSION == API_V2:
-        cuda = deploy_cuda_versions(spec)
-        if cuda:
-            spec = {**spec, "allowedCudaVersions": cuda}
+        floor = deploy_cuda_floor(spec)
+        if floor:
+            spec = {**spec, "minCudaVersion": floor}
         return create_pod(api_key, spec, timeout=timeout)
     gpu_ids = spec.get("gpuTypeIds") or []
     dcs = spec.get("dataCenterIds") or []
@@ -894,6 +995,89 @@ def terminate_pod(api_key, pod_id, timeout=60):
     return _pod_action(api_key, pod_id, "terminate", timeout=timeout)
 
 
+def _sse_lines(payload):
+    """Pull the log lines out of a chunk of Server-Sent Events text.
+
+    Pure, and the reason the reader below can be tested without a socket. Each
+    event is `id: …` + `data: {json}`; anything else (comments, keep-alive blank
+    lines, a half-received final event) is skipped rather than guessed at."""
+    out = []
+    for raw in (payload or "").splitlines():
+        if not raw.startswith("data:"):
+            continue
+        body = raw[5:].strip()
+        if not body:
+            continue
+        try:
+            ev = json.loads(body)
+        except ValueError:
+            continue                       # a truncated tail event; drop it
+        line = ev.get("line")
+        if isinstance(line, str) and line.strip():
+            src = ev.get("source") or ""
+            out.append(f"[{src}] {line}" if src else line)
+    return out
+
+
+def pod_logs(api_key, pod_id, tail=100, timeout=8):
+    """The last `tail` lines of a pod's container + system log, newest last.
+
+    Returns a list of strings, EMPTY on any failure -- this is a diagnostic shown
+    beside a failure that has already happened, so it must never add a second
+    one. Never raises.
+
+    Two things make this different from every other call in this module. It is
+    **SSE, not JSON**: the endpoint backfills `tail` lines and then holds the
+    connection open forever, so `timeout` is not a deadline for a reply, it is
+    how long to keep reading after the backfill goes quiet. A read timeout is
+    therefore the NORMAL exit, not an error. And it is the one thing the app can
+    learn about a pod **without its own tunnel and worker**, which is exactly
+    what is missing when a pod never came up (#25 P4).
+
+    So this always costs its full `timeout`, and that is deliberate. Measured
+    live on a real pod: 40 lines back in 8.8 s, `[system]` for the image pull and
+    `[container]` for the start script, ending on "Pod is ready to use". Stopping
+    as soon as `tail` lines have arrived would usually save 8 s, and was
+    rejected: it is only correct if the server honoured `tail`, and if it ever
+    replayed the whole log instead, an early stop would hand back the OLDEST
+    lines while looking exactly the same. Eight seconds, once, on a failure path
+    that is about to terminate a pod, is not worth that.
+
+    v2 only: v1 has no log route (the GraphQL console used a different one), and
+    the escape hatch simply returns nothing rather than pretending."""
+    if _API_VERSION != API_V2 or not api_key or not pod_id:
+        return []
+    url = f"{base_url()}/pods/{pod_id}/logs?" + urllib.parse.urlencode({
+        "tail": max(0, min(int(tail or 0), 5000)),
+    })
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent":    _USER_AGENT,
+        "Accept":        "text/event-stream",
+    })
+    chunks = []
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                # readline, NOT read(n): a fixed-size read blocks until the
+                # buffer fills and then loses everything it had when the socket
+                # times out, which on a short backfill is the whole log. SSE is
+                # line-oriented, so each complete line comes back at once and
+                # only a half-written final line can ever be lost.
+                line = resp.readline()
+                if not line:               # server closed: backfill complete
+                    break
+                chunks.append(line.decode("utf-8", "replace"))
+        finally:
+            resp.close()
+    except Exception:                      # noqa: BLE001 (incl. the expected read timeout)
+        pass
+    lines = _sse_lines("".join(chunks))
+    return lines[-tail:] if tail else lines
+
+
 def pod_status(api_key, pod_id, timeout=30):
     """Return a pod's lifecycle state (RUNNING/EXITED/TERMINATED), or None if the
     pod is gone / unreadable. Never raises, for safe polling. Reads through
@@ -917,14 +1101,18 @@ def ssh_endpoint(pod):
 
 def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
     """Poll a pod until it is RUNNING with a reachable SSH endpoint, and return
-    the pod dict. Raises RunPodError on timeout or if the pod ends up
-    EXITED/TERMINATED first. `on_status(status, host, port)` is called on each
+    the pod dict. Raises RunPodError on timeout or if the pod reaches one of the
+    TERMINAL_STATUSES first. `on_status(status, host, port)` is called on each
     poll for UI feedback.
 
     Requiring BOTH is load-bearing, not belt and braces: v2 reports
     `status: "RUNNING"` in the CREATE response itself, measured ~50 s before
     `ssh.direct` was anything but null. A caller that trusted the status alone
-    would be handed a host of None and fail somewhere far less obvious."""
+    would be handed a host of None and fail somewhere far less obvious.
+
+    Failing on `ERROR` is #25 P4: v2 says so as soon as it knows, and without
+    reading it a pod that is never coming up burns the whole `deploy_timeout`
+    (four minutes of the caller's retry budget, billed) before anything reacts."""
     deadline = time.time() + timeout
     while True:
         pod = get_pod(api_key, pod_id)
@@ -935,7 +1123,7 @@ def wait_until_running(api_key, pod_id, timeout=600, poll=5, on_status=None):
                 on_status(status, host, port)
             except Exception:                            # noqa: BLE001 (UI cb is best-effort)
                 pass
-        if status in (STATUS_EXITED, STATUS_TERMINATED):
+        if status in TERMINAL_STATUSES:
             raise RunPodError(f"Pod entered {status} before it became reachable.")
         if status == STATUS_RUNNING and host and port:
             return pod
@@ -973,6 +1161,21 @@ def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
                                        # a capacity error breaks a GPU's retries early)
     for gpu in gpu_chain:
         gspec = spec if gpu is None else {**spec, "gpuTypeIds": [gpu]}
+        # Pre-flight the CUDA floor before spending a deploy on it (#25 P4). A
+        # card whose every new-enough host is full answers a create with "no
+        # instances available", the SAME message a sold-out card gives, so the
+        # user refreshes the picker, still sees the card in stock, and tries
+        # again. Advisory: cuda_capacity_problem returns None on any doubt.
+        floor = deploy_cuda_floor(gspec)
+        if floor:
+            problem = cuda_capacity_problem(
+                api_key, gpu, floor,
+                (gspec.get("dataCenterIds") or [None])[0])
+            if problem:
+                last_err = f"{gpu or '?'}: {problem}"
+                if on_event:
+                    on_event("bad", 0, None, last_err)
+                continue
         for attempt in range(1, attempts + 1):
             attempts_made += 1
             try:
@@ -1003,6 +1206,12 @@ def create_pod_resilient(api_key, spec, attempts=3, deploy_timeout=240, poll=8,
                 last_err = f"{gpu or '?'}: {exc}"
                 if on_event:
                     on_event("bad", attempt, pod_id, last_err)
+                    # The pod's own log, while it still exists (#25 P4). This is
+                    # the one moment the app can say WHY a pod never came up:
+                    # its tunnel and worker are exactly what is missing, and the
+                    # next line terminates the only place the answer lives.
+                    for line in pod_logs(api_key, pod_id, tail=40):
+                        on_event("log", attempt, pod_id, line)
                 # Tear the bad pod down before trying again (don't leave it billing).
                 ensure_stopped(api_key, pod_id, terminate=True)
     if on_event:
@@ -1170,6 +1379,11 @@ def _gpus_via_graphql(api_key, data_center_id, timeout):
             "memory_gb": g.get("memoryInGb") or 0,
             "price":     lp.get("uninterruptablePrice"),
             "stock":     _stock_label(lp.get("stockStatus")),
+            # GraphQL answers for ONE data center at a time and says nothing
+            # about host CUDA versions. Empty rather than absent, so a caller
+            # never has to ask which transport it is reading (#25 P4).
+            "dc_stock":  {},
+            "cuda":      [],
         })
     return out
 
@@ -1197,18 +1411,28 @@ def _gpus_via_catalog(api_key, data_center_id, timeout):
     for g in items:
         if not isinstance(g, dict):
             continue
+        per_dc = {d.get("id"): _stock_label(d.get("availability"))
+                  for d in g.get("dataCenters") or []
+                  if isinstance(d, dict) and d.get("id")}
         if data_center_id:
-            here = next((d for d in g.get("dataCenters") or []
-                         if isinstance(d, dict) and d.get("id") == data_center_id), None)
-            stock = here.get("availability") if here else None
+            stock = per_dc.get(data_center_id)
         else:
-            stock = g.get("availability")
+            stock = _stock_label(g.get("availability"))
         out.append({
             "id":        g.get("id") or "",
             "name":      g.get("name") or g.get("id") or "",
             "memory_gb": g.get("memory") or 0,
             "price":     (g.get("price") or {}).get("secure"),
-            "stock":     _stock_label(stock),
+            "stock":     stock,
+            # Everything the same response already knew and the old row threw
+            # away (#25 P4): where else this card is in stock, and which host
+            # CUDA versions exist for it with capacity right now. A card with no
+            # stock anywhere carries an EMPTY dataCenters list, measured, so an
+            # empty map means "nowhere", not "not asked".
+            "dc_stock":  per_dc,
+            "cuda":      [(c.get("version"), bool(c.get("available")))
+                          for c in g.get("cudaVersions") or []
+                          if isinstance(c, dict) and c.get("version")],
         })
     return out
 
@@ -1262,6 +1486,82 @@ def available_gpus(api_key, data_center_id=None, min_memory_gb=0, timeout=30,
     # Cheapest first; a missing price sorts last so a real quote always wins.
     out.sort(key=lambda r: (r["price"] is None, r["price"] or 0.0))
     return out
+
+
+def stock_elsewhere(rows, data_center_id, min_memory_gb=0):
+    """[(name, [other data centers where it is in stock]), …], cheapest first.
+
+    Pure: `rows` are `available_gpus(..., include_out_of_stock=True)` results.
+    Answers the one question an empty GPU picker raises and could not answer
+    before -- *is RunPod out, or is this data center out?* -- which are two very
+    different situations: the first is waited out, the second is fixed by putting
+    the model volume somewhere else, and the picker's "no GPU available in
+    EU-RO-1 right now" reads like the first even when it is the second.
+
+    Empty on v1: GraphQL asks one data center at a time, so `dc_stock` is empty
+    there and no claim can be made. Saying nothing is correct; the alternative is
+    a hint that quietly stops appearing when a user flips the transport."""
+    out = []
+    for r in rows:
+        if (r.get("memory_gb") or 0) < min_memory_gb:
+            continue
+        others = sorted(dc for dc, level in (r.get("dc_stock") or {}).items()
+                        if level and dc != data_center_id)
+        if others:
+            out.append((r.get("name") or r.get("id") or "?", others))
+    return out
+
+
+def cuda_floor_reachable(cuda_rows, floor):
+    """True/False/None for "is any host CUDA version >= `floor` free right now?"
+
+    Pure, and **None means unknown**, never False: no `cuda` data (v1, or a card
+    the catalog says nothing about) must read as "go ahead and try", because the
+    only thing worse than a burned deploy attempt is refusing a deploy that would
+    have worked. `floor` is compared numerically, the way v2's minCudaVersion is,
+    so 13.2 counts as above 12.8 (a string sort does not: "13.2" < "9.0")."""
+    if not cuda_rows or not floor:
+        return None
+    try:
+        want = float(floor)
+    except (TypeError, ValueError):
+        return None
+    seen = False
+    for version, available in cuda_rows:
+        try:
+            have = float(version)
+        except (TypeError, ValueError):
+            continue
+        seen = True
+        if have >= want and available:
+            return True
+    return False if seen else None
+
+
+def cuda_capacity_problem(api_key, gpu_id, floor, data_center_id=None, timeout=30):
+    """A sentence explaining that `gpu_id` cannot host a CUDA >= `floor` image
+    right now, or None to proceed. Never raises.
+
+    The pre-flight #25 P4 was for: "the card is in stock, but every machine on a
+    new enough driver is full" is otherwise indistinguishable from ordinary bad
+    luck -- the deploy answers "no instances available", which is what a sold-out
+    card says too, so the user refreshes the picker, sees the card still listed
+    with stock, and tries again. One catalog GET before a create that takes
+    minutes is cheap; being wrong about it is not, which is why every failure
+    path here returns None."""
+    try:
+        rows = _gpus_via_catalog(api_key, data_center_id, timeout) \
+            if _API_VERSION == API_V2 else []
+        row = next((r for r in rows if r["id"] == gpu_id), None)
+        if not row:
+            return None
+        if cuda_floor_reachable(row.get("cuda"), floor) is not False:
+            return None
+        offered = ", ".join(f"{v}{'' if a else ' (full)'}" for v, a in row["cuda"])
+        return (f"{row['name']} has no machine free on CUDA {floor} or newer "
+                f"(offered: {offered}). The image needs at least {floor}.")
+    except Exception:                                # noqa: BLE001 (advisory only)
+        return None
 
 
 _BALANCE_QUERY = "query { myself { clientBalance currentSpendPerHr } }"
@@ -1364,6 +1664,43 @@ def account_balance(api_key, timeout=15):
     if info.get("status") != BALANCE_OK:
         return None
     return {"balance": info["balance"], "spend_per_hr": info["spend_per_hr"]}
+
+
+def account_spend(api_key, days=30, timeout=20):
+    """What the account has SPENT over the last `days`, or None on any failure.
+
+    Returns {"days", "total", "gpu", "storage"} in USD. Never raises.
+
+    This is not, and cannot be turned into, a balance (#25 P3 settled that). It
+    is here because when the balance retires it becomes the only money figure
+    RunPod still publishes, and because it answers a question the balance never
+    could: **where the money went**. On this account a 30-day window read $4.26,
+    of which $3.48 was the standing 50 GB model volume and $0.78 all the GPU
+    time -- a split worth seeing next to the funds floor, since a volume bills
+    whether or not anything is running.
+
+    One call: `metadata.totals` already sums the window, so the per-bucket
+    records are not walked (and must not be counted on -- a bucket with no spend
+    is omitted rather than zero-padded, measured, so `lastN=N` does not promise N
+    records). v2 only; v1 has no billing route."""
+    if _API_VERSION != API_V2:
+        return None
+    try:
+        res = _request("GET", "/billing", api_key, timeout=timeout,
+                       params={"lastN": max(1, int(days)), "bucketSize": "day"})
+        totals = ((res or {}).get("metadata") or {}).get("totals") or {}
+        if not totals:
+            return None
+        return {
+            "days":    max(1, int(days)),
+            "total":   float(totals.get("totalAmount") or 0.0),
+            "gpu":     float(totals.get("podGpuAmount") or 0.0)
+                       + float(totals.get("podDiskAmount") or 0.0),
+            "storage": float(totals.get("storageStandardAmount") or 0.0)
+                       + float(totals.get("storageHighPerformanceAmount") or 0.0),
+        }
+    except Exception:                                # noqa: BLE001 (a readout, never a blocker)
+        return None
 
 
 _DC_QUERY = "{ dataCenters { id name location storageSupport listed } }"

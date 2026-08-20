@@ -328,24 +328,41 @@ class TelemetryRow(ttk.Frame):
         else:
             segs.append((fld("CPU —", 8), self.GREY))
 
+        # A percentage with no capacity behind it is all the RunPod control plane
+        # publishes, and it is what the remote row falls back to when the tunnel
+        # stops answering (#25 P4). Shown as the bare percentage: inventing a
+        # total to keep the familiar "12.3/24.0 GB" shape would put a made-up
+        # number on screen next to a real one.
         ru, rt = sample.get("ram_used_mb"), sample.get("ram_total_mb")
+        rpct   = sample.get("ram_pct")
         if ru is not None and rt:
             text, pct = self._gb(ru, rt)
             segs.append((fld(f"RAM {text}", 24), self._band(pct)))
+        elif rpct is not None:
+            p = round(rpct)
+            segs.append((fld(f"RAM {p}%", 24), self._band(p)))
 
         vu, vt = sample.get("gpu_used_mb"), sample.get("gpu_total_mb")
+        vpct   = sample.get("gpu_mem_pct")
         util   = sample.get("gpu_util_pct")
         temp   = sample.get("gpu_temp_c")
         if vu is not None and vt:
             text, pct = self._gb(vu, vt)
             segs.append((fld(f"VRAM {text}", 24), self._band(pct)))
+        elif vpct is not None:
+            p = round(vpct)
+            segs.append((fld(f"VRAM {p}%", 24), self._band(p)))
         if util is not None:
             u = round(util)
             segs.append((fld(f"GPU {u}%", 8), self._band(u)))
         if temp is not None:
             segs.append((f"GPU {temp}°C", self.GREY))
-        if vu is None and util is None and temp is None:
+        if vu is None and vpct is None and util is None and temp is None:
             segs.append(("GPU: n/a", self.GREY))
+        # Say where a thinner sample came from, or the drop in detail reads as the
+        # pod having gone quiet rather than the tunnel having gone down.
+        if sample.get("via") == "api":
+            segs.append(("via API (tunnel down)", self.GREY))
 
         self._set(segs)
 

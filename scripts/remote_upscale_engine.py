@@ -43,7 +43,12 @@ class RemoteUpscaleEngine:
     UpscaleEngine so it is a drop-in for batch_upscale."""
 
     def __init__(self, host, ssh_port, ssh_key, worker_port=8200, local_port=None,
-                 known_hosts=None, ready_timeout=420, request_timeout=600):
+                 known_hosts=None, ready_timeout=420, request_timeout=600,
+                 telemetry_fallback=None):
+        # Called with no arguments when the worker's own /telemetry cannot be
+        # reached, and expected to answer from somewhere that does not depend on
+        # the tunnel (see telemetry(), #25 P4). None = no fallback.
+        self._telemetry_fallback = telemetry_fallback
         self.host = host
         self.ssh_port = int(ssh_port)
         self.ssh_key = ssh_key
@@ -188,12 +193,24 @@ class RemoteUpscaleEngine:
         (cpu, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, gpu_temp_c,
         gpu_util_pct, gpu_power_w, gpu_power_limit_w, gpu_clock_mhz; any field may
         be None), or None on any error. The worker answers this lock-free, so it
-        works even while an upscale is in flight."""
+        works even while an upscale is in flight.
+
+        On failure it asks `telemetry_fallback` (#25 P4). The row going blank was
+        the app's only sign that the tunnel had stopped answering, and it looked
+        exactly like a card that had gone quiet -- while the control plane could
+        say all along whether the pod was still working. The fallback's sample is
+        thinner (percentages, no capacities) and marks itself `via="api"`."""
         url = f"http://127.0.0.1:{self.local_port}/telemetry"
         try:
             with urllib.request.urlopen(url, timeout=15) as resp:
                 import json
                 return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            pass
+        if self._telemetry_fallback is None:
+            return None
+        try:
+            return self._telemetry_fallback()
         except Exception:
             return None
 

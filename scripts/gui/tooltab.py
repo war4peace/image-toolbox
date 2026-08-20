@@ -435,7 +435,8 @@ class ToolTab(MqttTaskState, ttk.Frame):
             if self._remote_gpus is None:
                 self._refresh_gpus()
             else:
-                self._populate_gpus(self._remote_gpus, self._remote_dc)
+                self._populate_gpus(self._remote_gpus, self._remote_dc,
+                                    getattr(self, "_remote_elsewhere", ()))
         else:
             # The $/100 readout is meaningful only for a billed remote run.
             self.cost100_var.set("")
@@ -528,7 +529,19 @@ class ToolTab(MqttTaskState, ttk.Frame):
                 dc = (rp.volume_region(key, vol) if vol else None) \
                     or (cfg_dcs[0] if cfg_dcs else None)
                 gpus = rp.available_gpus(key, dc, min_memory_gb=min_vram)
-                self.after(0, lambda: self._populate_gpus(gpus, dc))
+                # Nothing here: ask ONE more question before reporting it, since
+                # "RunPod is out" and "this data center is out" look identical in
+                # the picker and are fixed differently (#25 P4). Only on an empty
+                # list, so the normal path still costs one call.
+                elsewhere = []
+                if not gpus and dc:
+                    try:
+                        rows = rp.available_gpus(key, None, min_memory_gb=min_vram,
+                                                 include_out_of_stock=True)
+                        elsewhere = rp.stock_elsewhere(rows, dc, min_memory_gb=min_vram)
+                    except Exception:                    # noqa: BLE001 (a hint, not the answer)
+                        elsewhere = []
+                self.after(0, lambda: self._populate_gpus(gpus, dc, elsewhere))
             except Exception as exc:                     # noqa: BLE001 (UI thread)
                 self.after(0, lambda e=exc: self._gpu_error(e))
 
@@ -538,16 +551,33 @@ class ToolTab(MqttTaskState, ttk.Frame):
         price = f"${g['price']:.2f}/h" if g.get("price") is not None else "price n/a"
         return f"{g['name']} — {g['memory_gb']} GB — {price} ({g['stock']})"
 
-    def _populate_gpus(self, gpus, dc):
+    def _populate_gpus(self, gpus, dc, elsewhere=()):
         self.gpu_refresh_btn.configure(state="normal")
         self._gpu_choices = gpus
         self._gpu_loaded  = True
         self._remote_gpus = gpus            # cached: a mode flip needn't re-fetch
         self._remote_dc   = dc
+        self._remote_elsewhere = elsewhere  # ... and neither should re-answer "where?"
         if not gpus:
             region = dc or "this region"
             self.gpu_combo.configure(values=[])
-            self.gpu_pick_var.set(f"no GPU available in {region} right now")
+            if elsewhere:
+                # The combobox says how many and the log says which: the detail is
+                # several lines long and a picker is not where it fits.
+                self.gpu_pick_var.set(
+                    f"no GPU in {region} — {len(elsewhere)} in stock elsewhere "
+                    f"(see the log)")
+                self.console.feed(
+                    f"[remote] No GPU is available in {region} right now. These are in "
+                    f"stock in other data centers:\n")
+                for name, dcs in elsewhere:
+                    self.console.feed(f"[remote]   {name}: {', '.join(dcs)}\n")
+                self.console.feed(
+                    "[remote] Pods run where the model volume lives, so using one of "
+                    "these means provisioning a volume in that data center "
+                    "(Settings -> RunPod).\n")
+            else:
+                self.gpu_pick_var.set(f"no GPU available in {region} right now")
             return
         labels = [self._gpu_label(g) for g in gpus]
         self.gpu_combo.configure(values=labels)

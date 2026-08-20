@@ -22,6 +22,16 @@ from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, CFG, s
 from gui.widgets import Tooltip, LogPane, _ScrollFrame, use_window_button_style
 
 
+def _fmt_spend(spend):
+    """The recent-spend label, or "" when there is nothing to show (no key, an
+    unreachable API, or the v1 escape hatch, which has no billing route). Pure,
+    so the wording is tested without a window."""
+    if not spend or not spend.get("days"):
+        return ""
+    return (f"spent in the last {spend['days']} days: ${spend['total']:.2f} "
+            f"(${spend['gpu']:.2f} pods, ${spend['storage']:.2f} storage)")
+
+
 class RunPodTab(ttk.Frame):
     """Remote-pod (RunPod) settings, split out of SettingsTab (0.3.7) into its own
     tab because the section grew large and complex. Self-contained: it owns its
@@ -310,6 +320,21 @@ class RunPodTab(ttk.Frame):
                             "auto-stops a running pod if the live balance falls to "
                             "it. 0 = no floor. Needs the RunPod API key set. "
                             "Unreadable balance never blocks a run (fail-safe).")
+
+        # Recent SPEND, beside the two money limits (#25 P4). It is not a balance
+        # and cannot become one, but it is the figure that says where the money
+        # actually went — and a network volume bills around the clock whether or
+        # not anything is running, which is invisible in every other readout.
+        self.runpod_spend_var = tk.StringVar(value="")
+        spend_lbl = ttk.Label(money, textvariable=self.runpod_spend_var,
+                              foreground="#666")
+        spend_lbl.pack(side="left", padx=(18, 0))
+        Tooltip(spend_lbl,
+                "What this RunPod account has been charged over the last 30 days, "
+                "split into pod GPU time and network-volume storage. Filled in by "
+                "the Refresh button above. Storage is billed continuously for as "
+                "long as the model volume exists, even with no pod running.",
+                wraplength=W)
 
         self.runpod_terminate_var = tk.BooleanVar(value=bool(rp.get("terminate_when_done", True)))
         term_chk = ttk.Checkbutton(
@@ -639,8 +664,10 @@ class RunPodTab(ttk.Frame):
             except runpod_client.RunPodError as exc:
                 dcs, err = [], str(exc)
             funds = runpod_client.account_balance_detail(key)   # never raises
+            spend = runpod_client.account_spend(key, days=30)   # never raises; None on v1
 
             def apply():
+                self.runpod_spend_var.set(_fmt_spend(spend))
                 # Push the fetched balance to the shared bottom-bar Funds readout.
                 try:
                     self.app.set_funds_cache(funds)

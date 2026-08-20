@@ -289,7 +289,8 @@ class RemoteSession:
                       else RemoteUpscaleEngine)
         self.engine = engine_cls(
             self.host, self.ssh_port, self.key_path,
-            worker_port=self.worker_port, known_hosts=self.known_hosts)
+            worker_port=self.worker_port, known_hosts=self.known_hosts,
+            telemetry_fallback=self._api_telemetry)
         if self.mode == "tag":
             self._open_ollama_tunnel()
             self._emit(f"Remote tagging ready (Ollama at {self.ollama_url}).")
@@ -313,6 +314,18 @@ class RemoteSession:
             self.on_event(msg)
         except Exception:
             pass
+
+    def _api_telemetry(self):
+        """The pod's utilisation read from the CONTROL PLANE, for when the ssh
+        tunnel (and therefore the worker's own /telemetry) is what broke. Thinner
+        than the worker's sample and marked as such; None when there is nothing
+        to say. Never raises: this is a readout (#25 P4)."""
+        if not self.pod_id:
+            return None
+        try:
+            return rp.pod_runtime_sample(rp.get_pod(self.api_key, self.pod_id))
+        except Exception:
+            return None
 
     def _find_existing_pod(self):
         """Return (id, host, ssh_port) of a RUNNING app pod that's already up and
@@ -404,6 +417,12 @@ class RemoteSession:
                 # next "Pod … created" line shows it — so we never promise a retry that
                 # won't happen.
                 self._emit(f"Pod start failed ({info}).")
+            elif kind == "log":
+                # The dead pod's own log, fetched from the control plane before it
+                # is terminated (#25 P4). Marked so it is obviously not our output:
+                # this is the container talking, and it is usually the only thing
+                # that says why it never came up.
+                self._emit(f"  pod log | {info}")
             # "giveup" is intentionally not surfaced here: main() prints one clean
             # "Run failed: …" line with the same cause, so a second line is just noise.
 
