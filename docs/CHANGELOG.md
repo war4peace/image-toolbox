@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.6.1](#061)
 - [0.6.0](#060)
 - [0.5.9](#059)
 - [0.5.8](#058)
@@ -17,6 +18,68 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.6.1
+
+### Reporting a problem now does the hard part for you
+
+The **Report an issue** link at the bottom of the window used to open an empty form and
+leave you to describe your setup and go hunting for logs. It now opens a small window that
+gathers the report for you: what version you run, what card you have, how the app is
+installed, your settings, and how each tool's last run ended. Press the button and your
+browser opens with all of that already written in, and the folder holding a diagnostics
+file opens behind it with the file selected, ready to drag into the page.
+
+**Nothing is sent anywhere.** It is a form you read, edit and submit yourself, and a file
+you attach yourself. The window shows you exactly what the file contains before you do.
+
+**Your folder names, file names and photo descriptions are removed first, and there is no
+option to include them.** Folders and files are replaced with short codes, so two lines
+about the same folder still line up without naming it. Anything the app wrote *about what
+is in your pictures* is taken out altogether: Tag & Rename asks a model to describe each
+photo, and a collection's worth of those sentences describes your family. Those lines are
+deleted, not blanked, because their outcome is already in the run's summary and a marker
+repeated once per photo is thousands of lines nobody wants to read. If a line still looks
+like it names something private, the whole line goes.
+
+There is no "include real names" tick-box on purpose. A public issue is public
+permanently, the window says so plainly, and the small debugging convenience is not worth
+the risk of somebody ticking it without reading.
+
+A **private list** of what each code means is saved next to your logs, for you alone. It is
+not inside the file you attach. If a conversation about your report needs a real name, you
+have it and nobody else does.
+
+There is also a **Copy diagnostics** button, for a forum post, a chat or an email that never
+becomes a GitHub issue. The Benchmark window's own report link goes through the same window
+and attaches its log for you.
+
+### Renting a GPU keeps working after RunPod switches off its old API
+
+RunPod is retiring the interface this app used to rent GPUs: part of it stops working in
+**November 2026** and the rest in early 2027. The app has moved to the new one. If you never
+rent a GPU, nothing here affects you, and if you do, the change should be invisible.
+
+Three things did get better along the way:
+
+- **The newest cards are offered again.** The old path decided whether a machine could run
+  the app's image from a hand-written list that had fallen behind reality, and it was
+  quietly refusing perfectly good machines, including RTX 4090s on current drivers.
+- **A pod that fails now fails quickly and says why.** It used to sit through the full
+  four-minute wait, billed, before giving up, and the reason lived on the pod that was
+  about to be destroyed. The app reads the pod's own log before terminating it.
+- **The funds line is honest about what it cannot see.** The account balance has no
+  equivalent in the new interface, so when the balance cannot be read the app now says
+  **"Funds: Not published"** instead of showing nothing. If you rely on the spending floor,
+  that is the line telling you it is not being enforced right now.
+
+### Smaller things
+
+- A per-image time under a second used to read **"Done in 00:00"**, which looks like
+  nothing was measured rather than like it was fast. It now shows fractions of a second:
+  **"Done in 00:00.867"**. Totals stay in whole seconds.
 
 ---
 
