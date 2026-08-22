@@ -1348,13 +1348,18 @@ Engine, packaging & CI:
   branch/fold mechanics.
 - `docs/` — `known-defects.md` (confirmed bugs, with root cause and
   what was done about it; **nothing open as of 0.6.1** - D1 to D4 were found while testing
-  0.6.0 and D5 while testing 0.6.1, all fixed before shipping. Kept because code comments
+  0.6.0, D5 and D6 while testing 0.6.1 (D6 after it shipped). Kept because code comments
   cite them by id and because three of the first four are one mistake in different clothes:
-  **present is not working**. D5 is that family's GUI cousin: `self._report = None` in
-  `__init__` shadowed the `_report` METHOD, so `command=self._report` bound the button to
-  `None` and tkinter accepted it silently, giving a button that drew, enabled and did
-  nothing. `tests/test_gui_command_bindings.py` now fails on any attribute that shadows a
-  method in a GUI class, and on any `command=self.x` that names none), `future-features.md`
+  **present is not working**. **D5 and D6 are the GUI pair and they rhyme**: a button that
+  drew, enabled and did nothing (`self._report = None` shadowed the `_report` METHOD, so
+  `command=self._report` bound to `None`, which tkinter accepts in silence), and a command
+  that launched, succeeded and opened the wrong window (`["explorer", "/select,%s" % p]`
+  goes through `list2cmdline`, which quotes the whole token when the path has a space, and
+  Explorer answers an unparseable argument by opening **Documents** - so it hit EVERY
+  install, since `DefaultDirName` is `...\Programs\Image Toolbox`). Both were silent by
+  construction and both reached a user because the suite could see the code but not the
+  effect, so each is now guarded by a check that reaches for the effect:
+  `tests/test_gui_command_bindings.py` and `tests/test_open_in_explorer.py`), `future-features.md`
   (roadmap: open milestones #21,
   #12/#15, #3/#4, plus #25 and #24, both BUILT: #25 stays open because it owns two dated
   deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027), #24

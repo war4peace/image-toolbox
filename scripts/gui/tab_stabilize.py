@@ -46,7 +46,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import mqtt_publisher
-from gui.common import APP_TITLE, CFG, get_default_folder, set_default_folder
+from gui.common import (APP_TITLE, CFG, get_default_folder, set_default_folder,
+                        open_in_explorer)
 from gui.widgets import Tooltip, ProgressBar, TelemetryRow
 from gui.tooltab import ToolTab
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
@@ -790,11 +791,9 @@ class StabilizeTab(ToolTab):
             messagebox.showerror(APP_TITLE, f"Could not open:\n{p}\n{exc}")
 
     def _open_folder(self, p):
-        import subprocess
-        try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
-        except Exception:                            # noqa: BLE001
-            self._open_path(os.path.dirname(p))
+        # One implementation, in gui.common: this spelling opened the right folder
+        # but selected nothing when the file name held a comma.
+        open_in_explorer(p)
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

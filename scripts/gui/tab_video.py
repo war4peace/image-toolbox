@@ -16,7 +16,7 @@ from tkinter import ttk, filedialog, messagebox
 import runpod_client
 import ssh_setup
 import taskbar_progress
-from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE, small_gpu_note
+from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE, small_gpu_note, open_in_explorer
 from gui.widgets import (ProgressBar, TelemetryRow, _log_hms, ConsoleBuffer, Tooltip,
                          use_window_button_style)
 from gui.comparison import VideoComparisonWindow, VideoPlaybackWindow
@@ -1988,10 +1988,9 @@ class VideoTab(MqttTaskState, ttk.Frame):
             messagebox.showerror(APP_TITLE, f"Could not open:\n{p}\n{exc}")
 
     def _open_folder(self, p):
-        try:
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
-        except Exception:
-            self._open_path(os.path.dirname(p))
+        # One implementation, in gui.common: this spelling opened the right folder
+        # but selected nothing when the file name held a comma.
+        open_in_explorer(p)
 
     def _open_compare(self, src, up):
         """Open/reuse the shared FRAME comparison window (scrub + before/after wipe,

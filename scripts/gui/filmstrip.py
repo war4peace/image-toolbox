@@ -10,13 +10,12 @@ imported lazily inside the decode methods so the module loads PIL-free.
 import os
 import time
 import queue
-import subprocess
 import threading
 
 import tkinter as tk
 from tkinter import ttk
 
-from gui.common import CREATE_NO_WINDOW
+from gui.common import open_in_explorer
 
 # RAW/DNG thumbnails (#19). Guarded so an install that predates raw_decode - or
 # one where rawpy failed to install - simply draws RAW cells the way it always
@@ -501,24 +500,15 @@ class FilmStrip(ttk.Frame):
 
     @staticmethod
     def _open_folder(path):
-        """Open the folder holding `path` in Explorer with the file selected;
-        fall back to just opening the folder. Fail-safe (best effort)."""
-        if not path:
-            return
-        norm = os.path.normpath(path)
-        if os.path.exists(norm):
-            try:
-                subprocess.Popen(["explorer", f"/select,{norm}"],
-                                 creationflags=CREATE_NO_WINDOW)
-                return
-            except Exception:
-                pass
-        folder = os.path.dirname(norm)
-        if os.path.isdir(folder):
-            try:
-                os.startfile(folder)
-            except OSError:
-                pass
+        """Open the folder holding `path` in Explorer with the file selected.
+
+        Delegates to the ONE implementation in gui.common. This used to be a copy,
+        and the copy is where the bug lived: four call sites had spelled the
+        explorer command three different ways, and two of the three spellings are
+        wrong (see `open_in_explorer` for the measurements). A gesture this small
+        does not deserve four implementations, and four is exactly how a fix in one
+        of them fails to reach the other three."""
+        open_in_explorer(path)
 
     # ── Background thumbnail loading ─────────────────────────────────────────
 

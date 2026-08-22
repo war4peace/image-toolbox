@@ -5,20 +5,27 @@ Confirmed bugs, each with its root cause and what was done about it. Open ones c
 worth more than the patches. Design questions live in `docs/future-features.md`; ideas that
 were rejected live in `docs/dropped-ideas.md`.
 
-> **Nothing is open as of 2026-08-22.** D1 to D4 were all found while testing 0.6.0 and D5
-> while testing 0.6.1; all five were fixed before shipping. Three of the first four are the
-> same mistake in different clothes, which is the reason to read them together: **present is
-> not working.** An ffmpeg binary that is there and corrupts memory, an encoder the build
-> lists that the hardware cannot run, a `python.exe` that exists and cannot start. Every one
-> of them was a check asking whether something EXISTED when the question was whether it
-> WORKED, and every one was invisible to the test suite because a healthy developer machine
-> answers both the same way. **D5 is that family's GUI cousin**: a button that exists, draws
-> and enables, wired to nothing.
+> **Nothing is open as of 2026-08-22.** D1 to D4 were all found while testing 0.6.0, D5 and
+> D6 while testing 0.6.1; all six were fixed, D6 after v0.6.1 had already shipped. Three of
+> the first four are the same mistake in different clothes, which is the reason to read them
+> together: **present is not working.** An ffmpeg binary that is there and corrupts memory,
+> an encoder the build lists that the hardware cannot run, a `python.exe` that exists and
+> cannot start. Every one of them was a check asking whether something EXISTED when the
+> question was whether it WORKED, and every one was invisible to the test suite because a
+> healthy developer machine answers both the same way.
+>
+> **D5 and D6 are the GUI pair, and they rhyme**: a button that exists, draws and enables,
+> wired to nothing; and a command that launches, succeeds, and opens the wrong window. Both
+> are silent by construction, and the reason both reached a user is that **the test suite
+> could see the code but not the effect.** Where a defect's only symptom is what appears on
+> screen, the check has to reach for the screen: D5 is guarded by a structural scan, D6 by
+> reading the opened window back through Shell.Application.
 
 ---
 
 ## Contents
 
+- [D6 (fixed): "show me the file" opened Documents, for every install](#d6-fixed-show-me-the-file-opened-documents-for-every-install)
 - [D5 (fixed): a button that drew, enabled and did nothing](#d5-fixed-a-button-that-drew-enabled-and-did-nothing)
 - [D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning](#d4-fixed-a-local-gpu-below-the-8-gb-minimum-was-offered-with-no-warning)
 - [D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled](#d1-fixed-the-app-would-not-start-after-the-system-python-was-uninstalled-or-reinstalled)
@@ -30,6 +37,74 @@ were rejected live in `docs/dropped-ideas.md`.
 ## Fixed
 
 Kept because the code comments and tests reference these ids.
+
+### D6 (fixed): "show me the file" opened Documents, for every install
+
+**Found:** 2026-08-22, by the user, within minutes of installing the released v0.6.1.
+**Reported precisely, including the cause:** "Report with this file" opened Explorer in
+**Documents** rather than at the diagnostics zip, and *"I suspect this is caused by Image
+Toolbox being installed in `C:\Image Toolbox` which contains a space which is not properly
+escaped."* That was exactly right.
+
+The command was built as a list:
+
+```python
+subprocess.Popen(["explorer", "/select,%s" % norm], ...)
+```
+
+Python's `list2cmdline` quotes any token containing a space, so the switch and the path went
+out as **one quoted token**:
+
+```
+explorer "/select,C:\Image Toolbox\issues\imgtbx-diag-20260822-203537.zip"
+```
+
+Explorer does not recognise a switch that arrives inside the quotes. Its response to a single
+argument it cannot parse is to **open the user's Documents folder**: no error, no diagnostic,
+and an exit code nobody reads (Explorer returns 1 on success anyway). The app did exactly what
+it was told and told the user, wordlessly, to look in the wrong place.
+
+**This was not an edge case: it was every install.** `DefaultDirName` is
+`{localappdata}\Programs\Image Toolbox`, so the space is in the application's own name and no
+install path can avoid it.
+
+#### Why it had been latent for a year
+
+The same spelling had been in `FilmStrip._open_folder` since 0.3.0, feeding the film strip's
+*Open image folder* / *Open upscaled image folder* entries, and it was broken there the whole
+time for any photo path containing a space. Nobody noticed because the developer's own library
+lives at `X:\Personale\Poze`, where no component has one. **The diagnostics zip is the first
+file the app ever asked Explorer to reveal underneath its own install directory**, which is
+the one path that is guaranteed to contain a space. The feature did not introduce the bug; it
+was the first thing to stand where the bug could be seen.
+
+#### Four call sites, three spellings, two of them wrong
+
+The fix is not the interesting part. What matters is that the same gesture had been written
+four times, and the three variants do not behave alike. Measured on Windows 11 by launching
+each form and reading the resulting window back through `Shell.Application`, checking the
+folder **and** the selection, because selecting the file is the entire purpose of `/select,`:
+
+| Form | Where it was | Folder | Selection |
+|---|---|---|---|
+| `["explorer", "/select,PATH"]` | `gui/common.py`, `gui/filmstrip.py` | **Documents** | none |
+| `["explorer", "/select,", "PATH"]` | `gui/tab_video.py`, `gui/tab_stabilize.py` | correct | **none, if the file name contains a comma** |
+| `'explorer /select,"PATH"'` | (nowhere) | correct | correct |
+
+The middle row is the trap that would have caught a partial fix. Splitting the token repairs
+the space, and it looks right, and it is right until a file name contains a comma, because
+`/select,` is comma-delimited and the path is no longer quoted as a unit. `Poze, Vacanta
+2019\foto, 01.jpg` is not a contrived name for this application's users.
+
+**Fixed** by building one raw command string in `gui.common.open_in_explorer` and routing all
+four call sites through it. A raw string is safe here: `Popen` without `shell=True` hands it
+straight to `CreateProcess`, so nothing reinterprets `&` or `^`, and a double quote cannot
+occur in a Windows path.
+
+`tests/test_open_in_explorer.py` pins the surviving form against both the space and the comma,
+and pins that **no other module builds an explorer command at all** - which is the guard that
+actually matters here, since the defect's real cause was four implementations rather than any
+one of them being wrong.
 
 ### D5 (fixed): a button that drew, enabled and did nothing
 

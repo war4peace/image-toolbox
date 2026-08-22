@@ -220,7 +220,31 @@ def open_in_explorer(path):
     norm = os.path.normpath(path)
     if os.path.exists(norm):
         try:
-            subprocess.Popen(["explorer", "/select,%s" % norm],
+            # The command line is built as ONE RAW STRING, and that is load-bearing
+            # twice over. A list goes through `list2cmdline`, which quotes any token
+            # holding a space, so `["explorer", "/select,%s" % norm]` becomes
+            #     explorer "/select,C:\Image Toolbox\issues\x.zip"
+            # and Explorer, handed a switch from inside the quotes, does not
+            # recognise it at all: it opens **Documents**. That is not hypothetical.
+            # It is how this shipped in 0.6.1, and it is what the first user with a
+            # space in their install path saw. Splitting it into three tokens fixes
+            # that much, but then the path is quoted and the switch is not, and
+            # `/select,` is COMMA-delimited, so a file whose own name contains a
+            # comma (ordinary in a photo folder) opens the right folder and selects
+            # nothing.
+            #
+            # Measured on Windows 11 by launching each form and reading the window
+            # back through Shell.Application, checking folder AND selection:
+            #
+            #   ["explorer", "/select,PATH"]     -> Documents. Wrong folder.
+            #   ["explorer", "/select,", "PATH"] -> right folder; selects nothing
+            #                                       when the name holds a comma.
+            #   'explorer /select,"PATH"'        -> right folder, right file, both.
+            #
+            # A raw string is safe here: Popen without shell=True hands it straight
+            # to CreateProcess, so no shell reinterprets `&` or `^`, and a double
+            # quote cannot occur in a Windows path.
+            subprocess.Popen('explorer /select,"%s"' % norm,
                              creationflags=CREATE_NO_WINDOW)
             return
         except Exception:
