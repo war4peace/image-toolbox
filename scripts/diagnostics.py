@@ -855,17 +855,21 @@ def names_from_db(db_path=None, limit=200000):
 
 
 def make_redactor(cfg=None, names=None, app_root=None, env=None, salt=None,
-                  db_path=None, use_db=True):
+                  db_path=None, use_db=True, extra=()):
     """Build a Redactor for this install.
 
     Fail-safe in the SAFE direction: on any error the result is a redactor with no
     roots, which recognises nothing and therefore DROPS every path-bearing line. A
     degraded report is the acceptable failure; a leaked one is not.
+
+    `extra` adds (label, path) roots on top of whatever the DB offers. Tests use it
+    to supply a spelling that `_path_spellings` could only DERIVE on a machine where
+    that path exists, which is not a property a unit test may depend on.
     """
-    extra, dict_names = [], set(names or ())
+    extra, dict_names = list(extra or ()), set(names or ())
     if use_db:
         try:
-            extra = roots_from_db(db_path)
+            extra = list(roots_from_db(db_path)) + extra
         except Exception as exc:
             debug_log("diagnostics: could not read recorded roots", exc)
         if names is None:

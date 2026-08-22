@@ -1344,8 +1344,17 @@ Engine, packaging & CI:
   table + feature list for any new module/tab, and `README.md` (tab count, the
   config-section table); (3) if a new config section or secret field landed, update
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
-  in the annotated tag `-m` message. See [release-workflow] in memory for the
-  branch/fold mechanics.
+  in the annotated tag `-m` message; (5) **read the tag message back** with
+  `git cat-file -p vX.Y.Z` before pushing: `git tag -a -F` defaults to
+  `--cleanup=strip`, which DELETES every `#`-led line, so a markdown `##` heading
+  vanishes silently and that message IS the release body and the in-app updater's
+  text (the house style is plain prose, ~80 columns, UPPERCASE headings, no markdown,
+  which sidesteps it); and (6) after pushing, check **every** workflow the push
+  triggered, not just `build-installer`. A release push starts **two**, and the one
+  that can fail is `Tests`. **v0.6.0 and v0.6.1 both shipped with `Tests` red** and
+  nobody noticed at the time, because the installer built fine and that was the run
+  being watched. `gh run list --limit 5` right after the push is the whole check.
+  See [release-workflow] in memory for the branch/fold mechanics.
 - `docs/` — `known-defects.md` (confirmed bugs, with root cause and
   what was done about it; **nothing open as of 0.6.1** - D1 to D4 were found while testing
   0.6.0, D5 and D6 while testing 0.6.1 (D6 after it shipped). Kept because code comments

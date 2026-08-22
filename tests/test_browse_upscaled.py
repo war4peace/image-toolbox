@@ -113,6 +113,29 @@ def test_an_empty_tag_index_is_harmless():
 
 # ── the scan walks the output tree ───────────────────────────────────────────
 
+def _wait_for_scan(root, win, timeout=20.0):
+    """Pump the Tk event loop until the window's background scan has finished.
+
+    Fails LOUDLY on timeout, which is the whole reason this exists. Eight copies of
+    this loop used to run for a fixed 4 s and then fall THROUGH, so a CI runner that
+    was merely slow reached the assertions against a half-built window and reported
+    `assert 0 == 1` on an empty tree: a timing problem wearing the costume of a
+    content bug. It cost a release's Tests run being red for a reason nobody could
+    read off the failure. One place now knows what "the scan finished" means, and it
+    says so when it does not happen.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        root.update()
+        if not win._busy:
+            return
+        time.sleep(0.02)
+    raise AssertionError(
+        "the background scan did not finish within %.0fs (status: %r). The "
+        "assertions after this point would have run against a window that is "
+        "still being built." % (timeout, win.status_var.get()))
+
+
 def _touch(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
@@ -500,11 +523,7 @@ def test_the_scan_really_runs_on_its_thread_and_finds_the_pairs(root, tmp_path,
 
     win = bu.BrowseUpscaledWindow(root, str(src), str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         assert not win._busy, "the scan never finished"
         assert "failed" not in win.status_var.get().lower(), win.status_var.get()
         assert len(win._pairs) == 2
@@ -553,11 +572,7 @@ def test_the_zoom_and_paging_controls_sit_over_the_thumbnails_only(
 
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         right = str(win.strip.winfo_parent())
         assert str(win._bar.winfo_parent()) == right
         for b in win._page_btns.values():
@@ -584,11 +599,7 @@ def test_the_paging_controls_are_centred_over_the_wall(root, tmp_path,
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
         win.geometry("1200x700")
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         for _ in range(20):
             root.update()
             time.sleep(0.02)
@@ -618,11 +629,7 @@ def test_the_folder_tree_opens_collapsed_below_the_root(root, tmp_path,
 
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         roots = win.tree.get_children("")
         assert len(roots) == 1
         # Tk answers 1/0 here, not True/False.
@@ -649,11 +656,7 @@ def test_the_status_line_lives_at_the_bottom_and_the_close_button_with_it(
 
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         assert win.status_lbl.master is win._foot
         assert win._foot.grid_info()["row"] > win._panes.grid_info()["row"]
         # The Close button shares that bottom row.
@@ -679,11 +682,7 @@ def test_match_by_content_sits_above_the_folder_tree(root, tmp_path, monkeypatch
 
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         assert str(win.content_chk.winfo_parent()) == str(win.tree.winfo_parent())
         assert win.content_chk.grid_info()["row"] < win.tree.grid_info()["row"]
     finally:
@@ -707,11 +706,7 @@ def test_the_status_line_counts_folders_as_well_as_images(root, tmp_path,
 
     win = bu.BrowseUpscaledWindow(root, "", str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         status = win.status_var.get()
         # 4 images across 3 folders that actually hold one; "2005" holds none of
         # its own and is a signpost, not a location, so it is not counted.
@@ -785,11 +780,7 @@ def test_the_status_line_does_not_repeat_the_checkbox(root, tmp_path,
 
     win = bu.BrowseUpscaledWindow(root, str(src), str(out), app=app)
     try:
-        for _ in range(200):
-            root.update()
-            if not win._busy:
-                break
-            time.sleep(0.02)
+        _wait_for_scan(root, win)
         status = win.status_var.get()
         assert "0 with the original alongside" in status, status
         assert "tick" not in status.lower(), status

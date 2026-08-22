@@ -50,12 +50,24 @@ def _redactor(**kw):
         "upscale_output": "X:\\Personale\\Poze\\__upscaled__",
     }}
     env = {"USERPROFILE": "C:\\Users\\Eduard Baniceru", "TEMP": "C:\\Temp"}
+    # The 8.3 spelling is passed EXPLICITLY, and that is the whole point of this
+    # comment. `_path_spellings` derives it with GetShortPathNameW, which only
+    # answers for a path that EXISTS: on the machine these lines were captured
+    # `C:\Users\Eduard Baniceru` does exist, so the short form was derived and the
+    # sample line resolved; on CI it does not, nothing was derived, and the line
+    # fell to the fail-closed rule and was dropped. The test passed here and failed
+    # there for a reason that had nothing to do with the rule under test.
+    #
+    # Deriving it is covered separately, against a directory that really exists
+    # (`test_the_short_form_of_a_root_is_registered_when_the_path_exists`). Here the
+    # spelling is supplied, so the redaction RULES are what is being measured.
+    kw.setdefault("names", ())
+    extra = list(kw.pop("extra", ()) or ()) + [("%USERPROFILE%", "C:\\Users\\EDUARD~1")]
     # use_db=False: a unit test must never read the developer's own cache.db. It
     # would make results machine-dependent, and the point of these tests is the
     # RULES, not this install's data.
-    kw.setdefault("names", ())
     return dg.make_redactor(cfg, env=env, app_root="D:\\App", salt=b"fixed-salt",
-                            use_db=False, **kw)
+                            use_db=False, extra=extra, **kw)
 
 
 # ─────────────────────────────────────────────
