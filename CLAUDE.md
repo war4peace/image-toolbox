@@ -1357,8 +1357,8 @@ Engine, packaging & CI:
   method in a GUI class, and on any `command=self.x` that names none), `future-features.md`
   (roadmap: open milestones #21,
   #12/#15, #3/#4, plus #25 and #24, both BUILT: #25 stays open because it owns two dated
-  deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027) and
-  #24 until its live GitHub check; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
+  deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027), #24
+  only for its redaction record, its live GitHub check having passed on 2026-08-22; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
   incl. folding a RAW render back into the source tree, whose revisit trigger is an

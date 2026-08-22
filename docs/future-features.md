@@ -416,9 +416,16 @@ open.
   traded away for convenience, and it is what makes the enrichment safe in the first place.
 - **The zip must stay small.** GitHub allows 25 MB for a `.zip`, so cap at roughly 10 MB for
   headroom. Redacted text compresses hard, so that is a great deal of log.
-- **Verify the flow once, live**, from a real install after the template lands: confirm the
-  app's link still opens the editor with the body intact rather than landing at
-  `/issues/new/choose`, and that a `.zip` drag-and-drop attach actually succeeds.
+- **Verified live, 2026-08-22**, from a real install with `.github/ISSUE_TEMPLATE/bug.md`
+  already in the repo: the app's link opens the **blank** editor with the body intact,
+  down to the line naming the zip, rather than landing at `/issues/new/choose`. That is
+  the half that could have failed, and it is the empirical half of decision 2 above:
+  bypassing the chooser via a URL query is documented behaviour that GitHub's own
+  maintainers treat as a defect to be closed, not as a contract. **So it is worth
+  re-checking whenever the template set changes**, and the failure would be loud rather
+  than silent (the user lands on a chooser page with an empty form), which is the one
+  saving grace. The drag itself is GitHub's ordinary `.zip` attach, well inside its
+  25 MB ceiling.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
@@ -800,7 +807,9 @@ The user installs and runs the application on their Unraid server.
   video stabilization; browsing already-upscaled images; the Video Stabilization workflow), so
   the remaining sequencing is only among the open milestones below.
 - **Open milestones: #21, #12, #15, #3, #4 — plus #25 and #24, both BUILT.** #25 is open only
-  for its two dated deletions; #24 is kept for its redaction record rather than for work left.
+  for its two dated deletions; #24 has nothing outstanding at all (its one live check passed on
+  2026-08-22) and is kept only for its redaction record, which is the part worth re-reading
+  before anything else in this app starts collecting user data.
 - **#25 (RunPod API v2) was the only milestone with a deadline, and it is done** — all five
   phases on 2026-08-20, months ahead of both dates. Nothing else sequences behind it any more.
   What remains is a **calendar item, not a task**: delete the v1 half after 2026-11-15 and the
