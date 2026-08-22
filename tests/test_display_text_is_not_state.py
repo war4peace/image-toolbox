@@ -24,6 +24,7 @@ Builds the real tabs in a hidden root, and skips where tkinter is unavailable.
 """
 
 import pytest
+from conftest import make_tk_root
 
 pytest.importorskip("tkinter")
 
@@ -43,11 +44,7 @@ def upscale_tab():
     calls back into are stubbed; none of them are what is under test."""
     from gui.tab_upscale import UpscaleTab
 
-    try:
-        root = tk.Tk()
-    except tk.TclError:                    # no display
-        pytest.skip("no Tk display")
-    root.withdraw()
+    root = make_tk_root()
     app = type("App", (), {
         "root": root, "settings": {}, "mqtt": None, "mqtt_publish": _noop,
         "refresh_benchmark_lock": _noop, "refresh_tab_exclusivity": _noop,

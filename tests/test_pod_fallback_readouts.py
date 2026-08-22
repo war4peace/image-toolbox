@@ -10,6 +10,7 @@ is the only money figure left once the balance retires (#25 P3).
 """
 
 import pytest
+from conftest import make_tk_root
 
 pytest.importorskip("tkinter")
 import tkinter as tk                                        # noqa: E402
@@ -20,11 +21,7 @@ from gui.tab_runpod import _fmt_spend                        # noqa: E402
 
 @pytest.fixture(scope="module")
 def root():
-    try:
-        r = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no display for tkinter")
-    r.withdraw()
+    r = make_tk_root()
     try:
         yield r
     finally:

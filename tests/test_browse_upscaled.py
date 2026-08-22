@@ -16,6 +16,7 @@ import os
 import time
 
 import pytest
+from conftest import make_tk_root
 
 from gui.browse_upscaled import (Pair, clamp_page, folder_rows, invert_tag_index,
                                  page_count, page_label, page_slice, pair_source,
@@ -401,11 +402,7 @@ SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 def root():
     """ONE hidden root for the module (creating and tearing one down per test is
     flaky on Windows)."""
-    try:
-        r = tk.Tk()
-    except tk.TclError:                                    # no display
-        pytest.skip("no Tk display")
-    r.withdraw()
+    r = make_tk_root()
     yield r
     r.destroy()
 

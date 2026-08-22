@@ -12,6 +12,7 @@ and the other is a dict literal a few hundred lines away.
 import re
 
 import pytest
+from conftest import make_tk_root
 
 import tkinter as tk
 from tkinter import ttk
@@ -55,11 +56,7 @@ class _FakeApp:
 
 @pytest.fixture(scope="module")
 def settings_tab():
-    try:
-        root = tk.Tk()
-    except tk.TclError:                                    # no display
-        pytest.skip("no Tk display")
-    root.withdraw()
+    root = make_tk_root()
     tab = SettingsTab(ttk.Notebook(root), _FakeApp())
     root.update_idletasks()
     yield tab

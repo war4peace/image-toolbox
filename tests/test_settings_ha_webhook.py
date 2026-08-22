@@ -16,6 +16,7 @@ where tkinter is unavailable.
 """
 
 import pytest
+from conftest import make_tk_root
 
 pytest.importorskip("tkinter")
 
@@ -37,11 +38,7 @@ def tab():
     destroyed widget after the last test."""
     from gui import tab_settings
 
-    try:
-        root = tk.Tk()
-    except tk.TclError:                       # no display
-        pytest.skip("no Tk display")
-    root.withdraw()
+    root = make_tk_root()
     tab_settings.SettingsTab._check_ollama = lambda self: None
     widget = tab_settings.SettingsTab(ttk.Notebook(root),
                                       app=type("App", (), {"root": root})())

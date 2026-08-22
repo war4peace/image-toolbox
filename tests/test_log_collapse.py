@@ -6,6 +6,7 @@ so it skips cleanly where there's no display (headless CI).
 """
 
 import pytest
+from conftest import make_tk_root
 
 tk = pytest.importorskip("tkinter")
 
@@ -16,11 +17,7 @@ from gui.widgets import LogPane, COLLAPSE_PROCESSING_RE
 def root():
     # One Tk per module: repeatedly creating/destroying roots in a single process is
     # flaky (an occasional TclError), so tests share a root and get their own LogPane.
-    try:
-        r = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no display for tkinter")
-    r.withdraw()
+    r = make_tk_root()
     try:
         yield r
     finally:

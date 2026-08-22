@@ -34,6 +34,7 @@ import shutil
 import subprocess
 
 import pytest
+from conftest import make_tk_root
 
 import tkinter as tk
 from tkinter import ttk
@@ -333,11 +334,7 @@ def test_real_ffmpeg_reports_a_vidstab_verdict():
 def root():
     """ONE hidden root for the module (creating and tearing one down per test is
     flaky on Windows)."""
-    try:
-        r = tk.Tk()
-    except tk.TclError:                                    # no display
-        pytest.skip("no Tk display")
-    r.withdraw()
+    r = make_tk_root()
     yield r
     r.destroy()
 

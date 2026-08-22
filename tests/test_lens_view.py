@@ -15,6 +15,7 @@ preference is persisted.
 """
 
 import pytest
+from conftest import make_tk_root
 
 from gui.comparison import (LENS_FALLBACK_MAG, LENS_PANEL_MAX, LENS_ZOOMS,
                             lens_magnification, lens_panel_size, lens_placement,
@@ -192,11 +193,7 @@ def _fake_event(x, y, delta=0, state=0):
 def root():
     """ONE hidden root for the module (creating and tearing one down per test is
     flaky on Windows)."""
-    try:
-        r = tk.Tk()
-    except tk.TclError:                                 # no display
-        pytest.skip("no Tk display")
-    r.withdraw()
+    r = make_tk_root()
     yield r
     r.destroy()
 
