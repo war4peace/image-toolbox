@@ -283,7 +283,7 @@ def _issue_url(attach_path=None, attach_desc=None, body=None):
     a repo that will be edited by someone who has forgotten the coupling, and GitHub
     silently ignores an unknown field parameter -- so every older install would
     start sending empty reports with nothing failing loudly. A `?body=` URL
-    references nothing in the repo and cannot go stale. See future-features #24.
+    references nothing in the repo and cannot go stale. See docs/bug-reports.md.
     """
     if body is not None:
         params = urllib.parse.urlencode(

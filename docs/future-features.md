@@ -7,24 +7,20 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 `docs/dropped-ideas.md`.
 
 One entry is listed first despite being **built**, because it is the only one with **dates**
-on it (#25, the RunPod API v2 migration: the code shipped in 0.6.1, but the old transports must
+on it: #25, the RunPod API v2 migration. The code shipped in 0.6.1, but the old transports must
 be deleted after **2026-11-15** and in **early 2027**, and nothing else in the project will
-remember that). A second is listed as built for a different reason: #24 (making a bug report
-actionable without asking the user anything) shipped in 0.6.1, and is kept here rather than
-folded into the legend because its redaction rules are the kind that get "simplified" later,
-and the record of what each one cost is the argument against that. The rest are unbuilt: one
-measurement-gated processing capability (#21 denoising, gated on a measurement that has not
-been run), a Video Upscaler feature (#12 mixed local+remote queue) and a remote-side one
-blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones each
-introduce a new process model, networking, or packaging (HTTP interface #3, Unraid #4). The
-**shipped** milestones are kept below as a numbering legend, after the open work.
+remember that. The rest are unbuilt: one measurement-gated processing capability (#21
+denoising, gated on a measurement that has not been run), a Video Upscaler feature (#12 mixed
+local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second GPU
+provider). Two lower-priority ones each introduce a new process model, networking, or packaging
+(HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a numbering
+legend, after the open work.
 
 ---
 
 ## Contents
 
 - [25. RunPod API v2 migration](#25-runpod-api-v2-migration-built-two-deletions-still-dated) (built; two dated deletions left)
-- [24. Make a bug report actionable without asking](#24-make-a-bug-report-actionable-without-asking-built-061) (built)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [15. Second remote GPU provider (packet.ai)](#15-second-remote-gpu-provider-packetai-medium)
@@ -68,364 +64,6 @@ on the newest driver. v2 sends a numeric floor instead and cannot go stale.
 announced `Sunset` headers and **does not serve them** (measured on both hosts). The dates are
 hard-coded and a **410 is the only signal**, which the app turns into "RunPod has retired the API
 this version of Image Toolbox uses. Update the app."
-
-<div align="right"><a href="#future-features">↑ Back to top</a></div>
-
----
-
-## 24. Make a bug report actionable without asking: BUILT (0.6.1)
-
-There is already an in-app **Report an issue** path (`gui.common._issue_url`, the link at the
-bottom of the main window plus a second entry point in the Benchmark window) that opens a
-pre-filled GitHub new-issue page. It fills the app version, the OS, the Python version, the GPU
-**name**, and a "please attach" line pointing at the newest crash log. This milestone is about
-everything it throws away.
-
-**The trigger.** A real report, in full: title "not working", body "the output folders seem
-empty", plus the auto-filled `GPU: NVIDIA GeForce RTX 2060`. Nothing there is enough to
-answer it, yet **the app knew the answer at the time and threw it away**: an empty output
-folder is almost always a completed run that skipped everything as already near the target, or
-a tree that has been conciliated (both correct behaviour), and the run summary said so. The
-user is not going to write that down. The app can.
-
-The premise: **a user who writes two words is the normal case, not a failure of the user.**
-The lever is the automated half, and everything below already exists somewhere in the process.
-
-### What to add, in order of what it would have settled
-
-| # | Field | Settles |
-|---|---|---|
-| 1 | **The last run's summary per tool**: which tool, when, and its counts (processed / skipped / failed / duration), from the same dict already published to MQTT as `last_run` | "The output folder is empty" in one line, without a round trip. The single highest-value item here |
-| 2 | **VRAM total, not just the GPU name** (`sample_gpu` already returns it, and a card name does not imply its memory: the RTX 2060 shipped in 6 GB and 12 GB) | Whether the card is under the 8 GB minimum, i.e. `known-defects.md` D4 |
-| 3 | **Install mode** (Local / Remote / Both, from `install_mode.txt`) | Which half of the app is even in play. A Remote-only install has no local GPU stack at all |
-| 4 | **The relevant settings for the tool that was last used**: Resolution Target, skip-cutoff, model, "Run on" mode | The most common "not working" is a correct run the settings explain |
-| 5 | **The ffmpeg build stamp** (`ffmpeg/build.txt`) and whether `.venv` looks healthy | D1 and the vidstab pin, both of which are invisible from the outside and both of which we have now hit |
-| 6 | **The run logs**, redacted, as an attached file rather than "please attach" | Users do not attach files, and a URL cannot carry a log anyway. See the delivery shape below |
-
-### The shape: a redacted zip the user drags in
-
-The URL is capped at roughly 8 KB (`_MAX_ISSUE_URL = 7800` already encodes this for benchmark
-contributions), which is enough for items 1 to 5 and nothing else. Rather than shrink the
-payload to fit the transport, the transport changes:
-
-1. One collector builds **both** a body (items 1 to 5, under the cap) **and** a diagnostics
-   zip written to `./issues` in the app folder. `{localappdata}\Programs\Image Toolbox` is
-   writable non-elevated (`PrivilegesRequired=lowest`), same as `logs/` and `db/` already are.
-2. A **review dialog** opens first, with nothing else on screen yet.
-3. Its one button opens the browser at the pre-filled `?body=` URL, then selects the zip in
-   Explorer (`explorer /select,`, already implemented in `gui/filmstrip.py` and worth lifting
-   into `gui/common.py` rather than copying a second time).
-4. The body's first line names the zip and asks the user to drag it into the box. That
-   instruction belongs **in the issue body**, where the user is already looking, not only in a
-   popup they will have dismissed.
-
-The same generator with a different sink is the **"Copy diagnostics"** button: the body block
-to the clipboard, no cap, for a forum post, a chat or an email that never becomes a GitHub
-issue. And `report.md` goes **inside** the zip, byte-identical to the issue body, so a browser
-flow that fails (not logged in, body lost through the login redirect) still leaves the whole
-report on disk.
-
-### Redaction, and the measurement that decides it
-
-Sampling a real upscale log (`logs/log_40d8b4704174.log`, 7 MB, 29,795 files) settles what the
-zip may contain:
-
-```
-[1/29795] SKIP (unreadable image)  X:\Personale\Poze\04-01-2004\IMG_0001_upscaled.JPG
-[2/29795] SKIP (unreadable image)  X:\Personale\Poze\James (cats mainly)\dsc01308.jpg
-[3/29795] SKIP (unreadable image)  X:\Personale\Poze\Oracle\Irinel  Poze Cairo\Cairo5\Picture 209.jpg
-```
-
-Three lines, and they carry a person's name, a location and a private folder taxonomy. The
-paths are not incidental to the log, they **are** the log, one per file, tens of thousands of
-times. And after Tag & Rename has run, the filenames are AI-written descriptions of private
-photos, so a tagged tree's log reads as a caption list of someone's family album.
-
-**A regex scrub cannot fix this.** `James (cats mainly)` has spaces and `Irinel  Poze Cairo`
-has a double space, so there is no reliable way to find where a Windows path ends inside
-free-form text: any pattern either stops early and leaks the tail, or swallows the rest of the
-line. This is exactly why redaction must be a rule about what is **collected**, and a zip is
-where that rule is most likely to be broken, because a zip makes it cheap to just throw the
-files in.
-
-Four rules, all unconditional:
-
-- **Allowlist the sources.** Structurally excluded, not filtered out afterwards:
-  `config.local.json` (`config_store.SECRET_FIELDS`: API key, MQTT password, notification
-  tokens and webhook URLs, where a webhook id IS the credential), `db/cache.db` and its `.bak`
-  siblings (20 MB, and a complete index of the private tree), and the raw output of
-  `nvidia-smi -q` (serial number and GPU UUID; allowlist the fields instead of dumping it).
-- **Tokenise the known roots, hash everything after them.** The app knows its own roots (every
-  `defaults.*` folder, `APP_ROOT`, `%USERPROFILE%`), so match longest-first and substitute,
-  then replace each remaining path component with a short stable hash, extension preserved.
-  Line 1 above becomes `<SRC1>\a3f1\7c2e.JPG`. Counts, sequence, depth, extensions and
-  repeat-offender correlation all survive, which is what a diagnosis actually uses; content
-  leaks nothing.
-- **Fail closed on the remainder.** After substitution, any line still matching a drive-letter
-  or UNC prefix means an unrecognised root, so the **whole line** is replaced with
-  `[redacted: unrecognised path]`. Losing a line costs a little diagnostic value; keeping it
-  costs the promise.
-- **No opt-out.** An "include real folder and file names" checkbox was considered and
-  **rejected**: it trades a permanent public leak for a marginal debugging convenience, most
-  users will not read it carefully, and knowing the exact filename is almost never what
-  settles a report. Dropping it also means the collector has one code path, no mode to test,
-  and no ambiguity about what a given report actually contains.
-
-Two invariants follow. **`./issues` holds redacted zips and nothing else, ever**, because it is
-the folder the app points Explorer at and anything un-redacted sitting beside the zip is a
-drag-and-drop accident waiting to happen. And since the hash is one-way for the **user** too,
-generate a hash-to-path **mapping file** so "what is `7c2e.JPG`?" stays answerable; it is
-written to `logs/`, never to `./issues` and never into the zip. Prune `./issues` to the newest
-N zips, reusing the newest-10 idiom `conc_runs` already uses, or the folder grows forever and
-nobody ever looks in it.
-
-### The review dialog
-
-Opening Explorer with the file selected is not inspection: nobody unzips twelve files to audit
-them. So the dialog does the work: the entries with their sizes, one line stating what was
-redacted, and the buttons **Open folder** / **Open report.md** / **Report without attaching**.
-
-It also carries one disclosure, in one line: attaching to a public issue makes the zip
-**publicly downloadable and permanent from the moment it uploads**, even if the issue is never
-submitted. That is the fact the whole redaction design exists to make safe.
-
-### The GitHub template question, and the trap in it
-
-A GitHub **issue template** would improve the human side, and the repo has none today
-(`.github/` holds only `workflows/`). Three things were verified before deciding:
-
-1. **Issue forms (YAML) and `?body=` do not compose.** A form is pre-filled per field, as
-   `?template=bug.yml&<field-id>=value`. A plain `?body=` has no field to land in.
-2. **A URL query is a documented way to bypass the template chooser**, so `?body=` keeps
-   opening a blank editor once templates exist. Note that GitHub's maintainers treat that as a
-   defect to be closed, not as a contract.
-3. `blank_issues_enabled: false` only hides the Blank option from the chooser for non-write
-   users. It is not enforcement.
-
-**The decision is a markdown template, with the app staying on `?body=` and no `template=`
-parameter**, and the reason is an asymmetry: **installs are immutable, the repo is not.** An
-install shipped today keeps sending whatever URL it was compiled with, forever. Point that URL
-at `?template=bug.yml&diagnostics=...` and it now depends on a filename and a field id living
-in a repo that will be edited by someone who has forgotten the coupling; rename either and
-GitHub silently ignores the unknown parameter, so every install older than the change starts
-sending empty reports with nothing failing loudly. That is the same shape as D1, the ffmpeg pin
-and NVENC: **present is not working**, and the failure is invisible from the side that can
-still act. A `?body=` URL references nothing in the repo and cannot go stale.
-
-The counter-argument is real and worth recording: a form with `validations: required` on "What
-happened?" is the only mechanism that stops a two-word report at the source, and a named
-`diagnostics` textarea would make the block greppable rather than prose. It is refused because
-this milestone's premise is that the two-word report is normal and the **automated** half is
-the lever; a required field mostly converts "not working" into "not working." typed into a box.
-
-So the template is **not a prerequisite**. What the template question gated was the output
-shape (one markdown string, or N named parameters), and that is now answered. The file itself
-is a short job that can land at any point: `.github/ISSUE_TEMPLATE/bug.md` with headings
-mirroring the app's body verbatim, plus `config.yml` with `blank_issues_enabled: true`. The two
-halves are then coupled by convention only, so drift costs nothing. Add `labels=bug` to
-`_issue_url` at the same time, which buys the triage half of a template's value today with no
-file and no coupling, exactly as `_benchmark_issue_url` already does.
-
-### Where the last-run summary comes from: the newest log's tail, unparsed
-
-**Decided: scrape the log files, take the tail verbatim, store nothing new.** The alternative
-was persisting a small ring of the `last_run` dicts already published to MQTT and then dropped.
-Two samples settled it.
-
-The trigger report ("the output folders seem empty") is answered **by the last eight lines of
-an upscale log, with no parsing at all**:
-
-```
-Found 0 eligible file(s) (0 already done, 0 too large, 2 left as-is - 2/2 from cache).
-  Left as they are - upscaling would discard part of these images (2):
-    <SRC1>\7c2e.png  (would lose transparency)
-    <SRC1>\a3f1.tif  (would lose 16-bit depth)
-Nothing to process.
-```
-
-And Tag & Rename already ends its log with a formatted Folder / Processed / Rotated / Skipped /
-Failed / Elapsed table. The information is not missing; it is simply never leaving the machine.
-
-**No parser, deliberately.** There are five log prefixes (`log_` upscale, `tag_`, `video_`,
-`conc_`, `stab_`), each ending in a different shape, and none of those shapes is a contract:
-they are human-readable run output that gets reworded whenever a runner is touched. A parser
-over them breaks **silently**, which is the one failure mode this feature cannot afford, since
-its whole purpose is to arrive when nobody is watching. A tail cannot break. Three further
-properties come free: it is **retroactive** (it reads runs that happened long before the
-feature shipped), it needs **no `db.py` change and no new schema**, and it is the only approach
-that works for the case that matters most, a run that **crashed** and therefore has no summary
-block at all, where the tail is precisely the interesting part.
-
-Mechanics:
-
-- **Select by mtime per prefix.** Logs are per source folder (`<prefix>_<hash>.log`), so the
-  newest file matching each prefix is that tool's most recent run.
-- **Budget.** The most recently modified log across all five prefixes gets a real tail (on the
-  order of 25 lines) in the URL body, since that is almost always the run being reported; the
-  other four get one line each (tool, when, size). Full tails go in the zip, where the 8 KB cap
-  does not apply.
-- **Collapse the tail** through `gui.widgets.COLLAPSE_PROCESSING_RE`, the same pattern the log
-  window's "Collapse repeating progress lines" toggle uses. Without it a video run's last 25
-  lines are 25 identical per-minute heartbeats. With it, the tail is literally what the user
-  saw on screen, which is the point.
-- **The redactor runs on the body too, not only on the zip.** Those tails are made of paths.
-
-One redactor requirement was discovered from the samples and is easy to miss: real logs contain
-the **8.3 short form** (`C:\Users\EDUARD~1\AppData\Local\Temp\...`), so a root table built from
-`%USERPROFILE%` in its long form alone will not match it, and the fail-closed rule would then
-drop those lines wholesale. Register both spellings of every root.
-
-### As built (0.6.1): what changed from the plan
-
-Shipped as `scripts/diagnostics.py` (redactor + collector, stdlib-only and torch-free),
-`gui.dialogs.DiagnosticsDialog` (the review step), `gui.common.open_in_explorer` +
-the `body=` path through `_issue_url`, and `.github/ISSUE_TEMPLATE/{bug.md,config.yml}`.
-`tests/test_diagnostics.py` pins the rules. Four things came out of building it that
-the plan above did not know.
-
-**1. Loosening the fail-closed rule turned drops into a leak, on real data.** The
-first cut asked only "is anything path-shaped left in this line". Hashing ONE
-component was enough to satisfy it, so this real line
-
-```
-[2/2] Poze (Fototarget)\2005-10-24\098.avi -> 2X: 160x120 327f
-```
-
-was emitted with the private folder intact: the date matched the name dictionary and
-was hashed, while `Poze (Fototarget)`, separated from `[2/2]` by a single space, was
-never isolated as a segment. The rule is now per-separator and asymmetric: whatever
-sits immediately either side of a backslash must be a redacted span or whitespace, so
-EVERY component of a joined token must resolve or the line goes. The lesson
-generalises and is worth keeping: **a loosened fail-closed rule does not fail loudly,
-it converts drops into leaks**, and only an adversarial pass over real logs finds it.
-
-**2. The vision model's DESCRIPTIONS were still in the zip, and a path rule can never
-reach them.** Found by the author reading an actual generated zip, after everything
-above already passed. Tag & Rename logs the model's own sentence about each picture,
-and the file name it condenses out of it:
-
-```
-           -> 0001_Kitten_Walking_Snowy_Surface.png  (renamed)
-           -> "A kitten with striking blue eyes and a fluffy coat is walking on a snowy surface..."
-```
-
-This is the **worst** disclosure in the whole feature and the redactor was blind to it
-by construction: it is not a path, not a folder name, not in any dictionary, just free
-English prose. And it is qualitatively different from a leaked folder name, because a
-collection's worth of these lines is a description of somebody's family, which for an
-app whose purpose is reviving personal photo collections is the entire point of the
-data. So the rule is **removal, not redaction**, and it is a rule about the line's
-SHAPE, because prose cannot be pattern-matched: measured across every log this install
-holds, 6,541 lines start with an arrow, **all** of them are Tag & Rename output, and
-every one carries a description or a generated name. No other runner uses the shape
-(the Video Upscaler's `a.avi -> b.mp4` sits mid-line).
-
-**The line goes entirely, placeholder included** (`Redactor.line` returns the `OMIT`
-sentinel and `lines()` filters it). Two intermediate cuts kept a
-`-> [description withheld]` marker, the second of them also re-attaching the outcome
-`(renamed)` through an allowlist of three exact literals. Both were wrong for the same
-reason, and it is a reason worth carrying: **a line that cannot say anything is not
-worth the line.** The per-image outcomes are already totalled in the run's own summary
-table a few lines below, so nothing is actually lost; what the placeholder added was
-one line of noise per image, thousands of them, in a file whose entire purpose is to
-be read by somebody debugging. The counter (`Redactor.withheld`) is what tells the
-user it happened, and it is reported in the dialog and in the body.
-
-Two follow-ons, both found only by auditing the zip against **the descriptions' own
-harvested vocabulary** rather than a guessed word list. The Undo section prints the
-current name as a **bare line with no path around it**, so removing the arrow lines and
-leaving those protects nothing: after a rename the name IS the description. A bare
-media file name is now hashed exactly as it would be inside a path (media extensions
-only, so `cache.db` and `video_benchmark.log` stay readable). And the counters were
-read off the redactor **before** the zip's logs went through it, so a real report
-announced "0 lines withheld" while its tag log had 5,716 removed; the excerpt in the
-URL body is now a SLICE of the already-redacted zip text rather than a second pass,
-which fixes both the count and any chance of the two disagreeing.
-
-A third follow-on came from asking what the surviving line is actually FOR. A tag
-log's per-image line reads `[21/100] 1280x960px  <path>`, and the counter and the
-dimensions are its entire diagnostic content: the run is a sequence, the outcomes are
-in the summary table, and the file's identity adds nothing the counter does not. So in
-Tag & Rename logs a path is **removed, not hashed** (`STRICT_PATH_TOOLS`), keeping the
-root TOKEN only where the path is exactly a root, because "was it pointed at the source
-folder instead of the upscaled one?" is a documented mistake and the legend answers it
-without naming anything. This is per-TOOL policy, not per-line parsing, so a change to
-the log's wording cannot quietly reintroduce the path. Collecting less is the only
-protection that a later bug in a redaction rule cannot undo. With the arrow lines gone,
-the Undo listing's bare name lines go too: a column of anonymous hashes answers
-nothing. Two post-conditions came out of reading the result. Removing a path must never
-leave a dangling `Cache:`, because an empty-looking field reads as "the app recorded
-nothing here", the same misreading that made a silent "0 lines withheld" worse than
-useless. And **a quoted path ends at its closing quote**: the runners print folders as
-`Scanning 'D:\...\Benchmark' ...`, where the end-of-line rule ate the quote and the
-ellipsis and left `Scanning '`, which reads as a truncated log. That end is knowable
-exactly rather than guessed, so it is the one case that does not need the end-of-line
-rule at all. Measurement (1) never saw it, because it counted trailing text after TWO
-spaces and here a single space precedes the ellipsis.
-
-The generalisation is the one worth keeping: **an app that generates text about the
-user's data has a disclosure channel that no structural rule will find.** Auditing has
-to be done against real output, with the vocabulary harvested from that output.
-
-**3. `db/cache.db` is the redaction dictionary.** The one file that must never be
-attached is also the best source of redaction knowledge, and the inversion is the
-happiest part of the design: **the file we refuse to ship is what makes the logs safe
-to ship.** It supplies both halves that `config.defaults` could not. Folders the app
-worked on BEFORE: logs are per-folder and long-lived, and one older log was dropping
-**78.5%** of its lines purely because its source is no longer a configured default
-(with the recorded roots added: 0.0%). And the NAME dictionary: walking the source
-tree for folder names took **145 seconds** over the SMB mount holding the photos,
-against 0.16 s for the same 34,991 names from a local SQL scan. It is opened
-read-only through a URI, so a diagnostics run can never migrate, lock or write the
-cache.
-
-**4. Two patterns were too greedy, and both cost diagnostic value rather than
-privacy.** `http://localhost:11434` matched the drive-letter rule as drive `p:`, so
-every line mentioning the Ollama URL was dropped and the setting itself came out as
-`<unrecognised path>`; a drive letter is ONE letter, so the pattern now has a
-lookbehind. And "a config value containing a slash or a colon is a path" mangled
-`tagging.camera_filename_patterns` (regexes, full of backslash escapes) along with
-that URL; the test is now what a path actually STARTS with. Between them the drop
-rate fell from 0.29% to 0.21%.
-
-**5. The review dialog needed a second pass after looking at it.** The redaction
-summary and the pointer to the private map were inside the scrolling file list, below
-the fold, behind a scrollbar nobody drags. They are the two things the user most needs
-to read, so they are fixed labels now and the box holds nothing but the file table.
-
-**Measured, on this developer's own logs:** ~201,000 real lines audited twice, first
-against 15 private terms drawn from the actual tree and then against a content-word
-list harvested from the model's own descriptions. **Zero leaks** of either kind: every
-distinctive word (village, hillside, donkey, romanian, castle) is gone, and what the
-audit still flags is ordinary log English ("already tagged", "Force rename mode") or a
-substring accident (`river` inside `driver`). 0.23% of lines dropped, 4.15% removed as
-model output, ~41,000 lines/s, a 0.5 s build. A report comes out as a ~4,200-character
-pre-filled URL (cap 7,800) plus a ~40 KB zip.
-
-Two rules to keep. The URL carries **no `template=` parameter** and must not grow one
-(`test_the_issue_url_carries_no_template_parameter` says why in full). And **`./issues`
-holds redacted zips and nothing else, ever**, which is what makes dragging from it
-safe; the hash-to-name map is the private half and goes to `logs/`, where it is pruned
-on a longer schedule than the zips because it stays useful for as long as the ISSUE is
-open.
-
-### Constraints that shape it
-
-- **Nothing may be sent anywhere.** This is a pre-filled browser form the user reads and can
-  edit before submitting, and a file the user drags in themselves. That property must not be
-  traded away for convenience, and it is what makes the enrichment safe in the first place.
-- **The zip must stay small.** GitHub allows 25 MB for a `.zip`, so cap at roughly 10 MB for
-  headroom. Redacted text compresses hard, so that is a great deal of log.
-- **Verified live, 2026-08-22**, from a real install with `.github/ISSUE_TEMPLATE/bug.md`
-  already in the repo: the app's link opens the **blank** editor with the body intact,
-  down to the line naming the zip, rather than landing at `/issues/new/choose`. That is
-  the half that could have failed, and it is the empirical half of decision 2 above:
-  bypassing the chooser via a URL query is documented behaviour that GitHub's own
-  maintainers treat as a defect to be closed, not as a contract. **So it is worth
-  re-checking whenever the template set changes**, and the failure would be loud rather
-  than silent (the user lands on a chooser page with an empty form), which is the one
-  saving grace. The drag itself is GitHub's ordinary `.zip` attach, well inside its
-  25 MB ceiling.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
@@ -799,18 +437,17 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22 and #23 are
-  complete** (remote upscaling + funds-floor; RunPod video; video conciliation; self-healing
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23 and #24
+  are complete** (remote upscaling + funds-floor; RunPod video; video conciliation; self-healing
   remote runs; local video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard
   samples; Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
   pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; RAW input;
-  video stabilization; browsing already-upscaled images; the Video Stabilization workflow), so
-  the remaining sequencing is only among the open milestones below.
-- **Open milestones: #21, #12, #15, #3, #4 — plus #25 and #24, both BUILT.** #25 is open only
-  for its two dated deletions; #24 has nothing outstanding at all (its one live check passed on
-  2026-08-22) and is kept only for its redaction record, which is the part worth re-reading
-  before anything else in this app starts collecting user data.
-- **#25 (RunPod API v2) was the only milestone with a deadline, and it is done** — all five
+  video stabilization; browsing already-upscaled images; the Video Stabilization workflow; the
+  diagnostics bug report), so the remaining sequencing is only among the open milestones
+  below.
+- **Open milestones: #21, #12, #15, #3, #4, plus #25, which is BUILT** and open only for its
+  two dated deletions.
+- **#25 (RunPod API v2) was the only milestone with a deadline, and it is done**: all five
   phases on 2026-08-20, months ahead of both dates. Nothing else sequences behind it any more.
   What remains is a **calendar item, not a task**: delete the v1 half after 2026-11-15 and the
   GraphQL balance island when it 410s in early 2027. Neither can be pulled forward, since each
@@ -885,8 +522,8 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22 and
-#23** are done and live. **This section is a pointer list, not a record.** Each entry says what the
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23
+and #24** are done and live. **This section is a pointer list, not a record.** Each entry says what the
 number meant and where the design of record actually lives; nothing is described in full
 here. The numbers survive because code and other docs cite the roadmap by them (`remote
 #1`, `Video Upscaler #2`, `local #7`), so deleting the entries outright would strand those
@@ -985,6 +622,15 @@ kept in two places drifts, and the stale copy is the one that gets read.
   which no conciliation query reads. The item-5 sub-decision that was left open ("may
   Conciliation ACT on it") was answered **no**, explicitly and with a test. See `CLAUDE.md`
   (Video Stabilization) and `tests/test_video_stabilize.py`.
+- **#24: Make a bug report actionable without asking.** Shipped 0.6.1. **Report an issue**
+  now builds a pre-filled body and a redacted diagnostics zip, and hands the user the file to
+  drag in. Read the record before touching any redaction rule: they are the kind that get
+  "simplified" later, and it documents what each one cost. Two are load-bearing beyond this
+  feature - **collecting less is the only protection a later bug in a rule cannot undo**, and
+  **an app that generates text about the user's data has a disclosure channel no structural
+  rule will find** (the vision model's descriptions were still in the zip after every path
+  rule passed). See `docs/bug-reports.md`, `CLAUDE.md` (Report an issue) and
+  `tests/test_diagnostics.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

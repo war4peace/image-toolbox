@@ -211,10 +211,10 @@ knows how to ask (`video_estimate` drops cards below a target's floor).
 #### The other half of this, now its own milestone
 
 The report was terse because nothing invited detail, and the app knew the answer at the time
-and threw it away. That is **`future-features.md` #24** (make a bug report actionable without
-asking): auto-fill the last run's summary, the VRAM total rather than just the card name, the
-install mode and the ffmpeg build stamp. Item 2 there is what would settle THIS defect from a
-report, without a round trip.
+and threw it away. That was roadmap **#24** (make a bug report actionable without asking),
+**shipped in 0.6.1**: a report now auto-fills the last run's summary, the VRAM total rather
+than just the card name, the install mode and the ffmpeg build stamp. The VRAM total is what
+would settle THIS defect from a report, without a round trip. See `docs/bug-reports.md`.
 
 #### As fixed
 
