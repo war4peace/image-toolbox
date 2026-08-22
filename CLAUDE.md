@@ -895,6 +895,57 @@ was a net loss at every real 1080p+ target because it halves the batch, see
 config: compile stays gated at runtime by `batch_video_upscale.gate_local_compile`.
 See `gui/wizard.py`, `gui/wizard_recommend.py`, and `docs/first-start-wizard.md`.
 
+**Report an issue** (0.6.1, future-features #24) - the bottom-bar link now opens a
+**review dialog** (`gui.dialogs.DiagnosticsDialog`) instead of the browser. It builds,
+off the UI thread, a pre-filled issue body AND a redacted diagnostics zip in
+`./issues`, lists what the zip holds, and only then opens GitHub with Explorer behind
+it, the zip selected, ready to drag into the comment box. The trigger was a real
+report reading, in full, "not working" / "the output folders seem empty" / `GPU: RTX
+2060`: **the app knew the answer at the time and threw it away.** The premise is that
+a two-word report is the normal case and the automated half is the lever. The
+last-run summary is the **tail of the newest log per tool, unparsed** (the five
+runners end their logs in five shapes and none is a contract, so a parser would break
+silently; a tail is retroactive and is the only thing that works for a run that
+CRASHED and has no summary block), collapsed through the log window's own
+`COLLAPSE_PROCESSING_RE` so it is what the user saw on screen. **Everything private is
+redacted at COLLECTION, never filtered afterwards** - see `diagnostics.py` in the
+table below for the rules and why each exists. The sharpest of them is not about
+paths at all: **Tag & Rename's generated DESCRIPTIONS are removed outright**, because
+the model's sentence about each picture (and the file name condensed from it) is free
+prose that no path rule can see, and a collection's worth of it describes somebody's
+family. That is a rule about the line's SHAPE (measured: 6,541 arrow-led lines exist
+and all 6,541 are Tag & Rename output), plus hashing for the bare file names the Undo
+listing prints with no path around them. Those lines go **entirely**, no placeholder:
+their outcome is already totalled in the run's summary table, so a marker repeated once
+per image is thousands of lines of noise in a file meant to be read. In a Tag & Rename
+log a path is then **removed rather than hashed** (`STRICT_PATH_TOOLS`): its per-image line is `[21/100] 1280x960px
+<path>`, where the counter and the dimensions are the whole diagnostic content, so
+collecting the name buys nothing and risks everything. That is per-TOOL policy, never
+per-line parsing, so a reworded log cannot quietly reintroduce the path.
+The generalisation to carry forward: **an app
+that generates text about the user's data has a disclosure channel no structural rule
+will find**, and auditing has to run against real output with the vocabulary harvested
+from that output. Four things here are decisions, not
+details. The URL carries **no `template=` parameter**: installs are immutable and the
+repo is not, so coupling a shipped URL to a filename and field id in `.github/` would
+silently gut every older install the day someone renames either (`?body=` references
+nothing and cannot go stale; `.github/ISSUE_TEMPLATE/config.yml` keeps
+`blank_issues_enabled: true` for the same reason). **`./issues` holds redacted zips and
+nothing else, ever**, because it is the folder the app opens for the user to drag from;
+the hash-to-name map is the private half, goes to `logs/`, and is pruned on a longer
+schedule than the zips because it stays useful for as long as the ISSUE is open.
+**There is no "include real names" opt-out** - it would trade a permanent public leak
+for a marginal debugging convenience, most users would not read it, and dropping it
+leaves the collector with one code path and no ambiguity about what a report contains.
+And the dialog **states plainly** that attaching to a public issue publishes the file
+immediately and permanently, which is what the aggressive defaults exist to make safe.
+A **Copy diagnostics** button is the other half and often the better one: no cap at
+all, for a forum post or an email that never becomes an issue. The Benchmark window's
+own link routes here too, attaching `video_benchmark.log` rather than asking the user
+to (users do not attach files). Fail-safe throughout: a report that cannot be gathered
+falls through to the plain pre-filled issue, because the one thing this must never do
+is stop somebody reporting a bug. See `docs/future-features.md` #24.
+
 **Performance watchdog** (0.3.0, experimental) — guards long upscale runs against
 the **degraded-GPU** failure mode: as a run accumulates GPU/driver state the
 pipeline can silently slow from seconds/image to minutes (the GPU thrashing VRAM
@@ -1179,7 +1230,8 @@ plain by design, the rule is recorded above the style constant)); **`gui/compari
 | `bench_share.py` (~330 lines) | Benchmark sharing (0.5.1, future-features #8), torch-free/stdlib, fail-safe. The CSV serializer for the shared per-card VIDEO benchmark summary (`write_csv`/`read_csv`/`to_text`, a `# imgtbx-bench v1` sentinel, a malformed row is skipped not raised); `fetch_community` (anonymous GitHub GET of the curated `docs/video-benchmarks.csv` via `net_ssl`, offline-cacheable); `new_rows` (dedup a contribution against the published corpus by measurement identity, ignoring volatile date/price); and the **maintainer** `--merge` tool (ingest submissions into a private gitignored `benchmarks.db`, newest-wins dedupe, a physical-plausibility **sanity gate**, re-export the diffable master). Consumed by `video_benchmark` (`build_share_rows`/`import_rows`/`auto_update`) and `gui.common.contribute_benchmark`. See docs/benchmark-sharing.md. |
 | `exif_copy.py` (~330 lines) | Metadata transfer (0.5.9, future-features #13), Pillow-only and fail-safe. `exif_for_upscaled()` reads the source's block, normalises Orientation to 1 (the pipeline already applied it), corrects the pixel dimensions to the output size, and strips a TIFF source's structural tags before they can describe a strip layout inside a JPEG; `save_kwargs()` splats it into `Image.save` for the formats that can carry one (BMP is excluded: Pillow accepts `exif=` and writes nothing). `pending_backfill()` / `backfill()` are Conciliation's retroactive half: "copy what is missing, keep what is present", JPEG via `piexif.insert` (byte-identical scan data) and PNG via an atomic lossless re-save, everything else refused with a named reason. Every entry point swallows its own errors and returns "nothing to do" -- 13a runs inside an upscale and 13b runs one statement before an archive or a delete. Pushed to the pod with `upscale_engine.py`. |
 | `raw_decode.py` (~380 lines) | RAW / DNG input (0.6.0, future-features #19). Owns `RAW_EXTS`, the header-only `raw_dimensions()` (LibRaw, flip-corrected, and the reason a RAW never reaches Pillow), `render()` (the preview-vs-demosaic choice plus the container+preview metadata merge), `thumbnail()` for the film strip, and `render_name()` (the `_raw.jpg` rule that stops a RAW and its sibling camera JPEG mapping to one output). The geometry is pure module-level functions (`upright_size` / `preview_is_full_size`), tested without rawpy. rawpy and Pillow are lazy inside it, so importing it stays instant and torch-free -- which is why `runner_common` can import it at module level for the one shared extension list. |
-| `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers, `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
+| `diagnostics.py` (~430 lines) | Bug-report diagnostics (0.6.1, future-features #24), stdlib-only/torch-free/fail-safe. Turns the app's own logs and state into something that can safely leave the machine, for the in-app **Report an issue** flow. The **redactor** is the whole module: it substitutes the roots the app already knows (`build_roots`, every root registered in BOTH its long and 8.3 short spelling, because real logs carry `C:\Users\EDUARD~1\...`), hashes every component after them (`hash_tail` / `component_hash`, salted per report so a public zip cannot be brute-forced for common folder names, extension and its case preserved because `.CR2` vs `.jpg` is often the answer), replaces bare private names with a greedy longest match (`_match_names`, for the folder headers that carry no path syntax at all), and then **drops any line that still looks like it holds a path** (`has_residual_path`). It never tries to find "a path" in free text: a Windows name can contain spaces, and one real folder contains a DOUBLE space, so no pattern can bound one. Two rules are load-bearing and must not be relaxed: a path runs **to the end of its line** (measured: of 16,128 path-bearing lines only 2 had genuine trailing text, hence `split_trailing_note`), and **every** component of a backslash-joined token must resolve or the LINE goes (`_has_unresolved_backslash`; a first cut asked only "is anything path-shaped left" and hashing ONE component let a private folder through beside it). It also **removes**, rather than redacts, the vision model's own descriptions, the names generated from them, and -- in a Tag & Rename log, whose per-image line is fully explained by its counter and dimensions -- file paths outright (`_withhold_model_output` / `_hash_bare_name` / `STRICT_PATH_TOOLS`): prose cannot be pattern-matched, so the rule is the line's shape, and the per-image outcome marker survives only through an allowlist of three exact literals. It reads `db/cache.db` READ-ONLY as its dictionary (`roots_from_db` / `names_from_db`): the one file that must never be attached is the best redaction source there is, and it is what fixed an older log dropping 78.5% of its lines and replaced a 145 s SMB tree-walk with a 0.16 s SQL scan. The **collector** half (`build_report` / `write_zip` / `write_mapping` / `prune_reports`) reads the newest log per tool (`newest_logs` + `tail_lines`, a TAIL and deliberately not a parser) and fits the URL body to a budget. Measured: ~200,000 real log lines audited twice, once for paths and once against 396 content words harvested from the model's own descriptions; zero leaks of either, 0.22% dropped, 3.1% withheld, ~41k lines/s. See `tests/test_diagnostics.py`, whose sampled lines are verbatim and are the regression net. |
+| `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers (0.6.1: `fmt_mmss` is `mm:ss.mmm`, because a per-image time is routinely under a second and a flat `00:00` reads as "nothing was measured" rather than "this was fast"; the TOTALS stay whole-second, where a millisecond is noise), `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename; the Video Upscaler records a whole-video source→output row here too, 0.4.9 item 10); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools;
 `cached_hash` is its read-only half, which returns a hash only if one is already
 stored and never opens the file); `conc_runs`/`conc_actions` (0.5.9, #18: the
@@ -1238,6 +1290,7 @@ Configuration & state:
   (upscale) and `trcache/` (tag/rename) folders are now read only once, on first
   DB creation, for the one-time import; they are otherwise vestigial.
 - `logs/` — run logs (kept as text files, not in the DB).
+- `issues/` — redacted diagnostics zips built by "Report an issue" (#24), newest 10 kept. **Redacted zips and nothing else, ever**: it is the folder the app opens in Explorer for the user to drag from. The hash-to-name map that decodes one is private and lives in `logs/`.
   `test_output/`, `samples/` — sample images.
 
 Engine, packaging & CI:
@@ -1293,12 +1346,19 @@ Engine, packaging & CI:
   `config_store.SECRET_FIELDS` and the config docs; (4) write the user-facing notes
   in the annotated tag `-m` message. See [release-workflow] in memory for the
   branch/fold mechanics.
-- `docs/` — `known-defects.md` (confirmed shipped bugs not yet fixed, with root cause and
-  what was done about it; **nothing open as of 0.6.0** - D1 to D4 were all found while testing
-  it and all fixed before it shipped. Kept because code comments cite them by id and because
-  three of the four are one mistake in different clothes: **present is not working**), `future-features.md` (roadmap: open milestones #24, #21,
-  #12/#15, #3/#4, plus #25, which is BUILT but kept open because it owns two dated
-  deletions: the v1 half after 2026-11-15 and the GraphQL balance island in early 2027; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
+- `docs/` — `known-defects.md` (confirmed bugs, with root cause and
+  what was done about it; **nothing open as of 0.6.1** - D1 to D4 were found while testing
+  0.6.0 and D5 while testing 0.6.1, all fixed before shipping. Kept because code comments
+  cite them by id and because three of the first four are one mistake in different clothes:
+  **present is not working**. D5 is that family's GUI cousin: `self._report = None` in
+  `__init__` shadowed the `_report` METHOD, so `command=self._report` bound the button to
+  `None` and tkinter accepted it silently, giving a button that drew, enabled and did
+  nothing. `tests/test_gui_command_bindings.py` now fails on any attribute that shadows a
+  method in a GUI class, and on any `command=self.x` that names none), `future-features.md`
+  (roadmap: open milestones #21,
+  #12/#15, #3/#4, plus #25 and #24, both BUILT: #25 stays open because it owns two dated
+  deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027) and
+  #24 until its live GitHub check; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
   incl. folding a RAW render back into the source tree, whose revisit trigger is an

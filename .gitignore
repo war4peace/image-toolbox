@@ -1,5 +1,8 @@
 # Local-only: logs, caches, environments, engine clone, test artifacts
 logs/
+# Diagnostics reports built by "Report an issue" (future-features #24). Redacted,
+# but still this machine's data, and regenerated on demand.
+issues/
 scans/
 db/
 .venv/

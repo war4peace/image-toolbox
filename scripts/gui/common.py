@@ -21,6 +21,7 @@ import json
 import shutil
 import datetime
 import platform
+import subprocess
 import webbrowser
 import urllib.parse
 import urllib.request
@@ -191,8 +192,46 @@ def set_update_skipped_version(version):
 
 
 # ─────────────────────────────────────────────
-#  REPORT AN ISSUE  (Future Feature #3)
+#  REPORT AN ISSUE  (Future Feature #3, enriched by #24)
 # ─────────────────────────────────────────────
+# The URL is a pre-filled browser form the user reads and can edit before
+# submitting, and (since #24) a zip they drag in themselves. NOTHING is ever sent
+# anywhere by the app. That property is the whole reason it is safe to put this
+# much in it, and it must not be traded away for convenience.
+
+# GitHub labels applied to a pre-filled report. A reporter without triage rights
+# cannot set labels and GitHub simply ignores the parameter for them, so this
+# helps the maintainer and costs everyone else nothing.
+ISSUE_LABEL = "bug"
+
+
+def open_in_explorer(path):
+    """Open the folder holding `path` in Explorer with the file SELECTED, falling
+    back to just opening the folder.
+
+    Lifted out of `FilmStrip._open_folder` for #24, which needs the same gesture to
+    put the diagnostics zip under the user's cursor. Selecting the file rather than
+    opening the folder is the point: the folder may hold ten previous reports, and
+    the user is being asked to drag one specific file into a browser window.
+    Fail-safe (best effort), Windows-only like the rest of the app.
+    """
+    if not path:
+        return
+    norm = os.path.normpath(path)
+    if os.path.exists(norm):
+        try:
+            subprocess.Popen(["explorer", "/select,%s" % norm],
+                             creationflags=CREATE_NO_WINDOW)
+            return
+        except Exception:
+            pass
+    folder = os.path.dirname(norm)
+    if os.path.isdir(folder):
+        try:
+            os.startfile(folder)
+        except OSError:
+            pass
+
 
 def _newest_crash_log():
     """Path of the most recent logs/crash_*.log, or None. Best-effort."""
@@ -208,7 +247,28 @@ def _newest_crash_log():
         return None
 
 
-def _issue_url(attach_path=None, attach_desc=None):
+def _issue_url(attach_path=None, attach_desc=None, body=None):
+    """New-issue URL. With `body`, that text is used verbatim (feature #24's
+    diagnostics block); without it, the original short environment block is built
+    here, which is what the fallback path uses when a report cannot be gathered.
+
+    Deliberately NO `template=` parameter, and this is a decision, not an oversight.
+    Installs are immutable and the repo is not: an install shipped today keeps
+    sending whatever URL it was compiled with, forever. Pointing it at
+    `?template=bug.yml&<field>=...` would couple it to a filename and a field id in
+    a repo that will be edited by someone who has forgotten the coupling, and GitHub
+    silently ignores an unknown field parameter -- so every older install would
+    start sending empty reports with nothing failing loudly. A `?body=` URL
+    references nothing in the repo and cannot go stale. See future-features #24.
+    """
+    if body is not None:
+        params = urllib.parse.urlencode(
+            {"title": "", "labels": ISSUE_LABEL, "body": body})
+        return "https://github.com/%s/issues/new?%s" % (updater.GITHUB_REPO, params)
+    return _legacy_issue_url(attach_path, attach_desc)
+
+
+def _legacy_issue_url(attach_path=None, attach_desc=None):
     """
     Build a GitHub "new issue" URL pre-filled with the app version and basic
     environment, so reports arrive actionable. The GPU name is best-effort (it
@@ -255,12 +315,14 @@ def open_donate():
         pass
 
 
-def report_issue(attach_path=None, attach_desc=None):
+def report_issue(attach_path=None, attach_desc=None, body=None):
     """Open a pre-filled GitHub new-issue page in the browser. Fail-safe: on any
     error, fall back to the plain issues page. `attach_path`/`attach_desc` override
-    the default crash-log attachment hint (see `_issue_url`)."""
+    the default crash-log attachment hint; `body` replaces the whole body with a
+    prepared one (#24's diagnostics). See `gui.dialogs.open_issue_reporter` for the
+    normal entry point, which gathers diagnostics and shows them first."""
     try:
-        webbrowser.open(_issue_url(attach_path, attach_desc))
+        webbrowser.open(_issue_url(attach_path, attach_desc, body))
     except Exception:
         try:
             webbrowser.open(f"https://github.com/{updater.GITHUB_REPO}/issues/new")

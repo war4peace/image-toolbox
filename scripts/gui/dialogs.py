@@ -1,17 +1,33 @@
 """
 gui/dialogs.py
 --------------
-Standalone dialogs (the in-app update dialog).
+Standalone dialogs: the in-app update dialog, the one-model Ollama pull, and the
+diagnostics review shown before a bug report leaves the machine (#24).
+
+This module may import both `gui.common` and `gui.widgets`; `gui.common` may import
+neither, which is why the log-collapse pattern is injected into `diagnostics` from
+here rather than read there.
 """
 
+import io
 import os
+import tempfile
 import threading
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 import updater
-from gui.common import (APP_ROOT, APP_TITLE, APP_VERSION, set_update_skipped_version,
-                       ollama_pull)
+import diagnostics
+from gui.common import (APP_ROOT, APP_TITLE, APP_VERSION, CFG,
+                        set_update_skipped_version, ollama_pull,
+                        open_in_explorer, report_issue)
+from gui.widgets import Tooltip, COLLAPSE_PROCESSING_RE
+
+try:                                                    # optional, never required
+    from debug_log import debug_log
+except Exception:                                       # pragma: no cover
+    def debug_log(*_a, **_k):
+        pass
 
 
 class UpdateDialog(tk.Toplevel):
@@ -349,3 +365,298 @@ def prompt_install_triton(parent, on_done=None):
         parent.after(0, _done, ok, msg)
 
     threading.Thread(target=work, daemon=True).start()
+
+class DiagnosticsDialog(tk.Toplevel):
+    """
+    Future feature #24: the review step before a bug report leaves the machine.
+
+    The flow is deliberately one thing at a time. This dialog opens FIRST, with
+    nothing else on screen; only when the user presses the report button does the
+    browser open and Explorer come up behind it with the zip selected. Opening
+    three surfaces at once is disorienting, and the user needs to have read what is
+    in the zip before they are looking at a form.
+
+    Opening Explorer with the file selected is NOT inspection: nobody unzips twelve
+    files to audit them. So the dialog does that work: it lists what the zip holds
+    with sizes, states in one line what was removed, and says plainly that
+    attaching the file to a public issue publishes it permanently. That disclosure
+    is the reason the redaction defaults are the aggressive ones, and the reason
+    there is no "include real names" opt-out anywhere in this feature.
+
+    Gathering runs OFF the UI thread: it reads the cache DB, several megabytes of
+    log, and shells out to nvidia-smi for the card's VRAM.
+    """
+
+    def __init__(self, app, extra_logs=()):
+        super().__init__(app)
+        self.app = app
+        self._extra_logs = list(extra_logs or ())
+        self._report = None
+        self._zip_path = None
+        self._map_path = None
+
+        self.title("Report an issue")
+        try:
+            self.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+        except Exception:
+            pass
+        self.transient(app)
+        self.resizable(True, True)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build()
+        self.update_idletasks()
+        self._centre_on(app)
+        threading.Thread(target=self._gather, daemon=True).start()
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def _build(self):
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            outer, wraplength=560, justify="left",
+            text=("The app can attach a diagnostics file to your report, so you do "
+                  "not have to describe your setup or find any logs.\n\n"
+                  "Folder names and file names are replaced with short codes, and "
+                  "anything the app wrote about what is IN your pictures (the "
+                  "descriptions Tag & Rename generates) is removed outright. So the "
+                  "file does not reveal what your photos are or where they live.")
+        ).grid(row=0, column=0, sticky="we")
+
+        self.status = ttk.Label(outer, text="Collecting diagnostics ...",
+                                foreground="#7f8a99")
+        self.status.grid(row=1, column=0, sticky="w", pady=(10, 4))
+
+        box = ttk.LabelFrame(outer, text="What the file contains", padding=(8, 6))
+        box.grid(row=2, column=0, sticky="nsew")
+        box.columnconfigure(0, weight=1)
+        box.rowconfigure(0, weight=1)
+        self.listing = tk.Text(box, height=8, width=68, wrap="none",
+                               relief="flat", background=self.cget("background"))
+        self.listing.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(box, orient="vertical", command=self.listing.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.listing.configure(yscrollcommand=scroll.set, state="disabled")
+
+        # These two lines were inside the scrolling list in the first cut, and a
+        # screenshot showed them sitting below the fold behind a scrollbar nobody
+        # is going to drag. What was redacted, and where the private key to it went,
+        # are the two things the user most needs to read, so they are fixed labels
+        # under the box and the box holds nothing but the file table.
+        self.redaction_note = ttk.Label(outer, wraplength=560, justify="left",
+                                        foreground="#7f8a99", text="")
+        self.redaction_note.grid(row=3, column=0, sticky="we", pady=(6, 0))
+        self.map_note = ttk.Label(outer, wraplength=560, justify="left",
+                                  foreground="#7f8a99", text="")
+        self.map_note.grid(row=4, column=0, sticky="we", pady=(2, 0))
+
+        # The disclosure. One line, always visible, never behind a "details" toggle:
+        # a viewer of a public issue can download an attachment the moment it
+        # uploads, and it stays there even if the issue is never submitted.
+        warn = ttk.Label(
+            outer, wraplength=560, justify="left", foreground="#b06000",
+            text=("Note: once you drag the file into a public issue it uploads "
+                  "immediately and can be downloaded by anyone, even if you never "
+                  "submit the issue."))
+        warn.grid(row=5, column=0, sticky="we", pady=(8, 0))
+
+        row = ttk.Frame(outer)
+        row.grid(row=6, column=0, sticky="we", pady=(12, 0))
+        self.open_btn = ttk.Button(row, text="Open folder", width=14,
+                                   command=self._open_folder, state="disabled")
+        self.open_btn.pack(side="left")
+        self.read_btn = ttk.Button(row, text="Open report.md", width=16,
+                                   command=self._open_report, state="disabled")
+        self.read_btn.pack(side="left", padx=(8, 0))
+        self.copy_btn = ttk.Button(row, text="Copy diagnostics", width=17,
+                                   command=self._copy, state="disabled")
+        self.copy_btn.pack(side="left", padx=(8, 0))
+
+        self.go_btn = ttk.Button(row, text="Report with this file", width=20,
+                                 command=self._report_with_file, state="disabled")
+        self.go_btn.pack(side="right")
+        self.plain_btn = ttk.Button(row, text="Report without it",
+                                    command=self._report_plain, state="disabled")
+        self.plain_btn.pack(side="right", padx=(0, 8))
+
+        for widget, hint in (
+            (self.open_btn, "Open the folder holding the diagnostics file, with the "
+                            "file selected so you can drag it into your browser."),
+            (self.read_btn, "Open the readable summary that goes at the top of your "
+                            "report, so you can see exactly what is being sent."),
+            (self.copy_btn, "Copy the summary to the clipboard, for a forum post, a "
+                            "chat message or an email instead of a GitHub issue."),
+            (self.go_btn,   "Open a pre-filled GitHub issue in your browser and show "
+                            "the diagnostics file ready to drag in."),
+            (self.plain_btn, "Open the pre-filled issue without the file. The "
+                             "summary above is still included in the report."),
+        ):
+            Tooltip(widget, hint)
+
+    def _centre_on(self, app):
+        try:
+            x = app.winfo_rootx() + (app.winfo_width() - self.winfo_width()) // 2
+            y = app.winfo_rooty() + (app.winfo_height() - self.winfo_height()) // 3
+            self.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        except Exception:
+            pass
+
+    # ── gathering (background thread) ────────────────────────────────────────
+
+    def _post(self, fn, *args):
+        """Hand a result back to the UI thread, tolerating a dialog that is already
+        gone. Gathering takes about half a second, and closing the window inside
+        that window is an ordinary thing for a user to do; `after` on a destroyed
+        widget raises, and a traceback out of a daemon thread helps nobody."""
+        try:
+            self.after(0, fn, *args)
+        except Exception:
+            pass
+
+    def _gather(self):
+        """Build the report, write the zip and the private map. Off the UI thread:
+        it reads the cache DB, several megabytes of log, and shells out to
+        nvidia-smi for the card's VRAM."""
+        try:
+            name = diagnostics.report_name()
+            report = diagnostics.build_report(
+                CFG, app_root=APP_ROOT, collapse_re=COLLAPSE_PROCESSING_RE,
+                zip_name=name, extra_logs=self._extra_logs)
+            zip_path = diagnostics.write_zip(report, name=name)
+            map_path = diagnostics.write_mapping(report)
+            diagnostics.prune_reports()
+        except Exception as exc:
+            debug_log("diagnostics: report could not be built", exc, tb=True)
+            self._post(self._gather_failed)
+            return
+        self._post(self._gather_done, report, zip_path, map_path)
+
+    def _gather_failed(self):
+        """A report that cannot be gathered must not block reporting the bug. The
+        plain path still carries the app version, OS, Python and GPU name."""
+        self._report = None
+        self.status.configure(
+            text="Diagnostics could not be collected. You can still report the "
+                 "issue without them.", foreground="#c04040")
+        self.plain_btn.configure(state="normal")
+        self.plain_btn.focus_set()
+
+    def _gather_done(self, report, zip_path, map_path):
+        self._report, self._zip_path, self._map_path = report, zip_path, map_path
+        try:
+            size = os.path.getsize(zip_path) / 1024.0
+        except OSError:
+            size = 0.0
+        self.status.configure(
+            text="%s  (%.0f KB)" % (os.path.basename(zip_path), size),
+            foreground="#2e7d32")
+
+        lines = []
+        for arcname, text in report.files:
+            kb = len((text or "").encode("utf-8", "replace")) / 1024.0
+            lines.append("%-34s %8.0f KB" % (arcname, kb))
+        self.listing.configure(state="normal")
+        self.listing.delete("1.0", "end")
+        self.listing.insert("1.0", "\n".join(lines))
+        self.listing.configure(state="disabled")
+
+        # Says what happened to THIS file, without repeating the explanation the
+        # paragraph at the top already gives. The description count leads: it is the
+        # one people ask about, because it is their photos being described.
+        bits = []
+        if report.withheld:
+            bits.append("%d line(s) holding the description of a photo, and the name "
+                        "made from it, were removed." % report.withheld)
+        if report.dropped:
+            bits.append("%d line(s) were removed for naming a folder this app did "
+                        "not recognise." % report.dropped)
+        self.redaction_note.configure(
+            text=" ".join(bits) or "Nothing had to be removed outright.")
+        if map_path:
+            self.map_note.configure(
+                text=("A private list of what each code means was saved for you "
+                      "alone, next to your logs, as %s. It is not inside the file "
+                      "above and must not be attached to anything."
+                      % os.path.basename(map_path)))
+
+        for btn in (self.open_btn, self.read_btn, self.copy_btn,
+                    self.go_btn, self.plain_btn):
+            btn.configure(state="normal")
+        self.go_btn.focus_set()
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    def _report_with_file(self):
+        """Browser first, then Explorer behind it. The body already names the file
+        and asks for the drag, so the instruction is where the user is looking.
+
+        NOT named `_report`: `self._report` is the gathered report, and an attribute
+        that shadows a method is silent here in a way it is not elsewhere. `_build`
+        runs before the gather thread finishes, so `command=self._report` read the
+        `None` set in `__init__`, and tkinter accepts `command=None` without a word:
+        the button drew normally, enabled itself normally and did nothing at all.
+        `tests/test_gui_command_bindings.py` now fails on any such collision."""
+        body = self._report.body if self._report else None
+        report_issue(body=body)
+        if self._zip_path:
+            open_in_explorer(self._zip_path)
+        self._close()
+
+    def _report_plain(self):
+        report_issue(body=self._report.body if self._report else None)
+        self._close()
+
+    def _open_folder(self):
+        open_in_explorer(self._zip_path)
+
+    def _open_report(self):
+        """Write report.md beside the zip's own name and open it.
+
+        It is written to the TEMP folder, not to ./issues: that folder holds
+        redacted zips and nothing else, ever, because it is what the user drags
+        from and a loose file beside the zip is an accident waiting to happen.
+        """
+        if not self._report:
+            return
+        try:
+            path = os.path.join(tempfile.gettempdir(), "imgtbx-report-preview.md")
+            with io.open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(self._report.full)
+            os.startfile(path)
+        except Exception as exc:
+            debug_log("diagnostics: could not open the report preview", exc)
+
+    def _copy(self):
+        """The other half of the feature, and often the better one: no cap at all,
+        and it works for a forum, a chat or an email that never becomes an issue."""
+        if not self._report:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self._report.full)
+            self.status.configure(text="Diagnostics copied to the clipboard.",
+                                  foreground="#2e7d32")
+        except Exception as exc:
+            debug_log("diagnostics: clipboard copy failed", exc)
+
+    def _close(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+def open_issue_reporter(parent, extra_logs=()):
+    """Open the review dialog. Fail-safe: if the dialog itself cannot be built, fall
+    straight through to the plain pre-filled issue, because the one thing this
+    feature must never do is stop somebody reporting a bug."""
+    try:
+        return DiagnosticsDialog(parent, extra_logs=extra_logs)
+    except Exception as exc:
+        debug_log("diagnostics: review dialog failed to open", exc, tb=True)
+        report_issue()
+        return None

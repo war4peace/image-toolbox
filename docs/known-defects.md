@@ -5,18 +5,21 @@ Confirmed bugs, each with its root cause and what was done about it. Open ones c
 worth more than the patches. Design questions live in `docs/future-features.md`; ideas that
 were rejected live in `docs/dropped-ideas.md`.
 
-> **Nothing is open as of 2026-08-19.** D1 to D4 were all found while testing 0.6.0 and all
-> fixed before it shipped. Three of the four are the same mistake in different clothes, which
-> is the reason to read them together: **present is not working.** An ffmpeg binary that is
-> there and corrupts memory, an encoder the build lists that the hardware cannot run, a
-> `python.exe` that exists and cannot start. Every one of them was a check asking whether
-> something EXISTED when the question was whether it WORKED, and every one was invisible to
-> the test suite because a healthy developer machine answers both the same way.
+> **Nothing is open as of 2026-08-22.** D1 to D4 were all found while testing 0.6.0 and D5
+> while testing 0.6.1; all five were fixed before shipping. Three of the first four are the
+> same mistake in different clothes, which is the reason to read them together: **present is
+> not working.** An ffmpeg binary that is there and corrupts memory, an encoder the build
+> lists that the hardware cannot run, a `python.exe` that exists and cannot start. Every one
+> of them was a check asking whether something EXISTED when the question was whether it
+> WORKED, and every one was invisible to the test suite because a healthy developer machine
+> answers both the same way. **D5 is that family's GUI cousin**: a button that exists, draws
+> and enables, wired to nothing.
 
 ---
 
 ## Contents
 
+- [D5 (fixed): a button that drew, enabled and did nothing](#d5-fixed-a-button-that-drew-enabled-and-did-nothing)
 - [D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning](#d4-fixed-a-local-gpu-below-the-8-gb-minimum-was-offered-with-no-warning)
 - [D1 (fixed): the app would not start after the system Python was uninstalled or reinstalled](#d1-fixed-the-app-would-not-start-after-the-system-python-was-uninstalled-or-reinstalled)
 - [D2 (fixed): NVENC was chosen because the build lists it, not because the machine has it](#d2-fixed-nvenc-was-chosen-because-the-build-lists-it-not-because-the-machine-has-it)
@@ -27,6 +30,44 @@ were rejected live in `docs/dropped-ideas.md`.
 ## Fixed
 
 Kept because the code comments and tests reference these ids.
+
+### D5 (fixed): a button that drew, enabled and did nothing
+
+**Found:** 2026-08-22, by the user, on the first hands-on run of the new "Report an issue"
+review dialog (feature #24). **"Report with this file" did nothing when clicked. "Report
+without it", the button next to it, worked.**
+
+The cause is one name used twice. `DiagnosticsDialog.__init__` sets `self._report = None` (the
+gathered report, filled in later by the background thread), and the handler for the button was
+also called `_report`. `_build` runs immediately after, so `command=self._report` read the
+attribute, not the method, and bound the button to **`None`**.
+
+**Nothing anywhere says so.** Tkinter accepts `command=None` without a warning: the button
+draws normally, `state="normal"` enables it normally, pressing it animates normally, and no
+callback runs. There is no traceback, no log line and no visual difference from a working
+button, which is why the working button beside it is what made the report possible at all.
+
+Two things made it survive to a user. The obvious one is that the collision is invisible in
+review: the assignment is in `__init__` and the `def` is two hundred lines below it, and each
+reads correctly on its own. The subtler one is that this is **not** the ordinary Python
+mistake, which is loud: shadowing a method usually blows up with `TypeError: 'NoneType' object
+is not callable` at the first call. Here the attribute is read at BIND time, long before any
+call, and tkinter's tolerance of `None` converts the crash into silence.
+
+**Fixed** by renaming the handler to `_report_with_file`. The guard is
+`tests/test_gui_command_bindings.py`, which is structural rather than behavioural, because a
+headless test cannot press a button and a test that could press it would still see nothing
+happen:
+
+- no instance attribute in a GUI class may share a name with a method of that class;
+- every `command=self.x` must name a method that actually exists, resolving the base chain
+  through this repo's own classes and then through tkinter's (the first cut skipped any class
+  with an unresolved base, which excluded `DiagnosticsDialog` itself, since it derives from
+  `tk.Toplevel`: the one class the test existed for);
+- and one pin on the specific names, since renaming the method back is precisely the change
+  that reintroduces the defect.
+
+The scan is clean across the whole `gui/` package, so this was the only instance.
 
 ### D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning
 

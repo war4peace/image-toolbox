@@ -116,6 +116,10 @@ Type: filesandordirs; Name: "{app}\ffmpeg"
 ; The bundled libVLC build downloaded by bootstrap.ps1 / vlc_setup.py (in-app playback)
 Type: filesandordirs; Name: "{app}\vlc"
 Type: filesandordirs; Name: "{app}\logs"
+; Diagnostics reports the user generated for a bug report (future-features #24).
+; They are redacted, but they are still the user's data and there is no reason to
+; leave them behind after an uninstall.
+Type: filesandordirs; Name: "{app}\issues"
 Type: filesandordirs; Name: "{app}\scans"
 Type: filesandordirs; Name: "{app}\trcache"
 Type: filesandordirs; Name: "{app}\db"

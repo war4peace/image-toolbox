@@ -60,7 +60,7 @@ from gui.tab_conciliate import ConciliateTab
 
 from gui.tab_stabilize import StabilizeTab
 
-from gui.dialogs import UpdateDialog
+from gui.dialogs import UpdateDialog, open_issue_reporter
 
 from gui.tab_video import VideoTab
 
@@ -247,7 +247,9 @@ class App(tk.Tk):
         link = tk.Label(bar, text="Report an issue", fg="#3a86ff",
                         cursor="hand2", font=("Segoe UI", 9, "underline"))
         link.pack(side="right")
-        link.bind("<Button-1>", lambda _e: report_issue())
+        # #24: this opens the diagnostics REVIEW dialog, not the browser. The user
+        # sees what would be attached before anything is on screen but this window.
+        link.bind("<Button-1>", lambda _e: open_issue_reporter(self))
         # Subtle hover feedback (darker blue) so it reads as a link.
         link.bind("<Enter>", lambda _e: link.configure(fg="#1a5fd0"))
         link.bind("<Leave>", lambda _e: link.configure(fg="#3a86ff"))

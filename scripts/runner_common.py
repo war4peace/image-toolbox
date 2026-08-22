@@ -162,10 +162,20 @@ def fmt_duration(seconds):
 
 
 def fmt_mmss(seconds):
-    """Format a duration as mm:ss - used for per-image elapsed time."""
-    seconds = int(seconds)
+    """Format a duration as mm:ss.mmm - used for per-image elapsed time.
+
+    The milliseconds are not decoration. A per-image time is often UNDER a second
+    (a tag that hit the cache, a skip, a small image), and `mm:ss` rendered every
+    one of those as a flat "00:00", which reads as "no time was recorded" rather
+    than "this was fast" and makes a whole run's worth of them indistinguishable
+    from each other. `00:00.867` says what actually happened.
+
+    Only the per-image displays use this. Totals keep whole seconds (`fmt_hhmmss`,
+    `fmt_duration`), where a millisecond is noise.
+    """
+    seconds = max(0.0, float(seconds))
     m, s    = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
+    return f"{int(m):02d}:{s:06.3f}"
 
 
 def fmt_hhmmss(seconds):

@@ -1,0 +1,14 @@
+# Blank issues stay ENABLED, deliberately.
+#
+# The app's "Report an issue" link opens a pre-filled `/issues/new?body=...` URL
+# with no `template=` parameter (see `gui.common._issue_url` and future-features
+# #24). That URL is what carries the auto-filled diagnostics, and it lands on the
+# blank editor. GitHub currently treats a URL query as a way past the template
+# chooser, but its maintainers call that a defect rather than a contract, so the
+# app's path must not depend on it: leaving blank issues on keeps that route
+# legitimately open.
+#
+# The cost is that some people open blank issues by hand. For a project this size
+# that is a fair trade against silently breaking every installed copy of the app,
+# none of which can be updated to match a change made here.
+blank_issues_enabled: true

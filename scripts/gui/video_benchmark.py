@@ -29,6 +29,7 @@ from gui.common import (APP_ROOT, APP_TITLE, CFG, GUI_MARKER, PYTHON_EXE, SCRIPT
                         fmt_funds, funds_color, config_funds_floor, _FUNDS_GREY,
                         report_issue, contribute_benchmark)
 from gui.widgets import ConsoleBuffer, LogPane, TelemetryRow, Tooltip
+from gui.dialogs import open_issue_reporter
 
 
 def _fmt_hms(seconds):
@@ -670,8 +671,12 @@ class BenchmarkWindow(tk.Toplevel):
         issue = tk.Label(bf, text="Report an issue", fg="#3a86ff",
                          cursor="hand2", font=("Segoe UI", 9, "underline"))
         issue.grid(row=0, column=4, sticky="w", padx=(16, 0))
-        issue.bind("<Button-1>", lambda _e: report_issue(
-            os.path.join(APP_ROOT, "logs", "video_benchmark.log"), "Benchmark log"))
+        # #24: the benchmark log is now ATTACHED to the report (redacted) rather
+        # than pointed at with a "please attach" line, because users do not attach
+        # files. `extra_logs` puts it in the zip alongside the five tool logs.
+        issue.bind("<Button-1>", lambda _e: open_issue_reporter(
+            self, extra_logs=[("benchmark",
+                               os.path.join(APP_ROOT, "logs", "video_benchmark.log"))]))
         issue.bind("<Enter>", lambda _e: issue.configure(fg="#1a5fd0"))
         issue.bind("<Leave>", lambda _e: issue.configure(fg="#3a86ff"))
         self.close_btn = ttk.Button(bf, text="Close", command=self._close)

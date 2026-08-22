@@ -27,9 +27,22 @@ def test_fmt_duration(secs, expected):
     assert rc.fmt_duration(secs) == expected
 
 
-@pytest.mark.parametrize("secs,expected", [(0, "00:00"), (75, "01:15"), (3599, "59:59")])
+@pytest.mark.parametrize("secs,expected", [
+    (0, "00:00.000"), (75, "01:15.000"), (3599, "59:59.000"),
+])
 def test_fmt_mmss(secs, expected):
     assert rc.fmt_mmss(secs) == expected
+
+
+def test_a_sub_second_image_does_not_read_as_no_time_at_all():
+    """Per-image times are routinely under a second (a cached tag, a skip, a small
+    image), and whole seconds rendered every one of them as a flat "00:00" - which
+    reads as "nothing was measured" and makes a run's worth of them
+    indistinguishable. This is the per-image format; totals stay whole-second."""
+    assert rc.fmt_mmss(0.867) == "00:00.867"
+    assert rc.fmt_mmss(0.0004) == "00:00.000"
+    assert rc.fmt_mmss(9.5) == "00:09.500"
+    assert rc.fmt_mmss(59.9994) == "00:59.999"
 
 
 @pytest.mark.parametrize("secs,expected", [(0, "00:00:00"), (3725, "01:02:05"), (90061, "25:01:01")])
@@ -38,8 +51,9 @@ def test_fmt_hhmmss(secs, expected):
 
 
 def test_fmt_truncates_fractional_seconds():
-    assert rc.fmt_mmss(75.9) == "01:15"
+    """The TOTALS still truncate: a millisecond on a multi-hour run is noise."""
     assert rc.fmt_duration(65.9) == "1m 05s"
+    assert rc.fmt_hhmmss(65.9) == "00:01:05"
 
 
 # ── the same functions back every runner (re-export check) ───────────────────
