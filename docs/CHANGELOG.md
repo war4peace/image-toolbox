@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.6.2](#062)
 - [0.6.1](#061)
 - [0.6.0](#060)
 - [0.5.9](#059)
@@ -18,6 +19,29 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.6.2
+
+A single fix, for a bug that affected every installation.
+
+### "Show me the file" opened the wrong folder
+
+Buttons that are supposed to open a folder and highlight a file in it were opening
+your **Documents** folder instead. It affected the new **Report an issue** window
+(both "Report with this file" and "Open folder"), and the film strip's right-click
+*Open image folder* entries.
+
+The app is installed in a folder whose name contains a space, so every installation
+had it. The film strip's version had been broken for a year without anyone noticing,
+because it only shows up when the path contains a space and plenty of photo folders
+do not.
+
+Nothing was lost while it was broken: the diagnostics file was always written
+correctly, the app just pointed you at the wrong window. If you reported an issue on
+0.6.1 and could not find the file, it is in the `issues` folder inside your Image
+Toolbox installation.
 
 ---
 
