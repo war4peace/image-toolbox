@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.6.3](#063)
 - [0.6.2](#062)
 - [0.6.1](#061)
 - [0.6.0](#060)
@@ -19,6 +20,65 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.6.3
+
+GIF pictures and animations, and a much wider choice of upscaling model.
+
+### GIF pictures
+
+A still `.gif` is now accepted by the **Batch Upscaler** and comes back as
+`<name>_gif.png`.
+
+PNG rather than GIF on purpose: a GIF holds at most 256 colours, so writing a 4K
+result back as a GIF would throw away most of what was just computed. A PNG keeps
+every colour and the see-through parts. The `_gif` in the name keeps `logo.gif` and
+`logo.png` in one folder as two separate results instead of one quietly overwriting
+the other, and Conciliation understands the new name and files the PNG back in place
+of the original GIF.
+
+### Animated GIFs are upscaled as video
+
+Drop an animated `.gif` into the **Video Upscaler** and it comes back as
+`<name>_gif_<target>.mp4`.
+
+It belongs on that tab rather than the Batch Upscaler because upscaling frame by
+frame invents the added detail afresh for each picture, which flickers badly once the
+frames are played back. The video path keeps one look across the whole animation.
+
+The original timing is preserved exactly, frame by frame, including animations whose
+frames have uneven delays. See-through parts are filled with a background colour
+(black by default, changeable in **Settings → Video Upscaler**), because video has no
+transparency. Looping information is lost, and Conciliation will never replace an
+animated GIF with the video.
+
+The Batch Upscaler no longer just refuses an animated GIF: it names the Video
+Upscaler as the tool for the job.
+
+### Ten upscaling models to choose from, described
+
+The Video Upscaler's **Method** picklist now offers ten SeedVR2 models, from the 7B
+family for the best detail down to small quantised versions that fit a modest card.
+Five of them were already downloadable and ready to use; nothing in the app had ever
+listed them.
+
+Each is now described by what it is good for, in the picklist itself:
+"7B FP16 (best detail, default)", "3B Q4 (smallest, lowest VRAM)". Previously the
+list named the weight and nothing else, which told you nothing unless you already
+knew.
+
+The **Benchmark GPU** window can measure several models in one run, so they can be
+compared on your own card under identical conditions. On a rented pod that reuses a
+single pod rather than renting one per model.
+
+### Smaller things
+
+A card that had proven it could reach a given size was being trusted too broadly:
+the proof is now matched to the model and the settings it was measured under. On the
+author's RTX 3090 this stops a compiled run being offered 1080p that only the
+uncompiled measurements supported.
 
 ---
 
