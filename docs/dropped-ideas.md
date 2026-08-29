@@ -28,6 +28,7 @@ Source for the open roadmap: `docs/future-features.md`.
 - [Processing alpha, multi-page and high-bit-depth images](#processing-alpha-multi-page-and-high-bit-depth-images-2026-07-29)
 - [Managing the network volume via the RunPod S3 API](#managing-the-network-volume-via-the-runpod-s3-api-2026-07-29)
 - [Folding a RAW render back into the source tree](#folding-a-raw-render-back-into-the-source-tree-2026-07-30)
+- [A second upscaling engine: every candidate except SeedVR2](#a-second-upscaling-engine-every-candidate-except-seedvr2-2026-08-23)
 - [Standing constraints](#standing-constraints)
 
 ---
@@ -817,6 +818,108 @@ returns. The render is `<stem>_raw.jpg`, chosen so a RAW and its sibling camera 
 map to the same output. #19's original text said the folded-in file should be
 `<stem>_upscaled.jpg`, which was written when the plan assumed RAW files get upscaled; on the
 measured behaviour that name would be **false on nearly every file**.
+
+<div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
+
+---
+
+## A second upscaling engine: every candidate except SeedVR2 (2026-08-23)
+
+**The idea.** The app leans on SeedVR2 alone for diffusion upscaling with temporal
+consistency. TBG ETUR (`Ltamann/ComfyUI-TBG-ETUR`) was raised as a specific candidate,
+with a general "branch out, offer alternatives" behind it. A full survey was run.
+
+**Result: every surveyed alternative is dropped.** Not one of them is close. What the
+survey did establish is that the *category* is thinner than it looks from the outside,
+and that is the finding worth keeping, because "surely there is another good upscaler
+by now" is a question that will come back.
+
+### TBG ETUR: four independent disqualifiers
+
+Read off the repository, not the marketing. Any one of these ends it.
+
+1. **No licence, plus a no-redistribution ToS.** There is no LICENSE file (the GitHub
+   API reports `license: null`). What ships instead is `tos.md`, section 6: *"You may
+   not reproduce, modify, redistribute, or reverse-engineer any part of the Service
+   without express permission."* Governing law Spain. This app vendors its engine into
+   the repo and ships it inside an Inno Setup installer, which is redistribution.
+2. **The core is a compiled binary.** `TBG/TBG_APP/` holds 20 prebuilt `.pyd`/`.so`
+   blobs, one per Python 3.10-3.14 per platform, and no source. An opaque native blob
+   in an app whose promise is that everything runs locally and inspectably.
+3. **A licence server in the upscale path.** PRO features need an active Patreon
+   membership validated against the author's server, which by its own privacy policy
+   logs Patreon ID, email, IP and request volume. Access is revocable at the provider's
+   sole discretion, without notice, *including for paying members* (ToS 1, 4, 8, 13).
+   A user's batch would fail when a membership lapses. The app's one hard external
+   dependency today (RunPod) is opt-in, per-run, and the user's own account.
+4. **It does not solve the stated problem.** It is **image-only**, so temporal
+   consistency is untouched. And it is not an upscaling model at all: it is a tiled
+   ComfyUI node pack that orchestrates FLUX.1 / FLUX 2 / Krea 2 / SDXL / Qwen Image.
+   Those carry non-commercial research licences, so even if TBG itself were open, the
+   models it drives are the real redistribution problem. It also requires ComfyUI,
+   against the app's headline decision to run SeedVR2 in-process without it, and its
+   `requirements.txt` pulls diffusers, transformers, accelerate, bitsandbytes, optimum,
+   kornia, timm, omegaconf, opencv twice, triton and a dozen more.
+
+The Patreon post (HTTP 403) and tbgetur.com could not be read, so tier pricing is
+unconfirmed. It does not matter: disqualifiers 1 and 2 come straight off the repo.
+
+### FlashVSR: the only near-miss, and why it still misses
+
+`OpenImagingLab/FlashVSR`, Apache-2.0, CVPR 2026 (arXiv 2510.12747), actively developed.
+Found inside TBG's own `py/vendor/flashvsr_ultra_fast/`. The first one-step **streaming**
+diffusion VSR framework: ~17 FPS at 768x1408 on an A100, up to ~12x faster than prior
+one-step diffusion VSR. Code Apache-2.0 and the Wan2.1 VAE it carries is Apache-2.0 too,
+so unlike everything else here the licence is genuinely fine. Fixed 4x, which would slot
+into the `fixed_ratio` seam that **#11** already built and shipped.
+
+**Why dropped anyway.** It buys speed, and speed is the axis this app cares least about:
+runs are unattended, already budgeted in GPU hours, and paced by a queue. Against that it
+costs: a custom CUDA kernel (`mit-han-lab/Block-Sparse-Attention`) compiled from source,
+where third-party ports that skip it fall back to dense attention and the authors warn
+this visibly degrades quality at higher resolutions, so the cheap path is also the wrong
+one; Windows support that exists only as unofficial community wheels, which fails the
+standing hash-pin rule on principle; Python 3.11 pinned upstream against this app's 3.12;
+and A100-oriented tuning with consumer-card behaviour unstated. Most decisively, a direct
+A/B in numz's own SeedVR2 repo (discussion #219) found **SeedVR2 better overall**:
+FlashVSR is good on close-up faces but distorts distant faces and struggles with
+inanimate objects, and the tester needed two days and Tiled VAE to fit 16 GB.
+
+**Revisit if** two things become true together: an *official* Windows Block-Sparse-Attention
+distribution exists (not community wheels), and a release closes the measured quality gap.
+Speed alone does not pay for a second engine here. If it is ever built, build it
+**remote-first**: the pod is Linux with a known CUDA image, which is where that kernel
+actually compiles, and it sidesteps the Windows question entirely until the local path
+earns itself.
+
+### The rest, and the two patterns that explain them
+
+| Candidate | Kind | Licence | Last push | Why dropped |
+|---|---|---|---|---|
+| STAR (`NJU-PCALab/STAR`) | video diffusion | **none** | 2025-07 | no licence, stale |
+| Upscale-A-Video | video diffusion | NOASSERTION | 2024-09 | superseded, custom licence |
+| VEnhancer | video enhancement | **none** | 2024-09 | abandoned, no licence |
+| InfVSR | streaming VSR | tbd | paper only | not implemented |
+| SUPIR | **image**, SDXL | NOASSERTION | 2025-05 | image-only, non-commercial model |
+| Clarity Upscaler | **image**, SD tiled | **AGPL-3.0** | 2025-03 | AGPL would infect the whole app |
+
+**Pattern 1: the academic video upscalers rot, and most ship no licence.** STAR,
+Upscale-A-Video and VEnhancer are all 1-2 years stale and two of the three have no
+LICENSE file. A research repo with no licence is not "permissive by default", it is
+all-rights-reserved by default. Of everything surveyed, only SeedVR2 and FlashVSR are
+both alive and licensed. That is the whole field.
+
+**Pattern 2: the image-side "Magnific alternatives" are a different product.** SUPIR and
+Clarity hallucinate detail from a text prompt at high denoise. That is the opposite of
+this app's promise, which is reviving a real photo, not reimagining it. The distinction
+is the same one that decided **#17**: guessing at pixels the user did not have is how
+quiet loss happens, and here it would be the headline feature.
+
+**Revisit the category** only on a named model that is (a) permissively licensed in code
+*and* weights, (b) temporally aware, and (c) measurably better than SeedVR2 rather than
+merely faster. Absent (c), the answer is no, because the engine seam being cheap (**#11**
+made it cheap) is not a reason to spend a second set of weights, a second benchmark
+corpus and a second set of VRAM tiers on a worse result.
 
 <div align="right"><a href="#dropped-ideas--constraints">↑ Back to top</a></div>
 

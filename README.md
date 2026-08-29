@@ -84,6 +84,11 @@ git clone https://github.com/war4peace/image-toolbox
 cd image-toolbox
 git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler seedvr2
 
+# Pin the engine to the version the app is built against: SeedVR2 v2.5
+# (commit 4490bd1 = v2.5.24). The installer pins the same commit, so checking
+# it out here keeps a from-source setup identical to a normal install.
+git -C seedvr2 checkout 4490bd1f482e026674543386bb2a4d176da245b9
+
 # 2. Create the Python environment (Python 3.12, NVIDIA GPU required).
 py -3.12 -m venv .venv
 .venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
