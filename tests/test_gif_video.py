@@ -436,3 +436,28 @@ def test_only_an_ANIMATED_gif_gets_the_pointer():
     # A transparent ANIMATED GIF is animated, so it does get the pointer.
     assert "Video Upscaler" in bu.variant_next_step(
         "both.gif", "would lose transparency, 5 of 6 frames")
+
+
+def test_the_scan_records_a_gifs_real_frame_count(tmp_path):
+    """A GIF container declares no frame count, so a metadata-only probe leaves it None
+    and the tab reads `nb_frames or 0`: the scan list shows "?" and the cost estimate
+    counts the job as ZERO frames. Under-reporting is the wrong direction for a number
+    a "confirm before renting a pod" dialog quotes, and the right value is a header read
+    away. It must be the SOURCE count (what the run actually pays), not the inflated
+    CFR-normalised one."""
+    import sqlite3
+    import batch_video_upscale as bv
+    import db as _db
+
+    src = tmp_path / "src"
+    src.mkdir()
+    g = _gif(src / "a.gif", MESSY)                 # 10 frames, normalises to 38
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_db.SCHEMA)
+    rid = _db.get_video_root_id(conn, str(src), str(tmp_path / "out"))
+
+    row = bv.scan_file(conn, rid, g, "a.gif")
+    assert row["nb_frames"] == len(MESSY)
+    assert row["nb_frames"] != 38, "the CFR-normalised count is not what the run pays"

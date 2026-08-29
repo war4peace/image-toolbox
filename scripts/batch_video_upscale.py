@@ -1319,10 +1319,22 @@ def scan_file(conn, root_id, abs_path, rel):
         info = vp.probe(abs_path)                 # fast: metadata only, count=False
     except Exception:
         return None
+    # A GIF container carries no frame count, so a metadata-only probe leaves it None
+    # like any other format that does not declare one -- but for a GIF the real count is
+    # a HEADER READ away (Pillow n_frames), and it is the number that matters twice: the
+    # scan list shows "?" without it, and the cost/duration estimate reads
+    # `nb_frames or 0`, so a GIF queue would be estimated at ZERO frames. Under-reporting
+    # is the wrong direction for anything a "confirm before renting a pod" dialog quotes.
+    # It is also the count the run really pays: prepare() writes one frame per source
+    # frame, deliberately, so this is not the inflated CFR-normalised number.
+    nb = None
+    if os.path.splitext(rel)[1].lower() == gif_video.GIF_EXT:
+        nb = len(gif_video.frame_delays(abs_path)) or None
     db.upsert_video_file(conn, root_id, rel,
                          width=info.width, height=info.height,
                          vcodec=info.vcodec, acodec=info.acodec,
                          fps=float(info.fps), duration=info.duration,
+                         nb_frames=nb,
                          mtime=round(st.st_mtime, 3), size=st.st_size,
                          probe_version=db.VIDEO_PROBE_VERSION)
     return db.get_video_file(conn, root_id, rel)
