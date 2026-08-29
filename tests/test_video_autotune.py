@@ -159,10 +159,13 @@ def _learn_key(vcfg, gpu="GPU-TEST"):
     """The video_batch_learn key the runner will read for this config, derived the way
     process_job derives it rather than spelled out here. A literal "GPU-TEST" used to work
     only because the key happened to be the bare card id; it stopped the moment the VRAM
-    regime joined the key, and a test that hardcodes a key cannot notice that it moved.
+    regime joined the key, and it moved again in 0.6.3 when the MODEL joined it (#26 Part A,
+    so a multi-model sweep or a mixed-model queue cannot hand one model's ceiling to
+    another). A test that hardcodes a key cannot notice either move.
     """
     import video_vram_sizer as sizer
-    return gpu + sizer.learn_tag(bv._engine_flags(vcfg))
+    return (f"{gpu}|{sizer.model_tag(vcfg.get('dit_model'))}"
+            + sizer.learn_tag(bv._engine_flags(vcfg)))
 
 
 @needs_ffmpeg

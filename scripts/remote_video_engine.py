@@ -127,7 +127,7 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
 
     def probe_batch(self, src_path, dest_path, *, resolution, batch, overlap=None,
                     frames=None, poll_interval=5, should_stop=None, on_progress=None,
-                    warmup_src=None):
+                    warmup_src=None, model=None):
         """Benchmark primitive (feature #7, docs/local-video-upscaler.md section 22):
         stream one short clip to the pod's /video/probe, measure ONE fixed-batch window,
         and return the outcome dict. This is the SAME contract as
@@ -150,11 +150,16 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
         resident worker already spares us the per-rung model load; only torch.compile is per
         shape), so a short warmup clip would have to be cut and uploaded per rung -- not worth
         the transfer against the pod's smaller warmup cost. The local short-warmup lives where
-        the saving is large (a fresh process per rung)."""
+        the saving is large (a fresh process per rung).
+
+        `model` names the SeedVR2 DiT this probe must measure (#26 Part A). The worker
+        reloads only on a MISMATCH, so a single-model sweep pays nothing and a multi-model
+        sweep costs one swap per model instead of one POD per model. None = whatever the pod
+        loaded at boot, which is what every pre-0.6.3 caller means."""
         ext = os.path.splitext(src_path)[1] or ".mkv"
         b = int(batch)
         ov = -1 if overlap is None else int(overlap)         # -1 = the pod's AUTO overlap
-        job_id = self._submit_probe(src_path, ext, resolution, b, ov)
+        job_id = self._submit_probe(src_path, ext, resolution, b, ov, model)
         return self._await_probe(job_id, b, poll_interval, should_stop, on_progress)
 
     # ── protocol steps ──────────────────────────────────────────────────────
@@ -249,11 +254,13 @@ class RemoteVideoEngine(RemoteUpscaleEngine):
 
     # ── probe steps (remote benchmark, section 22) ───────────────────────────
 
-    def _submit_probe(self, src_path, ext, resolution, batch, overlap):
+    def _submit_probe(self, src_path, ext, resolution, batch, overlap, model=None):
         """Upload the probe clip to /video/probe (streamed straight from the file, like
         _submit) and return the job id. Raises RemoteVideoError on a transport failure."""
         q = (f"?resolution={int(resolution)}&batch_size={int(batch)}"
              f"&temporal_overlap={int(overlap)}&ext={ext}")
+        if model:                                      # the DiT to measure (#26 Part A)
+            q += f"&model={urllib.parse.quote(str(model))}"
         size = os.path.getsize(src_path)
         try:
             with open(src_path, "rb") as body:

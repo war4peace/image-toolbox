@@ -82,6 +82,23 @@ _MODE = "full"          # "full" (SeedVR2 + /upscale), "tag" (/orient only),
 _ESR_ENGINE = None
 _ESR_MODEL = None
 _ESR_LOCK = threading.Lock()
+# SeedVR2 model swapping (0.6.3, #26 Part A). The worker loads ONE DiT at startup from
+# worker_settings.json, which was fine while a pod served one model. It no longer is: the
+# multi-model benchmark sweeps several DiTs in one run, and a mixed-model video QUEUE groups
+# by (engine, gpu) with the model NOT in the key. Both used to run every job on whatever was
+# loaded at boot -- the benchmark would have filed one model's numbers under another's, and a
+# queue silently upscaled with a model the user did not pick. So a job may now name its DiT
+# and the worker reloads on a MISMATCH only.
+#
+# This is NOT the esrgan pattern despite looking like it. An esrgan weight is ~65 MB and
+# swaps in about a second; a SeedVR2 DiT is 1.9 to 15.4 GiB and costs a minute or two. That
+# is still far cheaper than the alternative (terminate the pod, deploy another, mount the
+# volume, load) and it is the whole reason one pod can sweep ten models. But it means a swap
+# is worth AVOIDING, so the boot-loaded model is kept when a job does not ask for another,
+# and an omitted `model` is "whatever is loaded", never a reload.
+_ENGINE_SETTINGS = None     # the boot settings dict, so a reload overrides only dit_model
+_ENGINE_ARGS = None         # (repo_dir, model_dir), likewise
+_ENGINE_MODEL = None        # the dit_model currently resident
 _GPU_NAME = None        # esrgan mode has no resident _ENGINE to name the card, so /health
                         # reads this (queried once at startup); the card identity matters
                         # for the wide-GPU benchmarking this mode exists for (#18 B)
@@ -821,6 +838,53 @@ def _get_esr_engine(model_key):
     return _ESR_ENGINE
 
 
+def _ensure_video_model(dit_model):
+    """Make `dit_model` the resident SeedVR2 DiT, reloading the engine only if a DIFFERENT
+    one is loaded. Returns the engine. Call INSIDE _GPU_LOCK: it frees and rebuilds the very
+    thing every other GPU path is using.
+
+    A falsy `dit_model` means "whatever is loaded" and never reloads, so every pre-0.6.3
+    client keeps the exact boot behaviour. An unknown or undownloadable weight RAISES rather
+    than falling back to the loaded one: for a benchmark, quietly measuring a different model
+    than the one asked for is worse than failing (the numbers would be filed under the wrong
+    key and believed), and for a real job it is the silent wrong-model upscale this exists to
+    stop.
+
+    The old engine is closed BEFORE the new one is built. Holding both would need up to
+    30.7 GiB of weights for a 7B-to-7B swap, which no card this runs on has spare."""
+    global _ENGINE, _ENGINE_MODEL
+    want = (dit_model or "").strip()
+    if not want or want == _ENGINE_MODEL:
+        return _ENGINE
+    if _ENGINE_SETTINGS is None or _ENGINE_ARGS is None:
+        raise RuntimeError("worker cannot swap models (no SeedVR2 engine was loaded)")
+    repo_dir, model_dir = _ENGINE_ARGS
+    _log(f"model swap: {_ENGINE_MODEL or '?'} -> {want} (unloading, then loading)")
+    t0 = time.time()
+    if _ENGINE is not None:
+        try:
+            _ENGINE.close()
+        except Exception as exc:                       # noqa: BLE001 (best-effort teardown)
+            _log(f"  (close of the previous engine raised {type(exc).__name__}; continuing)")
+    _ENGINE = None
+    _ENGINE_MODEL = None
+    _empty_cuda_cache()
+    from upscale_engine import UpscaleEngine, ensure_seedvr2_weights
+    # Pre-fetch with the verified/resumable downloader before the engine's own, exactly as
+    # startup does: an off-list weight is NOT on the volume and seedvr2's downloader stalls
+    # silently. Then seed the validation cache so the trusted volume is not re-hashed.
+    try:
+        ensure_seedvr2_weights(model_dir, want, log=lambda m: _log("  " + str(m)))
+    except Exception as exc:                           # noqa: BLE001 (engine retries its own)
+        _log(f"  pre-download of {want} failed ({type(exc).__name__}); the engine will try")
+    _seed_validation_cache(model_dir, want)
+    settings = {**_ENGINE_SETTINGS, "dit_model": want}
+    _ENGINE = UpscaleEngine(repo_dir, model_dir, settings)
+    _ENGINE_MODEL = want
+    _log(f"model swap complete in {time.time() - t0:.1f}s ({want} on {_ENGINE.device_name})")
+    return _ENGINE
+
+
 def _run_esrgan_job(job, params):
     """Upscale one segment with a fixed-ratio Real-ESRGAN model (#18 B): no SeedVR2, no batch/
     overlap tuning (the engine does its own tiled OOM back-off). Mirrors _run_video_job's
@@ -906,10 +970,13 @@ def _run_video_job(job, params):
                 # must include every failed higher-batch attempt, not just the final
                 # successful one. Resetting t0 per attempt (the old bug) hid that waste,
                 # making a segment that OOM-recovered look far cheaper than it was billed.
+                # Honour a job-named DiT before anything is timed: a swap is minutes and
+                # must not be charged to the segment's rate.
+                _eng = _ensure_video_model(job.get("model"))
                 t0 = time.time()
                 while True:
                     try:
-                        n = _ENGINE.process_video(
+                        n = _eng.process_video(
                             job["input"], job["output"],
                             resolution=params["resolution"],
                             batch_size=params["batch_size"],
@@ -1024,6 +1091,10 @@ def _run_probe_job(job, params):
     try:
         with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
             with _GPU_LOCK:
+                # Swap BEFORE the peak reset: a reload allocates the new weights, and that
+                # allocation belongs to no probe (it would inflate the first rung's peak and
+                # so the measured ceiling for the whole cell).
+                _eng = _ensure_video_model(job.get("model"))
                 try:
                     import torch
                     torch.cuda.reset_peak_memory_stats()   # spans the warmup too, on purpose
@@ -1031,7 +1102,7 @@ def _run_probe_job(job, params):
                     pass
 
                 def _pass():
-                    return _ENGINE.process_video(
+                    return _eng.process_video(
                         job["input"], job["output"], resolution=params["resolution"],
                         batch_size=b, chunk_size=chunk, temporal_overlap=o,
                         seed=params["seed"], video_backend=params["video_backend"],
@@ -1409,6 +1480,9 @@ class Handler(BaseHTTPRequestHandler):
                 "error": None,
                 "started": time.time(),
                 "last_output_t": time.time(),
+                # The DiT this probe measures (#26 Part A). Absent = whatever is loaded,
+                # which is what every pre-0.6.3 client sends.
+                "model": q.get("model", [""])[0] or None,
             }
             _VIDEO_JOB = job
             threading.Thread(target=_run_probe_job, args=(job, params),
@@ -1515,6 +1589,7 @@ def _ctype_for(ext):
 
 def main(argv=None):
     global _ENGINE, _HEARTBEAT, _VERSION, _MODE, _GPU_NAME
+    global _ENGINE_SETTINGS, _ENGINE_ARGS, _ENGINE_MODEL
     p = argparse.ArgumentParser(description="Resident upscale worker for a RunPod pod.")
     p.add_argument("--repo-dir", required=True)
     p.add_argument("--model-dir", required=True)
@@ -1570,7 +1645,13 @@ def main(argv=None):
              f"models={args.model_dir}) …")
         t0 = time.time()
         _ENGINE = UpscaleEngine(args.repo_dir, args.model_dir, settings)
-        _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name}")
+        # Remember what built it, so a job naming a different DiT can rebuild with only
+        # dit_model changed (_ensure_video_model). Every other setting stays as pushed.
+        _ENGINE_SETTINGS = settings
+        _ENGINE_ARGS = (args.repo_dir, args.model_dir)
+        _ENGINE_MODEL = settings.get("dit_model", "seedvr2_ema_7b_fp16.safetensors")
+        _log(f"engine ready in {time.time() - t0:.1f}s on {_ENGINE.device_name} "
+             f"(model {_ENGINE_MODEL})")
         _touch(_HEARTBEAT)                        # ready = first heartbeat
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)

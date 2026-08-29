@@ -21,6 +21,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import db
+import seedvr2_models as _seedvr2_models
 import video_benchmark as vb
 import video_estimate as ve
 import video_vram_sizer as sizer
@@ -110,6 +111,12 @@ class BenchmarkWindow(tk.Toplevel):
         self._methods = _benchmark_methods()
         self._method_label_to_val = {lbl: (e, t) for lbl, e, t in self._methods}
         self._engine, self._tier = method or self._default_method()
+        # The SeedVR2 DiTs this window will sweep (#26 Part A). Defaults to the CONFIGURED
+        # model alone, never to all ten: a SeedVR2 sweep is hours per model and, on a pod,
+        # billed, so "measure everything" has to be chosen (the Models… picker), unlike
+        # Real-ESRGAN where all tiers is the cheap and correct default.
+        self._sweep_models = [ (CFG.get("video", {}) or {}).get("dit_model")
+                               or vb.DEFAULT_MODEL ]
         self._configure_method()            # sets self._cells + self._ratio_tokens
         # Per-compile-mode video_bench keys + whether compile-ON is benchmarkable on THIS machine.
         # Resolved via the runner's own helpers so the table reads exactly the keys the runner writes.
@@ -274,25 +281,50 @@ class BenchmarkWindow(tk.Toplevel):
             self._bench_keys = {t: vb.esrgan_bench_model(t) for t in tiers}
             self._display_modes = list(tiers)
             return
-        self.model_tag = sizer.model_tag(CFG.get("video", {}).get(
-            "dit_model", "seedvr2_ema_7b_fp16.safetensors"))
+        # SeedVR2 (#26 Part A): a regime is a (model, compile) pair, so the keys are resolved
+        # per SELECTED model and the row token carries both (vb.mode_token). With one model
+        # selected the tokens stay "off"/"on", byte-identical to pre-0.6.3, so a reopened
+        # window still matches the rows an older build wrote.
+        models = self._sweep_models or [vb.DEFAULT_MODEL]
+        self.model_tag = (sizer.model_tag(models[0]) if len(models) == 1
+                          else f"{len(models)} models")
+        self._bench_keys = {}
+        self._display_modes = []
         try:
-            if self.remote:
-                key = vb.resolve_bench_key(remote=True, log_fn=lambda *_a, **_k: None)
-                mode = "on" if (key.endswith("|c") or key.endswith("|cd")) else "off"
-                self._bench_keys = {mode: key}
-                self._display_modes = [mode]
-            else:
-                keys = vb.resolve_bench_keys(remote=False, log_fn=lambda *_a, **_k: None)
-                self._bench_keys = {"off": keys["off"]}
-                self._display_modes = ["off"]
-                self._compile_available = bool(keys.get("compile_available"))
-                self._compile_why = keys.get("compile_why")
-                if self._compile_available and keys.get("on"):
-                    self._bench_keys["on"] = keys["on"]
-                    self._display_modes.append("on")
-        except Exception:                              # noqa: BLE001 (a working window beats a right key)
-            self._bench_keys = {"off": self.model_tag}
+            for mdl in models:
+                if self.remote:
+                    key = vb.resolve_bench_key(remote=True, log_fn=lambda *_a, **_k: None,
+                                               model=mdl)
+                    on = key.endswith("|c") or key.endswith("|cd")
+                    tok = vb.mode_token(mdl, on, multi=len(models) > 1)
+                    self._bench_keys[tok] = key
+                    self._display_modes.append(tok)
+                else:
+                    keys = vb.resolve_bench_keys(remote=False, log_fn=lambda *_a, **_k: None,
+                                                 model=mdl)
+                    tok_off = vb.mode_token(mdl, False, multi=len(models) > 1)
+                    self._bench_keys[tok_off] = keys["off"]
+                    self._display_modes.append(tok_off)
+                    # Compile availability is a property of the MACHINE, not of the model, so
+                    # the last model's answer is every model's answer.
+                    self._compile_available = bool(keys.get("compile_available"))
+                    self._compile_why = keys.get("compile_why")
+                    if self._compile_available and keys.get("on"):
+                        tok_on = vb.mode_token(mdl, True, multi=len(models) > 1)
+                        self._bench_keys[tok_on] = keys["on"]
+                        self._display_modes.append(tok_on)
+        except Exception as exc:                       # noqa: BLE001 (a working window beats a right key)
+            # LOG IT. This fallback is correct (a window that opens beats a right key) but it
+            # is silent by construction, and it has already hidden a real defect once: a
+            # `model=` argument added to resolve_bench_keys but not to resolve_bench_key made
+            # every REMOTE multi-model window raise TypeError in here and quietly collapse to
+            # one row, which looks exactly like "the sweep only found one model".
+            try:
+                from debug_log import debug_log
+                debug_log("gui.video_benchmark._resolve_keys", exc=exc)
+            except Exception:                          # noqa: BLE001 (an old install has no debug_log)
+                pass
+            self._bench_keys = {"off": sizer.model_tag(models[0])}
             self._display_modes = ["off"]
 
     def _bench_key(self, mode):
@@ -301,17 +333,33 @@ class BenchmarkWindow(tk.Toplevel):
         return self._bench_keys.get(mode)
 
     def _run_modes(self):
-        """The compile modes the NEXT run will benchmark. LOCAL: the no-compile baseline always,
-        plus compile-ON when 'Also use Torch Compile' is ticked (and available). REMOTE: the single
-        config-derived mode (the runner reads config; no --compile-modes is passed)."""
+        """The ROW TOKENS the NEXT run will benchmark, one per regime it will sweep. Both
+        callers (the estimate and Start's row-clearing) key on these, so they must be the same
+        tokens _ensure_row uses, not the bare compile modes they used to be before a regime
+        grew a model axis (#26 Part A).
+
+        LOCAL: the no-compile baseline always, plus compile-ON when 'Also use Torch Compile'
+        is ticked (and available), crossed with every selected model. REMOTE: the single
+        config-derived compile mode per model (the runner reads config; no --compile-modes)."""
         if self.is_esrgan:
             return list(self._display_modes)            # a single mode: the tier (no compile)
         if self.remote:
             return list(self._display_modes)
-        modes = ["off"]
+        comps = [False]
         if self._compile_available and self.also_compile_var.get():
-            modes.append("on")
-        return modes
+            comps.append(True)
+        models = self._sweep_models or [vb.DEFAULT_MODEL]
+        multi = len(models) > 1
+        return [vb.mode_token(m, c, multi=multi) for m in models for c in comps]
+
+    def _run_compile_modes(self):
+        """The distinct compile modes in _run_modes, for the runner's --compile-modes flag."""
+        seen = []
+        for tok in self._run_modes():
+            _mk, comp = vb.split_mode_token(tok)
+            if comp not in seen:
+                seen.append(comp)
+        return seen or ["off"]
 
     def _also_compile_tip_text(self):
         """Dynamic tooltip for the 'Also use Torch Compile' checkbox: what it does, or why it is
@@ -381,6 +429,27 @@ class BenchmarkWindow(tk.Toplevel):
         base_row = (len(tokens) + cols - 1) // cols
         span = max(cols, 1)
         if not self.is_esrgan:
+            # Models… (#26 Part A). A BUTTON, not ten checkboxes: the list is long, the common
+            # case is one model, and the count on the button is the honest summary of a choice
+            # that multiplies the run's length (and, on a pod, its bill) by the number picked.
+            mrow = ttk.Frame(holder)
+            mrow.grid(row=base_row, column=0, columnspan=span, sticky="w", pady=(6, 0))
+            self.models_btn = ttk.Button(mrow, text="Models…", command=self._pick_models)
+            self.models_btn.pack(side="left")
+            self.models_lbl = ttk.Label(mrow, text="")
+            self.models_lbl.pack(side="left", padx=(8, 0))
+            self._toggles.append(self.models_btn)       # locked while a run is in flight
+            Tooltip(self.models_btn,
+                    "Which SeedVR2 model(s) to benchmark.\n\n"
+                    "Pick several to compare them on this card: each is measured separately "
+                    "and gets its own row, so you can see which gives the best quality per "
+                    "second and per GB of VRAM before committing a long run to one of them.\n\n"
+                    "Every extra model multiplies the sweep's length. On a rented pod they all "
+                    "run on ONE pod (the model is swapped on it, a minute or two each) rather "
+                    "than a new pod per model, so the extra cost is the sweep time, not the "
+                    "pod setup.", wraplength=Tooltip.WRAP_NARROW)
+            self._refresh_models_label()
+            base_row += 1
             # "Also use Torch Compile": benchmark both compile modes at once (SeedVR2 only).
             self.also_compile_var.set(bool(self._compile_available and not self.remote))
             self.also_compile_cb = ttk.Checkbutton(
@@ -420,8 +489,7 @@ class BenchmarkWindow(tk.Toplevel):
         self._rebuild_targets()
         self._rebuild_rows()
         if self.gpu_id:
-            self.header_var.set(
-                f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
+            self._refresh_header()
             self._default_check_targets()
         self._refresh_estimate()
 
@@ -535,8 +603,10 @@ class BenchmarkWindow(tk.Toplevel):
         ttk.Label(filt, text="Filter:").pack(side="left")
         self.filter_mode_var = tk.StringVar(value="All")
         self.filter_target_var = tk.StringVar(value="All")
+        self.filter_model_var = tk.StringVar(value="All")
         self._filter_combos = {}
-        for label, var, width in (("Torch Compile", self.filter_mode_var, 8),
+        for label, var, width in (("Model", self.filter_model_var, 14),
+                                  ("Torch Compile", self.filter_mode_var, 8),
                                   ("Target", self.filter_target_var, 12)):
             ttk.Label(filt, text=f"  {label}:").pack(side="left")
             cb = ttk.Combobox(filt, textvariable=var, state="readonly",
@@ -549,7 +619,8 @@ class BenchmarkWindow(tk.Toplevel):
 
         # Column one is "Torch Compile" (ON/OFF): each target gets a row per benchmarked compile
         # mode. The tree column (#0) carries it; "Target" is the first data column.
-        cols = ("target", "ceiling", "saved", "overlap", "spf", "peak", "status", "runtime")
+        cols = ("model", "target", "ceiling", "saved", "overlap", "spf", "peak", "status",
+                "runtime")
         self.tree = ttk.Treeview(rf, columns=cols, show="tree headings", height=6)
         self.tree.column("#0", width=100, minwidth=90, stretch=False, anchor="center")
         # Click any header (incl. Torch Compile/#0) to view-sort by that column (toggles
@@ -561,7 +632,8 @@ class BenchmarkWindow(tk.Toplevel):
         # actually runs (the fastest window, which can be lower: the ceiling rides VRAM spill).
         # "Runtime" = the GPU time this cell's probes took (summed from the saved probes, so it
         # persists and re-accumulates correctly on resume).
-        for c, txt, w in (("target", "Target", 104), ("ceiling", "Max batch", 84),
+        for c, txt, w in (("model", "Model", 108), ("target", "Target", 104),
+                          ("ceiling", "Max batch", 84),
                           ("saved", "Used", 60), ("overlap", "Overlap", 66),
                           ("spf", "s/frame", 74), ("peak", "Peak VRAM", 104),
                           ("status", "Status", 170), ("runtime", "Runtime", 78)):
@@ -710,6 +782,20 @@ class BenchmarkWindow(tk.Toplevel):
             self.after(0, lambda: self._fill_gpu(g, name))
         threading.Thread(target=work, daemon=True).start()
 
+    def _refresh_header(self):
+        """The card + VRAM + model line. ONE formatter for what used to be two copies of the
+        same f-string and would have become three: the model half is no longer fixed for the
+        window's lifetime (the Models… picker changes it), so a copy left behind would show a
+        stale model against live results. Fail-safe: called before the header exists during
+        construction."""
+        # "model 7b" reads right for one, "model 3 models" does not, so the noun moves.
+        n = len(self._sweep_models or [])
+        what = f"{n} models" if (n > 1 and not self.is_esrgan) else f"model {self.model_tag}"
+        try:
+            self.header_var.set(f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — {what}")
+        except Exception:                              # noqa: BLE001 (header not built yet)
+            pass
+
     def _fill_gpu(self, g, name):
         if not g:
             self.header_var.set("No NVIDIA GPU detected — local benchmark unavailable.")
@@ -717,7 +803,7 @@ class BenchmarkWindow(tk.Toplevel):
             return
         self.gpu_id = name or "local"
         self.total_vram_gb = round((g.get("gpu_total_mb") or 0) / 1024.0)
-        self.header_var.set(f"{self.gpu_id} — {self.total_vram_gb} GB VRAM — model {self.model_tag}")
+        self._refresh_header()
         # Default-check the targets this card can plausibly reach (all stay toggleable). SeedVR2:
         # every feasible LANDSCAPE 4:3 ladder cell + the presets a big card can do. Real-ESRGAN:
         # every native ratio (it is light). See _default_check_targets.
@@ -820,12 +906,27 @@ class BenchmarkWindow(tk.Toplevel):
     def conn(self):
         return db.get_conn()
 
+    def _model_cell(self, mode):
+        """The Model column's text for a row token. ESRGAN has no model axis (its tier IS the
+        mode), and a single-model SeedVR2 sweep names the one model it swept, so the column is
+        never blank and never lies about which weights produced the row."""
+        if self.is_esrgan:
+            return ""
+        model_key, _comp = vb.split_mode_token(mode)
+        if not model_key:                              # single-model sweep: token is just off/on
+            spec = _seedvr2_models.by_filename((self._sweep_models or [vb.DEFAULT_MODEL])[0])
+            return spec.key if spec else ""
+        return model_key
+
     def _ensure_row(self, target, mode):
         key = (target, mode)
         if key not in self._rows:
+            _mk, comp = vb.split_mode_token(mode)
+            head = mode.upper() if self.is_esrgan else comp.upper()
             iid = self.tree.insert(
-                "", "end", text=mode.upper(),          # "OFF"/"ON" (compile) or the tier (ESRGAN)
-                values=(self._row_label(target), "", "", "", "", "", "", ""))
+                "", "end", text=head,                  # "OFF"/"ON" (compile) or the tier (ESRGAN)
+                values=(self._model_cell(mode), self._row_label(target),
+                        "", "", "", "", "", "", ""))
             self._rows[key] = iid
             self._row_meta[iid] = (target, mode)
             self._row_order.append(iid)
@@ -836,19 +937,26 @@ class BenchmarkWindow(tk.Toplevel):
     def _populate_bench_filters(self):
         """Fill the Torch Compile / Target filter combos with the DISTINCT values now present
         in the table (plus 'All'), in row-creation order. Called once the rows exist."""
-        modes, targets = [], []
+        modes, targets, models = [], [], []
         for iid in self._row_order:
             t, m = self._row_meta[iid]
-            if m.upper() not in modes:
-                modes.append(m.upper())
+            _mk, comp = vb.split_mode_token(m)
+            disp = m.upper() if self.is_esrgan else comp.upper()
+            if disp not in modes:
+                modes.append(disp)
             if t not in targets:
                 targets.append(t)
+            mc = self._model_cell(m)
+            if mc and mc not in models:
+                models.append(mc)
         self._filter_combos["Torch Compile"].configure(values=["All"] + modes)
         self._filter_combos["Target"].configure(values=["All"] + targets)
+        self._filter_combos["Model"].configure(values=["All"] + models)
 
     def _reset_bench_filters(self):
         self.filter_mode_var.set("All")
         self.filter_target_var.set("All")
+        self.filter_model_var.set("All")
         self._apply_bench_filters()
 
     def _apply_bench_filters(self):
@@ -857,13 +965,17 @@ class BenchmarkWindow(tk.Toplevel):
         values on a detached row is fine, so a running sweep still updates hidden rows."""
         mf = self.filter_mode_var.get()
         tf = self.filter_target_var.get()
+        df = self.filter_model_var.get()
         idx = 0
         for iid in self._row_order:
             t, m = self._row_meta.get(iid, (None, None))
             if t is None:
                 continue
-            ok = ((mf in ("", "All") or m.upper() == mf) and
-                  (tf in ("", "All") or t == tf))
+            _mk, comp = vb.split_mode_token(m)
+            disp = m.upper() if self.is_esrgan else comp.upper()
+            ok = ((mf in ("", "All") or disp == mf) and
+                  (tf in ("", "All") or t == tf) and
+                  (df in ("", "All") or self._model_cell(m) == df))
             if ok:
                 self.tree.reattach(iid, "", idx)
                 idx += 1
@@ -1090,10 +1202,14 @@ class BenchmarkWindow(tk.Toplevel):
                     self._set_ceiling(c["name"], c["tier"], None, "queued")
         else:
             cmd = [PYTHON_EXE, "-u", script, "--targets", ",".join(targets)]
+            # The models to sweep (#26 Part A). Always passed explicitly, even for a single
+            # model: the runner would otherwise fall back to the CONFIGURED one, and the
+            # window's selection is not required to be the configured one.
+            cmd += ["--models", ",".join(self._sweep_models or [vb.DEFAULT_MODEL])]
             if self.remote:
                 cmd.append("--remote")                 # remote uses the config compile setting
             else:
-                cmd += ["--compile-modes", ",".join(run_modes)]
+                cmd += ["--compile-modes", ",".join(self._run_compile_modes())]
             if self.restart_var.get():
                 cmd.append("--restart")
                 for t in targets:                      # clear the table rows we're redoing
@@ -1223,6 +1339,94 @@ class BenchmarkWindow(tk.Toplevel):
                                        run_on=self._run_on_for(gpu_id), price_usd_hr=price)
         except Exception:                                  # noqa: BLE001 (never break the window)
             return []
+
+    def _refresh_models_label(self):
+        """The one-line summary beside the Models… button."""
+        lbl = getattr(self, "models_lbl", None)
+        if lbl is None:
+            return
+        models = self._sweep_models or [vb.DEFAULT_MODEL]
+        if len(models) == 1:
+            spec = _seedvr2_models.by_filename(models[0])
+            lbl.configure(text=spec.label if spec else models[0])
+        else:
+            gib = _seedvr2_models.total_bytes(models) / (1 << 30)
+            lbl.configure(text=f"{len(models)} models selected  ({gib:.1f} GiB of weights)")
+
+    def _pick_models(self):
+        """Modal MULTI-select SeedVR2 model chooser (#26 Part A), mirroring _gpu_picker.
+
+        Changing the selection re-resolves the per-regime keys and rebuilds the results table,
+        because both are derived from it: the rows ARE the (target, model, compile) grid and
+        each reads its own saved key. Cancelling or choosing nothing leaves the selection
+        alone rather than emptying it, since an empty sweep is never what anyone meant."""
+        catalog = _seedvr2_models.catalog()
+        win = tk.Toplevel(self)
+        win.title("Choose SeedVR2 models to benchmark")
+        win.transient(self)
+        win.grab_set()
+        try:
+            win.iconbitmap(os.path.join(APP_ROOT, "app.ico"))
+        except Exception:
+            pass
+        ttk.Label(win, text="Benchmark these model(s) on this card (select one or more):").pack(
+            anchor="w", padx=12, pady=(12, 4))
+        lb = tk.Listbox(win, selectmode="extended", width=58, height=min(12, len(catalog)),
+                        activestyle="none", exportselection=False)
+        lb.pack(fill="both", expand=True, padx=12)
+        for spec in catalog:
+            lb.insert("end", f"{spec.label}   ({spec.size_gib:.1f} GiB)")
+        for i, spec in enumerate(catalog):             # pre-select the current choice
+            if spec.filename in (self._sweep_models or []):
+                lb.selection_set(i)
+        if not lb.curselection():
+            lb.selection_set(0)
+        lb.see(0)
+        note = ttk.Label(
+            win, wraplength=430, foreground="#7f8a99",
+            text=("Each model is swept separately, so the run takes roughly this many times "
+                  "longer. On a rented pod they share ONE pod: the model is swapped on it "
+                  "between sweeps, which costs a minute or two each, not a new pod."))
+        note.pack(anchor="w", padx=12, pady=(8, 0))
+        chosen = {"models": None}
+
+        def ok(_e=None):
+            picked = [catalog[i].filename for i in lb.curselection()]
+            if picked:
+                chosen["models"] = picked
+            win.destroy()
+
+        lb.bind("<Double-Button-1>", ok)
+        lb.bind("<Return>", ok)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=12, pady=12)
+        ttk.Button(bf, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(bf, text="OK", command=ok).pack(side="right", padx=(0, 6))
+        ttk.Button(bf, text="Select all",
+                   command=lambda: lb.selection_set(0, "end")).pack(side="left")
+        win.update_idletasks()
+        self.wait_window(win)
+        if not chosen["models"] or chosen["models"] == self._sweep_models:
+            return
+        self._sweep_models = chosen["models"]
+        self._resolve_keys()                           # new regimes -> new keys and rows
+        self._rebuild_results_table()
+        self._refresh_models_label()
+        self._refresh_estimate()
+
+    def _rebuild_results_table(self):
+        """Drop and re-create every results row for the current regimes. Called when the model
+        selection changes; the saved probes are untouched (only the VIEW is rebuilt)."""
+        for iid in list(self._row_order):
+            try:
+                self.tree.delete(iid)
+            except Exception:                          # noqa: BLE001 (already gone)
+                pass
+        self._rows, self._row_meta, self._row_order = {}, {}, []
+        self._load_prior()
+        self._populate_bench_filters()
+        self._refresh_header()
 
     def _gpu_picker(self, cards, counts):
         """Modal MULTI-select card chooser: every card with contributable rows on disk (out-of-

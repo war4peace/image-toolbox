@@ -1550,11 +1550,18 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # Per-job engine/model (#11): NULL -> the SeedVR2 default. `job_engine` is the STRING
     # ("seedvr2"|"fixed_ratio"); the concrete engine object is passed in as `engine`.
     job_engine = (_row_get(job, "engine") or "seedvr2")
-    # For a REMOTE fixed_ratio group one esrgan pod serves every model, swapping the
-    # resident weight per job, so the per-job model key must travel to process_segment
-    # (#18 B). Only fixed_ratio jobs carry it: a local fixed_ratio engine bakes the model
-    # in at construction and ignores this, and a SeedVR2 worker ignores &model= entirely.
-    job_model = ((_row_get(job, "model") or None) if job_engine == "fixed_ratio" else None)
+    # For a REMOTE group one pod serves every model, swapping the resident weight per job,
+    # so the per-job model key must travel to process_segment (#18 B for fixed_ratio).
+    #
+    # SeedVR2 jobs carry it too since 0.6.3 (#26 Part A), and that is a FIX, not a tidy-up.
+    # `job_group_key` is (engine, gpu) with the model deliberately absent, so two SeedVR2
+    # jobs picked with different models on the same card are ONE group on ONE pod. The pod
+    # loaded whatever `_worker_cfg` sent (the Settings default), and this line used to pass
+    # None for SeedVR2, so both jobs were silently upscaled with a model the user had not
+    # picked for at least one of them: a wrong output that reported success. The worker now
+    # reloads the DiT when a job names a different one. A local engine bakes its model in at
+    # construction and ignores this.
+    job_model = (_row_get(job, "model") or None)
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
     src_abs = os.path.join(source_root, rel)
     out_video = job["output_path"] or _output_path(
@@ -1669,8 +1676,18 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     # measured under -- VAE tiling and torch.compile both move it (see sizer.learn_tag) -- so
     # their tags join the card id. Everything off tags to "" (the historical key), so rows
     # learned before this landed keep working and keep meaning what they said.
+    #
+    # The MODEL joins it too since 0.6.3 (#26 Part A). It used to be the bare card id here,
+    # which held only while a pod ran exactly one DiT. It no longer does: the benchmark can
+    # sweep several models on one pod and a queue can mix them, and the six 7B variants alone
+    # span 4.43 to 15.35 GiB of resident weights. Sharing one key means the last thing
+    # measured becomes every model's seed, and since a LEARNED value legitimately bypasses
+    # BATCH_CAP, replaying a 3B-Q4 ceiling into a 7B-FP16 run OOMs. This must stay identical
+    # to video_benchmark's write key or a remote sweep's results are written where no run
+    # ever reads them (tests/test_video_benchmark.py pins the pair together).
     import video_vram_sizer as _sizer
-    learn_key = (gpu_id + _sizer.learn_tag(_engine_flags(vcfg))) if gpu_id else ""
+    learn_key = ((f"{gpu_id}|{_sizer.model_tag(vcfg.get('dit_model'))}"
+                  + _sizer.learn_tag(_engine_flags(vcfg))) if gpu_id else "")
     seg_out_mp = ve.output_megapixels(info.width, info.height, target)
     mp_bucket = _mp_bucket(seg_out_mp)
     tuning = bool(vcfg.get("auto_tune_batch", True) and learn_key and not batch
@@ -1788,7 +1805,7 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             use_10bit=vcfg["use_10bit"], on_progress=_progress,
             should_stop=_STOP.is_set,        # responsive Stop: abort the poll mid-segment
             seg_index=s.index, seg_total=len(segs),   # labels the live per-chunk progress line
-            model=job_model)                 # remote esrgan: the per-job fixed-ratio model key
+            model=job_model)                 # remote: the per-job model the pod swaps to
         secs = getattr(engine, "last_segment_seconds", None)
         db.upsert_video_segment(conn, root_id, rel, target, s.index, clip_id=clip_id,
                                 status="done", out_frames=n, output_path=up_path,

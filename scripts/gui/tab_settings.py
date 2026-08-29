@@ -12,6 +12,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import mqtt_publisher
 import notifications
+import seedvr2_models as _seedvr2_models
 import updater
 from gui.common import APP_TITLE, APP_VERSION, CFG, save_config, update_auto_check_enabled, ollama_installed, ollama_list_models, test_discord_webhook
 from gui.widgets import Tooltip, _ScrollFrame, use_window_button_style
@@ -105,15 +106,14 @@ _VIDEO_CODEC_OPTIONS = [
     ("High quality — H.265 10-bit (ffmpeg)", "ffmpeg", True),
 ]
 
-# Video model choices (label -> dit_model filename). The pod auto-downloads the chosen
-# weights to the network volume on first use (no reprovision). 7B fp16 is the quality
-# default; 3B-Q8 is smaller and frees VRAM for bigger temporal windows.
-_VIDEO_MODEL_OPTIONS = [
-    ("7B FP16 (best detail, default)",        "seedvr2_ema_7b_fp16.safetensors"),
-    ("7B FP16 Sharp (stylized/crisper)",      "seedvr2_ema_7b_sharp_fp16.safetensors"),
-    ("3B Q8 (smaller, more VRAM headroom)",   "seedvr2_ema_3b-Q8_0.gguf"),
-    ("3B FP16 (small, full precision)",       "seedvr2_ema_3b_fp16.safetensors"),
-]
+# Video model choices (label -> dit_model filename), from the shared SeedVR2 catalog so
+# Settings, the wizard and the Video tab never disagree on what exists (#26 Part A; this
+# list used to be a hand-kept copy and had drifted from the wizard's in both contents and
+# order). The pod auto-downloads the chosen weights to the network volume on first use
+# (no reprovision). 7B fp16 is the quality default; the quantised tiers are smaller and
+# free VRAM for bigger temporal windows.
+_VIDEO_MODEL_OPTIONS = _seedvr2_models.options()
+_VIDEO_MODEL_DEFAULT = _seedvr2_models.DEFAULT_MODEL
 
 # LOCAL video engine choice (feature #11). SeedVR2 = the generative default; Real-ESRGAN
 # (fixed_ratio) = a fast, low-VRAM, deterministic per-frame GAN. Only affects LOCAL runs;
@@ -1115,12 +1115,14 @@ class SettingsTab(ttk.Frame):
         return _VIDEO_CODEC_OPTIONS[0][0]
 
     def _video_model_label(self, vid):
-        """The model combobox label matching the saved dit_model filename."""
-        model = vid.get("dit_model", "seedvr2_ema_7b_fp16.safetensors")
-        for lbl, fname in _VIDEO_MODEL_OPTIONS:
-            if fname == model:
-                return lbl
-        return _VIDEO_MODEL_OPTIONS[0][0]
+        """The model combobox label matching the saved dit_model filename. An unlisted
+        (hand-configured) model falls back to the default's label, which is also what
+        _collect would then save -- so the form never shows one model and stores another."""
+        model = vid.get("dit_model", _VIDEO_MODEL_DEFAULT)
+        spec = _seedvr2_models.by_filename(model)
+        if spec:
+            return spec.label
+        return _seedvr2_models.by_filename(_VIDEO_MODEL_DEFAULT).label
 
     def _video_engine_label(self, vid):
         """The local-engine combobox label matching the saved video.engine value."""
@@ -1142,9 +1144,13 @@ class SettingsTab(ttk.Frame):
         "The SeedVR2 weights used when the default method above is SeedVR2 (video only; "
         "the Batch Upscaler keeps its own). You still choose the method and model per "
         "video on the Video Upscaler tab.\n\n"
-        "7B FP16 = best detail. 3B Q8 = smaller, frees VRAM for bigger windows. A remote "
-        "pod downloads the chosen file to the volume on first use (one-time), so switching "
-        "needs no reprovision; that first run is slower while it downloads.")
+        "7B = best detail, 3B = lighter. Within each, FP16 is full precision and FP8 / Q8 / "
+        "Q4 trade a little quality for much less VRAM (Q4 is the smallest). 'Sharp' is a "
+        "crisper, more stylized variant of the same model.\n\n"
+        "A remote pod downloads the chosen file to the volume on first use (one-time), so "
+        "switching needs no reprovision; that first run is slower while it downloads. Three "
+        "models are pre-cached on a new volume (7B FP16, 7B FP8 mixed, 3B Q8) and take about "
+        "27 GB of it, so leave room if you plan to use a fourth.")
     MODEL_TIP_ESRGAN = (
         "The Real-ESRGAN model used when the default method above is Real-ESRGAN. You "
         "still choose the method and model per video on the Video Upscaler tab.\n\n"
@@ -1198,7 +1204,7 @@ class SettingsTab(ttk.Frame):
         ns = self.video_noise_var.get()
         noise = 0.0 if ns.lower() in ("off", "") else float(ns)
         model = next((f for lbl, f in _VIDEO_MODEL_OPTIONS
-                      if lbl == self.video_model_var.get()), _VIDEO_MODEL_OPTIONS[0][1])
+                      if lbl == self.video_model_var.get()), _VIDEO_MODEL_DEFAULT)
         engine = next((v for lbl, v in _VIDEO_ENGINE_OPTIONS
                        if lbl == self.video_engine_var.get()), _VIDEO_ENGINE_OPTIONS[0][1])
         esrgan_model = next((k for lbl, k in _ESRGAN_MODEL_OPTIONS

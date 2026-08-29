@@ -722,7 +722,8 @@ class LocalVideoEngine:
                 "steady_alloc": steady_alloc, "steady_reserved": steady_reserved}
 
     def probe_batch(self, src_path, dest_path, *, resolution, batch, overlap=None,
-                    frames=None, should_stop=None, on_progress=None, warmup_src=None):
+                    frames=None, should_stop=None, on_progress=None, warmup_src=None,
+                    model=None):
         """Benchmark primitive (feature #7, docs 16/20): run ONE upscale attempt at a FIXED
         batch and report the outcome, WITHOUT the process_segment OOM step-down (the benchmark
         sweeps UPWARD to failure, so a failed probe must fail, not silently shrink). Requires
@@ -742,7 +743,19 @@ class LocalVideoEngine:
         `warmup_src` (optional) is a SHORT clip the warmup pass(es) run on instead of the timed
         `src_path`, absorbing the model load + torch.compile at the same per-window ceiling for
         a fraction of the work (see local_video_worker). The caller sizes it (>= batch+1 frames);
-        None warms on the full clip."""
+        None warms on the full clip.
+
+        `model` is VERIFIED, not applied (#26 Part A). A local engine bakes its DiT in at
+        construction, so a multi-model sweep builds one engine per model; the remote engine
+        instead swaps the model on a shared pod, which is why the shared `probe_batch`
+        contract carries it. Checking it here rather than ignoring it is the point: silently
+        measuring a different model than the caller asked for would file the numbers under
+        the wrong regime key and be believed, which is exactly the failure the per-model keys
+        exist to prevent. None = no claim, no check."""
+        if model and model != self.model:
+            raise RuntimeError(
+                f"probe_batch asked for {model!r} but this engine holds {self.model!r}; "
+                f"a local sweep must build one engine per model")
         if not self.use_subprocess:
             raise RuntimeError("probe_batch requires use_subprocess=True (fresh CUDA context "
                                "per probe is mandatory for an honest upward sweep)")

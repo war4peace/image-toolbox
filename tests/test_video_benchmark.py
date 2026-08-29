@@ -64,15 +64,18 @@ def _learn_key(gpu, remote=False, cfg=None):
 
     Same reasoning as [_bench_key], and the same trap: this key carries the VRAM regime too
     (see video_vram_sizer.learn_tag), so a hardcoded "FakeGPU|7b" silently stops describing
-    what the runner writes the moment a regime tag applies. Remote keys the plain card id;
-    local qualifies it with the model family.
+    what the runner writes the moment a regime tag applies.
+
+    Both local AND remote qualify the card id with the model family since 0.6.3 (#26 Part A).
+    Remote used to key the plain id, which was survivable only while one pod ran one DiT; a
+    multi-model sweep would otherwise leave the last model's ceiling as every model's seed.
     """
     import batch_video_upscale as bv
     import video_vram_sizer as sizer
     cfg = cfg or {"upscale": {}, "video": {}}
     vcfg = bv.resolve_video_cfg(cfg)
     ws = vb.effective_settings(cfg, vcfg, remote=remote, log_fn=lambda *_a, **_k: None)
-    base = gpu if remote else f"{gpu}|{sizer.model_tag(vcfg['dit_model'])}"
+    base = f"{gpu}|{sizer.model_tag(vcfg['dit_model'])}"
     return base + sizer.learn_tag(ws)
 
 
@@ -406,7 +409,8 @@ class _FakeEngine:
         self.asked = []
 
     def probe_batch(self, src, dest, *, resolution, batch, overlap=None, frames=None,
-                    should_stop=None, on_progress=None, warmup_src=None):
+                    should_stop=None, on_progress=None, warmup_src=None, model=None):
+        self.model_asked = model
         self.asked.append(batch)
         if batch <= 13:
             return {"outcome": "ok", "batch": batch, "overlap": 6, "frames": frames,
@@ -564,7 +568,7 @@ def test_probe_clip_is_sized_to_the_batch_no_collapse(db_conn, tmp_path, monkeyp
             self.asked = []
 
         def probe_batch(self, src, dest, *, resolution, batch, frames=None,
-                        should_stop=None, on_progress=None, warmup_src=None):
+                        should_stop=None, on_progress=None, warmup_src=None, model=None):
             self.asked.append((batch, frames))
             oc = "ok" if batch <= 45 else "oom"             # real ceiling ABOVE the old 37/65 fog
             return {"outcome": oc, "batch": batch, "overlap": 6, "frames": frames,
@@ -611,7 +615,7 @@ def test_the_sweep_warms_each_probe_on_a_batch_plus_one_clip(db_conn, tmp_path, 
             self.asked = []
 
         def probe_batch(self, src, dest, *, resolution, batch, frames=None,
-                        should_stop=None, on_progress=None, warmup_src=None):
+                        should_stop=None, on_progress=None, warmup_src=None, model=None):
             self.asked.append(batch)
             seen.append((batch, src, warmup_src))
             return {"outcome": "ok" if batch <= 13 else "oom", "batch": batch, "overlap": 6,
@@ -663,9 +667,10 @@ def _remote_cfg(tmp_path):
 
 
 def test_run_benchmark_remote_keys_plain_id_and_tears_down(db_conn, tmp_path, monkeypatch):
-    """A REMOTE sweep keys the learned batch under the PLAIN RunPod id (what process_job's
-    auto-tuner reads), NOT the model-qualified local key, and tears the pod down at the end
-    (docs section 22.3)."""
+    """A REMOTE sweep keys the learned batch under the id the RUN reads (what process_job's
+    auto-tuner reads) and tears the pod down at the end (docs section 22.3). Since 0.6.3 that
+    key carries the model family on both sides (#26 Part A), so a multi-model sweep cannot
+    leave one model's ceiling as another's seed."""
     engine = _FakeEngine()
     session = _FakeSession()
     monkeypatch.setattr(vb, "_deploy_remote_engine", lambda cfg, vcfg: (engine, session))
@@ -683,7 +688,9 @@ def test_run_benchmark_remote_keys_plain_id_and_tears_down(db_conn, tmp_path, mo
     # probes stored under the RunPod id (returned sorted by batch; 17 is the recorded oom)
     rows = db.get_bench_probes(db_conn, gpu, _bench_key(remote=True), 1920, 1080)
     assert (17, "oom") in [(r["batch"], r["outcome"]) for r in rows]
-    # learned batch stored under the PLAIN id (the remote run's read key), NOT gpu|model.
+    # Learned batch stored under the key the remote RUN reads. That key carries the model
+    # family since 0.6.3 (#26 Part A) on BOTH sides: batch_video_upscale builds the same
+    # string, and if these two ever drift a remote sweep writes rows no run will ever read.
     # The VRAM-regime tag still applies (a pod compiles), so the key is the id + that tag.
     learn = _learn_key(gpu, remote=True)
     assert db.get_learned_batch(db_conn, learn, sizer.mp_bucket(2.0736)) == 13
@@ -720,7 +727,7 @@ def test_local_sweep_asks_only_for_the_rungs_it_measures(fake_run, db_conn):
     assert fake_run.asked == [5, 9, 17, 13]                  # measured sweep, no warmup prefix
 
 
-def test_run_benchmark_remote_refuses_without_selected_gpu(tmp_path, monkeypatch):
+def test_run_benchmark_remote_refuses_without_selected_gpu(db_conn, tmp_path, monkeypatch):
     monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
     monkeypatch.delenv("IMGTBX_GPU_OVERRIDE", raising=False)
     deployed = []
@@ -1215,3 +1222,74 @@ def test_unscoped_clear_still_wipes_the_card(db_conn):
     db.clear_bench(db_conn, gpu, "7b")
 
     assert db.get_bench_probes(db_conn, gpu, "7b") == []
+
+
+# ── multi-model sweeps (#26 Part A) ──────────────────────────────────────────
+
+def test_multi_model_remote_sweep_uses_ONE_pod_and_names_the_model_per_probe(
+        db_conn, tmp_path, monkeypatch):
+    """The reason the feature exists at all. A redeploy per model pays pod creation, volume
+    mount and cold start EACH TIME, all billed; swapping the DiT on a live pod pays only the
+    weight reload. So a remote multi-model run must deploy ONCE, tear down ONCE, and name the
+    model on every probe so the worker knows when to swap."""
+    engine = _FakeEngine()
+    session = _FakeSession()
+    deploys = []
+
+    def _deploy(cfg, vcfg):
+        deploys.append(vcfg.get("dit_model"))
+        return engine, session
+
+    monkeypatch.setattr(vb, "_deploy_remote_engine", _deploy)
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "NVIDIA GeForce RTX 5090")
+
+    models = ["seedvr2_ema_7b_fp16.safetensors", "seedvr2_ema_3b-Q8_0.gguf"]
+    summary = vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33,
+                               remote=True, models=models)
+    assert summary["models"] == 2
+    assert len(deploys) == 1, "one pod for the whole sweep, not one per model"
+    assert session.closed is True, "the shared pod is torn down exactly once"
+    assert engine.model_asked == models[-1], "each probe names the DiT it must measure"
+
+
+def test_multi_model_sweep_writes_a_separate_key_per_model(db_conn, tmp_path, monkeypatch):
+    """Two models must not share a probe key, or the second would resume the first's rungs
+    and publish its seconds and ceiling as its own."""
+    monkeypatch.setattr(vb, "_deploy_remote_engine",
+                        lambda cfg, vcfg: (_FakeEngine(), _FakeSession()))
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    gpu = "NVIDIA GeForce RTX 5090"
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", gpu)
+
+    models = ["seedvr2_ema_7b_fp16.safetensors", "seedvr2_ema_3b-Q8_0.gguf"]
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33,
+                     remote=True, models=models)
+    seen = set()
+    for m in models:
+        cfg = _remote_cfg(tmp_path)
+        import batch_video_upscale as _bv
+        vcfg = {**_bv.resolve_video_cfg(cfg), "dit_model": m}
+        key = vb.bench_key(vcfg, vb.effective_settings(cfg, vcfg, remote=True))
+        rows = db.get_bench_probes(db_conn, gpu, key, 1920, 1080)
+        assert rows, f"{m} wrote no probes under its own key {key!r}"
+        seen.add(key)
+    assert len(seen) == len(models), "the two models shared one probe key"
+
+
+def test_single_model_sweep_still_emits_the_bare_legacy_tokens(db_conn, tmp_path, monkeypatch):
+    """A one-model sweep must emit exactly the mode tokens an older build emitted: they are
+    what a reopened window matches its saved rows against."""
+    monkeypatch.setattr(vb, "_deploy_remote_engine",
+                        lambda cfg, vcfg: (_FakeEngine(), _FakeSession()))
+    monkeypatch.setattr(vb.bclip, "ensure_source_clip", lambda *a, **k: str(tmp_path / "d.mp4"))
+    monkeypatch.setattr(vb.bv, "_load_config", lambda: _remote_cfg(tmp_path))
+    monkeypatch.setenv("IMGTBX_GPU_OVERRIDE", "NVIDIA GeForce RTX 5090")
+    events = []
+    monkeypatch.setattr(vb, "gui_event", lambda kind, data: events.append((kind, data)))
+    vb.run_benchmark(["1080p"], frames=37, resume=False, batch_cap=33, remote=True,
+                     models=["seedvr2_ema_7b_fp16.safetensors"])
+    tokens = {d["compile"] for k, d in events if k in ("BCELL", "BPROBE", "BCEILING")}
+    assert tokens <= {"off", "on"}, f"a single-model sweep decorated its tokens: {tokens}"

@@ -102,12 +102,52 @@ def auto_overlap(batch):
 
 
 def model_tag(model):
-    """Family tag for the learned-store key + seed selection: 3b_fp16 / 3b / 7b. Unknown
-    models map to 7b (the heavier profile), so an unknown card errs conservative."""
+    """Family+precision tag for the learned-store key and the bench_key: 7b / 7b_fp8 /
+    7b_q4 / 3b_fp16 / 3b / 3b_fp8 / 3b_q4. Unknown models map to 7b (the heaviest
+    profile), so an unknown card errs conservative.
+
+    PRECISION IS PART OF THE KEY (0.6.3, #26 Part A), and it has to be. The tag used to
+    be family-only, so ALL SIX 7B variants shared one key while spanning 4.43 GiB (Q4) to
+    15.35 GiB (FP16) of resident weights (sizes: seedvr2_models.py). That is the same
+    error tile_tag and compile_tag exist to prevent, and it fails in the dangerous
+    direction: a ceiling measured on Q4 or FP8 is HIGHER, a learned value legitimately
+    bypasses BATCH_CAP, so handing it to an FP16 run OOMs. It stayed mostly latent only
+    because a user could not switch models -- which is exactly what #26 Part A changed,
+    so it had to be closed in the same change.
+
+    The unchanged tags are unchanged ON PURPOSE, the same way tile_tag returns "" for the
+    historical regime: '7b' still means 7B FP16 and '3b' still means 3B Q8, so every row
+    already in video_bench / video_batch_learn keeps its key and its meaning. The one
+    knowingly-imperfect case is a pre-0.6.3 row written by a 16 GB user whose wizard
+    recommendation was FP8-mixed: it is filed under '7b' and cannot be told apart from an
+    FP16 row now. That is not migrated because the information to migrate it with does not
+    exist; splitting FP8 out from here on at least stops the pool growing, and the sizer's
+    OOM back-off is the net under the ones already there.
+
+    Sharp variants deliberately share their non-sharp twin's tag: same architecture, same
+    file size, so the same VRAM ceiling. That was true before this change too.
+    """
     m = (model or "").lower()
-    if "3b" in m:
-        return "3b_fp16" if ("fp16" in m and "gguf" not in m) else "3b"
-    return "7b"
+    family = "3b" if "3b" in m else "7b"
+    # Order matters: the FP8-mixed weight's name carries BOTH "fp8" and "fp16" (its final
+    # block is FP16), and it is an FP8 model. An unrecognised name yields None and falls
+    # through to the family's historical bare tag, which keeps the conservative default.
+    if "q4" in m:
+        precision = "q4"
+    elif "fp8" in m:
+        precision = "fp8"
+    elif "fp16" in m and "gguf" not in m:
+        precision = "fp16"
+    else:
+        precision = None
+    if family == "7b":
+        # Bare "7b" is 7B FP16 AND the unknown-model fallback, byte-identical to pre-0.6.3.
+        return "7b" if precision in (None, "fp16") else f"7b_{precision}"
+    # Bare "3b" is 3B Q8 (the only 3B GGUF that was reachable before 0.6.3) and the
+    # unrecognised-3B fallback, again byte-identical to pre-0.6.3.
+    if precision == "fp16":
+        return "3b_fp16"
+    return "3b" if precision is None else f"3b_{precision}"
 
 
 def tile_tag(settings):

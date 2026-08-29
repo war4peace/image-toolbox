@@ -844,6 +844,111 @@ def effective_settings(cfg, vcfg, remote=False, log_fn=None):
     return _engine_settings(cfg, vcfg, log_fn=log_fn)
 
 
+def default_model():
+    """The SeedVR2 DiT a sweep uses when nothing else is named (the catalog default). Exposed
+    so the GUI does not have to hard-code the filename a third time."""
+    try:
+        import seedvr2_models as sm
+        return sm.DEFAULT_MODEL
+    except Exception:                                  # noqa: BLE001
+        return "seedvr2_ema_7b_fp16.safetensors"
+
+
+DEFAULT_MODEL = default_model()
+
+
+def seedvr2_all_models():
+    """Every SeedVR2 DiT the GUI offers, in catalog order (#26 Part A). The multi-model
+    counterpart of esrgan_all_tiers, and the list a "sweep everything" run uses."""
+    try:
+        import seedvr2_models as sm
+        return sm.filenames()
+    except Exception:                                  # noqa: BLE001 (fail-safe)
+        return ["seedvr2_ema_7b_fp16.safetensors"]
+
+
+def resolve_models(vcfg, models=None):
+    """The DiT list a sweep will measure, de-duplicated, in catalog order.
+
+    The DEFAULT IS ONE MODEL, the configured one, and that is deliberately unlike
+    esrgan_all_tiers (which defaults to every tier). Real-ESRGAN has two tiers whose probes
+    take seconds; SeedVR2 has TEN models whose sweeps take hours each and, on a pod, are
+    billed. Sweeping everything by accident because the default changed under someone is a
+    money bug, so "all" has to be asked for.
+
+    Unknown names are dropped with the catalog as the authority: a typo in --models must not
+    reach the pod as a weight it will fail to download halfway through a paid sweep."""
+    try:
+        import seedvr2_models as sm
+        known = {f: i for i, f in enumerate(sm.filenames())}
+    except Exception:                                  # noqa: BLE001 (fail-safe: trust the caller)
+        known = {}
+    wanted = list(models or []) or [vcfg.get("dit_model") or "seedvr2_ema_7b_fp16.safetensors"]
+    out, seen = [], set()
+    for m in wanted:
+        m = (m or "").strip()
+        if not m or m in seen:
+            continue
+        if known and m not in known:
+            log(f"Unknown SeedVR2 model {m!r}; skipping it.")
+            continue
+        seen.add(m)
+        out.append(m)
+    if known:
+        out.sort(key=lambda m: known[m])
+    return out
+
+
+def _model_label(dit_model):
+    """A short human label for a DiT in the log ("7B Q4 (7B on a smaller card)"), falling back
+    to the bare filename for an off-catalog one."""
+    try:
+        import seedvr2_models as sm
+        spec = sm.by_filename(dit_model)
+        if spec:
+            return f"{spec.label}  [{spec.size_gib:.1f} GiB]"
+    except Exception:                                  # noqa: BLE001
+        pass
+    return str(dit_model)
+
+
+def mode_token(dit_model, compile_on, multi=True):
+    """The GUI row / display token for one benchmark regime (#26 Part A).
+
+    A regime is a (model, compile) pair now, but the row machinery, the saved keys and the
+    filters were all built around a single `mode` string, and Real-ESRGAN already puts a
+    non-compile meaning in it (its tier). So the pair is CARRIED IN that one string rather
+    than threaded as a second dimension through every event, row key and handler.
+
+    `multi=False` yields the BARE pre-0.6.3 token ("off" / "on"), and that is not cosmetic:
+    those tokens are what a reopened window matches its saved rows against and what the
+    runner echoes back in every BCELL / BPROBE / BCEILING event, so a one-model sweep must
+    still produce exactly the strings an older build produced. The flag lives here rather
+    than at each call site so the runner and the GUI cannot disagree about when a token
+    grows its model half -- they did briefly, and the result was a single-model sweep
+    emitting "7b_fp16/on" that no existing row could match."""
+    suffix = "on" if compile_on else "off"
+    if not multi:
+        return suffix
+    try:
+        import seedvr2_models as sm
+        spec = sm.by_filename(dit_model)
+        key = spec.key if spec else None
+    except Exception:                                  # noqa: BLE001
+        key = None
+    return suffix if not key else f"{key}/{suffix}"
+
+
+def split_mode_token(token):
+    """(model key or None, "off"/"on") for a mode token. The inverse of mode_token, used by
+    the GUI to fill its Model and Torch Compile columns from one string."""
+    t = (token or "").strip()
+    if "/" in t:
+        model_key, _, comp = t.rpartition("/")
+        return (model_key or None), (comp or "off")
+    return None, (t or "off")
+
+
 def bench_key(vcfg, eff_settings):
     """The video_bench PROBE key. A probe's outcome ('ok' at batch N / 'oom') and its SECONDS
     are only true for the regime it ran under, so every setting that moves them joins the model
@@ -861,22 +966,32 @@ def bench_key(vcfg, eff_settings):
             + sizer.compile_tag(eff_settings))
 
 
-def resolve_bench_key(remote=False, log_fn=None):
+def resolve_bench_key(remote=False, log_fn=None, model=None):
     """The key the NEXT sweep on this machine will WRITE under, config loaded fresh. For callers
     OUTSIDE the runner (the GUI's results table + resume estimate) that must read the rows the
     runner is going to produce. The GUI used to derive a bare model tag instead, so a compiled
     sweep wrote "7b|c" while the window read "7b": it showed the stale uncompiled baseline for
-    the entire run and counted those rows as work already done."""
+    the entire run and counted those rows as work already done.
+
+    `model` overrides the configured DiT, so the GUI can resolve one model's key at a time for
+    a multi-model sweep (#26 Part A). It must stay in step with resolve_bench_keys' identical
+    parameter: this is the REMOTE branch's resolver, and without it a remote multi-model window
+    raised TypeError into a bare `except` and silently fell back to a single fallback row."""
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
+    if model:
+        vcfg = {**vcfg, "dit_model": model}
     return bench_key(vcfg, effective_settings(cfg, vcfg, remote=remote, log_fn=log_fn))
 
 
-def resolve_bench_keys(remote=False, log_fn=None):
+def resolve_bench_keys(remote=False, log_fn=None, model=None):
     """Both regime-tagged probe keys the benchmark can write -- one per torch.compile mode -- plus
     whether the compile-ON mode can actually run on THIS machine. The GUI reads these so its results
     table shows the right per-mode rows and knows whether to offer the "Also use Torch Compile"
     toggle (feature: benchmark both compile modes from one window, no Settings round-trip).
+
+    `model` overrides the configured DiT, so the GUI can resolve one model's keys at a time
+    when a multi-model sweep is selected (#26 Part A).
 
     Returns {"off": <key>, "on": <key or None>, "compile_available": bool, "compile_why": str|None}.
     The two keys differ only by the compile suffix (bench_key = model + tile + compile). OFF is
@@ -887,6 +1002,11 @@ def resolve_bench_keys(remote=False, log_fn=None):
     key), so a genuinely broken config still raises here rather than hiding it."""
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
+    if model:
+        # A multi-model sweep asks for each model's keys in turn (#26 Part A); without this
+        # override every model would resolve the CONFIGURED one's key and the table would
+        # show ten rows reading the same data.
+        vcfg = {**vcfg, "dit_model": model}
     key_off = bench_key({**vcfg, "compile": False},
                         effective_settings(cfg, {**vcfg, "compile": False},
                                            remote=remote, log_fn=log_fn))
@@ -1043,14 +1163,26 @@ def _resolve_modes(vcfg, compile_modes):
 
 
 def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote, plan, conn,
-                    gpu_id, total_gb, cap, frames, work, resume, compile_on, multi):
-    """Sweep every target in `plan` for ONE torch.compile mode, writing probes under this mode's
-    regime-tagged `bench_model` key (see bench_key) and the learned batch/rate under `learn_key`.
-    Factored out of run_benchmark so the with- and without-compile passes share one code path and
-    the compile-OFF / compile-ON results never overwrite each other. Emits mode-tagged BCELL /
-    BPROBE / BCEILING so the GUI routes each to its (target, mode) row. Returns (stopped, results),
-    results = [(name, ceiling, saved)] per finished cell."""
-    if multi:
+                    gpu_id, total_gb, cap, frames, work, resume, compile_on, multi,
+                    mode=None, dit_model=None, engine=None, session=None, tele_stop=None,
+                    banner=None):
+    """Sweep every target in `plan` for ONE REGIME, writing probes under that regime's
+    `bench_model` key (see bench_key) and the learned batch/rate under `learn_key`. A regime is a
+    (SeedVR2 model, torch.compile) pair since 0.6.3 (#26 Part A); before that it was the compile
+    mode alone. Factored out of run_benchmark so every pass shares one code path and no two
+    regimes can overwrite each other's results. Emits regime-tagged BCELL / BPROBE / BCEILING so
+    the GUI routes each to its (target, mode) row. Returns (stopped, results), results =
+    [(name, ceiling, saved)] per finished cell.
+
+    `engine` (with its `session` / `tele_stop`) may be INJECTED, and for a remote multi-model
+    sweep it always is. That is the whole point of the feature: the pod is deployed ONCE by the
+    caller and each model is swapped in on it (the worker reloads only the DiT, `dit_model`
+    travelling with every probe), instead of terminating and redeploying a pod per model. An
+    injected engine is NOT closed here, because the caller owns what it created. Passing none
+    keeps the original behaviour: build it, own it, tear it down."""
+    if banner:
+        log(f"\n{'=' * 56}\n{banner}\n{'=' * 56}")
+    elif multi:
         log(f"\n{'=' * 56}\ntorch.compile {'ON' if compile_on else 'OFF'}\n{'=' * 56}")
     vram_note = (f"{total_gb:.0f} GB VRAM -> floor scales per target" if total_gb
                  else "VRAM unknown -> climbing from the base floor")
@@ -1085,10 +1217,14 @@ def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote
             "opens with a brief silent model load (a few seconds locally) before any progress. "
             "That is normal, not a hang.")
 
-    mode = "on" if compile_on else "off"
-    session = None
-    tele_stop = None
-    if remote:
+    mode = mode or ("on" if compile_on else "off")
+    # An injected engine is the caller's (a shared pod across models); only an engine built
+    # HERE is torn down here. Getting this wrong either leaks a billed pod or kills the shared
+    # one after the first model, so it is one flag read in exactly one place (the finally).
+    owns_engine = engine is None
+    if not owns_engine:
+        pass
+    elif remote:
         # Deploy the pod for the picked card. A capacity failure (stock empty, no substitution)
         # raises here and lands cleanly in the benchmark log (RemoteSession emits the reason).
         engine, session = _deploy_remote_engine(cfg, vcfg_m)
@@ -1170,10 +1306,14 @@ def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote
                 gui_event("BPROBE", {"name": cell["name"], "batch": b, "state": "running",
                                      "compile": mode})
                 log(f"  probing batch {b} …")
+                # `model` names the DiT this probe must measure. On a shared pod the worker
+                # swaps to it when it differs from what is resident; locally the engine was
+                # built for it and only VERIFIES (a mismatch raises rather than quietly
+                # measuring the wrong model into this regime's key).
                 res = engine.probe_batch(clip, probe_out, resolution=cell["resolution"],
                                          batch=b, frames=probe_frames, should_stop=stop_now,
                                          on_progress=_probe_pinger(log, f"batch {b}"),
-                                         warmup_src=warmup_clip)
+                                         warmup_src=warmup_clip, model=dit_model)
                 if res["outcome"] == "stopped":
                     stopped = "funds guard" if funds_tripped() else "stopped by user"
                     break
@@ -1232,13 +1372,14 @@ def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote
             if stopped:
                 break
     finally:
-        if tele_stop is not None:
+        if owns_engine and tele_stop is not None:
             tele_stop.set()                            # end the pod telemetry sampler
-        try:
-            engine.close()
-        except Exception:                              # noqa: BLE001
-            pass
-        if session is not None:
+        if owns_engine:
+            try:
+                engine.close()
+            except Exception:                          # noqa: BLE001
+                pass
+        if owns_engine and session is not None:
             # Tear the pod down (billing stops). RemoteSession.close() stops a pod we
             # created; a pod we reused (attached) is left as we found it.
             try:
@@ -1257,20 +1398,32 @@ def _sweep_one_mode(cfg, vcfg_m, eff_settings, bench_model, learn_key, *, remote
 
 
 def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT_BATCH_CAP,
-                  remote=False, compile_modes=None):
-    """Drive the benchmark on the LOCAL card or (remote=True) a rented RunPod GPU, sweeping ONE or
-    BOTH torch.compile modes in a single run. `compile_modes` (list of bool, GUI-supplied) selects
-    the modes; each is measured under its own regime-tagged key (see bench_key) so with- and
-    without-compile results never overwrite each other. None (headless default) keeps the
-    pre-feature behaviour: a single sweep at the config's compile setting. Persists every probe,
-    honours a Stop (stdin 'q') between and DURING a probe, writes the learned batch + rate per
-    finished cell, and (remote) tears the pod down. Returns a summary."""
+                  remote=False, compile_modes=None, models=None):
+    """Drive the benchmark on the LOCAL card or (remote=True) a rented RunPod GPU, sweeping one
+    or MORE SeedVR2 models across one or both torch.compile modes in a single run.
+
+    `models` (list of dit_model filenames, GUI/CLI-supplied) selects the models and defaults to
+    the configured one alone, so an unchanged caller behaves exactly as before. `compile_modes`
+    (list of bool) selects the compile regimes. Every (model, compile) pair is measured under
+    its own regime-tagged key (see bench_key) so no two can overwrite each other.
+
+    The remote path deploys ONE pod for the whole run and swaps the DiT on it per model
+    (#26 Part A). That is the reason to sweep several models in one go: a redeploy per model
+    would pay pod creation, volume mount and cold start each time, all billed, where a swap
+    pays only the weight reload. Persists every probe, honours a Stop (stdin 'q') between and
+    DURING a probe, writes the learned batch + rate per finished cell, and tears the pod down.
+    Returns a summary."""
     cfg = bv._load_config()
     vcfg = bv.resolve_video_cfg(cfg)
     notify_settings = notifications.resolve_settings(cfg)
     t_start = time.monotonic()
     conn = db.get_conn()
-    model_tag = sizer.model_tag(vcfg["dit_model"])          # the DISPLAY name
+    sweep_models = resolve_models(vcfg, models)
+    if not sweep_models:
+        log("No valid SeedVR2 model selected; nothing to do.")
+        return {"cells": 0, "stopped": "no model"}
+    multi_model = len(sweep_models) > 1
+    model_tag = sizer.model_tag(sweep_models[0])            # the DISPLAY name (first model)
     work = os.path.join(vcfg["work_root"], "benchmark")
     os.makedirs(work, exist_ok=True)
 
@@ -1308,51 +1461,105 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
     # alone: the runner is the last gate). The learn_key carries the FULL regime tag (VAE tiling +
     # compile) so a compiled sweep's ceiling can never overwrite the uncompiled one's, or vice
     # versa (sizer.learn_tag); the bench_model does the same for the per-probe rows (bench_key).
+    # One plan per (model, compile) regime. The MODEL is the outer loop so a remote sweep
+    # swaps the pod's DiT as few times as possible: a swap is a 1.9-15.4 GiB reload, minutes
+    # of billed time, and compile-ON/OFF of the SAME model costs none.
     mode_plans = []
-    for compile_on in _resolve_modes(vcfg, compile_modes):
-        vcfg_m = {**vcfg, "compile": compile_on}
-        eff = effective_settings(cfg, vcfg_m, remote=remote)
-        if compile_on and not remote and not (eff.get("compile_dit") or eff.get("compile_vae")):
-            log("torch.compile is not available on this machine (needs Triton + a verified C "
-                "compiler); skipping the compile-ON sweep.")
-            continue
-        bench_model = bench_key(vcfg_m, eff)
-        learn_key = (gpu_id if remote else f"{gpu_id}|{model_tag}") + sizer.learn_tag(eff)
-        done = sum(len(db.get_bench_probes(conn, gpu_id, bench_model, c["out_w"], c["out_h"]))
-                   for c in plan) if resume else 0
-        mode_plans.append({"compile_on": compile_on, "vcfg_m": vcfg_m, "eff": eff,
-                           "bench_model": bench_model, "learn_key": learn_key,
-                           "est": estimate_runtime(plan, gpu_id, conn, done=done)})
+    for dit in sweep_models:
+        for compile_on in _resolve_modes(vcfg, compile_modes):
+            vcfg_m = {**vcfg, "compile": compile_on, "dit_model": dit}
+            eff = effective_settings(cfg, vcfg_m, remote=remote)
+            if compile_on and not remote and not (eff.get("compile_dit") or eff.get("compile_vae")):
+                log("torch.compile is not available on this machine (needs Triton + a verified C "
+                    "compiler); skipping the compile-ON sweep.")
+                continue
+            bench_model = bench_key(vcfg_m, eff)
+            # The learned-batch key carries the MODEL on remote too since 0.6.3. It used to be
+            # the bare RunPod id there, which was survivable only while a pod ran one model: a
+            # multi-model sweep would otherwise leave the LAST model's ceiling as the learned
+            # value for every other one, and a 3B-Q4 ceiling replayed into a 7B-FP16 run OOMs.
+            # Existing bare-id rows are orphaned by this and fall back to the seed + the OOM
+            # back-off, which is the same trade the model_tag split made and for the same
+            # reason: the information to migrate them does not exist.
+            m_tag = sizer.model_tag(dit)
+            learn_key = f"{gpu_id}|{m_tag}" + sizer.learn_tag(eff)
+            done = sum(len(db.get_bench_probes(conn, gpu_id, bench_model, c["out_w"], c["out_h"]))
+                       for c in plan) if resume else 0
+            mode_plans.append({"compile_on": compile_on, "vcfg_m": vcfg_m, "eff": eff,
+                               "dit_model": dit, "model_tag": m_tag,
+                               "mode": mode_token(dit, compile_on, multi=multi_model),
+                               "bench_model": bench_model, "learn_key": learn_key,
+                               "est": estimate_runtime(plan, gpu_id, conn, done=done)})
     if not mode_plans:
         log("Nothing to benchmark.")
         return {"cells": 0, "stopped": None}
 
     multi = len(mode_plans) > 1
+    multi_compile = len({mp["compile_on"] for mp in mode_plans}) > 1
     total_est = sum(mp["est"] for mp in mode_plans)
     where = "on a RunPod pod" if remote else "locally"
-    gui_event("BSTART", {"gpu": gpu_id, "model": model_tag, "remote": bool(remote),
+    display_tag = ("+".join(mp["model_tag"] for mp in mode_plans[:1]) if not multi_model
+                   else f"{len(sweep_models)} models")
+    gui_event("BSTART", {"gpu": gpu_id, "model": display_tag, "remote": bool(remote),
                          "plan": [{"name": c["name"], "out_w": c["out_w"], "out_h": c["out_h"],
                                    "mp": round(c["mp"], 2)} for c in plan],
                          "batch_cap": cap, "frames": frames, "estimate_seconds": round(total_est),
-                         "modes": [("on" if mp["compile_on"] else "off") for mp in mode_plans]})
-    log(f"Benchmarking {gpu_id} ({model_tag}) {where}: {len(plan)} target(s)"
-        + (f", torch.compile "
-           + " + ".join("ON" if mp["compile_on"] else "OFF" for mp in mode_plans)
-           if multi else "") + ".")
+                         "modes": [mp["mode"] for mp in mode_plans],
+                         "models": list(sweep_models)})
+    log(f"Benchmarking {gpu_id} ({display_tag}) {where}: {len(plan)} target(s)"
+        + (f", {len(mode_plans)} regime(s)" if multi else "") + ".")
+    if multi_model:
+        for dit in sweep_models:
+            log(f"  model: {_model_label(dit)}")
     log(f"Estimated runtime: ~{fmt_hhmmss(total_est)} (rough).")
 
+    # ONE pod for the whole remote run (#26 Part A). Deployed here rather than inside
+    # _sweep_one_mode so every regime shares it; the worker swaps the DiT per model. Built
+    # from the FIRST regime's settings: everything a pod is created with (card, image, volume,
+    # tunnel) is model-independent, and the one thing that is not (dit_model) is exactly what
+    # the per-probe swap overrides.
+    shared_engine = shared_session = shared_tele = None
+    if remote:
+        shared_engine, shared_session = _deploy_remote_engine(cfg, mode_plans[0]["vcfg_m"])
+        shared_tele = threading.Event()
+        bv._start_remote_telemetry(shared_engine, shared_tele)
+
     overall_stopped = None
-    all_results = []                                   # [(compile_on, [(name, ceil, saved), ...])]
-    for mp in mode_plans:
-        if overall_stopped:
-            break
-        stopped, results = _sweep_one_mode(
-            cfg, mp["vcfg_m"], mp["eff"], mp["bench_model"], mp["learn_key"],
-            remote=remote, plan=plan, conn=conn, gpu_id=gpu_id, total_gb=total_gb, cap=cap,
-            frames=frames, work=work, resume=resume, compile_on=mp["compile_on"], multi=multi)
-        all_results.append((mp["compile_on"], results))
-        if stopped:
-            overall_stopped = stopped
+    all_results = []                                   # [(mode token, [(name, ceil, saved), ...])]
+    try:
+        for mp in mode_plans:
+            if overall_stopped:
+                break
+            banner = None
+            if multi_model:
+                banner = _model_label(mp["dit_model"]) + (
+                    f"  ·  torch.compile {'ON' if mp['compile_on'] else 'OFF'}" if multi else "")
+            stopped, results = _sweep_one_mode(
+                cfg, mp["vcfg_m"], mp["eff"], mp["bench_model"], mp["learn_key"],
+                remote=remote, plan=plan, conn=conn, gpu_id=gpu_id, total_gb=total_gb, cap=cap,
+                frames=frames, work=work, resume=resume, compile_on=mp["compile_on"], multi=multi,
+                mode=mp["mode"], dit_model=mp["dit_model"], engine=shared_engine,
+                session=shared_session, tele_stop=shared_tele, banner=banner)
+            all_results.append((mp["mode"], results))
+            if stopped:
+                overall_stopped = stopped
+    finally:
+        # The shared pod is torn down HERE because it was created here. _sweep_one_mode leaves
+        # an injected engine alone precisely so this stays the single teardown, whatever
+        # happened in between (a Stop, a funds trip, a raise out of any regime).
+        if shared_tele is not None:
+            shared_tele.set()
+        if shared_engine is not None:
+            try:
+                shared_engine.close()
+            except Exception:                          # noqa: BLE001 (fail-safe teardown)
+                pass
+        if shared_session is not None:
+            try:
+                shared_session.close()
+            except Exception:                          # noqa: BLE001 (fail-safe teardown)
+                pass
+            gui_event("POD", "")
 
     gui_event("BDONE", {"cells": len(plan), "stopped": overall_stopped})
     tail = ("Results saved; AUTO runs and the time estimate now use them."
@@ -1360,17 +1567,20 @@ def run_benchmark(targets, frames=DEFAULT_FRAMES, resume=True, batch_cap=DEFAULT
             "Results saved; remote runs on this card now seed from them.")
     log(f"\nBenchmark {'stopped' if overall_stopped else 'complete'}: {len(plan)} "
         f"target(s). " + tail)
-    # One completion notification. When both modes ran, label each target field with its mode.
+    # One completion notification. With more than one regime, label each target field with the
+    # regime it came from, or a ten-model sweep reports ten identical-looking target names.
     if multi:
         merged = []
-        for con, res in all_results:
-            tag = "compile ON" if con else "compile OFF"
-            merged += [(f"{n} · {tag}", c, s) for n, c, s in res]
+        for token, res in all_results:
+            mkey, comp = split_mode_token(token)
+            tag = " · ".join(filter(None, [mkey, f"compile {comp.upper()}" if multi_compile else ""]))
+            merged += [(f"{n} · {tag}" if tag else n, c, s) for n, c, s in res]
     else:
         merged = all_results[0][1] if all_results else []
-    _notify_benchmark(notify_settings, gpu_id, model_tag, remote, merged, overall_stopped,
+    _notify_benchmark(notify_settings, gpu_id, display_tag, remote, merged, overall_stopped,
                       time.monotonic() - t_start)
-    return {"cells": len(plan), "stopped": overall_stopped, "modes": len(mode_plans)}
+    return {"cells": len(plan), "stopped": overall_stopped, "modes": len(mode_plans),
+            "models": len(sweep_models)}
 
 
 # ── Real-ESRGAN benchmark run (#18 B) ────────────────────────────────────────
@@ -1637,6 +1847,16 @@ def main(argv=None):
                    help="comma list of torch.compile modes to benchmark: 'off', 'on', or "
                         "'off,on' (both). Each writes its own regime-tagged key. Omit to use "
                         "the config's compile setting (the pre-feature default).")
+    p.add_argument("--models", default=None,
+                   help="comma list of SeedVR2 DiT weights to benchmark, or 'all' for every "
+                        "model the GUI offers (#26 Part A). Each (model, compile) pair writes "
+                        "its own regime-tagged key, and a REMOTE sweep runs them all on ONE "
+                        "pod (the worker swaps the DiT per model) instead of one pod each. "
+                        "Omit to benchmark only the configured model. Names are the weight "
+                        "filenames; see --list-models.")
+    p.add_argument("--list-models", action="store_true",
+                   help="print the SeedVR2 DiT weights --models accepts, with their sizes, "
+                        "and exit.")
     p.add_argument("--engine", choices=("seedvr2", "esrgan"), default="seedvr2",
                    help="which upscaling method to benchmark: 'seedvr2' (batch sweep, the "
                         "default) or 'esrgan' (Real-ESRGAN fixed-ratio, #18 B: one s/frame + "
@@ -1660,6 +1880,16 @@ def main(argv=None):
                         "'community' to download the curated master from GitHub instead "
                         "(feature #8).")
     args = p.parse_args(argv)
+
+    if args.list_models:
+        try:
+            import seedvr2_models as sm
+            for spec in sm.catalog():
+                print(f"{spec.filename:<62} {spec.size_gib:6.2f} GiB  {spec.label}")
+        except Exception as exc:                        # noqa: BLE001
+            print(f"Could not read the SeedVR2 catalog: {exc}")
+            return 1
+        return 0
 
     if args.import_csv:
         if args.import_csv.strip().lower() == "community":
@@ -1725,6 +1955,12 @@ def main(argv=None):
         return 0
 
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    models = None
+    if args.models:
+        if args.models.strip().lower() == "all":
+            models = seedvr2_all_models()
+        else:
+            models = [m.strip() for m in args.models.split(",") if m.strip()]
     compile_modes = None
     if args.compile_modes:
         cm = []
@@ -1738,7 +1974,7 @@ def main(argv=None):
     try:
         run_benchmark(targets, frames=args.frames, resume=not args.restart,
                       batch_cap=args.batch_cap, remote=args.remote,
-                      compile_modes=compile_modes)
+                      compile_modes=compile_modes, models=models)
     except Exception as exc:                            # noqa: BLE001
         import traceback
         log(f"Benchmark failed: {exc}")

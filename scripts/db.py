@@ -401,6 +401,8 @@ def _open_conn():
     conn.executescript(SCHEMA)
     _ensure_video_columns(conn)
     conn.commit()
+    # After SCHEMA + columns: this one READS video_bench to decide, so both tables must exist.
+    _migrate_learn_keys_add_model(conn)
     if fresh:
         try:
             import_legacy_json(conn)
@@ -444,6 +446,77 @@ def _migrate_video_batch_learn(conn):
             conn.commit()
     except Exception as exc:
         debug_log("db._migrate_video_batch_learn", exc=exc)
+
+
+_MODEL_TAGS = ("3b_fp16", "3b_fp8", "3b_q4", "7b_fp8", "7b_q4", "3b", "7b")
+
+
+def _migrate_learn_keys_add_model(conn):
+    """Give the REMOTE `video_batch_learn` keys the model tag they were missing (0.6.3, #26
+    Part A), using each install's OWN measurements as the evidence.
+
+    The remote learn key used to be the bare RunPod card id: `process_job` wrote it that way
+    and the benchmark matched it. That held only while one pod ran one DiT, and 0.6.3 ended
+    that (a multi-model sweep, and a mixed-model queue on one pod). Both sides now key
+    `gpu_id|model_tag`, which ORPHANS every pre-0.6.3 remote row. Those rows are not cheap:
+    they are the converged batch for a card at an output size, measured on rented hardware.
+
+    **This does not guess.** It migrates a row only when the install's own `video_bench`
+    probes for that same card agree on exactly ONE model tag, because the learn row and those
+    probes were written by the same sweeps and runs. Where the evidence is absent or
+    ambiguous (a card benchmarked under two models before the split), the row is LEFT ALONE:
+    it stays orphaned and the sizer falls back to its predictive seed plus the OOM back-off,
+    which is a slow first segment rather than a wrong one. A guessed key is worse than no
+    key, because a learned value legitimately bypasses BATCH_CAP, so a ceiling attributed to
+    the wrong model can OOM a real run rather than merely mis-seeding it.
+
+    A blanket "assume 7B FP16" rule was rejected for the same reason: the wizard writes
+    `7b_fp8_e4m3fn_mixed_block35_fp16` into `video.dit_model` for every 16 GB card, so an
+    install whose LOCAL card is 16 GB can hold remote rows measured on FP8. That is invisible
+    from the key and knowable only from the probes.
+
+    Never overwrites an existing tagged row (a real measurement outranks a migrated one), runs
+    once (a migrated key contains a tag, so the scan finds nothing next time), and is
+    fail-safe."""
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(video_batch_learn)")]
+        if not cols or "mp_key" not in cols:
+            return                              # table absent or pre-#7 shape (dropped above)
+        rows = conn.execute("SELECT gpu_id, mp_key, batch, updated_at "
+                            "FROM video_batch_learn").fetchall()
+        if not rows:
+            return
+        # Evidence per card: the DISTINCT model tags its probes were recorded under. The
+        # bench `model` column is bench_key (model_tag + tile + compile), so take its head.
+        evidence = {}
+        for gid, model in conn.execute("SELECT DISTINCT gpu_id, model FROM video_bench"):
+            head = (model or "").split("|")[0]
+            if head and not head.startswith("esrgan"):
+                evidence.setdefault(gid, set()).add(head)
+        moved = 0
+        for r in rows:
+            key = r[0] or ""
+            card, sep, regime = key.partition("|")   # a card id never contains "|"
+            if sep and regime.split("|")[0] in _MODEL_TAGS:
+                continue                        # already model-qualified
+            tags = evidence.get(card)
+            if not tags or len(tags) != 1:
+                continue                        # no evidence, or two models: leave it orphaned
+            new_key = f"{card}|{next(iter(tags))}" + (f"|{regime}" if sep else "")
+            exists = conn.execute("SELECT 1 FROM video_batch_learn WHERE gpu_id=? AND mp_key=?",
+                                  (new_key, r[1])).fetchone()
+            if exists:
+                continue                        # a real measurement already holds that key
+            conn.execute("INSERT INTO video_batch_learn (gpu_id, mp_key, batch, updated_at) "
+                         "VALUES (?,?,?,?)", (new_key, r[1], r[2], r[3]))
+            conn.execute("DELETE FROM video_batch_learn WHERE gpu_id=? AND mp_key=?",
+                         (key, r[1]))
+            moved += 1
+        if moved:
+            conn.commit()
+            debug_log(f"db._migrate_learn_keys_add_model: re-keyed {moved} learned-batch row(s)")
+    except Exception as exc:
+        debug_log("db._migrate_learn_keys_add_model", exc=exc)
 
 
 def _migrate_video_clip_columns(conn):

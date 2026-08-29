@@ -16,16 +16,16 @@ knowingly pick a heavier or lighter model.
 """
 from collections import namedtuple
 
+import seedvr2_models as _seedvr2_models
+
 # SeedVR2 upscale DiT options: (label, dit_model filename), heaviest first so the
-# picklist reads best-quality at the top down to lightest. The filenames mirror
-# tab_settings._VIDEO_MODEL_OPTIONS and seedvr2's MODEL_REGISTRY.
-SEEDVR_OPTIONS = [
-    ("7B FP16 (best detail)",                 "seedvr2_ema_7b_fp16.safetensors"),
-    ("7B FP16 Sharp (crisper)",               "seedvr2_ema_7b_sharp_fp16.safetensors"),
-    ("7B FP8 mixed (7B quality, less VRAM)",  "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors"),
-    ("3B FP16 (small, full precision)",       "seedvr2_ema_3b_fp16.safetensors"),
-    ("3B Q8 (smallest, quantized)",           "seedvr2_ema_3b-Q8_0.gguf"),
-]
+# picklist reads best-quality at the top down to lightest.
+#
+# DERIVED, not written out (0.6.3, #26 Part A). This list, tab_settings'
+# _VIDEO_MODEL_OPTIONS and tab_video's _SEEDVR2_METHODS were three hand-kept copies
+# that had already drifted apart in contents AND order; they now all come from the one
+# torch-free catalog in seedvr2_models.py. Add a model there, not here.
+SEEDVR_OPTIONS = _seedvr2_models.options()
 
 # Ollama vision options: (label, model tag), heaviest first. These must be pulled
 # (nothing auto-fetches them), which the wizard's pull step handles. The qwen3-vl

@@ -860,10 +860,17 @@ class RunPodTab(ttk.Frame):
             "Name for the model volume:", parent=self, initialvalue="image-toolbox-models")
         if not name:
             return
+        # The itemisation is measured, not estimated, and it is NOT what it used to say:
+        # provisioning caches THREE SeedVR2 tiers (~27 GB), not one 16 GB model, plus all
+        # three vision tiers (~11 GB) and the venv. That is ~40 of a 50 GB volume, which
+        # is why 40 GB has been seen 94% full. A fourth SeedVR2 model picked in Settings
+        # downloads to the volume on first use (1.9 to 15.4 GB depending on the tier), so
+        # the headroom is the thing to size for. Sizes: scripts/seedvr2_models.py.
         size = simpledialog.askinteger(
             "Create network volume",
-            "Size in GB (SeedVR2 ~16 GB + Ollama runtime & model ~10 GB + video "
-            "scratch; 50 leaves headroom, 40 has run 94% full):",
+            "Size in GB (SeedVR2 models ~27 GB + Ollama runtime & models ~11 GB + venv "
+            "and video scratch; 50 leaves headroom for another model, 40 has run 94% "
+            "full):",
             parent=self, initialvalue=50, minvalue=1, maxvalue=4000)
         if not size:
             return

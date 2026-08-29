@@ -14,6 +14,7 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import runpod_client
+import seedvr2_models as _seedvr2_models
 import ssh_setup
 import taskbar_progress
 from gui.common import SCRIPT_DIR, APP_ROOT, APP_TITLE, CREATE_NO_WINDOW, GUI_MARKER, CFG, get_default_folder, set_default_folder, PYTHON_EXE, _geometry_on_screen, save_settings, get_install_mode, RUN_ON_LOCAL, RUN_ON_REMOTE, small_gpu_note, open_in_explorer
@@ -66,17 +67,14 @@ def _clip_tc(seconds):
     return f"{s // 60}:{s % 60:02d}"
 
 
-# The "Method / Model" selector's options (#11): (label, engine, model). The SeedVR2 half
-# mirrors tab_settings._VIDEO_MODEL_OPTIONS (kept short here for the combobox); the
-# Real-ESRGAN half comes from the shared esrgan_models catalog. It runs BOTH locally (#11)
-# and remotely (#18 B: a volume-free esrgan pod), so it is offered in both modes. Keep in
-# sync with tab_settings if a SeedVR2 model is added.
-_SEEDVR2_METHODS = [
-    ("SeedVR2 / 7B FP16",  "seedvr2_ema_7b_fp16.safetensors"),
-    ("SeedVR2 / 7B Sharp", "seedvr2_ema_7b_sharp_fp16.safetensors"),
-    ("SeedVR2 / 3B Q8",    "seedvr2_ema_3b-Q8_0.gguf"),
-    ("SeedVR2 / 3B FP16",  "seedvr2_ema_3b_fp16.safetensors"),
-]
+# The "Method / Model" selector's options (#11): (label, engine, model). BOTH halves now
+# come from a shared torch-free catalog rather than a hand-kept copy -- SeedVR2 from
+# seedvr2_models (#26 Part A; this list had drifted from tab_settings' and was missing the
+# 7B FP8-mixed weight the wizard recommends to every 16 GB card), Real-ESRGAN from
+# esrgan_models. Real-ESRGAN runs BOTH locally (#11) and remotely (#18 B: a volume-free
+# esrgan pod), so it is offered in both modes. The catalog's `short` labels are used here
+# because this combobox is only 22 characters wide.
+_SEEDVR2_METHODS = _seedvr2_models.short_options()
 
 
 def _method_options(local):

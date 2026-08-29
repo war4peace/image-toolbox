@@ -9,10 +9,15 @@ dependencies" for the threads that drive ordering. Ideas investigated and
 One entry is listed first despite being **built**, because it is the only one with **dates**
 on it: #25, the RunPod API v2 migration. The code shipped in 0.6.1, but the old transports must
 be deleted after **2026-11-15** and in **early 2027**, and nothing else in the project will
-remember that. The rest are unbuilt: one measurement-gated processing capability (#21
-denoising, gated on a measurement that has not been run), a Video Upscaler feature (#12 mixed
-local+remote queue) and a remote-side one blocked on funds rather than design (#15 a second GPU
-provider). Two lower-priority ones each introduce a new process model, networking, or packaging
+remember that. #26 is half-shipped for the same reason: its easy half (list the five SeedVR2 weights the app
+already pinned but never offered) went out in 0.6.3, while its other half is a GPU measurement
+nobody has run, and the entry records a claim that half made which turned out to be false.
+The rest are unbuilt: one measurement-gated one (#21
+denoising, gated on a measurement that has not been run), one small input-format addition whose
+real content is a data-loss guard (#27 static GIF), a remote-side pair covering the same harm at
+different cost (#28, a pre-built public template, plus the cheap idle-volume mitigation it
+carries that needs no new primitives), a Video Upscaler feature (#12 mixed local+remote queue)
+and one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new process model, networking, or packaging
 (HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a numbering
 legend, after the open work.
 
@@ -21,6 +26,9 @@ legend, after the open work.
 ## Contents
 
 - [25. RunPod API v2 migration](#25-runpod-api-v2-migration-built-two-deletions-still-dated) (built; two dated deletions left)
+- [26. The five unreachable SeedVR2 DiT weights](#26-the-five-unreachable-seedvr2-dit-weights-part-a-built-part-b-still-gated-on-a-measurement) (Part A built; Part B needs a measurement)
+- [27. Static GIF input](#27-static-gif-input-easy-and-the-guard-is-the-point)
+- [28. Pre-built public RunPod template](#28-pre-built-public-runpod-template-medium-plus-a-cheap-mitigation-worth-doing-first)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
 - [15. Second remote GPU provider (packet.ai)](#15-second-remote-gpu-provider-packetai-medium)
@@ -66,6 +74,509 @@ hard-coded and a **410 is the only signal**, which the app turns into "RunPod ha
 this version of Image Toolbox uses. Update the app."
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
+
+---
+
+## 26. The five unreachable SeedVR2 DiT weights: Part A BUILT, Part B still gated on a measurement
+
+Found 2026-08-23 while surveying alternative upscaling engines (that survey is finished
+and every candidate was dropped: `docs/dropped-ideas.md`, "A second upscaling engine").
+This is what the survey turned up instead, and it is entirely inside the engine already
+shipped.
+
+**`upscale_engine._SEEDVR2_WEIGHTS` hash-pins TEN DiT variants. The GUI offered FIVE.**
+The other five were already downloadable, already SHA-256 verified, already handled by
+`ensure_seedvr2_weights` and already plumbed to the pod via `DIT_MODEL`. The only thing
+missing was a list entry.
+
+| Weight | GiB | Offered before 0.6.3 | Offered now |
+|---|---|---|---|
+| `7b_fp16` | 15.35 | wizard + video | all three |
+| `7b_sharp_fp16` | 15.35 | wizard + video | all three |
+| `7b_fp8_e4m3fn_mixed_block35_fp16` | 7.88 | **wizard only** | all three |
+| `7b_sharp_fp8_e4m3fn_mixed_block35_fp16` | 7.88 | **no** | all three |
+| `7b-Q4_K_M.gguf` | 4.43 | **no** | all three |
+| `7b_sharp-Q4_K_M.gguf` | 4.43 | **no** | all three |
+| `3b_fp16` | 6.32 | wizard + video | all three |
+| `3b-Q8_0.gguf` | 3.41 | wizard + video | all three |
+| `3b_fp8_e4m3fn` | 3.16 | **no** | all three |
+| `3b-Q4_K_M.gguf` | 1.86 | **no** | all three |
+
+Sizes measured 2026-08-23 from each pinned file's HuggingFace `Content-Length`; they are
+recorded in `scripts/seedvr2_models.py` because they answer the network-volume question
+below. **No new dependency:** `gguf` arrives via `seedvr2/requirements.txt`, which
+`bootstrap.ps1` installs for Local/Both, and the quantised path has been in production
+since 0.4.6 (`3b-Q8_0.gguf` is the wizard's <=12 GB tier). The loader guards on
+`GGUF_AVAILABLE` and fails with a named message. Only the **4-bit** and **FP8** variants
+were never listed.
+
+### Part A: BUILT in 0.6.3
+
+All ten are now selectable in the wizard, in Settings and on the Video tab. Four things
+came out of building it, and three of them were not in the plan.
+
+**There were THREE hand-kept lists, not two, and they had already drifted.** The plan
+named the wizard's `SEEDVR_OPTIONS` and Settings' `_VIDEO_MODEL_OPTIONS`; the Video tab's
+`_SEEDVR2_METHODS` is a third, with its own "keep in sync with tab_settings" comment. The
+drift was already real in two directions: `7b_fp8_e4m3fn_mixed_block35_fp16` was in the
+wizard but in NEITHER video list (so a 16 GB card was recommended a model for images that
+it could not select for video), and the two lists that did agree on contents disagreed on
+ORDER. So the fix is **not** the pinning test the plan proposed. A test only detects the
+next drift; `scripts/seedvr2_models.py` is one torch-free catalog that all three derive
+from, which cannot drift at all. That is the same shape as `esrgan_models.py`, whose
+catalog Settings and the Video tab already share, so it is a pattern the codebase had
+already proven on this exact problem.
+
+**The learned-batch and benchmark key could not tell these weights apart, and that had to
+be fixed in the same change.** `video_vram_sizer.model_tag` was family-only, so all SIX
+7B variants shared one key while spanning **4.43 GiB (Q4) to 15.35 GiB (FP16)** of
+resident weights. That is precisely the error `tile_tag` and `compile_tag` exist to
+prevent, and it fails in the dangerous direction: a ceiling measured on Q4 is higher, a
+learned value legitimately bypasses `BATCH_CAP`, so replaying it into an FP16 run OOMs. It
+stayed mostly latent only because a user could not switch models, which is exactly what
+Part A changed. `model_tag` now carries precision, and the two historical spellings are
+kept **byte-identical** (`7b` = 7B FP16 and the unknown-model fallback, `3b` = 3B Q8) so
+every row already in `video_bench` / `video_batch_learn` keeps its key and its meaning.
+One case is knowingly imperfect and is not migrated: a pre-0.6.3 row written by a 16 GB
+user whose wizard recommendation was FP8-mixed is filed under `7b` and can no longer be
+told apart from an FP16 row. The information to migrate it with does not exist; splitting
+FP8 out from here on at least stops that pool growing, and the sizer's OOM back-off is the
+net under the rows already in it.
+
+**Sharp variants deliberately share their twin's key.** Same architecture, byte-identical
+file size, so the same VRAM ceiling. Splitting them would orphan rows for no measurement
+gain. That was already true before this change.
+
+**The tests reach for the effect, not the list** (D5/D6): one builds the real Settings tab
+and reads the combobox's realised `values`, and one round-trips a newly-listed model
+through `_video_section()` to prove the picked label is what gets SAVED. A label that
+displays but maps back to the default on save is exactly the silent failure this codebase
+has now been bitten by twice. It earned its keep immediately: the equivalent test on the
+Benchmark window caught a `model=` parameter added to `resolve_bench_keys` but not to
+`resolve_bench_key`, which made every REMOTE multi-model window raise `TypeError` inside a
+bare `except` and collapse to a single row. That looked exactly like "the sweep only found
+one model", and no test of the module constants could have seen it.
+
+### The multi-model sweep (built 0.6.3, the half that makes Part B possible)
+
+Listing the models was the easy half. The measurement half needed the benchmark to sweep
+SEVERAL of them, which is what Real-ESRGAN has always done (`esrgan_all_tiers`, one run and
+one pod for every tier) and SeedVR2 never did: the model came from `CFG["video"]["dit_model"]`
+with no flag and no picker, so ten models meant ten rounds of Settings-Save-reopen and, on a
+pod, **ten deploys**. Five decisions shaped the fix.
+
+**The pod is deployed ONCE and the DiT is swapped on it.** That is the whole feature. A
+redeploy per model pays pod creation, volume mount and cold start each time, all billed; a
+swap pays only the weight reload. It needed a real change on the pod, because the worker
+loaded one DiT at startup and `process_job` explicitly withheld the model from SeedVR2 jobs
+(its comment said "a SeedVR2 worker ignores `&model=` entirely"). The worker now reloads on a
+MISMATCH only, so an omitted or matching model costs nothing and every older client behaves
+exactly as before. `_sweep_one_mode` grew an injected-engine path and does not close what it
+did not create, so the shared pod has exactly one teardown whatever happens in between.
+
+**The default is ONE model, deliberately unlike Real-ESRGAN's "all tiers".** An ESRGAN tier
+probe takes seconds; a SeedVR2 sweep takes hours per model and is billed on a pod. Sweeping
+ten because a default changed under somebody is a money bug, so `--models all` and the
+Models… picker have to be asked for.
+
+**A single-model sweep emits byte-identical tokens** ("off"/"on", not "7b_fp16/off"). Those
+tokens are what a reopened window matches its saved rows against and what every
+BCELL/BPROBE/BCEILING echoes, so decorating them would orphan every row an older build wrote.
+The `multi` flag lives inside `mode_token` rather than at each call site, because the runner
+and the GUI briefly disagreed about when a token grows its model half and the result was a
+one-model sweep emitting rows nothing could match.
+
+**It fixed a production bug on the way past, not just a benchmark limitation.**
+`job_group_key` is `(engine, gpu)` with the model deliberately absent, so two SeedVR2 jobs
+picked with different models on one card were already ONE group on ONE pod, running whatever
+`_worker_cfg` had sent. That was a wrong output reporting success. The LOCAL path never had
+it: `LocalEngineRouter` caches by `(etype, model)` and evicts on a change, which is the same
+policy the worker now implements. Remote was the odd one out.
+
+**The learned-batch key had to change on BOTH sides at once.** Remote keyed it under the bare
+RunPod id, which held only while one pod ran one DiT; a multi-model sweep would leave the last
+model's ceiling as every model's seed, and a learned value legitimately bypasses `BATCH_CAP`,
+so replaying a 3B-Q4 ceiling into a 7B-FP16 run OOMs. `video_benchmark` writes it and
+`batch_video_upscale` reads it, and if those two ever drift a remote sweep writes rows no run
+will ever read, which looks precisely like a benchmark that did nothing. They are pinned
+together by a test.
+
+**The orphaned rows were then recovered, on evidence rather than on a guess**
+(`db._migrate_learn_keys_add_model`). Those rows are converged batches measured on rented
+hardware, so throwing them away has a price. A row is re-keyed only when that install's OWN
+`video_bench` probes for the same card agree on exactly one model tag, because the learn row
+and those probes were written by the same sweeps and runs; where the evidence is absent or
+two models were measured, the row is LEFT orphaned and the sizer falls back to the seed plus
+the OOM back-off. A blanket "assume 7B FP16" was rejected: the wizard writes FP8-mixed into
+`video.dit_model` for every 16 GB card, so an install whose LOCAL card is 16 GB holds remote
+rows measured on FP8, which is invisible from the key and knowable only from the probes. A
+guessed key is worse than no key, because a learned value legitimately bypasses `BATCH_CAP`,
+so a ceiling filed against the wrong model can OOM a real run rather than merely mis-seed it.
+On the author's own corpus all five orphaned keys resolved, and three independent lines of
+evidence agreed (reachability: no benchmarked card was 16 GB, and FP8-mixed was in no video
+picklist; config: `video.dit_model` is FP16; and physics: `peak_alloc` at the smallest batch
+of the smallest output IS essentially the resident weights, and a 3090 read 15.8 GB against
+FP16's 15.35 GiB, where FP8-mixed would have read about half that).
+
+**The probe rows needed no migration at all**, which is the reassuring half: `model_tag` was
+deliberately left byte-identical for the two historical spellings, so every `7b` row is still
+`7b` and every `3b` row still `3b`. The expensive corpus (406 SeedVR2 probes, hours of GPU
+time, some of it rented) was never at risk.
+
+### The network volume: listing a model costs it nothing
+
+The question this raised is a fair one, because a fresh RunPod volume is created at 50 GB
+and provisioned with **26.6 GiB** of DiT weights (three tiers) plus ~11 GB of vision
+models and the venv, so it is already about 40/50 used. Pre-caching all ten DiTs would
+need **70.1 GiB** of weights alone. That does not fit, and it never will.
+
+**It does not have to, because availability and pre-caching are separate axes.** What the
+GUI offers is `seedvr2_models.py`; what the volume pre-caches is `pod/provision.sh`'s
+`DIT_MODEL_LIST`, and the second is deliberately the shorter list:
+
+- the configured `DIT_MODEL` is **always appended** to the provision download list and
+  de-duplicated, so whatever the user picks is on the volume after a re-provision;
+- and a model switched to **without** a re-provision is downloaded to the volume on first
+  use. That path is not new and not incidental: `remote_run`'s health wait budgets 15
+  minutes for exactly it, and the Settings tooltip has always said so.
+
+So `DIT_MODEL_LIST` is unchanged at three tiers. The only real cost of an off-list pick is
+a slow first run, plus **volume free space**, which is the one thing that did need
+attention: the volume-size prompt still itemised "SeedVR2 ~16 GB" from the single-model
+era, understating the cached set by 11 GB on the screen where the user chooses how big to
+make the thing. It now quotes the measured ~27 GB and says to leave room for another
+model. `provision.sh` carries the per-weight sizes so the next person to consider widening
+the cached set can check the budget without a network call.
+
+**Not built, and deliberately:** a free-space check on the pod before an on-demand weight
+download. It is the honest failure (a full volume fails the download mid-way rather than
+at a decision point), but it belongs to the provisioning path rather than to a picklist
+change, and the sizing prompt now makes the situation avoidable rather than merely
+detectable.
+
+### Part B: the tier question (gated on a measurement, do NOT guess)
+
+The interesting weight is **`7b-Q4_K_M`, not the 3B one.** `recommend_models` jumps from
+3B Q8 at <=12 GB straight to 7B FP8-mixed at 16 GB, and a 4-bit 7B sits in that gap. The
+question that decides it is the one that always decides quantisation: **does a 4-bit 7B
+beat a full-precision 3B at equal VRAM?** If yes, the 12 GB tier recommendation is
+currently wrong for every install, which is worth knowing. Secondary: `3b-Q4_K_M` is
+roughly half of Q8, so it is the candidate for whether the documented **8 GB minimum**
+can actually come down.
+
+**The rig already exists and is better than anything built ad hoc.**
+`video_benchmark.py` sweeps a target to its measured VRAM ceiling on the real card and
+persists per-probe rows to `video_bench` keyed by `bench_key` (model + tile + compile).
+Quality is a human call on real photographs, and the tool for that also exists: the
+`ComparisonWindow` **lens** (#14) puts the same patch from both images side by side at
+the true ratio.
+
+**One claim in the original plan here was WRONG, and Part A is what fixed it.** The plan
+said "model is already part of the key, so a Q4 sweep cannot collide with an existing
+one". It was not: the key was built from `sizer.model_tag`, which was family-only, so a 7B
+Q4 sweep would have resumed a 7B FP16 sweep's rungs and published its seconds and its
+ceiling as if they were the same model. Part B was therefore **unmeasurable** as written.
+It is measurable now, because `model_tag` carries precision. Anything else in this section
+that assumes the key separates two regimes should be checked the same way before it is
+relied on.
+
+**One prior measurement says do not assume the answer.** The PRO 6000 4K sweep found the
+wall is **activations, roughly 80% of peak, not weights** (memory: `pro6000-4k-7b-infeasible`;
+it is also why `blocks_to_swap`, a weight lever, was not the answer). If that holds here,
+a 4-bit weight lowers the **floor** (the model fits at all) without raising the **batch**,
+which makes Q4 a reach-more-cards change rather than a speed one. That is still worth
+having, but it is a different claim and should not be sold as the other one.
+
+**Do not move a threshold in `recommend_models` before Part B produces a clear winner.**
+Those tiers are the first thing every new user is handed, they are calibrated in
+`docs/first-start-wizard.md`, and CLAUDE.md's wizard line plus its 8 GB requirement both
+quote them. Part A changed nothing about them on purpose: it only made the models a user
+can knowingly choose match the models the app can actually run.
+
+**Difficulty:** Part A done, including the multi-model sweep Part B runs on. Part B is a
+measurement job rather than a coding job, and its cost is GPU hours plus a judgement call on
+real photos.
+
+---
+
+## 27. Static GIF input: Easy, and the guard is the point
+
+Researched 2026-08-23. **Scope here is STATIC GIF only.** The animated half is
+recorded at the bottom as an unscheduled phase 2, because the research answered it and
+the answer is worth not re-deriving, but nothing about it is planned.
+
+**Today `.gif` appears in no extension list at all** - not `IMAGE_EXTS` (all three
+copies), not `VIDEO_EXTS`, not `RAW_EXTS`. The app ignores GIF completely, so this is a
+clean feature and not a latent bug.
+
+### The guard is not a detail of this feature, it IS this feature
+
+Adding `.gif` to `IMAGE_EXTS` **alone reproduces #17's data loss exactly, and the #17
+guard does not fire.** Measured on a 6-frame GIF carrying a transparency index:
+
+```
+VARIANT_CANDIDATE_EXTS: ('.png', '.webp', '.tif', '.tiff', '.bmp')
+image_variant_reason -> None
+```
+
+`.gif` is not a variant candidate, so the check returns None. The engine is RGB
+frame-0 only (`_load_image` does `convert("RGB")`, `_save_image` writes
+`arr[..., :3]` of `tensor[0]`), so the output is a flattened first frame under a
+mirrored name, and **Conciliation's mirrored-name fallback then matches it with full
+confidence and archives or DELETES the animated original.** That is precisely the
+failure #17 exists to prevent, in a format that was simply never on the list.
+
+**So `.gif` joins `IMAGE_EXTS` and `VARIANT_CANDIDATE_EXTS` in the SAME change, never
+in sequence.** With both, an animated GIF is reported and skipped ("would lose 5 of 6
+frames"), which is correct, protective, shipped behaviour from day one and needs no
+decision about animation at all. The multi-frame branch already picks its noun per
+extension, so GIF wants `"frames"` alongside `.webp`, not `"pages"`.
+
+### The one real decision: what a static GIF is written AS
+
+GIF is a 256-colour palette with 1-bit transparency. Upscaling to 4K and saving back
+to `.gif` re-quantises to 256 colours and re-dithers, discarding most of what was just
+computed. Writing `.png` instead keeps the gain, but the output filename then differs
+from the source in extension, which touches Conciliation's mirrored-name matching
+(`<stem>.gif` vs `<stem>.png`). That interaction must be **checked, not assumed** - it
+is the same class of thing that made `#19` need `<stem>_raw.jpg`.
+
+A transparent static GIF is also a live case: `convert("RGB")` composites transparent
+pixels to black **silently** (measured: corner pixel RGBA `(0,0,0,0)` becomes RGB
+`(0,0,0)`). The variant guard catches this once `.gif` is a candidate, since
+`"transparency" in img.info` is already one of its tests. Verify that it does rather
+than assuming, because it is the difference between a skip and a silent flatten.
+
+**Difficulty:** Easy. Two list entries, one noun, one output-extension decision, and a
+test that the guard fires on an animated and on a transparent GIF.
+
+### Phase 2, NOT scheduled: animated GIF out to MP4/MKV
+
+Recorded only so the measurements are not lost. The question asked was whether an
+animated GIF can be split into frames, upscaled separately, and recombined into a
+video container (MP4/MKV rather than GIF). **Measured answer: yes, and it is
+dramatically cheaper than the obvious route.**
+
+The obvious route is to treat the GIF as a video and let the existing splitter handle
+it. That works - `probe()` reads GIF correctly and sets `is_vfr=True`, and
+`plan_split` correctly plans a CFR normalise - **but it costs a fortune**. Measured
+end to end on a 10-frame GIF:
+
+```
+FRAME INFLATION: 10 source frames -> 67 encoded frames (6.7x)
+```
+
+`plan_split` normalises to `r_fps` = 1/shortest-delay, and GIF delays are
+centisecond-quantised and routinely non-uniform. Modelled over realistic timings:
+uniform delays cost 1.0x, but **one 10 ms tick among 100 ms frames costs 9.6x**, and a
+single 10 ms frame is what many encoders emit for "as fast as possible". Every
+duplicate is a full diffusion pass, and the penalty is invisible in the UI.
+
+The frame-exact route was then measured against it, same GIF:
+
+| Route | Diffusion passes |
+|---|---|
+| through the existing video splitter | **67** |
+| extract frames, upscale each, recombine | **10** |
+
+Both output shapes were produced and verified with the app's own `probe()`: a VFR MKV
+carrying the original per-frame timing, and a CFR MP4 at 50 fps. The CFR one contains
+73 frames, **but those duplications happen at ENCODE time and are free**. That is the
+whole insight, and it generalises past GIF: **duplicate after upscaling, never
+before.** ffmpeg's concat demuxer with per-frame `duration` directives is what carries
+the original timing; the last frame must be repeated in the list or it is dropped, and
+the resulting duration ran 60 ms long on the test file, which the existing drift check
+would see.
+
+**What MP4/MKV output settles, and what it does not.** It dissolves the palette problem
+entirely (true colour, no re-quantisation) but **not transparency**. A transparent
+animated GIF composited to black is a real #17-class loss.
+
+**Transparency is DECIDED, and the decision is a matte** (2026-08-23): a Settings
+option for the matte colour, **defaulting to black**, rather than refusing transparent
+animated GIFs. Black is what `convert("RGB")` already produces, so the default matches
+the measured behaviour instead of inventing a second one, and the setting exists so the
+answer is the user's rather than the app's. **Revisit the hardcoded default only on
+actual demand** - this is deliberately not a colour picker with a preview until someone
+asks for one.
+
+Two notes for whoever builds it. The matte must be applied **deliberately and visibly**
+(composite onto the chosen colour), never left to fall out of `convert("RGB")`, or the
+setting silently does nothing when the default happens to match. And the same setting
+would generalise to the transparent images #17 currently refuses outright, which is
+worth knowing but is **not** a reason to widen the scope here: #17's refusal covers
+alpha, multi-page and bit depth together, and only one of those is a matte question.
+
+Looping semantics are also lost in a plain video container, and that is accepted rather
+than solved.
+
+---
+
+## 28. Pre-built public RunPod template: Medium, plus a cheap mitigation worth doing first
+
+Researched 2026-08-23. The idea is to replace the per-user network volume with a
+**pre-built public template** whose image already carries the model weights, so a
+remote user deploys instead of provisioning.
+
+### The motivating harm, which is the real reason this is here
+
+**An abandoned network volume bills forever.** A network volume costs $0.07/GB/month
+**billed continuously, independent of pod state**, so the app's 50 GB volume is
+**~$3.50/month whether or not anything ever runs**. The app itself creates that volume
+through one-click provisioning, and then **never mentions it again**. A user who tries
+Image Toolbox, provisions a volume, and stops using it is left paying indefinitely for
+storage they have forgotten exists, with nothing in the app to remind them.
+
+The amount is small. The shape is not: this is the app spending a user's money after
+the user has stopped using the app, as a direct consequence of a button the app
+offered. That is a user-harm argument, not an optimisation argument, and it is what
+sets the priority.
+
+### The cheap mitigation, which does NOT need the template
+
+**Everything needed already exists**, so this should be considered on its own and
+probably done first regardless of what happens to the template:
+
+- `runpod_client.list_network_volumes` / `get_network_volume` / `pods_using_volume` /
+  `delete_network_volume` are all already implemented.
+- `account_spend` (added by #25 P4) already returns a **`storage`** component, so the
+  app can state what storage has actually cost over the last 30 days rather than
+  estimating it.
+
+Candidate shapes, cheapest first: surface the volume and its monthly cost on the
+RunPod tab instead of leaving it invisible; say the recurring cost **at the moment of
+provisioning**, in the tooltip style where money-affecting controls lead with the
+consequence; and offer a plain "delete this volume" with the usual confirmation. None
+of that is architecture, and it addresses the actual harm directly. A template removes
+the volume for **new** users; only this helps the ones who already have one.
+
+### The template itself: what the research found
+
+**Licensing is clean, which was the likeliest blocker and is not one.** Every weight
+the volume holds is Apache-2.0 or better and ungated: SeedVR2 (`numz/SeedVR2_comfyUI`,
+`AInVFX/SeedVR2_comfyUI`, `ByteDance-Seed/SeedVR2-3B` all apache-2.0), Qwen3-VL 2B/8B
+(apache-2.0), Real-ESRGAN (BSD-3), the `ternaus/check_orientation` CNN (MIT).
+Redistribution inside a public image is permitted for all of them.
+
+**The precedent is already in this codebase.** esrgan pods already run volume-free, and
+`remote_run.py` records the reason in exactly these terms: *"there is no model volume
+to bind and no region to lock to. That is what lets it deploy the cheapest card
+anywhere ... a volume would pin it to one datacenter."* esrgan manages it by
+self-downloading a few hundred MB per pod; SeedVR2's ~26 GB cannot. A pre-baked image
+is the third option, neither a persistent volume nor a per-run download.
+
+**Secondary wins beyond the billing harm.** The volume pins every SeedVR2 run to one
+datacenter and the GPU picker is filtered to that region, with EU-RO-1 already recorded
+as routinely out of stock on all four tag cards; a template deploys region-wide against
+the whole live catalog. And it collapses onboarding from "pick a storage-capable DC,
+create a volume, run a billed provisioning pod, wait for ~40 GB" down to "deploy".
+Publishing costs nothing: public templates appear in the console's Explore section,
+RunPod Hub publishes from a GitHub repo (with a compute revenue share up to 7%), and
+public image hosting is free on both Docker Hub and GHCR.
+
+### The open number: pull time (no longer a gate, see "offer both" below)
+
+**Large-image pull time versus volume mount** is the one thing unmeasured. The volume's
+value is that a pod starts with weights already present; if pulling is slower, the
+template costs a wait on every deploy that the volume pays once. Known: community
+reports put ~35 GB as the largest baked image known to work, with RunPod noting slower
+initial rollout for very large ones, and **container disk defaults to 5 GB** and must be
+raised explicitly.
+
+**This was originally framed as the go/no-go and it is not one any more.** Once both
+paths are offered (decided below), pull time stops deciding *whether* to build the
+template and becomes an input to *advising which path a user should pick*. It can
+therefore be answered later, including from real use.
+
+### Scope: do not bake 40 GB
+
+The volume caches ~26 GB of SeedVR2 tiers plus ~11 GB of Ollama tiers because a
+re-provision is a billed pod, so caching everything up front is the cheaper trade. **A
+template inverts that**: everything baked is paid for on every cold start, by everyone.
+The sensible shape is a small family holding one tier each (an image-mode template with
+a single DiT plus the orientation CNN, a tag-mode one with a single vision model), not
+one large image. `RemoteSession(mode=...)` already selects a pod image per mode, so
+this is a change of constant rather than of architecture.
+
+Also note what a template makes obsolete: 0.5.5's incremental re-provision, the
+`ollama rm` pruning and the SeedVR2 stale-weight pruning all exist to make **volume**
+updates cheap, and are replaced by "rebuild the image" - simpler, but coarser, and a
+multi-GB build/push is a slow maintainer loop on every weight change.
+
+### The #26 relationship is weaker than it looks
+
+#26 was expected to depend on this. **It mostly does not.** `provision.sh` already
+states the configured `DIT_MODEL` is always included and de-duplicated, so a
+newly-listed weight **reaches the pod today regardless of the 50 GB budget**; it just
+costs a download on first use instead of being pre-cached. The budget constrains
+**pre-caching**, not **availability**. So #26 Part A is not blocked by this and should
+not wait for it. The dependency runs the other way and weakly: if a template ships,
+decide what to bake **after** #26 Part B says which tiers are worth recommending, or a
+tier the measurement later demotes is paid for on every cold start forever.
+
+**Borne out.** #26 Part A shipped in 0.6.3 without touching `DIT_MODEL_LIST` or the volume
+size, exactly as this predicted. What it DID need was a correction to the volume-size
+prompt, which still itemised the pre-caching set at "SeedVR2 ~16 GB" when the measured
+figure is ~27 GB. Worth noting for this entry: a template's baked size has the same
+failure mode, a number written once and then silently outgrown.
+
+### DECIDED: offer both, because they serve opposite users
+
+Settled 2026-08-23. A template is **not** a replacement for the volume. The two suit
+genuinely different users, and the split is clean enough to state as a rule:
+
+- **A recurring, multi-GPU user prefers the VOLUME.** Someone running (say) a 5090 for
+  images, an RTX 6000 for video and a small card for Tag & Rename provisions **once**
+  and all three modes mount it: verified, `_create_pod` reads a single
+  `runpod.network_volume_id` for image, tag and video alike (only esrgan is volume-free).
+  A template would make that user pull a per-mode image instead, so the one cost is
+  amortised across three modes on a volume and paid three times on templates.
+- **A one-off user prefers the TEMPLATE.** Someone upscaling 100 images and never
+  returning wants nothing left behind. For that user the template is not merely
+  cheaper, it is **structurally safe**: there is no artifact to abandon, so the harm
+  this entry opens with cannot occur at all. The volume's idle billing and the one-off
+  user are the same problem seen from two ends.
+
+**The region lock looks like a tension against the first bullet and mostly is not**,
+for a reason that is easy to miss and worth stating so it is not re-raised. The volume
+is region-locked, so a multi-GPU user's cards must all live in **one** datacenter. But
+**the app is single-task**: `refresh_tab_exclusivity` disables every other tab while any
+run is active, and `active_tool_tab` is the single place that answers "is anything
+running". So that user needs their three cards **sequentially, never concurrently**, and
+"all three in stock at the same instant" is not a requirement the app can generate.
+
+That is not incidental, it is decided. Concurrent runs were investigated and **dropped**
+on 2026-07-21 (`docs/dropped-ideas.md`, "Parallel jobs: an image tool + the Video
+Upscaler"), which records the conclusion directly: *"0.5.2 locks all other tabs while any
+run is active. One run at a time is now the stated model."*
+
+Field observation from the author, which is what makes the sequential requirement
+comfortable rather than merely survivable: a well-developed datacenter generally offers
+**at least one cheap, one standard and one big GPU tier**, and EU-RO-1 has reliably held
+all three. Poorer datacenters have fewer and richer ones have more, but that is the
+user's choice at provisioning time and the picker already shows live stock per region.
+
+**So the residual risk is a stock miss on one tool at one moment, not a topology
+problem.** The volume's weight-sharing advantage for a multi-GPU user stands.
+**Revisit this only if run exclusivity is reversed**, which is the same trigger the
+Parallel jobs entry already carries: concurrent runs would make "all cards in one DC at
+once" a genuine constraint for the first time.
+
+**What "offer both" does to the pull-time measurement.** Under an either/or decision,
+pull time was the go/no-go. Under "offer both" it **stops being a gate** and becomes an
+input to advice: the app would need it to tell a user which path suits them, not to
+decide whether to build the template. That is a weaker requirement and it can be
+answered later, including from real use.
+
+It is still worth knowing that the go/no-go form of the measurement **does not require
+the feature**: a Dockerfile with one DiT, pushed to a public registry, deployed once
+through the existing `runpod_client` and timed, needs no app changes at all. What
+genuinely does need the shipped feature is the production picture (variance across
+datacenters, host-side image caching, behaviour under repeated deploys), and that is
+tuning rather than go/no-go.
+
+**Difficulty:** Medium for the template. **Easy** for the mitigation, which needs no new
+primitives and is the only half that helps users who already have a volume.
 
 ---
 
@@ -463,6 +974,13 @@ The user installs and runs the application on their Unraid server.
   than trust the unit tests, which is why the sampled lines are pinned verbatim in
   `tests/test_diagnostics.py`. It also needed **no `db.py` change**, as planned, and ended up
   reading `db/cache.db` for the opposite reason: not to report from, but to redact with.
+- **#26 Part A shipped in 0.6.3** and cost one thing the entry did not predict: making the
+  five stranded weights selectable exposed that `video_vram_sizer.model_tag` was
+  family-only, so all six 7B variants shared one learned-batch / benchmark key across a
+  4.43 to 15.35 GiB spread of resident weights. It had stayed latent purely because nobody
+  could switch models. The generalisable rule: **widening what a user can choose turns every
+  key that collapses those choices into a live bug**, and the collapse is invisible until
+  the choice exists. Check the key before shipping the choice.
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
   lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,

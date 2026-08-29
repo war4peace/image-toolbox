@@ -40,8 +40,24 @@ DIT_MODEL="${DIT_MODEL:-seedvr2_ema_7b_fp16.safetensors}"
 # the three vision tiers (~11 GB). DIT_MODEL_LIST is a space-separated list; the
 # single configured DIT_MODEL is always included too (de-duplicated), so a custom or
 # off-tier choice (e.g. a sharp variant) is guaranteed present. The shared VAE is
-# downloaded once. The two lighter 7B/3B tiers are NOT the sharp/fp16-3B variants —
-# add those to DIT_MODEL_LIST if you want them cached too (watch the 50 GB budget).
+# downloaded once.
+#
+# THIS LIST IS DELIBERATELY SHORTER THAN WHAT THE GUI OFFERS, and it must stay that
+# way. Since 0.6.3 (#26 Part A) all TEN hash-pinned DiT variants are selectable in
+# Settings; pre-caching all ten would need 70.1 GiB of weights (measured; see the
+# sizes in scripts/seedvr2_models.py), against 26.6 GiB for these three. That does
+# not fit a 50 GB volume next to the three vision tiers (~11 GB) and the venv.
+#
+# Listing a model in the GUI costs this volume NOTHING, because availability and
+# pre-caching are separate: the configured DIT_MODEL is appended above and always
+# fetched, and a model switched to WITHOUT a re-provision is downloaded to the volume
+# on first use (remote_run's health wait budgets 15 min for exactly that). So the
+# only cost of an off-list pick is a slow first run -- and volume free space, which
+# is what the volume-size prompt in gui/tab_runpod.py now sizes for.
+#
+# Add a weight here only to make it instant on a fresh volume, and only after
+# checking the budget: 7B FP16 / Sharp FP16 are 15.35 GiB each, the FP8-mixed pair
+# 7.88, the 7B Q4 pair 4.43, 3B FP16 6.32, 3B Q8 3.41, 3B FP8 3.16, 3B Q4 1.86.
 DIT_MODEL_LIST="${DIT_MODEL_LIST:-seedvr2_ema_7b_fp16.safetensors seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors seedvr2_ema_3b-Q8_0.gguf}"
 # Vision models to cache on the volume. Provisioning is meant to be a one-time job,
 # so we pull the whole common set (all three wizard tiers) by default — a re-provision

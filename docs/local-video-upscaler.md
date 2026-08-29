@@ -35,6 +35,8 @@ Upscaler** tab, mirroring the image tabs' "Run on" picker.
 - [20. As built: the per-card VRAM benchmark suite](#20-as-built-the-per-card-vram-benchmark-suite)
 - [21. As built: dynamic ratio targets + the per-GPU feasibility guard](#21-as-built-dynamic-ratio-targets--the-per-gpu-feasibility-guard)
 - [22. Planned: extending the benchmark to remote pods](#22-planned-extending-the-benchmark-to-remote-pods-050-experimental)
+- [23. As built: benchmarking the Real-ESRGAN method](#23-as-built-benchmarking-the-real-esrgan-method-local--remote-056)
+- [24. As built: sweeping several SeedVR2 models in one run](#24-as-built-sweeping-several-seedvr2-models-in-one-run-063-26-part-a)
 
 ---
 
@@ -1079,12 +1081,21 @@ id from the picker, `_mp_bucket` on the fine 0.05-MP grid) to seed the first seg
 remote benchmark simply has to WRITE the learned batch under that same key:
 
 - **Learned batch:** `db.put_learned_batch(gpu_id, mp_bucket, saved)` with `gpu_id =
-  IMGTBX_GPU_OVERRIDE` (the RunPod id) and **NO `|model_tag` suffix** -- the remote run reads
-  the PLAIN id, whereas the local sizer reads `f"{gpu_id}|{tag}"`. `_record_cell_result` picks
-  the key by mode. Matching the run's *current* (un-model-qualified) behaviour is a deliberate
-  scaffolding decision: benchmarking with 7B then running 3B would cross-feed, exactly as the
-  run already behaves today; model-qualifying BOTH sides is a separate later cleanup, not part
-  of this.
+  IMGTBX_GPU_OVERRIDE` (the RunPod id). This originally carried **NO `|model_tag` suffix**,
+  matching the run's own un-model-qualified read, and said so as a deliberate scaffolding
+  decision: "benchmarking with 7B then running 3B would cross-feed, exactly as the run already
+  behaves today; model-qualifying BOTH sides is a separate later cleanup".
+
+  **That cleanup landed in 0.6.3** (#26 Part A) and it stopped being optional the moment one
+  pod could sweep several models: the last model swept would otherwise become every model's
+  seed, and since a learned value legitimately bypasses `BATCH_CAP`, replaying a 3B-Q4 ceiling
+  into a 7B-FP16 run OOMs. Both sides now key `f"{gpu_id}|{model_tag}"` plus the regime tag:
+  `video_benchmark` writes it, `batch_video_upscale.process_job` reads it, and a test pins the
+  two strings together, because if they ever drift a remote sweep writes rows no run will ever
+  read -- which is indistinguishable from a benchmark that did nothing. Pre-0.6.3 remote rows
+  are orphaned by this and fall back to the seed plus the OOM back-off; the information to
+  migrate them does not exist. `model_tag` itself also gained precision in the same change (it
+  was family-only, so all six 7B variants shared one key across a 4.43-15.35 GiB spread).
 - **`gpu_id` for the sweep:** local uses `_query_gpu_name()`; remote uses `IMGTBX_GPU_OVERRIDE`
   (the pod's card is not the local card). The per-probe resume rows (`db.video_bench`, keyed
   `gpu_id, model, out_w, out_h, batch`) keep their own `model` column and are unaffected.
@@ -1190,5 +1201,73 @@ is fundamentally different from a SeedVR2 one and the code reflects that:
   for ESRGAN is NOT a full grid: rows are the valid `(cell, tier)` pairs (a 2X cell has only a
   quality row, a 4X cell has both), keyed via `_row_pairs`. The #0 column shows the tier
   (COMPACT/QUALITY) instead of a compile mode.
+
+<div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
+
+## 24. As built: sweeping several SeedVR2 models in one run (0.6.3, #26 Part A)
+
+Real-ESRGAN has always benchmarked every tier in one run and one pod (`esrgan_all_tiers`,
+section 23). SeedVR2 could not: the model came from `CFG["video"]["dit_model"]`, with no CLI
+flag and no picker, so comparing models meant a Settings edit and a reopen per model and, on
+a rented pod, one deploy per model. Since #26 Part A made all ten DiTs selectable, that gap
+was the thing standing between the app and the tier question in Part B.
+
+### 24.1 A regime is now a (model, compile) pair
+
+`run_benchmark(models=[...])` builds one plan per `(model, compile)` and `_sweep_one_mode`
+runs it, with the MODEL as the outer loop so a remote sweep swaps the pod's DiT as rarely as
+possible (compile-ON and compile-OFF of the same model cost no swap).
+
+The row/display token carries the pair (`mode_token` -> `"7b_q4/on"`). That is deliberately
+NOT a second dimension threaded through every event, row key and handler: the row machinery,
+the saved keys and the filters were all built around one `mode` string, and Real-ESRGAN
+already puts a non-compile meaning in it. `mode_token(..., multi=False)` returns the bare
+`"off"`/`"on"` for a single-model sweep, and that is load-bearing rather than cosmetic: those
+tokens are what a reopened window matches its saved rows against and what every
+BCELL/BPROBE/BCEILING echoes, so a decorated token would orphan every row an older build
+wrote. The flag lives inside `mode_token` because the runner and the GUI briefly disagreed
+about when a token grows its model half, and the result was a one-model sweep emitting rows
+nothing could match.
+
+### 24.2 One pod, and what that cost on the worker
+
+The remote sweep deploys ONCE (in `run_benchmark`, not inside `_sweep_one_mode`) and passes
+the engine down; `_sweep_one_mode` does not close what it did not create, so the shared pod
+has exactly one teardown whatever happens in between (a Stop, a funds trip, a raise).
+
+The pod side needed a real change. `pod/worker.py` loaded one DiT at startup from
+`worker_settings.json`, and `/video/probe` had no model parameter at all. It now reloads on a
+MISMATCH (`_ensure_video_model`), which means:
+
+- an omitted or matching model never reloads, so every pre-0.6.3 client and every
+  single-model sweep behaves exactly as before;
+- the old engine is CLOSED before the new one is built, because a 7B-to-7B swap holding both
+  would need 30.7 GiB of resident weights;
+- a swap that cannot happen RAISES. Falling back to the loaded model would file one model's
+  numbers under another's key and they would be believed, which is worse than a failed probe.
+
+This is not the esrgan pattern despite the resemblance: an esrgan weight is ~65 MB and swaps
+in about a second, a SeedVR2 DiT is 1.9-15.4 GiB and costs a minute or two. A swap is worth
+avoiding; a REDEPLOY (pod creation + volume mount + cold start, all billed) is worth avoiding
+far more.
+
+### 24.3 The bug it fixed on the way past
+
+`job_group_key` is `(engine, gpu)` with the model deliberately absent, so two SeedVR2 jobs
+picked with different models on one card were already ONE group on ONE pod, and `process_job`
+passed the per-job model only for `fixed_ratio`. Both jobs therefore ran on whatever
+`_worker_cfg` had sent (the Settings default): a wrong output that reported success. The
+LOCAL path never had this, because `LocalEngineRouter` caches by `(etype, model)` and evicts
+the resident engine on a change, which is exactly the policy the worker now implements.
+
+### 24.4 The default is one model, on purpose
+
+`resolve_models` defaults to the CONFIGURED model alone, unlike `esrgan_all_tiers`. An ESRGAN
+tier probe takes seconds; a SeedVR2 sweep takes hours per model and is billed on a pod, so
+sweeping ten because a default changed under somebody is a money bug. `--models all` and the
+Models… picker exist to ask for it, and the picker's label states the weight total so the
+size of the commitment is on screen before it is made. Unknown names are dropped against the
+catalog rather than passed through: a typo must not reach a pod as a weight it will fail to
+download halfway through a paid sweep.
 
 <div align="right"><a href="#local-video-upscaling-design">↑ Back to top</a></div>
