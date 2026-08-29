@@ -14,9 +14,11 @@ already pinned but never offered) went out in 0.6.3, while what is left is an ea
 (three VRAM constants that still describe only the heaviest weight, which is what currently
 stops the new ones being useful) and a GPU measurement nobody has run, whose entry records a
 claim that half made which turned out to be false.
-#27 (static GIF) is built and is kept in place rather than moved to the legend, because its
-real content was never the input format: it is a data-loss guard, and the reason that guard is
-needed is the same reason the next format added will need one.
+#27 (GIF, both phases) is built and is kept in place rather than moved to the legend, because
+its real content was never the input format: it is a data-loss guard, and the reason that guard
+is needed is the same reason the next format added will need one. Its phase 2 also carries two
+corrections to its own earlier measurements, which is exactly the kind of thing a pointer line
+cannot hold.
 The rest are unbuilt: one measurement-gated one (#21
 denoising, gated on a measurement that has not been run), a remote-side pair covering the same
 harm at
@@ -32,7 +34,7 @@ legend, after the open work.
 
 - [25. RunPod API v2 migration](#25-runpod-api-v2-migration-built-two-deletions-still-dated) (built; two dated deletions left)
 - [26. The five unreachable SeedVR2 DiT weights](#26-the-five-unreachable-seedvr2-dit-weights-part-a-built-the-vram-constants-next-part-b-gated-on-a-measurement) (Part A built; the model-blind VRAM constants next; Part B needs a measurement)
-- [27. Static GIF input](#27-static-gif-input-built-in-063) (built)
+- [27. GIF input, static and animated](#27-gif-input-static-and-animated-built-in-063) (built, both phases)
 - [28. Pre-built public RunPod template](#28-pre-built-public-runpod-template-medium-plus-a-cheap-mitigation-worth-doing-first)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
@@ -394,11 +396,13 @@ real photos.
 
 ---
 
-## 27. Static GIF input: BUILT in 0.6.3
+## 27. GIF input, static and animated: BUILT in 0.6.3
 
-Researched 2026-08-23, built 2026-08-29. **Scope is STATIC GIF only.** The animated
-half is recorded at the bottom as an unscheduled phase 2, because the research answered
-it and the answer is worth not re-deriving, but nothing about it is planned.
+Researched 2026-08-23, built 2026-08-29 in two phases. **Phase 1 is the static GIF**
+(an image, handled by the Batch Upscaler) and **phase 2 is the animated one** (an
+animation, handled by the Video Upscaler, recorded at the bottom). Phase 2 was
+deliberately unscheduled when phase 1 shipped; it was built when its measurements were
+re-taken against the app's own code, and two of them did not survive that.
 
 **Before this, `.gif` appeared in no extension list at all** - not `IMAGE_EXTS` (all
 three copies), not `VIDEO_EXTS`, not `RAW_EXTS`. The app ignored GIF completely, so this
@@ -500,65 +504,130 @@ optimise away, the fixture has to be read back and checked, not trusted.** That 
 same instinct as the "present is not working" trio in `known-defects.md`, applied to
 test data instead of to an installed component.
 
-### Phase 2, NOT scheduled: animated GIF out to MP4/MKV
+### Phase 2: animated GIF out to MP4, BUILT in 0.6.3
 
-Recorded only so the measurements are not lost. The question asked was whether an
-animated GIF can be split into frames, upscaled separately, and recombined into a
-video container (MP4/MKV rather than GIF). **Measured answer: yes, and it is
-dramatically cheaper than the obvious route.**
+Built 2026-08-29 on the measurements below, which were taken in 2026-08-23 research and
+then RE-taken against the app's own code. Two of them did not survive contact, and both
+corrections are recorded here rather than quietly fixed.
 
-The obvious route is to treat the GIF as a video and let the existing splitter handle
-it. That works - `probe()` reads GIF correctly and sets `is_vfr=True`, and
-`plan_split` correctly plans a CFR normalise - **but it costs a fortune**. Measured
-end to end on a 10-frame GIF:
+#### The tool that owns it was not a judgement call
 
-```
-FRAME INFLATION: 10 source frames -> 67 encoded frames (6.7x)
-```
+The open question was whether an animated GIF belongs to the Batch Upscaler (it is an
+image file) or the Video Upscaler (it produces a video). It is settled by one fact:
+**`upscale_engine.upscale()` draws a FRESH RANDOM SEED for every image**
+(`self.args.seed = random.randint(...)`, no setting pins it), while the video path fixes
+one stable seed per source (`batch_video_upscale.per_video_seed`). On a photo that is
+invisible. On ten consecutive frames of one scene it is generative FLICKER, and no
+encoder fixes it afterwards. The video path also brings temporal batching, which is what
+makes an animation look coherent in the first place.
 
-`plan_split` normalises to `r_fps` = 1/shortest-delay, and GIF delays are
-centisecond-quantised and routinely non-uniform. Modelled over realistic timings:
-uniform delays cost 1.0x, but **one 10 ms tick among 100 ms frames costs 9.6x**, and a
-single 10 ms frame is what many encoders emit for "as fast as possible". Every
-duplicate is a full diffusion pass, and the penalty is invisible in the UI.
+So the Video Upscaler owns it, `.gif` is kept OUT of `VIDEO_EXTS` as its own case (the
+same call `raw_decode.RAW_EXTS` gets for the same reason: it is not interchangeable
+anywhere downstream), and **`gif_video.is_animated` is the whole of the static/animated
+split**: static to the Batch Upscaler, animated here. That split is an implementation
+detail a user must never have to hold, which is why the Batch Upscaler's skip line for
+an animated GIF now names the Video Upscaler (`batch_upscale.variant_next_step`).
 
-The frame-exact route was then measured against it, same GIF:
+#### The shape: prep, the existing pipeline unchanged, re-time
 
-| Route | Diffusion passes |
-|---|---|
-| through the existing video splitter | **67** |
-| extract frames, upscale each, recombine | **10** |
+`gif_video.prepare()` turns the GIF into an ordinary constant-rate video with exactly one
+frame per source frame, in the work area; everything downstream (plan_split, split, the
+engine, concat, the drift check) treats it as any other short source; then
+`gif_video.retime()` puts the original per-frame timing back, duplicating frames at
+ENCODE time. Structurally it is the same move the CLIP branch already makes, and it sits
+right beside it.
 
-Both output shapes were produced and verified with the app's own `probe()`: a VFR MKV
-carrying the original per-frame timing, and a CFR MP4 at 50 fps. The CFR one contains
-73 frames, **but those duplications happen at ENCODE time and are free**. That is the
-whole insight, and it generalises past GIF: **duplicate after upscaling, never
-before.** ffmpeg's concat demuxer with per-frame `duration` directives is what carries
-the original timing; the last frame must be repeated in the list or it is dropped, and
-the resulting duration ran 60 ms long on the test file, which the existing drift check
-would see.
+**Correction 1: the inflation is real but the recorded model was wrong.** The entry said
+`plan_split` normalises to `r_fps` = 1/shortest-delay and that "one 10 ms tick among 100
+ms frames costs 9.6x". Measured through this app's own `probe()`, ffmpeg does not report
+r_fps that way: that exact GIF reads `r_fps=59/6` and would cost **0.9x**, not 9.6x. The
+conclusion still holds and the penalty is still worth avoiding, just for a different
+distribution of cases:
 
-**What MP4/MKV output settles, and what it does not.** It dissolves the palette problem
-entirely (true colour, no re-quantisation) but **not transparency**. A transparent
-animated GIF composited to black is a real #17-class loss.
+| timing | source frames | CFR-normalised |
+|---|---|---|
+| uniform 100 ms | 10 | 10 (1.0x, no penalty) |
+| messy real-world | 10 | 38 (3.8x) |
 
-**Transparency is DECIDED, and the decision is a matte** (2026-08-23): a Settings
-option for the matte colour, **defaulting to black**, rather than refusing transparent
-animated GIFs. Black is what `convert("RGB")` already produces, so the default matches
-the measured behaviour instead of inventing a second one, and the setting exists so the
-answer is the user's rather than the app's. **Revisit the hardcoded default only on
-actual demand** - this is deliberately not a colour picker with a preview until someone
-asks for one.
+Every one of those duplicates is a full diffusion pass and nothing in the UI shows the
+waste. The generalisable rule is unchanged and is the reason for the whole shape:
+**duplicate after upscaling, never before.**
 
-Two notes for whoever builds it. The matte must be applied **deliberately and visibly**
-(composite onto the chosen colour), never left to fall out of `convert("RGB")`, or the
-setting silently does nothing when the default happens to match. And the same setting
-would generalise to the transparent images #17 currently refuses outright, which is
-worth knowing but is **not** a reason to widen the scope here: #17's refusal covers
-alpha, multi-page and bit depth together, and only one of those is a matte question.
+**Correction 2: neither concat form is exact, and the entry only caught one half.** It
+recorded that `duration` directives plus the repeated last frame the demuxer needs ran
++60 ms long. Reproduced exactly. Adding `-t` to trim then **overcorrected to -40 ms**.
+Both leave the trailing frame's length to ffmpeg. `gif_video.plan_timing` removes the
+decision instead: GIF delays are centisecond-quantised, so take the GCD as a tick and
+list each frame `delay/tick` times with no duration directives at all. Total frames
+becomes arithmetic. Measured **zero drift on all four timing shapes**, including the
+pathological one. It is a pure function, so that arithmetic is unit-tested without
+ffmpeg.
 
-Looping semantics are also lost in a plain video container, and that is accepted rather
-than solved.
+#### The matte works, and the first version of it silently did not
+
+Measured: a transparent GIF decodes as `bgra`, a bare conversion composites it to
+**black** (confirming the entry's reasoning for that default), and compositing onto an
+explicit colour source produces black, white, magenta and `#336699` correctly.
+
+The bug worth recording is how the first implementation failed. Compositing in the
+filtergraph needs a second input, a `color` source, and **an overlay takes its output
+RATE from that background input**: `color=c=black` with no rate generated 25 fps, and a
+10-frame GIF came out as **17 PNGs**. Resampling before the model runs is the one thing
+this feature exists to avoid, and it was reintroduced by the matte. It was caught
+immediately, and only because `prepare()` asserts its own frame-exactness and refuses
+rather than continuing. So the work is split deliberately: **ffmpeg explodes the GIF**
+(frame disposal and coalescing are real semantics its decoder implements and a naive
+per-frame read gets wrong) and **Pillow composites the matte** (exact, no rate involved,
+no second input).
+
+The matte setting lives in **Settings -> Video Upscaler**, which is the user's own call
+and the right one: upscaling an animated GIF is a video upscaler's job, and whether a
+thing is "a video or a series of images" is a technical detail nobody should have to hold
+in order to find a setting.
+
+#### Naming, and the third encounter with one collision
+
+Output is **`<base>_gif_<target>.mp4`**. The video upscaler names outputs
+`<base>_<target>.mp4`, so `logo.gif` and `logo.mp4` in one folder would both claim
+`logo_4K.mp4` -- one silently becomes "already upscaled" with its lineage row pointing at
+a file made from the other source. That is #19's RAW+JPEG collision and phase 1's
+GIF+PNG collision for the third time, and the answer is the same each time: an
+UNCONDITIONAL marker. The rule lives in `gif_video.OUTPUT_MARKER` and is applied inside
+`batch_video_upscale._output_path`, which already owns naming for all four of its
+callers; a test pins that the two agree.
+
+#### Conciliation never replaces an animated GIF, three times over
+
+An MP4 is **not a superset** of an animated GIF: looping is gone and transparency has
+been composited onto a matte. Both are accepted losses for a DERIVED file the user asked
+for; neither is acceptable when the original is about to be archived or **deleted**.
+Three independent guards, because the failure is irreversible and quiet:
+
+1. **No lineage row is recorded for a GIF source.** This is #23 item 5's decision applied
+   again, and for exactly its reason: `db.lineage` is not a provenance log, it is what
+   Conciliation MATCHES ON, and video conciliation is lineage-only. No row means the
+   question is never even asked.
+2. **An explicit refusal in `conciliate.build_plan`**, listed and reported separately from
+   RAW (same reason, different files, and a user needs to know which is which).
+3. The #17 variant guard still catches it as a side effect. It is deliberately **not**
+   relied on: its reason ("would lose 5 of 6 frames") describes the Batch Upscaler
+   flattening it, which is no longer what the app does with one, so a future change that
+   taught it about animation would silently remove the protection.
+
+A **static** GIF is unaffected and is still conciliated normally, because there the
+processed PNG genuinely is a superset. The guard is about ANIMATION, not about the
+extension, and a test says so.
+
+#### What is still accepted rather than solved
+
+Looping semantics are lost in a plain video container. The `<base>_gif_` marker survives
+into the output name, which is the honest cost of never letting two sources claim one
+name. And `retime()` explodes the upscaled video to PNG in the work area, so a long GIF
+at 4K needs transient disk proportional to its frame count; GIFs are short, and the work
+area already holds multi-GB video segments, so this was not worth optimising before
+anyone hits it.
+
+See `gif_video.py` and `tests/test_gif_video.py`.
 
 ---
 
@@ -1104,7 +1173,8 @@ The user installs and runs the application on their Unraid server.
   Assistant dashboard samples; Real-ESRGAN engine; metadata copy + backfill; the comparison
   lens; derived-directory pruning; skipping image variants the pipeline cannot round-trip;
   Conciliation Undo; RAW input; video stabilization; browsing already-upscaled images; the
-  Video Stabilization workflow; the diagnostics bug report; static GIF input), so the
+  Video Stabilization workflow; the diagnostics bug report; GIF input, static and
+  animated), so the
   remaining sequencing is only among the open milestones below.
 - **Open milestones: #21, #28, #12, #15, #3, #4, plus #25 and #26, which are BUILT** and open
   only for what is left of them: #25 for its two dated deletions, #26 for the model-blind VRAM
@@ -1139,8 +1209,8 @@ The user installs and runs the application on their Unraid server.
   weights are selectable but are sized, gated and advised as the heaviest one. That failure
   is SILENT (a batch too small, or a card the picker never offers) rather than an error, so
   no fail-with-advice net catches it. Those are Easy and come before Part B.
-- **#27 (static GIF) shipped in 0.6.3** and confirmed its own premise: the feature was never
-  the input format, it was the **guard**, and the entry was right that adding `.gif` to
+- **#27 (GIF input) shipped in 0.6.3, both phases**, and confirmed its own premise: the
+  feature was never the input format, it was the **guard**, and the entry was right that adding `.gif` to
   `IMAGE_EXTS` alone would have reproduced #17's data loss in a format nothing was watching.
   What it did not predict is where the cost actually landed, and the lesson generalises past
   GIF. **Pillow's GIF writer silently discards the exact properties the tests are about**: a
@@ -1152,7 +1222,8 @@ The user installs and runs the application on their Unraid server.
   test data instead of at an installed component, and it is the third distinct place that
   shape has bitten this project. The other cost was the one the entry flagged: the output
   cannot keep its extension, so it needed #19's collision reasoning a second time
-  (`<stem>_gif.png`) plus an explicit inverse in `conciliate.resolve_by_name`, because
+  (`<stem>_gif.png`) and then a THIRD time in phase 2 (`<base>_gif_<target>.mp4`), plus an
+  explicit inverse in `conciliate.resolve_by_name`, because
   lineage is not available on every install and Conciliation is the tool that deletes things.
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
@@ -1322,15 +1393,17 @@ kept in two places drifts, and the stale copy is the one that gets read.
   rule will find** (the vision model's descriptions were still in the zip after every path
   rule passed). See `docs/bug-reports.md`, `CLAUDE.md` (Report an issue) and
   `tests/test_diagnostics.py`.
-- **#27: Static GIF input.** Shipped 0.6.3. The Batch Upscaler accepts `.gif`; the feature is
-  the **guard**, since adding it to `IMAGE_EXTS` without `VARIANT_CANDIDATE_EXTS` reproduces
-  #17's data loss in a format nothing was watching. Output is `<stem>_gif.png` (GIF would
-  re-quantise the result to 256 colours, and the marker is #19's collision reasoning a second
-  time), and `conciliate.resolve_by_name` inverts that name explicitly so the replacement does
-  not depend on a lineage row this install may not have. The entry stays in the open list
-  above rather than shrinking to this line, because it carries the measured, deliberately
-  unscheduled phase-2 record for animated GIF. See `CLAUDE.md` (Static GIF input) and
-  `tests/test_gif_input.py`.
+- **#27: GIF input, static and animated.** Shipped 0.6.3, both phases. A STATIC GIF is an
+  image the Batch Upscaler upscales to `<stem>_gif.png`; an ANIMATED one is an animation the
+  Video Upscaler turns into `<base>_gif_<target>.mp4`. The split is forced rather than chosen:
+  the image engine draws a fresh random seed per image, which on consecutive frames of one
+  scene is generative flicker. The feature is really the **guard** in both phases: `.gif` in
+  `IMAGE_EXTS` without `VARIANT_CANDIDATE_EXTS` reproduces #17's data loss, and Conciliation
+  must never replace an animated GIF with a video that has lost its looping and flattened its
+  transparency. The entry stays in the open list above rather than shrinking to this line,
+  because it holds two measurement corrections and the reason a matte cannot be built in an
+  ffmpeg filtergraph. See `CLAUDE.md` (GIF input), `tests/test_gif_input.py` and
+  `tests/test_gif_video.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 

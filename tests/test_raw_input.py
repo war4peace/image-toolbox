@@ -403,7 +403,7 @@ def test_conciliation_never_plans_to_replace_a_raw_original(tmp_path):
     Image.new("RGB", (3840, 2160)).save(str(proc / "IMG_1234_raw.jpg"), "jpeg")
     Image.new("RGB", (3840, 2160)).save(str(proc / "IMG_1234.jpg"), "jpeg")
 
-    plan, _folders, _kept, _variants, raw_files = cc.build_plan(
+    plan, _folders, _kept, _variants, raw_files, _gifs = cc.build_plan(
         str(orig), str(proc), tr_index=None, conn=None)
 
     assert plan == []
@@ -419,7 +419,7 @@ def test_every_raw_extension_is_refused_by_conciliation(tmp_path):
         (orig / f"shot{ext}").write_bytes(b"negative")
         Image.new("RGB", (64, 64)).save(str(proc / f"shot{ext[1:]}.jpg"), "jpeg")
 
-    plan, _folders, _kept, _variants, raw_files = cc.build_plan(
+    plan, _folders, _kept, _variants, raw_files, _gifs = cc.build_plan(
         str(orig), str(proc), tr_index=None, conn=None)
     assert plan == []
     assert len(raw_files) == len(raw_decode.RAW_EXTS)
@@ -436,7 +436,7 @@ def test_a_raw_is_reported_as_a_negative_not_as_a_non_media_file(tmp_path):
     (orig / "IMG_1234.CR2").write_bytes(b"negative")
     (orig / "Thumbs.db").write_bytes(b"junk")
 
-    _plan, folders, kept_files, _variants, raw_files = cc.build_plan(
+    _plan, folders, kept_files, _variants, raw_files, _gifs = cc.build_plan(
         str(orig), str(proc), tr_index=None, conn=None)
 
     _rel, replaced, skipped, kept = folders[0]
@@ -454,7 +454,7 @@ def test_an_ordinary_image_is_still_replaced_normally(tmp_path):
     Image.new("RGB", (800, 600)).save(str(orig / "photo.jpg"), "jpeg")
     Image.new("RGB", (3840, 2160)).save(str(proc / "photo.jpg"), "jpeg")
 
-    plan, _folders, _kept, _variants, raw_files = cc.build_plan(
+    plan, _folders, _kept, _variants, raw_files, _gifs = cc.build_plan(
         str(orig), str(proc), tr_index=None, conn=None)
     assert len(plan) == 1
     assert raw_files == []

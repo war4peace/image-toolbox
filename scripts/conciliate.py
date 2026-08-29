@@ -298,6 +298,22 @@ def resolve_by_lineage(o_abs, conn, get_index):
     return None
 
 
+def _is_animated_gif(path):
+    """True when `path` is a GIF with more than one frame (#27 phase 2).
+
+    Guarded and local rather than imported from `gif_video`: that module pulls in
+    `video_pipeline`, and this runner is deliberately free of the heavy video stack.
+    An unreadable file answers False, so the existing "corrupted / unreadable"
+    reporting keeps it instead of this stealing the classification.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return int(getattr(im, "n_frames", 1) or 1) > 1
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 def resolve_by_name(o_rel, processed_root, tr_index):
     """
     Fallback matching when no hash lineage exists: the upscaler mirrors the tree
@@ -394,6 +410,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
     kept_files    = []
     variant_files = []
     raw_files     = []
+    gif_files     = []
     processed_ab  = _norm(processed_root)
     # By NAME, so a nested archive deeper in the tree is skipped too: the old
     # single `<original_root>/__Archive__` path check only caught the top one (#16).
@@ -434,6 +451,26 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
             # and must not be "simplified" into the extension list above.
             if ext in RAW_EXTS:
                 raw_files.append(abs_f)
+                skipped += 1
+                continue
+            # An ANIMATED GIF is never replaced either (#27 phase 2), for the same
+            # superset reason and with the same explicitness. The Video Upscaler can
+            # now turn one into an MP4, and an MP4 is NOT a superset of it: looping is
+            # gone, and transparency has been composited onto a matte. Both are
+            # accepted losses for a DERIVED file the user asked for; neither is
+            # acceptable when the original is about to be archived or deleted.
+            #
+            # Two other things already point the same way and neither is relied on
+            # here. The variant guard (#17) refuses it as well, but its reason ("would
+            # lose 5 of 6 frames") describes the Batch Upscaler flattening it, which is
+            # not what happened, and a future change that taught it about animation
+            # would silently remove the protection. And `batch_video_upscale` does not
+            # record lineage for a GIF at all -- the same call #23 made for stabilised
+            # videos, because `lineage` is not a provenance log, it is what THIS
+            # function matches on. Three independent guards, because the failure is
+            # irreversible and quiet.
+            if ext == ".gif" and _is_animated_gif(abs_f):
+                gif_files.append(abs_f)
                 skipped += 1
                 continue
             if ext not in MEDIA_EXTS:
@@ -477,7 +514,7 @@ def build_plan(original_root, processed_root, tr_index, conn=None,
         summary = pruner.summary()
         if summary:
             log_cb(f"  {summary}")
-    return plan, folders, kept_files, variant_files, raw_files
+    return plan, folders, kept_files, variant_files, raw_files, gif_files
 
 
 # ─────────────────────────────────────────────
@@ -1070,7 +1107,7 @@ def main():
     _gui_event("STATUS", "Scanning the original folder …")
     log.tee("")
     log.tee("Scanning …")
-    plan, folders, kept_files, variant_files, raw_files = build_plan(
+    plan, folders, kept_files, variant_files, raw_files, gif_files = build_plan(
         original_root, processed_root, tr_index,
         conn=conn, abort=_quit_evt.is_set,
         status_cb=lambda m: _gui_event("STATUS", m),
@@ -1124,6 +1161,14 @@ def main():
         log.tee("RAW originals - never archived or deleted, whatever the mode:")
         for p in raw_files:
             log.tee(p)
+    # Listed separately from RAW rather than folded in with it: the two are kept for
+    # the same REASON (the processed file is not a superset of the original) but a
+    # user reading this needs to know which of their files are which.
+    if gif_files:
+        log.tee("")
+        log.tee("Animated GIFs - never archived or deleted, whatever the mode:")
+        for p in gif_files:
+            log.tee(p)
     log.tee("")
     log.tee(f"  Total: {total_replaced} file(s) to replace, "
             f"{total_skipped} left untouched, "
@@ -1137,6 +1182,11 @@ def main():
                 f"rendered JPEG is one interpretation of a negative, not a "
                 f"replacement for it, so they are kept and their renders stay in "
                 f"the processed folder.")
+    if gif_files:
+        log.tee(f"  Of the untouched, {len(gif_files)} are animated GIFs: an "
+                f"upscaled video of one does not loop and has its transparency "
+                f"flattened onto a matte, so the GIF is kept and the video stays "
+                f"in the processed folder.")
     if pending_meta:
         log.tee(f"  Metadata to restore: {pending_meta} image(s) will get the "
                 f"capture date, camera and other fields their original still has "

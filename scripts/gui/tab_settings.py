@@ -553,6 +553,29 @@ class SettingsTab(ttk.Frame):
         eng_cb.bind("<<ComboboxSelected>>", lambda _e: self._sync_model_choices())
         self._sync_model_choices()
 
+        # Animated GIF matte (#27 phase 2). It lives on the VIDEO Upscaler section, and
+        # that is the user's own call: upscaling an animated GIF is a video upscaler's
+        # job, and whether a thing is "a video or a series of images" is a technical
+        # detail nobody should have to hold in order to find the setting.
+        mat = ttk.Frame(sec)
+        mat.grid(row=15, column=0, columnspan=6, sticky="w", pady=(10, 0))
+        ttk.Label(mat, text="Transparent GIF background:").pack(side="left", padx=(0, 4))
+        self.video_gif_matte_var = tk.StringVar(
+            value=str(vid.get("gif_matte", "black") or "black"))
+        matte_cb = ttk.Combobox(mat, textvariable=self.video_gif_matte_var, width=18,
+                                values=["black", "white", "gray", "#336699"])
+        matte_cb.pack(side="left")
+        Tooltip(matte_cb,
+                "The colour painted behind an animated GIF's see-through areas when it is "
+                "upscaled into a video. Video files cannot store transparency, so something "
+                "has to go behind it.\n\n"
+                "Black is the recommended value and matches what you would get anyway. "
+                "Choose white if your GIFs are line art or logos meant for a light page. "
+                "Any colour name or #RRGGBB works; an unrecognised one falls back to black.\n\n"
+                "This does not affect still images: a see-through PNG or static GIF is left "
+                "alone rather than flattened.",
+                wraplength=W)
+
         # ── SeedVR Settings (everything else in the upscale block) ──────────────
         # Placed AFTER the two tabs it serves (Batch Upscaler + Video Upscaler): these
         # are engine internals both of them share, so they read as a footnote to the
@@ -1225,6 +1248,7 @@ class SettingsTab(ttk.Frame):
             "auto_tune_batch":     bool(self.video_autotune_var.get()),
             "input_noise_scale":   noise,
             "confirm_before_rent": bool(self.video_confirm_var.get()),
+            "gif_matte":           (self.video_gif_matte_var.get().strip() or "black"),
         }
 
     def _collect(self):

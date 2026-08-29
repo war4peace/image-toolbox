@@ -493,6 +493,26 @@ image_variant_reason = runner_common.image_variant_reason
 is_variant_reason    = runner_common.is_variant_reason
 
 
+def variant_next_step(path, reason):
+    """A pointer to the tool that CAN handle this file, or "" when none exists.
+
+    Only one case has an answer today: an ANIMATED GIF, which this tool genuinely
+    cannot process (it makes images, not videos) but the Video Upscaler can since #27
+    phase 2. Saying only "would lose 5 of 6 frames" is correct about the danger and
+    useless about the remedy, and it leaks the app's own internal split -- whether a
+    thing is "a video or a series of images" is a technical detail a user should never
+    have to hold in order to find the right tab.
+
+    Animated is detected from the REASON rather than by re-opening the file, and the
+    coupling is deliberate: only the multi-frame branch of image_variant_reason emits
+    " frames", so a transparent STATIC GIF ("would lose transparency") correctly gets
+    no pointer, while a transparent animated one does. tests/test_gif_video.py pins
+    both directions, since the two strings live in different modules."""
+    if os.path.splitext(path)[1].lower() == ".gif" and " frames" in (reason or ""):
+        return "  ->  the Video Upscaler tab can upscale this as a video"
+    return ""
+
+
 def _skip_for_dims(w, h, cutoff_pct):
     """
     The skip rule for a single (already-upright) width/height.
@@ -2077,8 +2097,9 @@ def main():
         logger.tee(f"  Left as they are - upscaling would discard part of these "
                    f"images ({len(variant_list)}):")
         for _vp, _vr in variant_list:
-            logger.log_only(f"    {_vp}  ({_vr})")
-            print(f"    {_osc8_link(_vp)}  ({_vr})")
+            _next = variant_next_step(_vp, _vr)
+            logger.log_only(f"    {_vp}  ({_vr}){_next}")
+            print(f"    {_osc8_link(_vp)}  ({_vr}){_next}")
 
     if not work_items:
         logger.tee("Nothing to process.")
@@ -2275,8 +2296,9 @@ def main():
         logger.tee(f"  Left as they are ({len(seen)}) - upscaling would discard part of them:")
         logger.tee("-" * _w)
         for vp, vr in seen.items():
-            logger.log_only(f"  {vp}  ({vr})")
-            print(f"  {_osc8_link(vp)}  ({vr})")
+            _next = variant_next_step(vp, vr)
+            logger.log_only(f"  {vp}  ({vr}){_next}")
+            print(f"  {_osc8_link(vp)}  ({vr}){_next}")
         logger.tee(sep)
 
     # ── Discord: queue finished / stopped ───────────────────────────────────

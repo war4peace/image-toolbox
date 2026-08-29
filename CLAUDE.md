@@ -124,7 +124,7 @@ exists that makes a RAW small, which is why the revisit trigger recorded in
 `docs/dropped-ideas.md` is an 8K resolution target. See `raw_decode.py` and
 `tests/test_raw_input.py`.
 
-**Static GIF input** (0.6.3, future-features #27) — the Batch Upscaler accepts `.gif`.
+**Static GIF input** (0.6.3, future-features #27 phase 1) — the Batch Upscaler accepts `.gif`.
 The feature is really the **guard**: before this `.gif` was in no extension list at all,
 and adding it to `IMAGE_EXTS` alone reproduces #17's data loss exactly, because `.gif`
 was not a `VARIANT_CANDIDATE_EXTS` member, so `image_variant_reason` returned None for
@@ -158,8 +158,53 @@ halves already no-op on a GIF source. The thing worth carrying forward is a TEST
 dropped unless index N is used in the pixel data; identical `append_images` collapse to
 `n_frames == 1`), so a naive fixture is quietly the opposite of what it claims and every
 builder in `tests/test_gif_input.py` asserts its own output before a test relies on it.
-Animated GIF out to MP4/MKV is researched, measured and **not scheduled**
-(`docs/future-features.md` #27 phase 2).
+Animated GIF is phase 2, below.
+
+**Animated GIF to video** (0.6.3, future-features #27 phase 2) — an animated GIF is
+upscaled by the **Video Upscaler**, not the Batch Upscaler, and that is forced rather
+than chosen: `upscale_engine.upscale()` draws a **fresh random seed for every image**
+with no setting to pin it, while the video path fixes one per source
+(`per_video_seed`), so upscaling an animation frame-by-frame through the image engine is
+generative FLICKER no encoder can fix. The video path also brings temporal batching,
+which is what makes an animation look coherent. `.gif` is kept OUT of `VIDEO_EXTS` as
+its own case (the call `RAW_EXTS` gets, for the same reason: not interchangeable
+downstream), and `gif_video.is_animated` is the whole static/animated split. Shape is
+**prep -> the existing pipeline unchanged -> re-time**, structurally the same move the
+CLIP branch already makes: `gif_video.prepare()` writes a constant-rate intermediate
+with exactly one frame per source frame, everything downstream treats it as an ordinary
+short video, and `gif_video.retime()` restores the original per-frame timing afterwards.
+That ordering IS the feature: handing the GIF straight to the splitter is not wrong, it
+is expensive, because a CFR normalise inflates a messy-timed 10-frame GIF to **38
+frames** (measured; uniform delays cost nothing), each one a full diffusion pass with
+nothing in the UI showing the waste. **Duplicate after upscaling, never before.**
+Re-timing is `plan_timing`, a pure GCD-tick function listing each frame `delay/tick`
+times with NO concat `duration` directives, because both obvious forms miss: directives
+plus the repeated last frame the demuxer needs ran **+60 ms** on a 760 ms clip and adding
+`-t` overcorrected to **-40 ms**, both leaving the trailing frame's length to ffmpeg.
+Measured **zero drift on four timing shapes**. Transparency becomes a **matte**
+(`video.gif_matte`, default black, Settings → Video Upscaler because upscaling an
+animated GIF is a video upscaler's job and "video or series of images" is a split no
+user should have to hold), and the matte is composited by **Pillow, not in the
+filtergraph**: an `overlay` takes its output RATE from its background input, so a
+`color` source with no rate turned 10 frames into **17** and silently reintroduced the
+one thing the feature exists to avoid. It was caught only because `prepare()` asserts
+its own frame-exactness and refuses. ffmpeg still does the exploding (GIF frame disposal
+and coalescing are real semantics its decoder implements). Output is
+**`<base>_gif_<target>.mp4`**, this codebase's THIRD encounter with one collision
+(`logo.gif` + `logo.mp4` would both claim `logo_4K.mp4`); the marker lives in
+`gif_video.OUTPUT_MARKER` and is applied inside `_output_path`, which already owns naming
+for all four callers. **Conciliation never replaces an animated GIF**, guarded three
+times because the failure is irreversible and quiet: no lineage row is recorded for a GIF
+source at all (#23 item 5's decision again -- `lineage` is not a provenance log, it is
+what Conciliation matches on), an explicit refusal in `build_plan` reported separately
+from RAW, and the #17 variant guard as an unrelied-on side effect (its reason describes
+the Batch Upscaler flattening it, which is no longer what the app does). A **static** GIF
+is unaffected and still conciliates normally: the guard is about ANIMATION, not the
+extension. The Batch Upscaler still refuses an animated GIF and now **names the Video
+Upscaler** in the skip line (`variant_next_step`), detected from the reason string rather
+than by re-opening the file. Looping is lost and accepted; `retime` explodes the upscaled
+video to PNG in the work area, so transient disk scales with frame count. See
+`gif_video.py` and `tests/test_gif_video.py`.
 
 **Tag & Rename** — analyses each image with a local Ollama vision model, writes
 a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`.
@@ -1273,6 +1318,7 @@ plain by design, the rule is recorded above the style constant)); **`gui/compari
 | `seedvr2_models.py` (~180 lines) | The SeedVR2 DiT catalog (0.6.3, future-features #26 Part A): which upscale models exist, each one's measured file size, and the two label styles the GUI shows (full for Settings + the wizard, short for the Video tab's 22-character Method combobox). Torch-free/tkinter-free/stdlib-only, and a deliberate mirror of `esrgan_models.py`, which already solved this same problem for the other engine. **It exists because the list was written out THREE times** (`wizard_recommend.SEEDVR_OPTIONS`, `tab_settings._VIDEO_MODEL_OPTIONS`, `tab_video._SEEDVR2_METHODS`), each with a comment claiming it mirrored the others, and all three had already drifted: `7b_fp8_mixed` was in the wizard but NEITHER video list even though `recommend_models` hands it to every 16 GB card, and the two that agreed on contents disagreed on order. A pinning test would only DETECT the next drift; one catalog all three derive from cannot drift. Adding a model is a row here plus a download pin in `upscale_engine._SEEDVR2_WEIGHTS`, which `tests/test_seedvr2_models.py` enforces in **both** directions (nothing offered without a pin, nothing pinned left stranded, which is how five weights went unreachable). `size_bytes` is measured, not estimated, and answers the volume question: the GUI offering all ten costs a RunPod network volume NOTHING, because availability and pre-caching are separate axes (the configured `DIT_MODEL` is always appended to `provision.sh`'s `DIT_MODEL_LIST`, and an off-list pick downloads to the volume on first use, which `remote_run`'s health wait already budgets 15 min for). Pre-caching all ten WOULD cost 70.1 GiB against 26.6 GiB today, which is why that list stays the shorter one. |
 | `exif_copy.py` (~330 lines) | Metadata transfer (0.5.9, future-features #13), Pillow-only and fail-safe. `exif_for_upscaled()` reads the source's block, normalises Orientation to 1 (the pipeline already applied it), corrects the pixel dimensions to the output size, and strips a TIFF source's structural tags before they can describe a strip layout inside a JPEG; `save_kwargs()` splats it into `Image.save` for the formats that can carry one (BMP is excluded: Pillow accepts `exif=` and writes nothing). `pending_backfill()` / `backfill()` are Conciliation's retroactive half: "copy what is missing, keep what is present", JPEG via `piexif.insert` (byte-identical scan data) and PNG via an atomic lossless re-save, everything else refused with a named reason. Every entry point swallows its own errors and returns "nothing to do" -- 13a runs inside an upscale and 13b runs one statement before an archive or a delete. Pushed to the pod with `upscale_engine.py`. |
 | `raw_decode.py` (~380 lines) | RAW / DNG input (0.6.0, future-features #19). Owns `RAW_EXTS`, the header-only `raw_dimensions()` (LibRaw, flip-corrected, and the reason a RAW never reaches Pillow), `render()` (the preview-vs-demosaic choice plus the container+preview metadata merge), `thumbnail()` for the film strip, and `render_name()` (the `_raw.jpg` rule that stops a RAW and its sibling camera JPEG mapping to one output). The geometry is pure module-level functions (`upright_size` / `preview_is_full_size`), tested without rawpy. rawpy and Pillow are lazy inside it, so importing it stays instant and torch-free -- which is why `runner_common` can import it at module level for the one shared extension list. |
+| `gif_video.py` (~300 lines) | Animated GIF to video (0.6.3, future-features #27 phase 2), torch-free: stdlib + Pillow + the bundled ffmpeg through `video_pipeline`. Owns the prep/re-time pair that lets an animated GIF run through the Video Upscaler's existing pipeline unchanged, plus `is_animated` (the whole static/animated split that decides which TOOL handles a `.gif`) and `OUTPUT_MARKER`. `plan_timing` is a pure GCD-tick function so the arithmetic deciding the output's length is tested without ffmpeg. Two things here are decisions, not details. The work is split between ffmpeg (explodes the GIF, because frame disposal and coalescing are real semantics its decoder implements) and Pillow (composites the matte, because an `overlay` takes its output RATE from its background input and a `color` source turned 10 frames into 17 -- resampling before the model runs is the ONE thing this module exists to avoid). And `prepare` REFUSES on a frame-count mismatch rather than continuing, which is the only reason that bug was caught rather than shipped as a silently expensive run. See `tests/test_gif_video.py`. |
 | `diagnostics.py` (~430 lines) | Bug-report diagnostics (0.6.1, future-features #24), stdlib-only/torch-free/fail-safe. Turns the app's own logs and state into something that can safely leave the machine, for the in-app **Report an issue** flow. **The design record is `docs/bug-reports.md`: read it before touching a redaction rule.** The **redactor** is most of the module: substitute the roots the app already knows (each registered in BOTH its long and 8.3 short spelling, because real logs carry `C:\Users\EDUARD~1\...`), hash every component after them (salted per report, extension and its case preserved), match bare private names greedily, then **drop any line that still looks like it holds a path**. It never tries to find "a path" in free text: a Windows name can contain spaces, and one real folder contains a DOUBLE space, so no pattern can bound one. Three rules must not be relaxed, each of which cost a leak or a gutted report to learn: a path runs **to the end of its line** unless it is quoted, where the closing quote ends it; **every** component of a backslash-joined token must resolve or the LINE goes; and the vision model's DESCRIPTIONS, the names generated from them, and (in a Tag & Rename log) file paths outright are **removed rather than redacted**, because prose cannot be pattern-matched, so the rule is the line's SHAPE and the policy is per-TOOL. It reads `db/cache.db` READ-ONLY as its dictionary: the one file that must never be attached is the best redaction source there is. The **collector** half reads the newest log per tool (a TAIL, deliberately not a parser) and fits the URL body to a budget. Measured: ~201,000 real lines audited twice, zero leaks, 0.23% dropped, 4.15% removed, ~41k lines/s. See `tests/test_diagnostics.py`, whose sampled lines are verbatim and are the regression net. |
 | `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers (0.6.1: `fmt_mmss` is `mm:ss.mmm`, because a per-image time is routinely under a second and a flat `00:00` reads as "nothing was measured" rather than "this was fast"; the TOTALS stay whole-second, where a millisecond is noise), `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation, and (0.6.3) **`gif_output_name()` / `is_gif_output_name()` / `gif_source_name()`** (#27), the naming rule for the one input whose output cannot keep its extension, plus the inverse Conciliation and the upscaled-image browser need to find their way back to the source without a database. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename; the Video Upscaler records a whole-video source→output row here too, 0.4.9 item 10); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools;

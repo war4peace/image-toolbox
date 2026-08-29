@@ -200,7 +200,7 @@ def test_conciliation_matches_a_gif_by_name_without_lineage(db_conn, tmp_path):
     src = _gif(orig / "holiday.gif")
     out = _png(proc / "holiday_gif.png")
 
-    plan, folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
+    plan, folders, _kept, variants, *_rest = cc.build_plan(str(orig), str(proc),
                                                        tr_index=None,
                                                        conn=db_conn)
     assert variants == []
@@ -238,20 +238,26 @@ def test_conciliation_finds_a_gif_output_that_was_tagged_and_renamed(tmp_path):
 
 
 def test_conciliation_refuses_an_animated_gif(db_conn, tmp_path):
-    """The data-loss case, checked on the ORIGINAL before either matching path,
-    so a tree upscaled before this shipped is protected too."""
+    """The data-loss case, checked on the ORIGINAL before either matching path, so a
+    tree upscaled before this shipped is protected too.
+
+    It is reported as an ANIMATED GIF rather than as a #17 variant since phase 2
+    (`gif_files`, not `variant_files`). The variant guard still refuses it, but its
+    reason ("would lose 5 of 6 frames") describes the Batch Upscaler flattening it,
+    which is no longer what the app does with one: the Video Upscaler keeps every
+    frame. The refusal now stands on its own explicit rule, so a future change to the
+    variant guard cannot quietly remove it."""
     orig, proc = tmp_path / "orig", tmp_path / "proc"
     orig.mkdir()
     proc.mkdir()
     _gif(orig / "clip.gif", frames=6)
     _png(proc / "clip_gif.png")               # what a careless build produced
 
-    plan, _folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
-                                                        tr_index=None,
-                                                        conn=db_conn)
+    plan, _folders, _kept, variants, _raws, gifs = cc.build_plan(
+        str(orig), str(proc), tr_index=None, conn=db_conn)
     assert plan == []
-    assert [os.path.basename(p) for p, _r in variants] == ["clip.gif"]
-    assert "frames" in variants[0][1]
+    assert [os.path.basename(p) for p in gifs] == ["clip.gif"]
+    assert variants == [], "an animated GIF is its own category now, not a variant"
 
 
 def test_conciliation_refuses_an_animated_gif_even_with_lineage(db_conn,
@@ -267,11 +273,10 @@ def test_conciliation_refuses_an_animated_gif_even_with_lineage(db_conn,
                               db.hash_file_cached(db_conn, src),
                               db.hash_file_cached(db_conn, out), src, out)
 
-    plan, _folders, _kept, variants, *_ = cc.build_plan(str(orig), str(proc),
-                                                        tr_index=None,
-                                                        conn=db_conn)
+    plan, _folders, _kept, _variants, _raws, gifs = cc.build_plan(
+        str(orig), str(proc), tr_index=None, conn=db_conn)
     assert plan == []
-    assert len(variants) == 1
+    assert len(gifs) == 1
 
 
 # -- the other tools ---------------------------------------------------------

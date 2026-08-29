@@ -60,6 +60,7 @@ runner_common.harden_stdout()
 import db
 import notifications
 import video_pipeline as vp
+import gif_video
 
 # Fail-safe diagnostic trail for the swallowed-error handlers (guarded import so an old
 # install missing debug_log.py still runs). Same pattern the other runners use.
@@ -75,6 +76,18 @@ APP_ROOT = os.path.dirname(_SCRIPT_DIR)
 # Containers the walker treats as video. Old home-camera formats first.
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg",
               ".flv", ".webm", ".3gp", ".ts", ".mts", ".m2ts", ".vob"}
+
+# An ANIMATED GIF is also a source here (#27 phase 2), and it is kept OUT of
+# VIDEO_EXTS on purpose, exactly as `raw_decode.RAW_EXTS` is kept out of the Batch
+# Upscaler's IMAGE_EXTS. It is not interchangeable with the others anywhere
+# downstream: it needs a prep pass before the pipeline and a re-time pass after, its
+# output name carries a marker, and Conciliation must never replace one. Every branch
+# asks which of the two it is rather than assuming.
+#
+# The STATIC/ANIMATED split is what decides which tool owns the file: a static GIF is
+# an image and the Batch Upscaler handles it (#27 phase 1), an animated one is an
+# animation and belongs here. A user should never have to know that, which is why the
+# Batch Upscaler's skip message for an animated GIF names this tab.
 
 # Target name -> SeedVR2 short-side output resolution.
 TARGET_RES = {"1080p": 1080, "1440p": 1440, "4K": 2160}
@@ -640,6 +653,15 @@ def resolve_video_cfg(cfg, overrides=None):
         # gated here (default on) for the rare case a user wants it off. Clips are never
         # linked (their "source" is a virtual sub-range, not a replaceable file).
         "record_lineage":      bool(v.get("record_lineage", True)),
+        # Matte colour for a TRANSPARENT animated GIF (#27 phase 2). A video container
+        # has no alpha, so the choice is a matte or a refusal, and refusing would make
+        # the feature unavailable for a large share of real GIFs. The default is BLACK
+        # because that is what a bare conversion already produces, so the default
+        # matches the measured behaviour instead of inventing a second one; the setting
+        # exists so the answer is the user's. Deliberately not a colour picker with a
+        # preview until somebody asks for one.
+        "gif_matte":           str(v.get("gif_matte", gif_video.DEFAULT_MATTE)
+                                   or gif_video.DEFAULT_MATTE),
     }
     # Resident-vs-phase VRAM threshold for the VIDEO path, SEPARATE from the image one
     # (upscale.vram_resident_threshold_gb, default 40). A video temporal window's VAE decode is
@@ -864,8 +886,15 @@ def iter_videos(src_root, skip_roots=None, pruner=None):
             keep.append(d)
         dirnames[:] = keep
         for name in filenames:
-            if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
-                ap = os.path.join(dirpath, name)
+            ext = os.path.splitext(name)[1].lower()
+            ap = os.path.join(dirpath, name)
+            if ext == gif_video.GIF_EXT:
+                # The only per-file OPEN in this walk, and it is confined to GIFs: a
+                # static one is the Batch Upscaler's job and must not be queued here.
+                # Pillow opens lazily, so this reads a header, not the frames.
+                if gif_video.is_animated(ap):
+                    yield ap, os.path.relpath(ap, src_root)
+            elif ext in VIDEO_EXTS:
                 yield ap, os.path.relpath(ap, src_root)
 
 
@@ -1257,6 +1286,13 @@ def _output_path(output_root, rel, target, clip_id=0, clip_label=None,
     (#11) appends its tag (e.g. `_realesrgan`) so two engines' outputs never collide."""
     rel_dir = os.path.dirname(rel)
     base = os.path.splitext(os.path.basename(rel))[0]
+    if os.path.splitext(rel)[1].lower() == gif_video.GIF_EXT:
+        # `logo.gif` and `logo.mp4` in one folder would both claim `logo_4K.mp4`, and
+        # that is not a crash: one silently becomes "already upscaled" and its lineage
+        # row points at a file made from the other source. Third time this codebase has
+        # met the collision (#19 RAW+JPEG, #27 phase 1 GIF+PNG). The marker is
+        # UNCONDITIONAL, so the name never depends on what else is in the folder.
+        base += gif_video.OUTPUT_MARKER
     etag = _engine_tag(engine)
     esuf = f"_{etag}" if etag else ""
     if clip_id:
@@ -1564,6 +1600,11 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     job_model = (_row_get(job, "model") or None)
     job_start = time.time()                        # wall-clock, for the true per-file elapsed
     src_abs = os.path.join(source_root, rel)
+    # #27 phase 2. Checked HERE because the output name depends on it, and cheap: a
+    # header read, and only for a `.gif`. `gif_delays` doubles as the "this job is a
+    # GIF" flag and as the timing retime() puts back at the end; prepare() fills it in
+    # with the real values below (a resumed job reads them from the source again).
+    gif_delays = gif_video.frame_delays(src_abs) if gif_video.is_animated(src_abs) else None
     out_video = job["output_path"] or _output_path(
         os.path.join(source_root, vcfg["output_subdir"]), rel, target,
         clip_id=clip_id,
@@ -1607,6 +1648,29 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
             f"[{_tc(job['clip_start'])}-{_tc(job['clip_end'])}]"
             + (f' "{job["clip_label"]}"' if job["clip_label"] else "")
             + f": {job_info.nb_frames}f extracted")
+    elif gif_delays is not None:
+        # An animated GIF is PREPPED into an ordinary constant-rate video first, and
+        # everything downstream then treats it as any other short source. Structurally
+        # the same move as the clip branch above: materialise a different input in the
+        # work area, point job_info/mux_source at it, leave `info` for the output
+        # resolution (the prep shares the GIF's dimensions).
+        #
+        # It exists because handing the GIF STRAIGHT to the splitter is not wrong, it is
+        # expensive. plan_split would correctly CFR-normalise it, but GIF delays are
+        # centisecond-quantised and routinely non-uniform, so a messy-timed 10-frame GIF
+        # normalises to 38 frames -- 38 full diffusion passes for 10 frames of animation,
+        # with nothing in the UI showing the waste. The original timing is re-applied
+        # after the upscale instead, where duplicating frames is free.
+        os.makedirs(work_root, exist_ok=True)
+        gif_src = os.path.join(work_root, "gif_prep.mkv")
+        if not os.path.exists(gif_src):                  # reused on resume
+            gif_delays = gif_video.prepare(
+                src_abs, gif_src, work_root, matte=vcfg.get("gif_matte"),
+                log=lambda m: log("    " + str(m).strip()))
+        job_info = vp.probe(gif_src, count=True)
+        mux_source = gif_src
+        log(f"[{index}/{total}] {rel}: animated GIF, {job_info.nb_frames} frame(s) "
+            f"prepped ({sum(gif_delays) / 1000.0:.2f}s)")
     else:
         job_info = info
         mux_source = src_abs
@@ -1966,13 +2030,32 @@ def process_job(engine, conn, root_id, source_root, job, vcfg, budget, index, to
     reference = sum(s.frame_count for s in segs)   # SeedVR2 preserves per-segment frames (6.3)
     # Drift is checked against the CLIP (job_info) for a clip job, not the whole source.
     report = vp.check_drift(job_info, out_info, seg_out, reference_frames=reference)
+
+    # An animated GIF gets its ORIGINAL per-frame timing back here, and the position in
+    # this sequence is the point. The drift check above compares the upscale against the
+    # PREP, which is the honest question ("did the pipeline preserve every frame?"); it
+    # is asked BEFORE re-timing deliberately, because re-timing changes the frame count
+    # on purpose and would read as drift. Lineage is recorded AFTER, so the hash it
+    # stores is of the file the user actually gets.
+    if gif_delays is not None:
+        gif_video.retime(out_video, gif_delays, out_video, work_root,
+                         log=lambda m: log("    " + str(m).strip()))
+        out_info = vp.probe(out_video, count=True)
+
     db.upsert_video_output(conn, root_id, rel, target, clip_id=clip_id, status="done",
                            output_path=out_video, out_frames=out_info.nb_frames)
     # Record source <-> output lineage for a WHOLE-video job (item 10). Skipped for a
     # clip: its "source" is a virtual sub-range of a longer file, not a replaceable
     # whole, so a src->clip link would be wrong for conciliation. src_abs is the untouched
     # source (never mux_source, which is the temp clip for a clip job).
-    if not clip_id and vcfg.get("record_lineage", True):
+    # A GIF source is deliberately NOT lineaged (#27 phase 2), which is #23 item 5's
+    # decision applied again: `db.lineage` is not a provenance log, it is what
+    # Conciliation MATCHES ON, and video conciliation is lineage-ONLY. A row here would
+    # make the app's one destructive tool offer to archive or DELETE the GIF and move
+    # the MP4 into its place -- for a conversion that drops looping and flattens
+    # transparency onto a matte. Conciliation refuses animated GIFs explicitly as well;
+    # this is the half that means the question is never even asked.
+    if not clip_id and gif_delays is None and vcfg.get("record_lineage", True):
         _record_video_lineage(conn, src_abs, out_video, log=log_file_only)  # file only
     shutil.rmtree(work_root, ignore_errors=True)
     try:
