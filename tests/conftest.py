@@ -137,3 +137,36 @@ def db_conn(tmp_path, monkeypatch):
     yield conn
     conn.close()
     monkeypatch.setattr(_db, "_conn", None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _settings_tab_never_probes_the_network():
+    """Neutralise SettingsTab's constructor-time Ollama probe for the WHOLE suite.
+
+    `SettingsTab.__init__` ends with `self._check_ollama()`, which is right for the app
+    (the status text is ready before the user opens the tab) and wrong for a test: it
+    starts a daemon thread that does a real `urlopen`, and `ssl.create_default_context()`
+    opens the Windows certificate store. The thread outlives the fixture that built the
+    tab, so it is still running -- inside the cert store, or calling back into a destroyed
+    widget -- while later tests run.
+
+    `test_settings_ha_webhook.py` already knew this and stubbed the method, but it did so
+    by assigning to the CLASS and never restoring it, which made the protection depend on
+    collection order: every file collected BEFORE it got the real probe. That was one file
+    out of two until 0.6.3 added two more SettingsTab builders, taking it to three.
+
+    It surfaced as `Windows fatal exception: code 0x80000003` on a CI run of a commit that
+    had passed minutes earlier on another branch, with two leaked threads in the dump: one
+    inside `_load_windows_store_certs`, one inside the import lock. Removing the network
+    thread does not prove the other one is harmless; it removes the half this suite has no
+    business starting at all. A test suite should make no network calls.
+    """
+    mp = pytest.MonkeyPatch()
+    try:
+        from gui import tab_settings
+    except Exception:                    # noqa: BLE001 (no tkinter: nothing to guard)
+        yield
+        return
+    mp.setattr(tab_settings.SettingsTab, "_check_ollama", lambda self: None)
+    yield
+    mp.undo()

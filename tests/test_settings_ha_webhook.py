@@ -33,13 +33,17 @@ WID = "imgtbx_a8f3c1"
 @pytest.fixture(scope="module")
 def tab():
     """One hidden root and one real tab for the module: building a Tk root per test
-    is what makes tkinter suites flaky. The Ollama reachability probe is stubbed
-    out because it spawns a background thread that would call back into a
-    destroyed widget after the last test."""
+    is what makes tkinter suites flaky.
+
+    The Ollama reachability probe used to be stubbed HERE, by assigning to the class and
+    never restoring it. The reason was right (it spawns a background thread that outlives
+    the fixture and calls back into a destroyed widget) but the placement made the
+    protection depend on collection order: it covered this file and everything collected
+    after it, and left every earlier SettingsTab builder with the real network call. It is
+    a session-wide autouse fixture in conftest now."""
     from gui import tab_settings
 
     root = make_tk_root()
-    tab_settings.SettingsTab._check_ollama = lambda self: None
     widget = tab_settings.SettingsTab(ttk.Notebook(root),
                                       app=type("App", (), {"root": root})())
     yield widget
