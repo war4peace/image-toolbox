@@ -927,7 +927,21 @@ def import_bench_rows(conn, rows):
 
 
 @_locked
-def max_feasible_output_mp(conn, gpu_id):
+def _regime_ok(proof_key, job_key):
+    """Whether a row recorded under `proof_key` proves `job_key`. Guarded import so db.py
+    stays loadable without the sizer (and so the lazy call never cycles: the sizer imports
+    db at module level)."""
+    if not job_key:
+        return True                                    # no regime asked for: no filtering
+    try:
+        import video_vram_sizer as _sizer
+        return _sizer.regime_qualifies(proof_key, job_key)
+    except Exception as exc:                           # noqa: BLE001 (fail-safe)
+        debug_log("db._regime_ok", exc=exc)
+        return True                                    # never narrow on our own failure
+
+
+def max_feasible_output_mp(conn, gpu_id, regime=None):
     """The largest OUTPUT megapixels PROVEN feasible for this card (feature #7 feasibility
     guard): the biggest 'ok' probe in video_bench plus the biggest learned key in
     video_batch_learn (a present key means a real run fit that output class). Returns None
@@ -937,24 +951,57 @@ def max_feasible_output_mp(conn, gpu_id):
     This is SeedVR2's VAE-decode ceiling, so Real-ESRGAN probes are EXCLUDED (model
     'esrgan-*'): a fixed-ratio GAN tiles on OOM and reaches 4K on a 16 GB card SeedVR2
     could never fit, so counting an ESRGAN 4K probe here would wrongly mark that card
-    feasible for a 4K SeedVR2 job. ESRGAN has no such ceiling and never consults this."""
+    feasible for a 4K SeedVR2 job. ESRGAN has no such ceiling and never consults this.
+
+    `regime` (0.6.3) is the full bench key the JOB will run under (`model_tag + learn_tag`,
+    e.g. "7b|c"); rows recorded under a regime that does not prove it are ignored. Omit it
+    and nothing is filtered, which is the pre-0.6.3 behaviour and what every caller that
+    cannot know its regime still gets.
+
+    It matters because this is the ONLY way a card BELOW its target's VRAM floor is
+    admitted (`tab_video._seedvr2_gpu_ok` has no seed to fall back on, unlike
+    `video_estimate.max_output_mp`), so an over-claim here is a card offered for a run that
+    then OOMs -- billed, on a pod. Both halves of the key were being ignored:
+
+      * MODEL. #26 Part A made ten weights selectable spanning 1.86 to 15.35 GiB, so a 4K
+        probe under 3B-Q4 could qualify the card for a 7B-FP16 4K job. Theoretical only so
+        far, since no light-model probes exist yet, but it became reachable the moment the
+        picklists grew.
+      * COMPILE, which is the half that already bites. Measured on this project's own
+        3090: `7b` (uncompiled) proves 2.07 MP while `7b|c` proves 1.23 MP, and at
+        1920x1080 compiled the card records ok=0 with an OOM at batch 5. Taking the max
+        over both told a compiled run that 1080p was proven when the card's own
+        measurements said otherwise. `learn_tag` had already established that compile
+        moves the ceiling (125 -> 53 at 540x720); that finding never reached here.
+
+    Filtering can only shrink the answer toward the VRAM-tier seed, never inflate it, which
+    is what makes it safe to tighten. A legacy learned row with no model tag (one the
+    0.6.3 migration could not attribute on evidence) names no regime and so proves nothing
+    specific: it is dropped when a regime is asked for, deliberately."""
     if not gpu_id:
         return None
     best = 0.0
     try:
         for r in conn.execute(
-                "SELECT out_w, out_h FROM video_bench WHERE gpu_id=? AND outcome='ok' "
-                "AND model NOT LIKE 'esrgan-%'",
+                "SELECT model, out_w, out_h FROM video_bench WHERE gpu_id=? "
+                "AND outcome='ok' AND model NOT LIKE 'esrgan-%'",
                 (gpu_id,)):
-            if r["out_w"] and r["out_h"]:
+            if r["out_w"] and r["out_h"] and _regime_ok(r["model"], regime):
                 best = max(best, (r["out_w"] * r["out_h"]) / 1_000_000.0)
     except Exception as exc:                           # noqa: BLE001 (fail-safe)
         debug_log("db.max_feasible_output_mp(video_bench)", exc=exc)
     try:
         for r in conn.execute(
-                "SELECT mp_key FROM video_batch_learn WHERE gpu_id = ? OR gpu_id LIKE ?",
+                "SELECT gpu_id, mp_key FROM video_batch_learn "
+                "WHERE gpu_id = ? OR gpu_id LIKE ?",
                 (gpu_id, gpu_id + "|%")):
-            if r["mp_key"]:
+            if not r["mp_key"]:
+                continue
+            # The learn key is `card|model|regime`; strip the card to get the same token
+            # video_bench stores. A bare `card` row carries no model at all.
+            key = r["gpu_id"] or ""
+            proof = key[len(gpu_id) + 1:] if key.startswith(gpu_id + "|") else ""
+            if _regime_ok(proof, regime):
                 best = max(best, r["mp_key"] * MP_KEY_UNIT)
     except Exception as exc:                           # noqa: BLE001 (fail-safe)
         debug_log("db.max_feasible_output_mp(video_batch_learn)", exc=exc)

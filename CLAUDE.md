@@ -759,7 +759,24 @@ cards that can actually run the video being added and never hides a valid card o
 the queue is non-empty. For SeedVR2 it gates by the selected target's VRAM floor (a
 16 GB card is not offered for a 4K SeedVR2 job, but a card proven by its OWN SeedVR2
 benchmark is; a Real-ESRGAN benchmark of the same card does NOT qualify it, since a
-GAN tiles on OOM and reaches sizes SeedVR2 can't). Prepare is disabled with no GPU
+GAN tiles on OOM and reaches sizes SeedVR2 can't). **That proof is scoped to the REGIME
+it was measured under** (0.6.3): `db.max_feasible_output_mp` takes the job's full bench
+key (`model_tag + learn_tag`) and ignores rows that do not prove it. This is the ONE
+place a below-floor card is admitted purely on its own numbers, with no VRAM-tier seed
+underneath to catch an over-claim (`video_estimate.max_output_mp` has one, which is why
+proof is currently inert there). Both halves were ignored and the COMPILE half was
+already wrong on real hardware: a 3090 proves 2.07 MP uncompiled and 1.55 MP compiled,
+and taking the max told a compiled run 1080p was proven when that card's own compiled
+probes record an OOM there. The MODEL half became reachable with #26 Part A's ten weights
+(a 4K probe under 3B-Q4 could qualify a card for 7B FP16 at 4K). The model order
+(`video_vram_sizer.model_outranks`) is **partial, not a size comparison**: within a family
+weights order it and 7B outranks 3B on both axes, but `3b_fp16` (6.32 GiB) is heavier by
+bytes than `7b_q4` (4.43 GiB) while having smaller activations, so neither proves the
+other. The regime half requires an EXACT match rather than an order, because filtering can
+only shrink the answer back toward the seed and a guard admitting a below-floor card should
+not rest on "probably". Omitting the regime keeps the pre-0.6.3 behaviour, and every
+existing row is `7b` (the heaviest weight AND the unknown-model fallback), so nothing
+needed migrating. Prepare is disabled with no GPU
 selected, the **Run on** switch locks while the queue is non-empty (a queue is one
 mode until the mixed local+remote milestone #12), and the segment extractor inherits
 the picked GPU + Method and offers only the targets that card can reach. Runs on a

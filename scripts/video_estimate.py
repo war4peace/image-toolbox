@@ -210,16 +210,23 @@ def _seed_max_mp(total_vram_gb):
     return cap
 
 
-def max_output_mp(total_vram_gb, gpu_id=None, conn=None):
+def max_output_mp(total_vram_gb, gpu_id=None, conn=None, regime=None):
     """The largest OUTPUT megapixels this card is believed able to upscale to: the VRAM-tier
     seed, RAISED to anything the card's own benchmark/learned data proves feasible (never
     lowered — a single contended failure shouldn't hide a target; the benchmark's free-VRAM
-    tag handles that). Returns 0.0 if VRAM is unknown (callers then don't filter)."""
+    tag handles that). Returns 0.0 if VRAM is unknown (callers then don't filter).
+
+    `regime` (0.6.3) is the full bench key the job will run under, so proof taken under a
+    lighter model or a different compile state is not counted (db.max_feasible_output_mp).
+    The seed floor means tightening it here can only pull the cap back toward the seed; on
+    every card in this project's own corpus the seed already exceeds proof, so it changes
+    nothing there. The path where proof is load-bearing and has NO seed under it is
+    `tab_video._seedvr2_gpu_ok`, which is why that one matters most."""
     cap = _seed_max_mp(total_vram_gb) or 0.0
     if conn is not None and gpu_id:
         try:
             import db
-            proven = db.max_feasible_output_mp(conn, gpu_id)
+            proven = db.max_feasible_output_mp(conn, gpu_id, regime=regime)
             if proven and proven > cap:
                 cap = proven
         except Exception:

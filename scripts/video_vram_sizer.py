@@ -243,6 +243,77 @@ def learn_tag(settings):
     return tile_tag(settings) + compile_tag(settings)
 
 
+def _tag_weights():
+    """{model_tag: resident weight bytes}, built from the catalog so it cannot drift.
+
+    Well-defined because every tag maps to exactly ONE size (the two `sharp` variants are
+    byte-identical to their twins, which is why they deliberately share a tag).
+    """
+    try:
+        import seedvr2_models as sm
+    except Exception:                                    # noqa: BLE001
+        return {}
+    out = {}
+    for spec in sm.catalog():
+        out.setdefault(model_tag(spec.filename), spec.size_bytes)
+    return out
+
+
+def model_outranks(proof_tag, job_tag):
+    """True when a measurement taken under `proof_tag` also proves `job_tag` will fit.
+
+    Used by the feasibility guard (`db.max_feasible_output_mp`): a card admitted below the
+    per-target VRAM floor gets in ONLY on its own measurements, so those measurements must
+    not have been taken under a lighter model than the job is about to run.
+
+    The order is deliberately PARTIAL, and a plain size comparison would be wrong. Within a
+    family it is sound: same architecture means the same activations, so the lighter weight
+    leaves strictly more VRAM for them. Across families 7B outranks 3B on BOTH axes, so a 7B
+    proof covers any 3B. But `3b_fp16` (6.32 GiB) is HEAVIER than `7b_q4` (4.43 GiB) while
+    having SMALLER activations, so neither proves the other -- and a size-only rule would let
+    a 3B proof qualify a 7B job, which is exactly the false positive this exists to stop.
+
+    An unknown tag on either side answers False: refusing costs a card a target it might have
+    reached, while accepting costs a failed run (and on a rented pod, billed minutes).
+    """
+    if not proof_tag or not job_tag:
+        return False
+    if proof_tag == job_tag:
+        return True
+    fam = lambda t: "7b" if str(t).startswith("7b") else ("3b" if str(t).startswith("3b")
+                                                          else "")
+    fp, fj = fam(proof_tag), fam(job_tag)
+    if not fp or not fj:
+        return False
+    if fp == "7b" and fj == "3b":
+        return True
+    if fp != fj:
+        return False                                     # a 3B proof never covers a 7B job
+    w = _tag_weights()
+    if proof_tag not in w or job_tag not in w:
+        return False
+    return w[proof_tag] >= w[job_tag]
+
+
+def regime_qualifies(proof_key, job_key):
+    """True when a probe/learned row recorded under `proof_key` proves `job_key` will fit.
+
+    Both are full bench keys (`model_tag + learn_tag`, e.g. "7b|c"). The MODEL half is
+    ordered by `model_outranks`; the REGIME half must match EXACTLY.
+
+    The exact match on the regime is the conservative call and it is on purpose. Compile
+    lowers the ceiling (measured on a 3090: 125 -> 53 at 540x720), so a compiled proof
+    almost certainly covers an uncompiled run -- but "almost certainly" is not what a guard
+    that admits a card BELOW its VRAM floor should be built on, and requiring a match can
+    only shrink the proof back toward the VRAM-tier seed, never inflate it. Tiling has the
+    same shape in the other direction. If either is ever measured properly, relax it here
+    and nowhere else.
+    """
+    pm, _, pr = str(proof_key or "").partition("|")
+    jm, _, jr = str(job_key or "").partition("|")
+    return pr == jr and model_outranks(pm, jm)
+
+
 def vram_tier(total_gb):
     """The largest seed tier <= the card's total VRAM (so a 24 GB card uses the 24 tier,
     a 20 GB card falls to 16). None if total is unknown."""

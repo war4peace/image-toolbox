@@ -1675,7 +1675,8 @@ class VideoTab(MqttTaskState, ttk.Frame):
         if not g:
             return 0.0
         import video_estimate as ve
-        return ve.max_output_mp(g.get("memory_gb"), g.get("id") or g.get("name"), self._conn())
+        return ve.max_output_mp(g.get("memory_gb"), g.get("id") or g.get("name"),
+                                self._conn(), regime=self._bench_regime())
 
     def _queue_feasibility(self, jobs, g):
         """(max_mp, feasible_jobs, infeasible_count) for a queue on GPU `g`. When the card's
@@ -1683,7 +1684,8 @@ class VideoTab(MqttTaskState, ttk.Frame):
         IMGTBX_MAX_OUTPUT_MP the runner uses to DEFER (not fail) jobs the card can't reach."""
         import video_estimate as ve
         max_mp = (ve.max_output_mp(g.get("memory_gb"), g.get("id") or g.get("name"),
-                                   self._conn()) if g else 0.0)
+                                   self._conn(), regime=self._bench_regime())
+                  if g else 0.0)
         if not max_mp:
             return max_mp, jobs, 0
         # Real-ESRGAN (#11) is not bound by SeedVR2's output-MP ceiling, so a fixed_ratio job
@@ -2489,19 +2491,45 @@ class VideoTab(MqttTaskState, ttk.Frame):
         self._gpus_raw = list(gpus or [])
         self._apply_gpu_filter()
 
-    def _seedvr2_gpu_ok(self, g, target, w, h):
+    def _bench_regime(self):
+        """The full bench key (`model_tag + learn_tag`, e.g. "7b|c") the NEXT SeedVR2 job
+        would run under, or None when it cannot be derived.
+
+        Resolved through `video_benchmark.resolve_bench_key`, the same function the results
+        table uses, so the guard reads rows under exactly the key the runner will write.
+        Deriving it here by hand is what let the GUI and the runner disagree once before
+        (a compiled sweep writing "7b|c" while the window read "7b").
+
+        Loads config, so callers resolve it ONCE and pass it down a filter loop rather than
+        per card. None means "do not filter", which is the pre-0.6.3 behaviour."""
+        try:
+            import video_benchmark as vb
+            _engine, model = self._selected_method()
+            return vb.resolve_bench_key(remote=(self.mode_var.get() != "local"),
+                                        model=model)
+        except Exception:                                # noqa: BLE001 (fail-safe)
+            return None
+
+    def _seedvr2_gpu_ok(self, g, target, w, h, regime=None):
         """Whether a card may be offered for a SeedVR2 job at `target`. SeedVR2 needs real VRAM
         (a 16 GB card can't do 4K), so a card qualifies only when it clears the target's VRAM
         floor (>= 32 GB, and the higher per-target floor for 1440p/4K) OR has been successfully
         benchmarked / already run to at least this target's output size (db proof, so a proven
-        smaller card like a 24 GB 3090 measured at 1080p still shows)."""
+        smaller card like a 24 GB 3090 measured at 1080p still shows).
+
+        `regime` (0.6.3) scopes that proof to measurements taken under a model and compile
+        state that actually prove THIS job. It matters here more than anywhere else: this is
+        the one place a below-floor card is admitted purely on its own numbers, with no
+        VRAM-tier seed underneath to catch an over-claim. Omitted, nothing is filtered."""
         import video_estimate as ve
         floor = max(32, ve.VRAM_FLOOR.get(target, 0))
         if (g.get("memory_gb") or 0) >= floor:
             return True
         try:
             import db
-            proven = db.max_feasible_output_mp(self._conn(), g.get("id") or g.get("name"))
+            proven = db.max_feasible_output_mp(self._conn(),
+                                               g.get("id") or g.get("name"),
+                                               regime=regime)
         except Exception:                                # noqa: BLE001 (fail-safe: no proof)
             proven = None
         if not proven:
@@ -2524,7 +2552,9 @@ class VideoTab(MqttTaskState, ttk.Frame):
             target = self._selected_target_token()
             if target:
                 w, h = self._selected_source_dims()
-                gpus = [g for g in gpus if self._seedvr2_gpu_ok(g, target, w, h)]
+                regime = self._bench_regime()            # once, not per card
+                gpus = [g for g in gpus
+                        if self._seedvr2_gpu_ok(g, target, w, h, regime)]
         g0 = self._selected_gpu()
         prev = (g0.get("id") or g0.get("name")) if g0 else None
         jobs = self._queue_jobs()

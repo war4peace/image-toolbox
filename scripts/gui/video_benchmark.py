@@ -256,6 +256,31 @@ class BenchmarkWindow(tk.Toplevel):
         w, h = self._dims(token)
         return w * h / 1_000_000.0
 
+    def _cell_regime(self):
+        """The bench key to scope the "which targets can this card reach" cap by.
+
+        The LIGHTEST swept model, deliberately. This cap only decides which target cells are
+        pre-ticked and which are greyed out, and a multi-model sweep should offer the UNION
+        of what any of its models might reach -- the sweep itself then discovers the truth
+        per model, which is its entire job. Because heavier proof qualifies lighter jobs,
+        asking as the lightest model matches the most rows and so offers the most cells;
+        asking as the heaviest would hide cells a light model could have measured.
+
+        The compile half is still scoped exactly, which is the point: an uncompiled proof
+        must not enable a cell for a compiled sweep. None (or ESRGAN) means no filtering.
+        """
+        if self.is_esrgan:
+            return None
+        try:
+            import video_vram_sizer as _sizer
+            weights = _sizer._tag_weights()
+            models = list(self._sweep_models or [vb.DEFAULT_MODEL])
+            lightest = min(models,
+                           key=lambda m: weights.get(_sizer.model_tag(m), 0))
+            return vb.resolve_bench_key(remote=self.remote, model=lightest)
+        except Exception:                                # noqa: BLE001 (fail-safe)
+            return None
+
     def _resolve_keys(self):
         """Resolve the per-torch.compile-mode video_bench keys the runner will WRITE, plus whether
         compile-ON can actually run here. Sets:
@@ -518,7 +543,8 @@ class BenchmarkWindow(tk.Toplevel):
             for t in self._checkbox_tokens():
                 self.target_vars[t].set(True)
             return
-        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
+        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn,
+                                  regime=self._cell_regime())
         for t in self.ALL_TARGETS:
             if self._is_ladder(t):
                 w, h = vb.TARGETS[t][:2]
@@ -830,7 +856,8 @@ class BenchmarkWindow(tk.Toplevel):
                 if cb is not None:
                     cb.configure(state="normal")
             return
-        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn)
+        max_mp = ve.max_output_mp(self.total_vram_gb, self.gpu_id, self.conn,
+                                  regime=self._cell_regime())
         if not max_mp:
             return
         for t in self.ALL_TARGETS:

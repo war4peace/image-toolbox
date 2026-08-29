@@ -261,7 +261,7 @@ at a decision point), but it belongs to the provisioning path rather than to a p
 change, and the sizing prompt now makes the situation avoidable rather than merely
 detectable.
 
-### Next: the three model-blind VRAM constants (Easy, and it is what makes Part A useful)
+### Next: the three model-blind VRAM constants (Easy; the fourth item is DONE)
 
 Found 2026-08-29, when the question was asked whether #26 could simply ship as-is and let
 an OOM tell the user to pick something smaller. It can, and it did. But that framing
@@ -273,6 +273,10 @@ advised as if they had picked a model three times the weight.
 **Nothing here needs Part B.** These are arithmetic and one cheap probe, not a quality
 judgement on photographs. They are also what converts ten *selectable* models into ten
 *useful* ones, so they are the better use of an evening than the measurement below.
+
+**Item 4 shipped in 0.6.3**; items 1 to 3 have not. Item 4 was separated out because
+researching it found a live false positive rather than a latent one, and because it needed
+no measurement at all.
 
 #### 1. `video_vram_sizer._WS_FIXED_GB` (14.85): the local batch comes out too small
 
@@ -317,18 +321,66 @@ cards before a run can start. So there is no OOM to advise on, because there is 
 run. **Until this is model-aware, the 4-bit weights are listed but unreachable in video**,
 which also means Part B's headline question cannot be answered on the cards it is about.
 
-#### 4. And a hole Part A opened that Part A did not close: `db.max_feasible_output_mp`
+#### 4. `db.max_feasible_output_mp`: FIXED in 0.6.3, and the research changed the diagnosis
 
-This is the bypass that lets a proven small card through the floor above, and it is **not
-SeedVR2-model-aware**. It already excludes Real-ESRGAN probes, and its docstring gives the
-exact reason: counting an ESRGAN 4K probe "would wrongly mark that card feasible" because a
-GAN tiles on OOM and reaches sizes SeedVR2 cannot.
+This is the bypass that lets a proven small card through the VRAM floor above, and it was
+reading its proof without asking what regime the proof was measured under. Researching it
+turned the priority around, so both halves are recorded.
 
-**That argument now applies INSIDE SeedVR2.** Benchmark a 24 GB card at 4K with
-`3b-Q4_K_M` (1.86 GiB), succeed, and the card becomes eligible for a **7B FP16** 4K job at
-15.35 GiB. This is the same shape as the `model_tag` collision Part A fixed, in the one
-place that was not looked at, and it became reachable the moment the light models were
-listed. It should be fixed WITH the constants above, not after them.
+**The model half was the one Part A made reachable.** Ten weights spanning 1.86 to 15.35
+GiB are now selectable, so a 4K probe under `3b-Q4_K_M` could qualify a card for a 7B FP16
+4K job. It is the same argument the function already made about Real-ESRGAN ("would wrongly
+mark that card feasible"), applied inside SeedVR2. **Theoretical, though**: every SeedVR2
+probe in this project's corpus is `7b`, so nothing false had been claimed from a light
+model yet.
+
+**The compile half was already biting, on hardware in this project.** Measured from the
+real corpus:
+
+```
+RTX 3090   7b    (uncompiled)  proves 2.07 MP
+RTX 3090   7b|c  (compiled)    proves 1.55 MP   <- probes: ok=0 and an OOM at 1920x1080
+```
+
+Taking the max over both told a **compiled** run that 1080p (2.07 MP) was proven, when that
+card's compiled measurements say it OOMs there. `learn_tag` had already established that
+compile moves the ceiling (125 -> 53 at 540x720) and had joined the learned-batch key for
+exactly that reason; the finding never reached this function. So the fix scopes BOTH halves:
+proof now counts only when its full bench key (`model_tag + learn_tag`) proves the job's.
+
+**The model order is PARTIAL, and a size comparison would be wrong.** Within a family
+weights order it soundly (same architecture, same activations, so the lighter weight leaves
+strictly more VRAM). Across families 7B outranks 3B on both axes. But `3b_fp16` (6.32 GiB)
+is HEAVIER than `7b_q4` (4.43 GiB) while having SMALLER activations, so neither proves the
+other, and a size-only rule would let a 3B proof qualify a 7B job -- precisely the false
+positive being removed. `video_vram_sizer.model_outranks` states it; the weight table is
+derived from `seedvr2_models` so it cannot drift, and is well-defined only because the two
+`sharp` variants are byte-identical to their twins.
+
+**The regime half requires an exact match rather than an order.** A compiled proof almost
+certainly covers an uncompiled run (compile lowers the ceiling), and tiling has the same
+shape in the other direction, but "almost certainly" is not what a guard admitting a
+below-floor card should rest on. Requiring a match can only shrink the answer back toward
+the VRAM-tier seed, never inflate it, which is what made this safe to tighten at all.
+
+**Three properties made it cheap.** Omitting the regime keeps the pre-0.6.3 behaviour, so
+any caller that cannot know its regime is unchanged. Every existing row is `7b`, the
+heaviest weight and also `model_tag`'s unknown-model fallback, so no corpus needs migrating
+and no card loses a target it had measured. And filtering only ever lowers the answer
+toward the seed, so a test asserts that as a property.
+
+**Where it actually matters is narrower than it looks.** `video_estimate.max_output_mp`
+takes `max(seed, proven)`, and on all six measured cards the seed already exceeds proof, so
+proof is inert there. The path with no seed underneath is `tab_video._seedvr2_gpu_ok`, which
+is the ONLY way a card below its target's floor is offered at all -- and the only card below
+a floor in the corpus is the 24 GB 3090, which is exactly where the compiled/uncompiled
+mix-up lands.
+
+A note for whoever touches the Benchmark window: it scopes its target-cell cap by the
+**lightest** swept model, not the heaviest. That cap only decides which cells are pre-ticked
+and which are greyed out, and a multi-model sweep should offer the union of what any of its
+models might reach; the sweep then discovers the truth per model, which is its job. Asking
+as the heaviest would hide cells a light model could have measured.
 
 While there: `db.py`'s `video_bench.model` column comment still reads
 `-- model family tag (7b / 3b / 3b_fp16)`, which Part A made stale.
