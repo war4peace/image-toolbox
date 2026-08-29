@@ -17,6 +17,8 @@ What lives here (the genuinely shared, behaviour-identical pieces):
   * get_image_dimensions() + header parsers                 - Pillow-free size read
   * image_variant_reason()            - "the upscaler cannot round-trip this
                                         image" detector (future-features #17)
+  * gif_output_name() + its inverse   - the one input whose output cannot keep
+                                        its extension (future-features #27)
   * is_oom_error()                    - CUDA/torch OOM classifier (watchdog)
   * remote_pod_stopped(session)       - "did the pod's dead-man's switch fire?"
   * DerivedPruner                     - keep our own output/archive folders out
@@ -378,7 +380,15 @@ def get_image_dimensions(path):
 # normal case pays nothing. BMP is in the list for the rare 32-bit file with a
 # real alpha mask; the common BGRX kind reads back as plain RGB, so it does not
 # produce a false positive.
-VARIANT_CANDIDATE_EXTS = (".png", ".webp", ".tif", ".tiff", ".bmp")
+#
+# GIF (#27) is here for the SAME reason it is an input format at all. Adding
+# `.gif` to IMAGE_EXTS without adding it here reproduces #17's data loss
+# exactly: the engine is RGB frame-0 only, so an animated or transparent GIF
+# would be written back flattened under a mirrored name, and Conciliation would
+# then match it with full confidence and archive or DELETE the animated
+# original. The two list entries are one change and must never be made in
+# sequence.
+VARIANT_CANDIDATE_EXTS = (".png", ".webp", ".tif", ".tiff", ".bmp", ".gif")
 
 # Every variant reason starts with this, so a cached skip_reason can be
 # classified later without a second look at the file (the eligibility cache
@@ -457,7 +467,10 @@ def image_variant_reason(path):
             except Exception:
                 pages = 1
             if pages > 1:
-                unit = "frames" if ext == ".webp" else "pages"
+                # GIF and animated WebP measure time, not paper. A TIFF really
+                # does have pages, so the noun is per format rather than one
+                # word that is wrong for two of the three.
+                unit = "frames" if ext in (".webp", ".gif") else "pages"
                 losses.append(f"{pages - 1} of {pages} {unit}")
 
             bits = _sample_bits(img, path, ext)
@@ -467,6 +480,61 @@ def image_variant_reason(path):
         return None
 
     return VARIANT_PREFIX + ", ".join(losses) if losses else None
+
+
+# ─────────────────────────────────────────────
+#  GIF OUTPUT NAMING  (future-features #27)
+# ─────────────────────────────────────────────
+# A static GIF is the one input whose output cannot keep its own extension.
+# GIF is a 256-colour palette format, so writing the upscaled result back as
+# `.gif` re-quantises and re-dithers it, discarding most of what the model just
+# computed. PNG keeps it.
+#
+# The `_gif` part is not decoration, and it is the same lesson #19 learned for
+# RAW: `logo.gif` and `logo.png` in one folder would BOTH want to become
+# `logo.png` in the mirrored output tree. Two sources mapping to one output is
+# not a crash, which is what makes it dangerous: the first processed wins and
+# the second is silently counted "already upscaled", with the film strip and the
+# lineage row pointing at a file produced from the other source.
+#
+# The suffix is UNCONDITIONAL, never "only when it would collide". A name that
+# depends on what else is in the folder changes when a sibling is added later,
+# which breaks every inverse below after the fact.
+#
+# Unlike a RAW render, this output is a genuine replacement for its source (a
+# static GIF holds at most 256 colours and 1-bit transparency, all of which a
+# PNG carries losslessly), so Conciliation is EXPECTED to match it and move it
+# into the original's place. That is what `gif_source_name` exists for: the
+# mirrored-name fallback has to be able to invert this rule without a database.
+
+GIF_OUTPUT_SUFFIX = "_gif.png"
+
+
+def gif_output_name(src_name):
+    """The output filename for a static GIF source: `<stem>_gif.png`."""
+    return os.path.splitext(os.path.basename(src_name))[0] + GIF_OUTPUT_SUFFIX
+
+
+def is_gif_output_name(name):
+    """True when `name` looks like a PNG this app produced from a GIF."""
+    return os.path.basename(name).lower().endswith(GIF_OUTPUT_SUFFIX)
+
+
+def gif_source_name(out_name):
+    """Invert `gif_output_name`: the `.gif` this output came from, or None.
+
+    Returns a name only, in the same directory, because both callers
+    (`conciliate.resolve_by_name` and `browse_upscaled.pair_source`) work in a
+    mirrored tree where the directory part is already correct.
+
+    The extension comes back lowercase, exactly like the mirrored-name rule it
+    extends. A source spelled `PHOTO.GIF` is found by the callers' own
+    case-insensitive resolution, not by guessing here.
+    """
+    if not out_name or not is_gif_output_name(out_name):
+        return None
+    base = os.path.basename(out_name)
+    return base[:-len(GIF_OUTPUT_SUFFIX)] + ".gif"
 
 
 # ─────────────────────────────────────────────

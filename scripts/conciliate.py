@@ -94,7 +94,12 @@ runner_common.harden_stdout()
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 # App root = parent of scripts/. Data folders (logs/, db/, …) live there.
 APP_ROOT    = runner_common.APP_ROOT
-IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+# `.gif` (#27) is here so a GIF original is walked, guarded and matched like any
+# other image. It is the one source whose processed counterpart does NOT mirror
+# its name (`<stem>_gif.png`), which resolve_by_name inverts explicitly. An
+# animated or transparent GIF never reaches that point: image_variant_reason is
+# checked on the ORIGINAL first, so it is reported and left untouched.
+IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
 # Mirrors batch_video_upscale.VIDEO_EXTS. Defined locally (not imported) to keep
 # conciliate.py torch-free — batch_video_upscale pulls in the heavy engine stack.
 VIDEO_EXTS  = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".wmv", ".mpg", ".mpeg",
@@ -299,16 +304,33 @@ def resolve_by_name(o_rel, processed_root, tr_index):
     and keeps the source filename with a lowercased extension, so the upscaled
     file lives at <dir>/<stem><ext.lower()>. If it was later tagged & renamed,
     the tag/rename cache maps it to its current name. Returns abs path or None.
+
+    A GIF is the ONE source that breaks the mirror (#27): it becomes
+    `<stem>_gif.png`, because writing the upscale back as GIF would re-quantise
+    it to 256 colours. So the rule is inverted here explicitly rather than left
+    to the content-hash lineage. Lineage would usually match it, but "usually"
+    is not good enough for the tool that archives or deletes the original: a
+    tree upscaled by another install, or one whose `db/cache.db` was deleted,
+    has no lineage row at all, and the whole point of this fallback is to keep
+    working without one.
     """
     stem, ext    = os.path.splitext(o_rel)
     upscaled_rel = stem + ext.lower()           # same dir, lowercased extension
 
+    # Most specific first. Each base is tried as itself AND as whatever Tag &
+    # Rename renamed it to, so a GIF's output is still found after tagging.
+    bases = []
+    if ext.lower() == ".gif":
+        bases.append(stem + runner_common.GIF_OUTPUT_SUFFIX)
+    bases.append(upscaled_rel)
+
     candidates = []
-    if tr_index is not None:
-        curr = tr_index.get(os.path.normcase(upscaled_rel))
-        if curr:
-            candidates.append(curr)             # upscaled then tagged & renamed
-    candidates.append(upscaled_rel)             # upscaled only (mirrored name)
+    for base in bases:
+        if tr_index is not None:
+            curr = tr_index.get(os.path.normcase(base))
+            if curr:
+                candidates.append(curr)         # upscaled then tagged & renamed
+        candidates.append(base)                 # upscaled only (mirrored name)
     if ext != ext.lower():
         candidates.append(o_rel)                # exact original extension, just in case
 
@@ -494,7 +516,17 @@ def count_pending_metadata(plan, abort=None, status_cb=None):
 
 def _move_processed_in(p_abs, o_rel, original_root):
     """Compute the destination of the processed file inside the original tree
-    (keeping the processed file's own name) and move it there."""
+    (keeping the processed file's own name) and move it there.
+
+    Keeping the PROCESSED name is what carries a Tag & Rename rename through,
+    and it is also why a conciliated GIF lands as `<stem>_gif.png` rather than
+    `<stem>.png` (#27). Stripping the marker on the way in looks tidier and is
+    not safe: `logo.gif` and `logo.png` can both exist in one folder, both get
+    conciliated, and both would then want the name `logo.png` -- and this moves
+    with `shutil.move`, which overwrites without asking. The suffix that stops
+    two sources sharing one OUTPUT is the same suffix that stops them sharing
+    one destination here.
+    """
     dest = os.path.join(original_root, os.path.dirname(o_rel), os.path.basename(p_abs))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     shutil.move(p_abs, dest)

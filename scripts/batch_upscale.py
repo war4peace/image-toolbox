@@ -92,7 +92,13 @@ def _resolve_path(value, default_rel):
 SEEDVR2_REPO_DIR    = _resolve_path(_S.get("repo_dir", ""),  "seedvr2")
 SEEDVR2_MODEL_DIR   = _resolve_path(_S.get("model_dir", ""), os.path.join("models", "SEEDVR2"))
 
-IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+# `.gif` (#27) is an ordinary member here: unlike a RAW it IS written to disk in
+# a form that replaces it, and Conciliation is expected to match and move it in.
+# What makes it safe is that `.gif` joined runner_common.VARIANT_CANDIDATE_EXTS
+# in the SAME change, so an animated or transparent one is skipped and reported
+# rather than flattened to its first frame. Never add one without the other.
+IMAGE_EXTS          = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif",
+                       ".gif"}
 # RAW / DNG input (#19). Kept as its OWN set rather than folded into IMAGE_EXTS,
 # because a RAW is not interchangeable with the others anywhere downstream: it is
 # never written to (Tag & Rename must not touch it), it never keeps its extension
@@ -1084,12 +1090,20 @@ def collect_work_items(root, output_root, already_done=None, abort_check=None,
             if local_path in already_done:
                 continue
             stem     = os.path.splitext(filename)[0]
-            # A RAW always becomes `<stem>_raw.jpg` (#19): it cannot keep its own
-            # extension, and it must not take the plain `<stem>.jpg` that a
-            # sibling camera JPEG of the same shot would map to. See
-            # raw_decode.render_name.
-            out_name = (raw_decode.render_name(filename) if ext in RAW_EXTS
-                        else f"{stem}{ext}")
+            # Two formats cannot keep their own extension, for the same reason
+            # in two costumes: the output is a different format, and a sibling
+            # of that format would collide with it. A RAW becomes
+            # `<stem>_raw.jpg` (#19, raw_decode.render_name); a GIF becomes
+            # `<stem>_gif.png` (#27, runner_common.gif_output_name), because
+            # writing it back as GIF would re-quantise the result to 256
+            # colours. Everything else keeps its stem and a lowercased
+            # extension, which is the mirrored name every inverse relies on.
+            if ext in RAW_EXTS:
+                out_name = raw_decode.render_name(filename)
+            elif ext == ".gif":
+                out_name = runner_common.gif_output_name(filename)
+            else:
+                out_name = f"{stem}{ext}"
             items.append((dirpath, local_path, output_dir, out_name))
 
         # Live progress: update in place every folder

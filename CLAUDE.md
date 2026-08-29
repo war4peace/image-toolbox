@@ -124,6 +124,43 @@ exists that makes a RAW small, which is why the revisit trigger recorded in
 `docs/dropped-ideas.md` is an 8K resolution target. See `raw_decode.py` and
 `tests/test_raw_input.py`.
 
+**Static GIF input** (0.6.3, future-features #27) — the Batch Upscaler accepts `.gif`.
+The feature is really the **guard**: before this `.gif` was in no extension list at all,
+and adding it to `IMAGE_EXTS` alone reproduces #17's data loss exactly, because `.gif`
+was not a `VARIANT_CANDIDATE_EXTS` member, so `image_variant_reason` returned None for
+an animated or transparent GIF, the RGB-frame-0 engine wrote a flattened first frame
+under a mirrored name, and **Conciliation's mirrored-name fallback then matched it with
+full confidence and archived or DELETED the animated original.** The two list entries are
+ONE change and must never be made in sequence (`test_the_two_lists_moved_together`); an
+animated GIF is now reported and skipped ("would lose 5 of 6 **frames**", the noun being
+per format, since GIF and animated WebP measure time while a TIFF really does have
+pages). Output is **`<stem>_gif.png`**, not `<stem>.gif`: GIF is a 256-colour palette, so
+writing the 4K result back as GIF re-quantises away most of what was computed, and the
+`_gif` marker is #19's RAW+JPEG collision in a second costume (`logo.gif` + `logo.png`
+would otherwise both map to `logo.png`, where the first processed wins and the second is
+silently counted "already upscaled"). The suffix is **unconditional**, because a name
+that depends on what else is in the folder changes when a sibling is added later and
+breaks every inverse after the fact. **Unlike a RAW render this output IS a replacement
+for its source** (a static GIF holds at most 256 colours and 1-bit transparency, all of
+which a PNG carries losslessly), so `conciliate.resolve_by_name` inverts the naming rule
+**explicitly** rather than leaning on the content-hash lineage: lineage would usually
+match it, and "usually" is not good enough for the one tool that archives or deletes
+originals, since a tree upscaled by another install or one whose `db/cache.db` was
+deleted has no lineage row at all. The conciliated file **keeps its marker** in the
+original tree, because `_move_processed_in` uses `shutil.move`, which overwrites without
+asking, and `logo.gif` + `logo.png` can both be conciliated into one folder. Tag & Rename
+ignores `.gif` (nowhere to write a description; by the documented workflow it is already
+a PNG in the upscaled folder), the upscaled-image browser #22 **pairs** it (unlike a RAW
+render, a GIF is an ordinary Pillow image, so it gets Compare) but does not list `.gif`
+itself (the app accepts one and never writes one). Metadata needed nothing: both #13
+halves already no-op on a GIF source. The thing worth carrying forward is a TEST finding:
+**Pillow's GIF writer silently discards both properties under test** (`transparency=N` is
+dropped unless index N is used in the pixel data; identical `append_images` collapse to
+`n_frames == 1`), so a naive fixture is quietly the opposite of what it claims and every
+builder in `tests/test_gif_input.py` asserts its own output before a test relies on it.
+Animated GIF out to MP4/MKV is researched, measured and **not scheduled**
+(`docs/future-features.md` #27 phase 2).
+
 **Tag & Rename** — analyses each image with a local Ollama vision model, writes
 a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`.
 **Auto-straighten** (on by default) uses a small CNN to rotate sideways photos
@@ -469,7 +506,12 @@ outputs), and Conciliation checks the **original** before BOTH matching paths (a
 lineage row proves the two files are a pair, not that the pair is lossless), which
 is what makes the protection retroactive for a tree upscaled before the fix. CMYK
 is deliberately not a variant (a colour-space argument, and testing for it would
-force a Pillow open on every JPEG). See `tests/test_image_variants.py`.
+force a Pillow open on every JPEG). `.gif` JOINED `VARIANT_CANDIDATE_EXTS` in 0.6.3
+(#27), in the same change that made the Batch Upscaler accept GIF at all, which is the
+rule this section generalises to: **a new input format and its variant-candidate entry
+are one change, never two**, because the format that is not on the candidate list is
+exactly the format this guard cannot see. See `tests/test_image_variants.py` and
+`tests/test_gif_input.py`.
 
 **Metadata carried across** (0.5.9, future-features #13) — `upscale_engine._save_image`
 saved the result tensor with a bare `img.save(...)`, so **every upscaled image lost
@@ -1232,7 +1274,7 @@ plain by design, the rule is recorded above the style constant)); **`gui/compari
 | `exif_copy.py` (~330 lines) | Metadata transfer (0.5.9, future-features #13), Pillow-only and fail-safe. `exif_for_upscaled()` reads the source's block, normalises Orientation to 1 (the pipeline already applied it), corrects the pixel dimensions to the output size, and strips a TIFF source's structural tags before they can describe a strip layout inside a JPEG; `save_kwargs()` splats it into `Image.save` for the formats that can carry one (BMP is excluded: Pillow accepts `exif=` and writes nothing). `pending_backfill()` / `backfill()` are Conciliation's retroactive half: "copy what is missing, keep what is present", JPEG via `piexif.insert` (byte-identical scan data) and PNG via an atomic lossless re-save, everything else refused with a named reason. Every entry point swallows its own errors and returns "nothing to do" -- 13a runs inside an upscale and 13b runs one statement before an archive or a delete. Pushed to the pod with `upscale_engine.py`. |
 | `raw_decode.py` (~380 lines) | RAW / DNG input (0.6.0, future-features #19). Owns `RAW_EXTS`, the header-only `raw_dimensions()` (LibRaw, flip-corrected, and the reason a RAW never reaches Pillow), `render()` (the preview-vs-demosaic choice plus the container+preview metadata merge), `thumbnail()` for the film strip, and `render_name()` (the `_raw.jpg` rule that stops a RAW and its sibling camera JPEG mapping to one output). The geometry is pure module-level functions (`upright_size` / `preview_is_full_size`), tested without rawpy. rawpy and Pillow are lazy inside it, so importing it stays instant and torch-free -- which is why `runner_common` can import it at module level for the one shared extension list. |
 | `diagnostics.py` (~430 lines) | Bug-report diagnostics (0.6.1, future-features #24), stdlib-only/torch-free/fail-safe. Turns the app's own logs and state into something that can safely leave the machine, for the in-app **Report an issue** flow. **The design record is `docs/bug-reports.md`: read it before touching a redaction rule.** The **redactor** is most of the module: substitute the roots the app already knows (each registered in BOTH its long and 8.3 short spelling, because real logs carry `C:\Users\EDUARD~1\...`), hash every component after them (salted per report, extension and its case preserved), match bare private names greedily, then **drop any line that still looks like it holds a path**. It never tries to find "a path" in free text: a Windows name can contain spaces, and one real folder contains a DOUBLE space, so no pattern can bound one. Three rules must not be relaxed, each of which cost a leak or a gutted report to learn: a path runs **to the end of its line** unless it is quoted, where the closing quote ends it; **every** component of a backslash-joined token must resolve or the LINE goes; and the vision model's DESCRIPTIONS, the names generated from them, and (in a Tag & Rename log) file paths outright are **removed rather than redacted**, because prose cannot be pattern-matched, so the rule is the line's SHAPE and the policy is per-TOOL. It reads `db/cache.db` READ-ONLY as its dictionary: the one file that must never be attached is the best redaction source there is. The **collector** half reads the newest log per tool (a TAIL, deliberately not a parser) and fits the URL body to a budget. Measured: ~201,000 real lines audited twice, zero leaks, 0.23% dropped, 4.15% removed, ~41k lines/s. See `tests/test_diagnostics.py`, whose sampled lines are verbatim and are the regression net. |
-| `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers (0.6.1: `fmt_mmss` is `mm:ss.mmm`, because a per-image time is routinely under a second and a flat `00:00` reads as "nothing was measured" rather than "this was fast"; the TOTALS stay whole-second, where a millisecond is noise), `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
+| `runner_common.py` (~300 lines) | Shared runner scaffolding (0.4.3), stdlib-only/torch-free. The single source of the pieces the four runners used to each copy: `load_config()` + `APP_ROOT`, `harden_stdout()` (UTF-8 stdout, now applied by every runner, not just video), the `@@TBX@@` event protocol (`GUI_MARKER`/`stdin_is_piped()`/`GUI_MODE`/`gui_event()`), the `fmt_duration`/`fmt_mmss`/`fmt_hhmmss` helpers (0.6.1: `fmt_mmss` is `mm:ss.mmm`, because a per-image time is routinely under a second and a flat `00:00` reads as "nothing was measured" rather than "this was fast"; the TOTALS stay whole-second, where a millisecond is noise), `get_image_dimensions()` + the 5 Pillow-free header parsers (superset with a Pillow fallback; fixed a latent lossy-WebP mis-parse), `is_oom_error()`, `remote_pod_stopped(session)`, and (0.5.9) **`DERIVED_DIRNAMES` / `derived_dirnames(cfg)` / `DerivedPruner`** — the one list of folder names the app itself creates, pruned from every input walk (see "Derived-directory pruning" above) — plus **`image_variant_reason()` / `is_variant_reason()`** (#17), the header-only "the engine cannot round-trip this image" detector shared by the Batch Upscaler and Conciliation, and (0.6.3) **`gif_output_name()` / `is_gif_output_name()` / `gif_source_name()`** (#27), the naming rule for the one input whose output cannot keep its extension, plus the inverse Conciliation and the upscaled-image browser need to find their way back to the source without a database. Each runner re-exports these under its old local names, so nothing else changed. Loggers, the pause/stdin controllers, and the `send_notification` wrappers stay per-runner (divergent by design). |
 | `db.py` (~400 lines) | Shared SQLite cache layer (`db/cache.db`, WAL). Tables: `upscale_roots`/`upscale_files` (eligibility cache); `tag_roots`/`tag_files` (tag & rename cache, full entry as JSON plus indexed columns); `lineage` (content-hash links source→upscaled→tagged, so conciliation can re-match files after a folder move/rename; the Video Upscaler records a whole-video source→output row here too, 0.4.9 item 10); `file_hashes` (memoised blake2b hashes by path+mtime+size, shared by all tools;
 `cached_hash` is its read-only half, which returns a hash only if one is already
 stored and never opens the file); `conc_runs`/`conc_actions` (0.5.9, #18: the

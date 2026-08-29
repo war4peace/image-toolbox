@@ -63,11 +63,28 @@ from gui.widgets import Tooltip
 # Scrolling is unaffected (~5 ms/notch).
 BROWSE_PAGE_SIZE = 200
 
-# Mirrors batch_upscale.IMAGE_EXTS (the set the upscaler accepts, so the set its
-# output tree can hold). Defined locally rather than imported: batch_upscale is a
-# runner and reconfigures stdout at import time, which has no business happening
-# inside the GUI process.
+# What an OUTPUT tree can hold, which is nearly but not exactly
+# batch_upscale.IMAGE_EXTS. Defined locally rather than imported: batch_upscale
+# is a runner and reconfigures stdout at import time, which has no business
+# happening inside the GUI process.
+#
+# `.gif` is deliberately absent (#27). The upscaler ACCEPTS a GIF but never
+# writes one: a static GIF comes out as `<stem>_gif.png`, already covered by
+# `.png`. Adding it here would only make the browser list stray GIFs that this
+# app did not produce.
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+
+
+def _gif_source_rel(out_rel):
+    """The `<stem>.gif` rel path an output came from, or None (#27). Guarded the
+    same way `_is_raw_render` is, so an install predating the helper simply
+    treats the output as unpaired."""
+    try:
+        import runner_common
+        base = runner_common.gif_source_name(out_rel)
+    except Exception:                       # noqa: BLE001
+        return None
+    return os.path.join(os.path.dirname(out_rel), base) if base else None
 
 
 def _is_raw_render(name):
@@ -151,6 +168,16 @@ def pair_source(out_rel, source_root, inv_tag=None, resolve=resolve_file):
         rels.append(mirrored)
     if out_rel not in rels:
         rels.append(out_rel)
+    # A GIF's output does not mirror its name: `<stem>.gif` becomes
+    # `<stem>_gif.png` (#27). Unlike a RAW render (which is excluded from
+    # pairing outright, because the browser cannot draw a RAW as the "before"
+    # half), a GIF is a perfectly ordinary Pillow image, so inverting the rule
+    # here is what gives it Compare. Applied to whichever name survived the tag
+    # index, since Tag & Rename may have renamed the output since.
+    for rel in list(rels):
+        src = _gif_source_rel(rel)
+        if src and src not in rels:
+            rels.append(src)
     for rel in rels:
         got = resolve(os.path.normpath(os.path.join(source_root, rel)))
         if got:

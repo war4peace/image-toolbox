@@ -344,6 +344,11 @@ def _remote_pod_stopped():
 MIN_WIDTH       = _T.get("min_width",       3840)
 MIN_HEIGHT      = _T.get("min_height",      2160)
 UPSCALED_SUBDIR = _T.get("upscaled_subdir", "upscaled")
+# `.gif` is deliberately ABSENT (#27), the same call RAW gets (#19): this tool
+# writes a description into the file's own metadata, and GIF has nowhere to put
+# one. Nothing is lost by it, because the documented workflow points this tab at
+# the UPSCALED folder, where a GIF has already become `<stem>_gif.png` and is
+# tagged like any other PNG.
 IMAGE_EXTS      = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".tif"}
 
 CAMERA_FILENAME_PATTERNS = _T.get("camera_filename_patterns", [

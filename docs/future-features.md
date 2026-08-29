@@ -10,11 +10,16 @@ One entry is listed first despite being **built**, because it is the only one wi
 on it: #25, the RunPod API v2 migration. The code shipped in 0.6.1, but the old transports must
 be deleted after **2026-11-15** and in **early 2027**, and nothing else in the project will
 remember that. #26 is half-shipped for the same reason: its easy half (list the five SeedVR2 weights the app
-already pinned but never offered) went out in 0.6.3, while its other half is a GPU measurement
-nobody has run, and the entry records a claim that half made which turned out to be false.
+already pinned but never offered) went out in 0.6.3, while what is left is an easy follow-on
+(three VRAM constants that still describe only the heaviest weight, which is what currently
+stops the new ones being useful) and a GPU measurement nobody has run, whose entry records a
+claim that half made which turned out to be false.
+#27 (static GIF) is built and is kept in place rather than moved to the legend, because its
+real content was never the input format: it is a data-loss guard, and the reason that guard is
+needed is the same reason the next format added will need one.
 The rest are unbuilt: one measurement-gated one (#21
-denoising, gated on a measurement that has not been run), one small input-format addition whose
-real content is a data-loss guard (#27 static GIF), a remote-side pair covering the same harm at
+denoising, gated on a measurement that has not been run), a remote-side pair covering the same
+harm at
 different cost (#28, a pre-built public template, plus the cheap idle-volume mitigation it
 carries that needs no new primitives), a Video Upscaler feature (#12 mixed local+remote queue)
 and one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new process model, networking, or packaging
@@ -26,8 +31,8 @@ legend, after the open work.
 ## Contents
 
 - [25. RunPod API v2 migration](#25-runpod-api-v2-migration-built-two-deletions-still-dated) (built; two dated deletions left)
-- [26. The five unreachable SeedVR2 DiT weights](#26-the-five-unreachable-seedvr2-dit-weights-part-a-built-part-b-still-gated-on-a-measurement) (Part A built; Part B needs a measurement)
-- [27. Static GIF input](#27-static-gif-input-easy-and-the-guard-is-the-point)
+- [26. The five unreachable SeedVR2 DiT weights](#26-the-five-unreachable-seedvr2-dit-weights-part-a-built-the-vram-constants-next-part-b-gated-on-a-measurement) (Part A built; the model-blind VRAM constants next; Part B needs a measurement)
+- [27. Static GIF input](#27-static-gif-input-built-in-063) (built)
 - [28. Pre-built public RunPod template](#28-pre-built-public-runpod-template-medium-plus-a-cheap-mitigation-worth-doing-first)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
@@ -77,7 +82,7 @@ this version of Image Toolbox uses. Update the app."
 
 ---
 
-## 26. The five unreachable SeedVR2 DiT weights: Part A BUILT, Part B still gated on a measurement
+## 26. The five unreachable SeedVR2 DiT weights: Part A BUILT, the VRAM constants next, Part B gated on a measurement
 
 Found 2026-08-23 while surveying alternative upscaling engines (that survey is finished
 and every candidate was dropped: `docs/dropped-ideas.md`, "A second upscaling engine").
@@ -254,6 +259,93 @@ at a decision point), but it belongs to the provisioning path rather than to a p
 change, and the sizing prompt now makes the situation avoidable rather than merely
 detectable.
 
+### Next: the three model-blind VRAM constants (Easy, and it is what makes Part A useful)
+
+Found 2026-08-29, when the question was asked whether #26 could simply ship as-is and let
+an OOM tell the user to pick something smaller. It can, and it did. But that framing
+assumes the failure mode is an OOM, and **on the newly-listed light models it is not.**
+Part A made ten weights selectable; the three constants standing in front of them still
+describe only 7B FP16, so a user who picks `7b-Q4_K_M` gets a run that is sized, gated and
+advised as if they had picked a model three times the weight.
+
+**Nothing here needs Part B.** These are arithmetic and one cheap probe, not a quality
+judgement on photographs. They are also what converts ten *selectable* models into ten
+*useful* ones, so they are the better use of an evening than the measurement below.
+
+#### 1. `video_vram_sizer._WS_FIXED_GB` (14.85): the local batch comes out too small
+
+The predictive curve is `peak ~= 14.85 + 0.289 * batch * mp`, fitted on this project's
+3090 running **7B FP16** (the fit is exact on its two anchors, so the constant is not a
+round number someone chose). The batch-independent term **alone is about 10 GB larger than
+the whole of `7b-Q4_K_M`** (4.43 GiB). Since the sizer only ever steps DOWN from the seed
+against live free VRAM, an over-large fixed term can only shrink the window. The run
+succeeds. There is no OOM, so no advice fires, and the user's reward for choosing the
+lighter model is a slower run than the card could give.
+
+That is the important asymmetry to hold on to: **for the light models the failure is silent
+underuse, not a visible error**, which is exactly the outcome a fail-with-a-recommendation
+net cannot catch.
+
+#### 2. `pod/worker._vram_profile` (`"7b": (16.3, ...)`): the same thing, billed
+
+`_vram_profile` maps every 7B variant to one profile whose FIXED is `16.3`, which is
+transparently the FP16 weight size (15.35 GiB = 16.48 GB). Same over-prediction, on rented
+hardware.
+
+**The fix is already demonstrated inside this very table, which is what makes it an
+evening's work.** The 3B family is ALREADY split by precision: `"3b": (6.40, ...)` against
+`"3b_fp16": (9.40, ...)`. That step is **3.00 GB**, and the measured file-size step between
+`3b-Q8_0.gguf` (3.41 GiB) and `3b_fp16` (6.32 GiB) is **3.13 GB**. They agree to within 4%.
+So within a family the fixed term moves with the weight file, and the remaining precisions
+can be **derived from `seedvr2_models.py`'s measured sizes** rather than swept for.
+
+Two honest caveats for whoever does it. The offset is per-FAMILY, not global: 3B's FIXED
+sits about 2.7 GB above its weights while 7B's sits marginally below, so derive **within**
+a family and never across one. And confirm rather than trust, which is cheap here:
+`video_bench.peak_alloc` at the smallest batch of the smallest output IS essentially the
+batch-independent term, so **one low-batch probe per model reads the constant off directly.**
+That is one probe, not a ceiling sweep, and the multi-model sweep built in Part A already
+runs several models on one pod.
+
+#### 3. `video_estimate.VRAM_FLOOR` (32 / 80 / 90): the light models cannot reach the cards they exist for
+
+The per-target floors gate which GPUs the picker will even offer, and they were measured on
+7B FP16. Q4's entire value proposition is running where FP16 cannot, and this refuses those
+cards before a run can start. So there is no OOM to advise on, because there is nothing to
+run. **Until this is model-aware, the 4-bit weights are listed but unreachable in video**,
+which also means Part B's headline question cannot be answered on the cards it is about.
+
+#### 4. And a hole Part A opened that Part A did not close: `db.max_feasible_output_mp`
+
+This is the bypass that lets a proven small card through the floor above, and it is **not
+SeedVR2-model-aware**. It already excludes Real-ESRGAN probes, and its docstring gives the
+exact reason: counting an ESRGAN 4K probe "would wrongly mark that card feasible" because a
+GAN tiles on OOM and reaches sizes SeedVR2 cannot.
+
+**That argument now applies INSIDE SeedVR2.** Benchmark a 24 GB card at 4K with
+`3b-Q4_K_M` (1.86 GiB), succeed, and the card becomes eligible for a **7B FP16** 4K job at
+15.35 GiB. This is the same shape as the `model_tag` collision Part A fixed, in the one
+place that was not looked at, and it became reachable the moment the light models were
+listed. It should be fixed WITH the constants above, not after them.
+
+While there: `db.py`'s `video_bench.model` column comment still reads
+`-- model family tag (7b / 3b / 3b_fp16)`, which Part A made stale.
+
+#### What to keep from the fail-with-advice idea
+
+Keep it, but as the net rather than the plan, because the case it catches is the rarest of
+the three. Two things are worth doing on their own:
+
+- **Images already do this and it is fine.** `upscale_engine` offloads, so a heavy model on
+  a small card is slow rather than failed, and `ToolTab.confirm_small_gpu` already names
+  "a smaller model (Settings) or a lower Resolution Target" before the first local run.
+- **One message is now sometimes wrong.** `batch_upscale`'s OOM handler attributes a hard
+  OOM to pipeline degradation (VRAM fragmentation, sysmem fallback). That was correct when
+  one model shipped. With ten selectable it is often just "this model does not fit this
+  card", and the text should say so as an alternative rather than asserting degradation.
+
+**Difficulty:** Easy, and independent of Part B. Do it first.
+
 ### Part B: the tier question (gated on a measurement, do NOT guess)
 
 The interesting weight is **`7b-Q4_K_M`, not the 3B one.** `recommend_models` jumps from
@@ -293,21 +385,24 @@ Those tiers are the first thing every new user is handed, they are calibrated in
 quote them. Part A changed nothing about them on purpose: it only made the models a user
 can knowingly choose match the models the app can actually run.
 
-**Difficulty:** Part A done, including the multi-model sweep Part B runs on. Part B is a
+**Difficulty:** Part A done, including the multi-model sweep Part B runs on. The three
+model-blind VRAM constants above are Easy, need no measurement campaign, and should be done
+FIRST: without them the light weights are selectable but cannot reach the cards they exist
+for, which is also what stops Part B being answerable on those cards. Part B itself is a
 measurement job rather than a coding job, and its cost is GPU hours plus a judgement call on
 real photos.
 
 ---
 
-## 27. Static GIF input: Easy, and the guard is the point
+## 27. Static GIF input: BUILT in 0.6.3
 
-Researched 2026-08-23. **Scope here is STATIC GIF only.** The animated half is
-recorded at the bottom as an unscheduled phase 2, because the research answered it and
-the answer is worth not re-deriving, but nothing about it is planned.
+Researched 2026-08-23, built 2026-08-29. **Scope is STATIC GIF only.** The animated
+half is recorded at the bottom as an unscheduled phase 2, because the research answered
+it and the answer is worth not re-deriving, but nothing about it is planned.
 
-**Today `.gif` appears in no extension list at all** - not `IMAGE_EXTS` (all three
-copies), not `VIDEO_EXTS`, not `RAW_EXTS`. The app ignores GIF completely, so this is a
-clean feature and not a latent bug.
+**Before this, `.gif` appeared in no extension list at all** - not `IMAGE_EXTS` (all
+three copies), not `VIDEO_EXTS`, not `RAW_EXTS`. The app ignored GIF completely, so this
+was a clean feature and not a latent bug.
 
 ### The guard is not a detail of this feature, it IS this feature
 
@@ -319,36 +414,91 @@ VARIANT_CANDIDATE_EXTS: ('.png', '.webp', '.tif', '.tiff', '.bmp')
 image_variant_reason -> None
 ```
 
-`.gif` is not a variant candidate, so the check returns None. The engine is RGB
+`.gif` was not a variant candidate, so the check returned None. The engine is RGB
 frame-0 only (`_load_image` does `convert("RGB")`, `_save_image` writes
-`arr[..., :3]` of `tensor[0]`), so the output is a flattened first frame under a
-mirrored name, and **Conciliation's mirrored-name fallback then matches it with full
-confidence and archives or DELETES the animated original.** That is precisely the
+`arr[..., :3]` of `tensor[0]`), so the output would be a flattened first frame under a
+mirrored name, and **Conciliation's mirrored-name fallback would then match it with full
+confidence and archive or DELETE the animated original.** That is precisely the
 failure #17 exists to prevent, in a format that was simply never on the list.
 
-**So `.gif` joins `IMAGE_EXTS` and `VARIANT_CANDIDATE_EXTS` in the SAME change, never
-in sequence.** With both, an animated GIF is reported and skipped ("would lose 5 of 6
-frames"), which is correct, protective, shipped behaviour from day one and needs no
-decision about animation at all. The multi-frame branch already picks its noun per
-extension, so GIF wants `"frames"` alongside `.webp`, not `"pages"`.
+**So `.gif` joined `IMAGE_EXTS` and `VARIANT_CANDIDATE_EXTS` in the SAME change, never
+in sequence**, and `test_the_two_lists_moved_together` is what keeps them that way.
+An animated GIF is now reported and skipped ("would lose 5 of 6 frames"), which is
+correct, protective behaviour from day one and needed no decision about animation at
+all. The noun is per format: GIF and animated WebP measure time, a TIFF really does
+have pages.
 
-### The one real decision: what a static GIF is written AS
+### As built: the output is `<stem>_gif.png`, and Conciliation inverts it
 
-GIF is a 256-colour palette with 1-bit transparency. Upscaling to 4K and saving back
-to `.gif` re-quantises to 256 colours and re-dithers, discarding most of what was just
-computed. Writing `.png` instead keeps the gain, but the output filename then differs
-from the source in extension, which touches Conciliation's mirrored-name matching
-(`<stem>.gif` vs `<stem>.png`). That interaction must be **checked, not assumed** - it
-is the same class of thing that made `#19` need `<stem>_raw.jpg`.
+The one real decision was what a static GIF is written AS. GIF is a 256-colour palette
+with 1-bit transparency, so saving the 4K result back to `.gif` re-quantises and
+re-dithers it, discarding most of what was just computed. It is written as **PNG**.
 
-A transparent static GIF is also a live case: `convert("RGB")` composites transparent
-pixels to black **silently** (measured: corner pixel RGBA `(0,0,0,0)` becomes RGB
-`(0,0,0)`). The variant guard catches this once `.gif` is a candidate, since
-`"transparency" in img.info` is already one of its tests. Verify that it does rather
-than assuming, because it is the difference between a skip and a silent flatten.
+**The `_gif` marker is #19's RAW+JPEG collision in a second costume.** `logo.gif` and
+`logo.png` in one folder would both want to become `logo.png` in the mirrored output
+tree, and two sources mapping to one output is not a crash: the first processed wins
+and the second is silently counted "already upscaled", with the film strip and the
+lineage row pointing at a file produced from the other source. The suffix is
+**unconditional**, never "only when it would collide", because a name that depends on
+what else is in the folder changes when a sibling is added later, which breaks every
+inverse after the fact.
 
-**Difficulty:** Easy. Two list entries, one noun, one output-extension decision, and a
-test that the guard fires on an animated and on a transparent GIF.
+**Unlike a RAW render, this output IS a replacement for its source**, and that is the
+difference that shaped the rest. A static GIF holds at most 256 colours and 1-bit
+transparency, all of which a PNG carries losslessly, so Conciliation is EXPECTED to
+match it and move it in. `conciliate.resolve_by_name` therefore inverts the naming rule
+explicitly rather than leaving it to the content-hash lineage. Lineage would usually
+match it, and "usually" is not good enough for the one tool that archives or deletes
+originals: a tree upscaled by another install, or one whose `db/cache.db` was deleted,
+has no lineage row at all, and working without one is the entire point of that fallback.
+The tag index is consulted for the GIF name as well as the mirrored one, so an output
+that Tag & Rename has since renamed is still found.
+
+**The conciliated file keeps its marker** (`<stem>_gif.png` lands in the original tree,
+not `<stem>.png`). Stripping it on the way in looks tidier and is not safe: `logo.gif`
+and `logo.png` can both be conciliated into one folder, and `_move_processed_in` moves
+with `shutil.move`, which overwrites without asking. The suffix that stops two sources
+sharing one OUTPUT is the same suffix that stops them sharing one destination.
+
+Three smaller calls, each recorded at its site:
+
+- **Tag & Rename ignores `.gif`**, the same call RAW gets: it writes a description into
+  the file's own metadata and GIF has nowhere to put one. Nothing is lost, because the
+  documented workflow points that tab at the UPSCALED folder, where a GIF is already a
+  PNG.
+- **The upscaled-image browser (#22) pairs it**, unlike a RAW render (which is excluded
+  from pairing outright, because the browser cannot draw a RAW as the "before" half). A
+  GIF is an ordinary Pillow image, so inverting the name is what gives it Compare long
+  after the run ended.
+- **`.gif` is NOT in the browser's own extension list.** The upscaler accepts a GIF but
+  never writes one, so an output tree holds no `.gif`; listing them would only surface
+  files this app did not produce.
+
+Metadata needed nothing: `exif_copy.exif_for_upscaled` returns None for a GIF source and
+`pending_backfill` returns 0, so both #13 halves are already the correct no-op.
+
+### What building it found: BOTH fixtures collapse silently
+
+This is the part worth carrying forward, because it makes a test file look right while
+testing nothing. **Pillow's GIF writer discards the exact properties under test**, in two
+independent ways, measured 2026-08-29:
+
+- `save(transparency=N)` writes **no transparency block** unless index N is actually
+  USED in the pixel data. A uniform fill saved with `transparency=0` reloads with info
+  keys `['background', 'version']` and nothing else. Three separate constructions failed
+  this way before one stuck.
+- `append_images=[im.copy()] * 5` collapses to **`n_frames == 1`**, because identical
+  frames are optimised away. The "animated" fixture is then a 105-byte static GIF.
+
+A naive fixture is therefore quietly the opposite of what it claims. Every builder in
+`tests/test_gif_input.py` asserts its own result before a test relies on it, and one
+test pins both collapse modes so a future Pillow that stops doing this is noticed rather
+than silently making the guard tests vacuous.
+
+The generalisable version: **when a test's subject is a property the WRITER may
+optimise away, the fixture has to be read back and checked, not trusted.** That is the
+same instinct as the "present is not working" trio in `known-defects.md`, applied to
+test data instead of to an installed component.
 
 ### Phase 2, NOT scheduled: animated GIF out to MP4/MKV
 
@@ -948,16 +1098,19 @@ The user installs and runs the application on their Unraid server.
 
 ## Sequencing & dependencies
 
-- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23 and #24
-  are complete** (remote upscaling + funds-floor; RunPod video; video conciliation; self-healing
-  remote runs; local video; benchmark sharing; telemetry usage graphs; Home Assistant dashboard
-  samples; Real-ESRGAN engine; metadata copy + backfill; the comparison lens; derived-directory
-  pruning; skipping image variants the pipeline cannot round-trip; Conciliation Undo; RAW input;
-  video stabilization; browsing already-upscaled images; the Video Stabilization workflow; the
-  diagnostics bug report), so the remaining sequencing is only among the open milestones
-  below.
-- **Open milestones: #21, #12, #15, #3, #4, plus #25, which is BUILT** and open only for its
-  two dated deletions.
+- **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23, #24
+  and #27 are complete** (remote upscaling + funds-floor; RunPod video; video conciliation;
+  self-healing remote runs; local video; benchmark sharing; telemetry usage graphs; Home
+  Assistant dashboard samples; Real-ESRGAN engine; metadata copy + backfill; the comparison
+  lens; derived-directory pruning; skipping image variants the pipeline cannot round-trip;
+  Conciliation Undo; RAW input; video stabilization; browsing already-upscaled images; the
+  Video Stabilization workflow; the diagnostics bug report; static GIF input), so the
+  remaining sequencing is only among the open milestones below.
+- **Open milestones: #21, #28, #12, #15, #3, #4, plus #25 and #26, which are BUILT** and open
+  only for what is left of them: #25 for its two dated deletions, #26 for the model-blind VRAM
+  constants (Easy) and then Part B's measurement. **#27 is also built** and stays in place
+  rather than moving to the legend, because it carries the measured phase-2 record for
+  animated GIF, which is deliberately unscheduled.
 - **#25 (RunPod API v2) was the only milestone with a deadline, and it is done**: all five
   phases on 2026-08-20, months ahead of both dates. Nothing else sequences behind it any more.
   What remains is a **calendar item, not a task**: delete the v1 half after 2026-11-15 and the
@@ -980,7 +1133,27 @@ The user installs and runs the application on their Unraid server.
   4.43 to 15.35 GiB spread of resident weights. It had stayed latent purely because nobody
   could switch models. The generalisable rule: **widening what a user can choose turns every
   key that collapses those choices into a live bug**, and the collapse is invisible until
-  the choice exists. Check the key before shipping the choice.
+  the choice exists. Check the key before shipping the choice. The rule has a second half,
+  found on 2026-08-29: it is not only KEYS that collapse the choices, it is **constants**.
+  Three VRAM numbers in front of the picklist still describe 7B FP16 alone, so the light
+  weights are selectable but are sized, gated and advised as the heaviest one. That failure
+  is SILENT (a batch too small, or a card the picker never offers) rather than an error, so
+  no fail-with-advice net catches it. Those are Easy and come before Part B.
+- **#27 (static GIF) shipped in 0.6.3** and confirmed its own premise: the feature was never
+  the input format, it was the **guard**, and the entry was right that adding `.gif` to
+  `IMAGE_EXTS` alone would have reproduced #17's data loss in a format nothing was watching.
+  What it did not predict is where the cost actually landed, and the lesson generalises past
+  GIF. **Pillow's GIF writer silently discards the exact properties the tests are about**: a
+  transparency index that is not used in the pixel data is dropped, and identical
+  `append_images` collapse to one frame, so the obvious fixture is a static opaque GIF that
+  reads as an animated transparent one in the source. The rule to carry forward: **when a
+  test's subject is a property the WRITER may optimise away, the fixture has to be read back
+  and checked, not trusted.** That is `known-defects.md`'s "present is not working" aimed at
+  test data instead of at an installed component, and it is the third distinct place that
+  shape has bitten this project. The other cost was the one the entry flagged: the output
+  cannot keep its extension, so it needed #19's collision reasoning a second time
+  (`<stem>_gif.png`) plus an explicit inverse in `conciliate.resolve_by_name`, because
+  lineage is not available on every install and Conciliation is the tool that deletes things.
 - **#21 (denoise) inherits #19's prepare pipeline**, which is built and in use: a RAW is
   decoded into an in-memory image, straightened in memory, and written to **exactly one**
   lossless temp only when it is actually upscaled (`batch_upscale._write_upscale_input`,
@@ -1040,8 +1213,8 @@ The user installs and runs the application on their Unraid server.
 
 ## Shipped milestones (numbering legend)
 
-Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23
-and #24** are done and live. **This section is a pointer list, not a record.** Each entry says what the
+Roadmap **#1, #2, #5, #6, #7, #8, #9, #10, #11, #13, #14, #16, #17, #18, #19, #20, #22, #23,
+#24 and #27** are done and live. **This section is a pointer list, not a record.** Each entry says what the
 number meant and where the design of record actually lives; nothing is described in full
 here. The numbers survive because code and other docs cite the roadmap by them (`remote
 #1`, `Video Upscaler #2`, `local #7`), so deleting the entries outright would strand those
@@ -1149,6 +1322,15 @@ kept in two places drifts, and the stale copy is the one that gets read.
   rule will find** (the vision model's descriptions were still in the zip after every path
   rule passed). See `docs/bug-reports.md`, `CLAUDE.md` (Report an issue) and
   `tests/test_diagnostics.py`.
+- **#27: Static GIF input.** Shipped 0.6.3. The Batch Upscaler accepts `.gif`; the feature is
+  the **guard**, since adding it to `IMAGE_EXTS` without `VARIANT_CANDIDATE_EXTS` reproduces
+  #17's data loss in a format nothing was watching. Output is `<stem>_gif.png` (GIF would
+  re-quantise the result to 256 colours, and the marker is #19's collision reasoning a second
+  time), and `conciliate.resolve_by_name` inverts that name explicitly so the replacement does
+  not depend on a lineage row this install may not have. The entry stays in the open list
+  above rather than shrinking to this line, because it carries the measured, deliberately
+  unscheduled phase-2 record for animated GIF. See `CLAUDE.md` (Static GIF input) and
+  `tests/test_gif_input.py`.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
