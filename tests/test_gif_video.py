@@ -438,8 +438,14 @@ def test_only_an_ANIMATED_gif_gets_the_pointer():
         "both.gif", "would lose transparency, 5 of 6 frames")
 
 
+@needs_ffmpeg
 def test_the_scan_records_a_gifs_real_frame_count(tmp_path):
-    """A GIF container declares no frame count, so a metadata-only probe leaves it None
+    """Needs ffmpeg despite the count itself coming from Pillow: `scan_file` returns None
+    outright when `vp.probe` fails, so without it this asserts against a None row rather
+    than against a frame count. (Found by CI the day Pillow was installed there and this
+    module stopped being skipped whole.)
+
+    A GIF container declares no frame count, so a metadata-only probe leaves it None
     and the tab reads `nb_frames or 0`: the scan list shows "?" and the cost estimate
     counts the job as ZERO frames. Under-reporting is the wrong direction for a number
     a "confirm before renting a pod" dialog quotes, and the right value is a header read
