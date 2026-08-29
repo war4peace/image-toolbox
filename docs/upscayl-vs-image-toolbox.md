@@ -4,7 +4,7 @@ A feature-by-feature comparison between [Upscayl](https://github.com/upscayl/ups
 and **Image Toolbox** (this project).
 
 Written 2026-07-27 against Upscayl's public repository / website; the Image Toolbox
-column was refreshed 2026-07-29 for **0.6.0**. Check their repo before
+column was refreshed 2026-08-29 for **0.6.3**. Check their repo before
 relying on their column: this is a snapshot of one day's reading, and their side can
 change without this file noticing.
 
@@ -92,7 +92,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | 100% offline processing | ✅ | ✅ | Image Toolbox only leaves the machine if you explicitly pick a remote pod. |
 | Real-ESRGAN family models | ✅ | ⚠️ | Upscayl: for images. Image Toolbox: Real-ESRGAN is a **video** method; images always use SeedVR2. |
 | Diffusion upscaler (SeedVR2) | ❌ | ✅ | Slower, heavier, generally higher quality on degraded photos. |
-| Multiple bundled model choices | ✅ | ⚠️ | Upscayl: Standard, Lite, Remacri, Ultramix, Ultrasharp, Digital Art, High Fidelity. Image Toolbox: SeedVR2 3B Q8 / 7B FP8 / 7B FP16 (size tiers, not styles). |
+| Multiple bundled model choices | ✅ | ⚠️ | Upscayl: Standard, Lite, Remacri, Ultramix, Ultrasharp, Digital Art, High Fidelity. Image Toolbox: ten SeedVR2 weights since 0.6.3 (3B and 7B, FP16 down to 4-bit, each with a Sharp variant), but they are size, precision and sharpening tiers of **one** model, not the different styles Upscayl's list offers. |
 | Custom / user-supplied models | ✅ | ❌ | Upscayl imports custom ncnn models (PyTorch models must be converted first). |
 | Fixed ratio output (2× / 3× / 4×) | ✅ | ❌ | Image Toolbox images target a **resolution**, not a ratio. |
 | Chained double pass (up to 16×) | ✅ | ❌ | "Double Upscayl". |
@@ -200,8 +200,8 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 
 | | Upscayl | Image Toolbox |
 |---|---|---|
-| Image input | PNG, JPG/JPEG, WebP | Common still formats (JPEG, PNG, WebP, BMP, TIFF...) |
-| Image output | PNG, JPG, WebP (lossy/lossless compression settings) | Same extension as the source, written atomically |
+| Image input | PNG, JPG/JPEG, WebP | Common still formats (JPEG, PNG, WebP, BMP, TIFF...), ten RAW/DNG extensions (0.6.0), still GIF (0.6.3) |
+| Image output | PNG, JPG, WebP (lossy/lossless compression settings) | Same extension as the source, written atomically; a RAW renders to `<name>_raw.jpg` and a GIF upscales to `<name>_gif.png`, so neither can collide with a same-named sibling |
 | Video | none | Common container/codec input; H.265 10-bit output by default |
 
 ---

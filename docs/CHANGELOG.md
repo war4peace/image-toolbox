@@ -8,6 +8,7 @@ Releases page.
 
 ## Contents
 
+- [0.6.4 (in development)](#064-in-development)
 - [0.6.3](#063)
 - [0.6.2](#062)
 - [0.6.1](#061)
@@ -20,6 +21,29 @@ Releases page.
 - [0.5.3](#053)
 - [0.5.2](#052)
 - [0.5.1](#051)
+
+---
+
+## 0.6.4 (in development)
+
+Nothing user-facing yet beyond one fix.
+
+### Closing a window now stops the work it started
+
+Closing the **Browse upscaled…** window left it decoding thumbnails in the
+background: up to a page of them, 200 pictures, for a window that was no longer on
+screen. Nothing was produced wrongly, it was simply your CPU and disk working on
+something nobody would ever see. The same applied to the preview strips on the tabs.
+
+A window's decoding now stops when the window closes, and the app waits for it rather
+than assuming.
+
+### Under the hood, not user-visible
+
+The test suite no longer makes network calls (a Settings tab built inside a test used
+to probe for Ollama, for real), it now runs the picture-handling tests on the build
+server instead of silently skipping 163 of them, and the run that checks every commit
+went from 261 seconds to 75.
 
 ---
 

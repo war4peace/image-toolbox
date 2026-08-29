@@ -7,7 +7,7 @@ lives in [`topaz-video-vs-image-toolbox.md`](topaz-video-vs-image-toolbox.md).
 
 Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`
 (app version **1.3.1**, released 2026-06-11); the Image Toolbox column was refreshed
-2026-07-29 for **0.6.0**. Check Topaz's own pages before relying on
+2026-08-29 for **0.6.3**. Check Topaz's own pages before relying on
 their column: their release cadence is fast, their pricing changed materially in the
 last year, and this is a snapshot of one day's reading.
 
@@ -120,7 +120,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 |---|:--:|:--:|---|
 | Local AI image upscaling | ✅ | ✅ | The shared core. |
 | 100% offline processing | ✅ | ✅ | Both. Gigapixel's cloud rendering is opt-in per job; Image Toolbox only leaves the machine if you pick a remote pod. |
-| Number of upscaling models | ✅ | ⚠️ | Gigapixel: Standard, Standard Max, High Fidelity 3, Low Resolution, Text & Shapes, Art & CG, Recover 2/3, Redefine, Wonder 1/2/3. Image Toolbox: SeedVR2 in three size tiers (3B Q8 / 7B FP8-mixed / 7B FP16), which are speed/VRAM tiers of **one** model, not different styles. |
+| Number of upscaling models | ✅ | ⚠️ | Gigapixel: Standard, Standard Max, High Fidelity 3, Low Resolution, Text & Shapes, Art & CG, Recover 2/3, Redefine, Wonder 1/2/3. Image Toolbox: ten SeedVR2 weights since 0.6.3 (roadmap #26), 3B and 7B, FP16 down to 4-bit, each with a Sharp variant. The count is misleading in Image Toolbox's favour: those are size, precision and sharpening tiers of **one** model, spanning 1.86 to 15.35 GiB of weights, not the different restoration styles Gigapixel's list describes. |
 | Subject-specialised models (text, art/CG, faces, low-res) | ✅ | ❌ | A genuine capability gap: line art, screenshots and CG have different failure modes than photos, and Gigapixel has a model per case. |
 | Generative / diffusion upscaling | ✅ | ✅ | Gigapixel: Wonder 1/2/3, Redefine, Standard Max, Recover. Image Toolbox: SeedVR2 (diffusion) for every image. |
 | Prompt-guided regeneration | ✅ | ❌ | Redefine takes a text description plus creativity (Low/Medium/High/Max) and a texture slider. |
@@ -167,7 +167,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 | Replace originals with processed results | ❌ | ✅ | Conciliation: archive or delete, content-hash lineage matching, non-destructive preview first. |
 | Video upscaling | ❌ | ✅ | Topaz sells that separately as Topaz Video; see the companion document. |
 | Metadata preserved in the output | ⚠️ | ✅ | Gigapixel writes the output with an export format choice (Preserve input format / JPEG / PNG / TIFF) and carries metadata across, though users have long reported field loss (lens model, white balance, flash bias on JPEG; near-total loss on TIFF). Image Toolbox copies the whole block since 0.5.9 (roadmap #13), with Orientation normalised and the stale thumbnail dropped, and Conciliation backfills anything upscaled before that. |
-| RAW / DNG input | ✅ | ❌ | Gigapixel accepts RAW and DNG (exported as TIFF since 7.0.4). Image Toolbox is JPEG/PNG/WebP/BMP/TIFF only. |
+| RAW / DNG input | ✅ | ⚠️ | Gigapixel accepts RAW and DNG and exports them as TIFF (since 7.0.4). Image Toolbox accepts ten RAW/DNG extensions since 0.6.0 (roadmap #19) and writes `<name>_raw.jpg`, but **renders** rather than **develops**: the camera's own embedded full-size preview where there is one, a neutral LibRaw demosaic where there is not, and no exposure or white-balance controls, ever. It is also rarely an *upscale*: RAW is a high-resolution format, and none of 24 real camera files from 2004-2020 was small enough to qualify at the shipped target. The RAW is never modified, never renamed and never archived by Conciliation. |
 
 ### 3.4 Comparison and preview UI
 
@@ -212,8 +212,8 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 
 | | Gigapixel | Image Toolbox |
 |---|---|---|
-| Input | JPG, PNG, TIFF, plus RAW and DNG | JPEG, PNG, WebP, BMP, TIFF |
-| Output | Preserve input format, JPEG, PNG, TIFF (RAW/DNG in becomes TIFF out; DNG export removed in 7.0.4) | Same extension as the source, written atomically |
+| Input | JPG, PNG, TIFF, plus RAW and DNG | JPEG, PNG, WebP, BMP, TIFF, ten RAW/DNG extensions (0.6.0), still GIF (0.6.3) |
+| Output | Preserve input format, JPEG, PNG, TIFF (RAW/DNG in becomes TIFF out; DNG export removed in 7.0.4) | Same extension as the source, written atomically, with two marked exceptions: a RAW renders to `<name>_raw.jpg` and a GIF upscales to `<name>_gif.png`. Both markers are deliberate: shooting RAW+JPEG, or keeping `logo.gif` beside `logo.png`, would otherwise map two sources onto one output name |
 | Max dimension | 32,000 px longest side / ~1 gigapixel / 2 GB | Bounded by the selected target (4K max) |
 
 ---
@@ -283,8 +283,12 @@ outcome.
   copyright, and Conciliation puts those fields back into anything upscaled before
   the fix, at the last moment both files exist. This was the worst gap in the
   document while it stood.
-- **No RAW support.** Anyone working from camera originals rather than JPEGs is
-  simply not served.
+- ~~**No RAW support.**~~ **Closed** by roadmap #19 (0.6.0): ten RAW/DNG extensions are
+  accepted and rendered. The gap that remains is narrower and worth stating as its own
+  thing: Gigapixel *develops* a RAW (its own demosaic, and an export format choice),
+  while Image Toolbox *renders* one, preferring the camera's embedded preview and
+  offering no exposure or white-balance controls. Someone working from negatives who
+  wants a say in the interpretation is still better served there.
 - **No live preview.** Gigapixel lets you audition a model on an image before
   committing to it; Image Toolbox only shows you the result after the file is
   written. The cost of that is highest on a long run, where a setting you would

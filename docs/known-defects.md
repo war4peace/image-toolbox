@@ -5,10 +5,11 @@ Confirmed bugs, each with its root cause and what was done about it. Open ones c
 worth more than the patches. Design questions live in `docs/future-features.md`; ideas that
 were rejected live in `docs/dropped-ideas.md`.
 
-> **Nothing is open as of 2026-08-22.** D1 to D4 were all found while testing 0.6.0, D5 and
-> D6 while testing 0.6.1; all six were fixed, D6 after v0.6.1 had already shipped. Three of
-> the first four are the same mistake in different clothes, which is the reason to read them
-> together: **present is not working.** An ffmpeg binary that is there and corrupts memory,
+> **Nothing is open as of 2026-08-29.** D1 to D4 were all found while testing 0.6.0, D5 and
+> D6 while testing 0.6.1, D7 by CI on the v0.6.3 release commit; all seven were fixed, D6 after
+> v0.6.1 had already shipped and D7 after v0.6.3 had. Three of the first four are the same
+> mistake in different clothes, which is the reason to read them together: **present is not
+> working.** An ffmpeg binary that is there and corrupts memory,
 > an encoder the build lists that the hardware cannot run, a `python.exe` that exists and
 > cannot start. Every one of them was a check asking whether something EXISTED when the
 > question was whether it WORKED, and every one was invisible to the test suite because a
@@ -20,11 +21,18 @@ were rejected live in `docs/dropped-ideas.md`.
 > could see the code but not the effect.** Where a defect's only symptom is what appears on
 > screen, the check has to reach for the screen: D5 is guarded by a structural scan, D6 by
 > reading the opened window back through Shell.Application.
+>
+> **D7 is the same shape one layer down: invalidated is not stopped.** A decode thread was
+> told to give up and was never waited for, so "cancelled" and "still running" looked
+> identical from the outside. It cost a leaked page of decodes in the app for a whole
+> release, and a hard process crash in CI. Its guard, again, reaches for the effect: no
+> thread survives the widget.
 
 ---
 
 ## Contents
 
+- [D7 (fixed): decode threads outlived the widget that started them](#d7-fixed-decode-threads-outlived-the-widget-that-started-them)
 - [D6 (fixed): "show me the file" opened Documents, for every install](#d6-fixed-show-me-the-file-opened-documents-for-every-install)
 - [D5 (fixed): a button that drew, enabled and did nothing](#d5-fixed-a-button-that-drew-enabled-and-did-nothing)
 - [D4 (fixed): a local GPU below the 8 GB minimum was offered with no warning](#d4-fixed-a-local-gpu-below-the-8-gb-minimum-was-offered-with-no-warning)
@@ -37,6 +45,67 @@ were rejected live in `docs/dropped-ideas.md`.
 ## Fixed
 
 Kept because the code comments and tests reference these ids.
+
+### D7 (fixed): decode threads outlived the widget that started them
+
+**Found:** 2026-08-29, by CI, on `main`, on the **v0.6.3 release commit** -- which had passed
+on `0.6.3-experimental` twenty minutes earlier. Not a test failure: a hard process crash,
+`Windows fatal exception: code 0x80000003`, with two leaked daemon threads in the faulthandler
+dump. A re-run went green, so **green-on-re-run is not proof there was nothing there.**
+
+`FilmStrip` started every decode thread and forgot it: `threading.Thread(...).start()` with
+nothing holding the reference. Cancellation was a generation counter, `_gen`, which a loader
+checks at the top of each iteration. That is the right mechanism and it answers the wrong
+question. **`_gen` ASKS a loader to give up at its next checkpoint. It does not say when the
+loader did, and nobody could wait for one or tell whether one was still going.** While the
+widget is alive that distinction costs nothing. Once the widget is gone it is the whole
+problem.
+
+It showed up twice, in opposite registers.
+
+**In the app**, closing the upscaled-image browser (#22) left up to a page of decodes running,
+200 paths at `BROWSE_PAGE_SIZE`, against a window nobody was looking at. Wasted CPU and disk,
+never wrong output, which is why it sat there from 0.6.0 until CI crashed on the other half of
+it.
+
+**In CI it killed the process**, and that mechanism is worth keeping. `_load_batch` opened with
+`from PIL import Image`, before its first `_gen` check, and the runner had no Pillow. **A
+failed import is never cached**, so each retry walked the entire finder chain again, holding
+the import lock, while the main thread ran its own `importorskip("PIL.Image")` and a garbage
+collection landed in between. The leak itself was old; 0.6.3 supplied the second thread and the
+missing module, and the crash needed all three.
+
+**Fixed** in three parts, because any one alone leaves the hole open:
+
+- every loader goes through `_spawn_loader`, is tracked in `_loaders`, and is stopped by
+  `stop_loaders()` from a `<Destroy>` binding. `stop_loaders` **returns the threads still
+  running when its budget expired** rather than sleeping and hoping, so a caller that wants a
+  fact gets one;
+- `_load_batch` checks `_gen` **before** the import, not only in its loop;
+- CI installs Pillow (a 3 MB app dependency whose absence was silently skipping 163 tests), and
+  `tests/conftest.py` neutralises `SettingsTab`'s constructor-time Ollama probe for the whole
+  session. That protection previously lived at class level inside one test module, so it
+  covered itself and whatever ran after it and nothing before: a **collection-order-dependent**
+  guard, which is not a guard.
+
+The guard is `tests/test_filmstrip_loader_threads.py`, and it asserts **the effect**, that no
+thread survives the widget, rather than that the widget holds a set or binds an event. Both of
+those can be true while a loader runs on, which is exactly what happened. Same rule D5 and D6
+arrived at from the other direction.
+
+**One test written for it was a no-op wearing a pass**, and that is the part to carry forward.
+It destroyed a CHILD widget and asserted the strip's loaders survived, on the plausible premise
+that a container's `<Destroy>` binding also sees its children's. **It does not.** A plain
+`bind` attaches to the widget's own bindtag, and a child's destroy goes to the child's tags
+(itself, its class, the toplevel, `all`), so the handler never sees one. The test passed
+identically with the guard deleted. Measured, rewritten to exercise the handler directly, and
+the comment corrected, since its first version asserted the opposite. **Every guard here now
+has a negative control that was seen to fail.**
+
+The fix had one measured side effect nobody was looking for: CI pytest time fell from **261 s
+to 75 s** while running six more tests. `_load_batch` sleeps 50 ms per failed decode attempt,
+four attempts per path, and `test_browse_upscaled` queues 250 non-existent paths per strip, so
+the leaked threads had been sleeping and retrying across the whole session.
 
 ### D6 (fixed): "show me the file" opened Documents, for every install
 

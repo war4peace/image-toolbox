@@ -1474,9 +1474,29 @@ Engine, packaging & CI:
   nobody noticed at the time, because the installer built fine and that was the run
   being watched. `gh run list --limit 5` right after the push is the whole check.
   See [release-workflow] in memory for the branch/fold mechanics.
+- `.github/workflows/test.yml` — the **`Tests`** workflow, which runs on every push and PR
+  (tag pushes go to `build-installer.yml` instead). A Windows runner with a plain system
+  Python and exactly two installs: **pytest and Pillow**. Both halves of that are decisions.
+  **torch stays out**: the suite is torch-free by design (`tests/test_import_smoke.py`), which
+  is what keeps this workflow seconds instead of a ~3 GB CUDA download. **Pillow went IN in
+  0.6.4**, and is not a relaxation of that rule but a 3 MB app dependency whose absence was
+  costing coverage AND stability: `importorskip("PIL")` was silently skipping 163 tests
+  including the whole of 0.6.3's GIF feature, and the missing module is what turned a leaked
+  decode thread into a hard process crash (D7 - a failed import is never cached, so it walked
+  the finder chain on every retry, in the import lock). Two invariants to keep: the suite
+  **makes no network calls** (a session-scoped `conftest.py` fixture neutralises
+  `SettingsTab`'s constructor-time Ollama probe; the same guard written at class level inside
+  one test module is **collection-order-dependent**, so it protected itself and everything
+  after it and nothing before, which is how a real network probe ended up running in CI at
+  all), and a green
+  tick is read as **passed-count AND skip-count together** - a HIGHER skip count can be the
+  improvement, since collecting a module that used to skip as one turns 1 skip into many
+  individually-skipped tests. Baseline as of 0.6.4: **1687 passed, 66 skipped, ~75 s** (261 s
+  before the D7 fix, for six fewer tests).
 - `docs/` — `known-defects.md` (confirmed bugs, with root cause and
-  what was done about it; **nothing open as of 0.6.1** - D1 to D4 were found while testing
-  0.6.0, D5 and D6 while testing 0.6.1 (D6 after it shipped). Kept because code comments
+  what was done about it; **nothing open as of 0.6.4** - D1 to D4 were found while testing
+  0.6.0, D5 and D6 while testing 0.6.1 (D6 after it shipped), D7 by CI on the v0.6.3 release
+  commit (also after it shipped). Kept because code comments
   cite them by id and because three of the first four are one mistake in different clothes:
   **present is not working**. **D5 and D6 are the GUI pair and they rhyme**: a button that
   drew, enabled and did nothing (`self._report = None` shadowed the `_report` METHOD, so
@@ -1487,11 +1507,20 @@ Engine, packaging & CI:
   install, since `DefaultDirName` is `...\Programs\Image Toolbox`). Both were silent by
   construction and both reached a user because the suite could see the code but not the
   effect, so each is now guarded by a check that reaches for the effect:
-  `tests/test_gui_command_bindings.py` and `tests/test_open_in_explorer.py`), `future-features.md`
-  (roadmap: open milestones #21,
-  #12/#15, #3/#4, plus #25 and #24, both BUILT: #25 stays open because it owns two dated
-  deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027), #24
-  only for its redaction record, its live GitHub check having passed on 2026-08-22; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22
+  `tests/test_gui_command_bindings.py` and `tests/test_open_in_explorer.py`. **D7 is that
+  same shape one layer down: invalidated is not stopped** - a FilmStrip decode thread was told
+  to give up via `_gen` and never waited for, so "cancelled" and "still running" were
+  indistinguishable from outside, which cost a leaked page of decodes on every browse window
+  closed since #22 shipped in 0.6.0, and a hard process crash in CI; its guard,
+  `tests/test_filmstrip_loader_threads.py`, asserts that no thread survives the widget),
+  `future-features.md`
+  (roadmap: open milestones #28, #21,
+  #12/#15, #3/#4, plus #25, #24, #26 and #27, all BUILT: #25 stays open because it owns two
+  dated deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027),
+  #24 only for its redaction record, its live GitHub check having passed on 2026-08-22, #26
+  for the half still to do (three model-blind VRAM constants, then a Part B quality
+  measurement nobody has run), and #27 because its real content was never the input format but
+  the data-loss guard the NEXT format will need too; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22/#23
   kept only as a numbering legend), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
   incl. folding a RAW render back into the source tree, whose revisit trigger is an

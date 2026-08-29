@@ -6,7 +6,7 @@ project). The image-side comparison against Topaz Gigapixel lives in
 [`topaz-gigapixel-vs-image-toolbox.md`](topaz-gigapixel-vs-image-toolbox.md).
 
 Written 2026-07-28 against Topaz's public product page and `docs.topazlabs.com`;
-the Image Toolbox column was refreshed 2026-07-29 for **0.6.0**. Check
+the Image Toolbox column was refreshed 2026-08-29 for **0.6.3**. Check
 Topaz's own pages before relying on their column: their model lineup changes several
 times a year and their pricing changed materially in the last one. This is a snapshot
 of one day's reading.
@@ -121,7 +121,7 @@ Legend: ✅ has it · ⚠️ partial / with caveats · ❌ does not have it.
 
 | Feature | Topaz Video | Image Toolbox | Notes |
 |---|:--:|:--:|---|
-| Number of models | ✅ | ⚠️ | Topaz: Starlight Precise 2.5, Starlight Sharp, Starlight HQ, Starlight Mini, Proteus, Iris, Nyx, Nyx XL, Rhea, Rhea XL, Artemis (six variants), Gaia (two), Theia, Apollo, Chronos, Aion, Themis, Hyperion, SDR-to-HDR, plus Pro-exclusive models. Image Toolbox: SeedVR2 (three size tiers) and Real-ESRGAN (two tiers). |
+| Number of models | ✅ | ⚠️ | Topaz: Starlight Precise 2.5, Starlight Sharp, Starlight HQ, Starlight Mini, Proteus, Iris, Nyx, Nyx XL, Rhea, Rhea XL, Artemis (six variants), Gaia (two), Theia, Apollo, Chronos, Aion, Themis, Hyperion, SDR-to-HDR, plus Pro-exclusive models. Image Toolbox: SeedVR2 (ten weights since 0.6.3: 3B and 7B, FP16 down to 4-bit, each with a Sharp variant) and Real-ESRGAN (two tiers). The comparison flatters Image Toolbox: those ten are size, precision and sharpening tiers of one model, where Topaz's list is genuinely different models for different problems. |
 | Diffusion upscaling | ✅ | ✅ | Topaz: the Starlight family. Image Toolbox: SeedVR2. |
 | GAN / fast upscaling | ✅ | ✅ | Topaz: the classic models. Image Toolbox: Real-ESRGAN Compact / Quality, added 0.5.6 as the fast, VRAM-light alternative. |
 | Choose the engine per job | ✅ | ✅ | Image Toolbox: a Method switch per queued job; the queue groups by (engine, GPU) and runs one pod per group. |
@@ -172,7 +172,7 @@ This is the section Image Toolbox was actually built for.
 
 | Feature | Topaz Video | Image Toolbox | Notes |
 |---|:--:|:--:|---|
-| Input formats | ✅ | ⚠️ | Topaz: 23 video extensions plus image sequences (PNG/TIF/JPG/DPX/EXR, min 5 frames). Image Toolbox: mp4, avi, mov, mkv, m4v, wmv, mpg, mpeg and similar. |
+| Input formats | ✅ | ⚠️ | Topaz: 23 video extensions plus image sequences (PNG/TIF/JPG/DPX/EXR, min 5 frames). Image Toolbox: mp4, avi, mov, mkv, m4v, wmv, mpg, mpeg and similar, plus **animated GIF** since 0.6.3, which is upscaled here rather than as a series of pictures because a per-frame upscale re-invents its detail on every frame and flickers. |
 | Output encoders | ✅ | ⚠️ | Topaz: 23, including ProRes (5 variants), H.264, H.265 Main/Main10, VP9, AV1, FFV1 (4:2:0/4:2:2/4:4:4), QuickTime V210/R210/Animation, and image sequences. Image Toolbox: H.265 via `hevc_nvenc` or `libx265` with an H.264 fallback, `yuv420p`, with a 10-bit option. The encoder is auto-picked by capability, not chosen from a list. |
 | Archival / intermediate codecs (ProRes, FFV1) | ✅ | ❌ | A hard blocker for anyone feeding an edit or an archive. |
 | Bit depths | ✅ | ⚠️ | Topaz: 8, 10, 12, 16, 32. Image Toolbox: 8-bit, or 10-bit when enabled. |

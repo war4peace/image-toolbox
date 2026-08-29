@@ -52,6 +52,7 @@ Upscaler"**.
 - [16. Segment extraction + real-time playback (0.4.7)](#16-segment-extraction--real-time-playback-047)
 - [17. Self-healing remote runs ("Auto-resume")](#17-self-healing-remote-runs-auto-resume-050-experimental)
 - [18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (planned, 0.5.6)](#18-per-item-gpu-binding--grouped-multi-pod-start-and-remote-real-esrgan-planned-056)
+- [19. The pod worker swaps its model (0.6.3)](#19-the-pod-worker-swaps-its-model-063)
 
 ---
 
@@ -1943,6 +1944,10 @@ model. This keeps the firm rule from section 17 intact.
   one card x the whole queue. Each group is also its own installment boundary for the per-run
   minute/cost cap.
 
+> **The group key is `(engine, gpu)` and the MODEL is deliberately not in it.** That was
+> correct for one engine with one loaded weight and became a wrong-output bug the moment ten
+> SeedVR2 weights were selectable per job: see section 19.
+
 ### 18.4 The pendulum (Auto-resume extended)
 
 The existing Auto-resume checkbox (section 17) becomes dual-purpose. When **every** remaining
@@ -2062,5 +2067,39 @@ from measured data instead of the ~100x-too-slow SeedVR2 table. Local and remote
 `process_segment` cell runner; remote reuses the B2 esrgan pod + the SeedVR2 remote-benchmark
 deploy/funds/telemetry path. Full design + code map: `docs/local-video-upscaler.md` section 23.
 Still deferred: the benchmark-corpus `engine` column and a Blackwell cu128 esrgan image override.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
+---
+
+## 19. The pod worker swaps its model (0.6.3)
+
+Roadmap **#26 Part A** made all ten hash-pinned SeedVR2 weights selectable. Most of that is
+GUI work and is recorded in `docs/future-features.md` #26; the part that lands **here** is
+that `pod/worker.py` used to load ONE DiT at startup from `worker_settings.json` and
+`/video/probe` had no model parameter at all, which broke two remote things at once.
+
+- **A multi-model benchmark had to redeploy a pod per model.** Pod creation, volume mount and
+  cold start, all billed, to avoid a weight reload that costs a minute or two. The sweep now
+  deploys once and swaps on the pod.
+- **A mixed-model queue produced wrong output and reported success.** Section 18.3's group key
+  is `(engine, gpu)`, model deliberately absent, and `process_job` passed the per-job model
+  only for `fixed_ratio`. Two SeedVR2 jobs picked with different models on one card were
+  therefore one group on one pod, both running whatever `_worker_cfg` had sent at boot. The
+  LOCAL path never had this: `LocalEngineRouter` caches by `(etype, model)` and evicts on a
+  change, which is the policy the worker now implements.
+
+`_ensure_video_model` reloads on a **mismatch only**, so an omitted or matching model costs
+nothing and every pre-0.6.3 client is unaffected; it **closes the old engine before building
+the new one** (a 7B-to-7B swap holding both would want 30.7 GiB of resident weights); and a
+swap it cannot perform **raises** rather than falling back to the loaded model, because for a
+benchmark that fallback files one model's numbers under another's key and they are believed.
+
+Not the esrgan pattern despite the resemblance (section 18.9): an esrgan weight is ~65 MB and
+swaps in about a second, a SeedVR2 DiT is 1.9-15.4 GiB. A swap is worth avoiding; a redeploy is
+worth avoiding far more.
+
+Full record, including the local half and the benchmark's one-pod sweep:
+`docs/local-video-upscaler.md` section 24.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
