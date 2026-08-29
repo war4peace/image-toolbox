@@ -122,6 +122,13 @@ class FilmStrip(ttk.Frame):
         self._gen     = 0         # invalidates stale loader threads
         self._q       = queue.Queue()
         self._resize_after = None
+        # Every live decode thread, so they can be stopped rather than merely
+        # invalidated. `_gen` alone tells a loader to give up at its next
+        # checkpoint; it does not tell anyone WHEN it did, which is the part that
+        # matters once the widget is gone (see stop_loaders / _on_destroy).
+        self._loaders = set()
+        self._loaders_lock = threading.Lock()
+        self.bind("<Destroy>", self._on_destroy)
 
     def _wheel(self, event):
         self.canvas.yview_scroll(-(event.delta // 120) * 2, "units")
@@ -204,8 +211,7 @@ class FilmStrip(ttk.Frame):
         if not p:
             return
         self._photo.pop(p, None)
-        threading.Thread(target=self._load_batch,
-                         args=([p], self._gen), daemon=True).start()
+        self._spawn_loader([p], self._gen)
 
     def page_count(self):
         """How many pages the queue spans (0 when it is empty)."""
@@ -517,8 +523,68 @@ class FilmStrip(ttk.Frame):
         if first in paths:              # decode the current image first
             i = paths.index(first)
             paths = paths[i:] + paths[:i]
-        threading.Thread(target=self._load_batch,
-                         args=(list(paths), self._gen), daemon=True).start()
+        self._spawn_loader(list(paths), self._gen)
+
+    def _spawn_loader(self, paths, gen):
+        """Start one decode thread and REMEMBER it.
+
+        Every loader used to be fire-and-forget. Nothing held a reference, so
+        nothing could wait for one, and `_gen` only asks a loader to stop at its
+        next checkpoint. That is fine while the widget lives and wrong the moment
+        it does not: a closed browse window left up to a page of decodes running,
+        and in the test suite the threads ran on into unrelated tests, where two of
+        them met in the import lock during a garbage collection and killed the
+        process (CI, 2026-08-29). Daemon threads make that quiet, not harmless."""
+        t = threading.Thread(target=self._run_loader, args=(paths, gen), daemon=True)
+        with self._loaders_lock:
+            self._loaders.add(t)
+        t.start()
+
+    def _run_loader(self, paths, gen):
+        """`_load_batch` plus deregistration, which must happen however it ends."""
+        try:
+            self._load_batch(paths, gen)
+        finally:
+            with self._loaders_lock:
+                self._loaders.discard(threading.current_thread())
+
+    def stop_loaders(self, timeout=1.0):
+        """Invalidate every decode thread and wait for them, briefly.
+
+        Bumping `_gen` is what stops them; the join is what makes "stopped" a fact
+        the caller can rely on instead of a request. The budget is shared across all
+        of them and deliberately short: they are daemon threads and already
+        invalidated, so overrunning it costs a little wasted decoding, never
+        correctness. Safe to call from the UI thread -- a loader touches no widget,
+        only `self._q`, so it can never be waiting on the caller.
+
+        Returns the threads still running when the budget ran out (empty is the
+        normal answer), so a test can assert on it rather than on a sleep."""
+        self._gen += 1
+        with self._loaders_lock:
+            alive = [t for t in self._loaders if t.is_alive()]
+        deadline = time.monotonic() + max(0.0, timeout)
+        for t in alive:
+            if t is threading.current_thread():
+                continue
+            t.join(max(0.0, deadline - time.monotonic()))
+        return [t for t in alive if t.is_alive()]
+
+    def _on_destroy(self, event):
+        """The widget is going away, so its decode threads should too.
+
+        The `event.widget is self` guard is NOT load-bearing today, and saying so is
+        the point: a plain `bind` attaches to this widget's own bindtag, and a child's
+        <Destroy> goes to the child's tags (itself, its class, the TOPLEVEL, `all`),
+        so this handler never sees one. Measured, because the plausible-sounding
+        opposite is what the first version of this comment claimed.
+
+        It stays because both of the tags that DO see every child -- the toplevel and
+        `all` -- are one `bind_all` away, and because cells are created and destroyed
+        on every page turn, so an unguarded handler would cancel the page it is in the
+        middle of drawing."""
+        if event.widget is self:
+            self.stop_loaders()
 
     def _resolve_renamed(self, p):
         """Follow any rename(s) recorded for `p` to its latest on-disk path.
@@ -531,6 +597,12 @@ class FilmStrip(ttk.Frame):
         return p
 
     def _load_batch(self, paths, gen):
+        # Checked BEFORE the import, not only in the loop below. An import is not
+        # free: with Pillow missing it is not even cached, so a stale loader walked
+        # the whole finder chain before reaching its first checkpoint, which is
+        # exactly where two of them collided in the import lock (see _spawn_loader).
+        if gen != self._gen:
+            return
         from PIL import Image, ImageOps
         for p in paths:
             if gen != self._gen:
