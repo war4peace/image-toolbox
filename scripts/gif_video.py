@@ -1,7 +1,8 @@
 """
 gif_video.py
 ------------
-Animated GIF -> upscaled video (future-features #27 phase 2).
+Animated GIF -> upscaled video (roadmap #27 phase 2; the design record, including the
+measurements behind every choice below, is `docs/video-upscaler.md` section 20).
 
 An animated GIF is upscaled by the VIDEO Upscaler, not the Batch Upscaler, and the
 reason is not architectural taste. `upscale_engine.upscale()` draws a FRESH RANDOM SEED

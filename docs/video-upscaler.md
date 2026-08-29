@@ -53,6 +53,7 @@ Upscaler"**.
 - [17. Self-healing remote runs ("Auto-resume")](#17-self-healing-remote-runs-auto-resume-050-experimental)
 - [18. Per-item GPU binding + grouped multi-pod Start, and remote Real-ESRGAN (planned, 0.5.6)](#18-per-item-gpu-binding--grouped-multi-pod-start-and-remote-real-esrgan-planned-056)
 - [19. The pod worker swaps its model (0.6.3)](#19-the-pod-worker-swaps-its-model-063)
+- [20. Animated GIF as a video source (0.6.3)](#20-animated-gif-as-a-video-source-063)
 
 ---
 
@@ -2101,5 +2102,129 @@ worth avoiding far more.
 
 Full record, including the local half and the benchmark's one-pod sweep:
 `docs/local-video-upscaler.md` section 24.
+
+<div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>
+
+---
+
+## 20. Animated GIF as a video source (0.6.3)
+
+Roadmap **#27 phase 2**, researched 2026-08-23 and built 2026-08-29. The record lived in
+`docs/future-features.md` while it was a plan; this is its home now that it is built. Phase 1,
+the STATIC GIF, is an image and belongs to the Batch Upscaler: see `CLAUDE.md` ("Static GIF
+input") and `tests/test_gif_input.py`.
+
+Its measurements were taken during research and then RE-taken against the app's own code.
+**Two of them did not survive that**, and both corrections are kept below rather than quietly
+fixed, because each one changed the design.
+
+### 20.1 The tool that owns it was not a judgement call
+
+The open question was whether an animated GIF belongs to the Batch Upscaler (it is an image
+file) or here (it produces a video). One fact settles it: **`upscale_engine.upscale()` draws a
+FRESH RANDOM SEED for every image** (`self.args.seed = random.randint(...)`, with no setting to
+pin it), while the video path fixes one stable seed per source
+(`batch_video_upscale.per_video_seed`). On a photo that is invisible. On ten consecutive frames
+of one scene it is generative FLICKER, and no encoder fixes it afterwards. The video path also
+brings temporal batching, which is what makes an animation look coherent in the first place.
+
+So the Video Upscaler owns it, `.gif` is kept **out of `VIDEO_EXTS`** as its own case (the same
+call `raw_decode.RAW_EXTS` gets, for the same reason: it is not interchangeable anywhere
+downstream), and **`gif_video.is_animated` is the whole of the static/animated split**. That
+split is an implementation detail a user must never have to hold, which is why the Batch
+Upscaler's skip line for an animated GIF names this tab (`batch_upscale.variant_next_step`).
+
+### 20.2 The shape: prep, the existing pipeline unchanged, re-time
+
+`gif_video.prepare()` turns the GIF into an ordinary constant-rate video with exactly one frame
+per source frame, in the work area; everything downstream (`plan_split`, `split`, the engine,
+concat, the drift check) treats it as any other short source; then `gif_video.retime()` puts the
+original per-frame timing back, duplicating frames at ENCODE time. Structurally it is the same
+move the clip branch (section 16.7) already makes, and it sits beside it.
+
+**Correction 1: the inflation is real but the recorded model was wrong.** The plan said
+`plan_split` normalises to `r_fps` = 1/shortest-delay, and that "one 10 ms tick among 100 ms
+frames costs 9.6x". Measured through this app's own `probe()`, ffmpeg does not report `r_fps`
+that way: that exact GIF reads `r_fps=59/6` and would cost **0.9x**, not 9.6x. The conclusion
+holds and the penalty is still worth avoiding, for a different distribution of cases:
+
+| timing | source frames | CFR-normalised |
+|---|---|---|
+| uniform 100 ms | 10 | 10 (1.0x, no penalty) |
+| messy real-world | 10 | 38 (3.8x) |
+
+Every one of those duplicates is a full diffusion pass and nothing in the UI shows the waste.
+The rule the shape exists for is unchanged: **duplicate after upscaling, never before.**
+
+**Correction 2: neither concat form is exact, and the plan only caught one half.** It recorded
+that `duration` directives plus the repeated last frame the demuxer needs ran **+60 ms** long on
+a 760 ms clip. Reproduced exactly. Adding `-t` to trim then **overcorrected to -40 ms**. Both
+leave the trailing frame's length to ffmpeg. `gif_video.plan_timing` removes the decision
+instead: GIF delays are centisecond-quantised, so take the GCD as a tick and list each frame
+`delay/tick` times, with no duration directives at all. Total frames becomes arithmetic.
+Measured **zero drift on all four timing shapes**, including the pathological one. It is a pure
+function, so that arithmetic is unit-tested without ffmpeg.
+
+### 20.3 The matte works, and the first version of it silently did not
+
+Measured: a transparent GIF decodes as `bgra`, a bare conversion composites it to **black**
+(which is the default), and compositing onto an explicit colour source produces black, white,
+magenta and `#336699` correctly.
+
+The bug worth recording is how the first implementation failed. Compositing in the filtergraph
+needs a second input, a `color` source, and **an overlay takes its output RATE from that
+background input**: `color=c=black` with no rate generated 25 fps, and a 10-frame GIF came out
+as **17 PNGs**. Resampling before the model runs is the one thing this feature exists to avoid,
+and the matte reintroduced it. It was caught immediately, and only because `prepare()` asserts
+its own frame-exactness and refuses rather than continuing.
+
+So the work is split deliberately: **ffmpeg explodes the GIF** (frame disposal and coalescing
+are real semantics its decoder implements, which a naive per-frame read gets wrong) and
+**Pillow composites the matte** (exact, no rate involved, no second input).
+
+The matte setting lives in **Settings -> Video Upscaler**. Upscaling an animated GIF is a video
+upscaler's job, and whether a thing is "a video or a series of images" is a technical detail
+nobody should have to hold in order to find a setting.
+
+### 20.4 Naming: the third encounter with one collision
+
+Output is **`<base>_gif_<target>.mp4`**. This tab names outputs `<base>_<target>.mp4`, so
+`logo.gif` and `logo.mp4` in one folder would both claim `logo_4K.mp4`, and one would silently
+become "already upscaled" with its lineage row pointing at a file made from the other source.
+That is #19's RAW+JPEG collision and phase 1's GIF+PNG collision for the third time, and the
+answer is the same each time: an **unconditional** marker. It lives in `gif_video.OUTPUT_MARKER`
+and is applied inside `batch_video_upscale._output_path`, which already owns naming for all four
+of its callers; a test pins that the two agree.
+
+### 20.5 Conciliation never replaces an animated GIF, three times over
+
+An MP4 is **not a superset** of an animated GIF: looping is gone and transparency has been
+composited onto a matte. Both are accepted losses for a DERIVED file the user asked for; neither
+is acceptable when the original is about to be archived or **deleted**. Three independent guards,
+because the failure is irreversible and quiet:
+
+1. **No lineage row is recorded for a GIF source.** This is #23 item 5's decision applied again,
+   for exactly its reason: `db.lineage` is not a provenance log, it is what Conciliation MATCHES
+   ON, and video conciliation is lineage-only. No row means the question is never asked.
+2. **An explicit refusal in `conciliate.build_plan`**, listed and reported separately from RAW:
+   same reason, different files, and a user needs to know which is which.
+3. The #17 variant guard still catches it as a side effect. It is deliberately **not** relied
+   on: its reason ("would lose 5 of 6 frames") describes the Batch Upscaler flattening it, which
+   is no longer what the app does with one, so a future change that taught it about animation
+   would silently remove the protection.
+
+A **static** GIF is unaffected and is still conciliated normally, because there the processed
+PNG genuinely is a superset. The guard is about ANIMATION, not about the extension, and a test
+says so.
+
+### 20.6 What is accepted rather than solved
+
+Looping semantics are lost in a plain video container. The `<base>_gif_` marker survives into
+the output name, which is the honest cost of never letting two sources claim one name. And
+`retime()` explodes the upscaled video to PNG in the work area, so a long GIF at 4K needs
+transient disk proportional to its frame count; GIFs are short and the work area already holds
+multi-GB video segments, so this was not worth optimising before anyone hits it.
+
+See `gif_video.py` and `tests/test_gif_video.py`.
 
 <div align="right"><a href="#video-upscaler-design--as-built">↑ Back to top</a></div>

@@ -204,7 +204,8 @@ extension. The Batch Upscaler still refuses an animated GIF and now **names the 
 Upscaler** in the skip line (`variant_next_step`), detected from the reason string rather
 than by re-opening the file. Looping is lost and accepted; `retime` explodes the upscaled
 video to PNG in the work area, so transient disk scales with frame count. See
-`gif_video.py` and `tests/test_gif_video.py`.
+`docs/video-upscaler.md` section 20 (the design record), `gif_video.py` and
+`tests/test_gif_video.py`.
 
 **Tag & Rename** — analyses each image with a local Ollama vision model, writes
 a description into EXIF, and renames to `OriginalName_Condensed_Description.ext`.
@@ -1515,20 +1516,21 @@ Engine, packaging & CI:
   `tests/test_filmstrip_loader_threads.py`, asserts that no thread survives the widget),
   `future-features.md`
   (roadmap: open milestones #28, #21,
-  #12/#15, #3/#4, plus #25, #24, #26 and #27, all BUILT: #25 stays open because it owns two
+  #12/#15, #3/#4, plus #25, #24 and #26, all BUILT: #25 stays open because it owns two
   dated deletions (the v1 half after 2026-11-15 and the GraphQL balance island in early 2027),
-  #24 only for its redaction record, its live GitHub check having passed on 2026-08-22, #26
+  #24 only for its redaction record, its live GitHub check having passed on 2026-08-22, and #26
   for the half still to do (three model-blind VRAM constants, then a Part B quality
-  measurement nobody has run), and #27 because its real content was never the input format but
-  the data-loss guard the NEXT format will need too; shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22/#23
-  kept only as a numbering legend), `dropped-ideas.md` (ideas
+  measurement nobody has run); shipped #1/#2/#5/#6/#7/#8/#9/#10/#11/#13/#14/#16/#17/#18/#19/#20/#22/#23/#27
+  kept only as a numbering legend, each pointing at the doc that owns the feature), `dropped-ideas.md` (ideas
   investigated and decided against + the standing constraints: AMD/ROCm, vast.ai;
   incl. folding a RAW render back into the source tree, whose revisit trigger is an
   8K target),
   `runpod-notes.md` (remote-pod upscaling notes, INCLUDING the API v2 migration record
   and the two deletions still on a date), `video-upscaler.md` /
   `local-video-upscaler.md` (design + as-built notes for the Video Upscaler: remote #2
-  and the local GPU path #7), `benchmark-sharing.md` (as-built notes for the
+  and the local GPU path #7, plus the two 0.6.3 additions that landed on that tab, the
+  pod worker's model swap (#26 Part A, section 19) and animated GIF input (#27 phase 2,
+  section 20)), `benchmark-sharing.md` (as-built notes for the
   crowdsourced benchmark corpus, #8), `tag-and-rename.md` (vision-model design +
   as-built notes for Tag & Rename: the model tiers + the `ollama_num_ctx` cap, with
   `tag-rename-benchmarks.csv` the raw 100-image measurements),

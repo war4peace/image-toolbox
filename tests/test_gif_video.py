@@ -1,5 +1,6 @@
 """
-Animated GIF -> upscaled video (future-features #27 phase 2).
+Animated GIF -> upscaled video (roadmap #27 phase 2, recorded in `docs/video-upscaler.md`
+section 20).
 
 The feature is three stages around the EXISTING video pipeline: prep the GIF into an
 ordinary constant-rate video, let the pipeline do what it already does, then put the

@@ -14,18 +14,13 @@ already pinned but never offered) went out in 0.6.3, while what is left is an ea
 (three VRAM constants that still describe only the heaviest weight, which is what currently
 stops the new ones being useful) and a GPU measurement nobody has run, whose entry records a
 claim that half made which turned out to be false.
-#27 (GIF, both phases) is built and is kept in place rather than moved to the legend, because
-its real content was never the input format: it is a data-loss guard, and the reason that guard
-is needed is the same reason the next format added will need one. Its phase 2 also carries two
-corrections to its own earlier measurements, which is exactly the kind of thing a pointer line
-cannot hold.
-The rest are unbuilt: one measurement-gated one (#21
-denoising, gated on a measurement that has not been run), a remote-side pair covering the same
-harm at
-different cost (#28, a pre-built public template, plus the cheap idle-volume mitigation it
-carries that needs no new primitives), a Video Upscaler feature (#12 mixed local+remote queue)
-and one blocked on funds rather than design (#15 a second GPU provider). Two lower-priority ones each introduce a new process model, networking, or packaging
-(HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a numbering
+
+The rest are unbuilt: one measurement-gated one (#21 denoising, gated on a measurement that has
+not been run), a remote-side pair covering the same harm at different cost (#28, a pre-built
+public template, plus the cheap idle-volume mitigation it carries that needs no new primitives),
+a Video Upscaler feature (#12 mixed local+remote queue) and one blocked on funds rather than
+design (#15 a second GPU provider). Two lower-priority ones each introduce a new process model,
+networking, or packaging (HTTP interface #3, Unraid #4). The **shipped** milestones are kept below as a numbering
 legend, after the open work.
 
 ---
@@ -34,7 +29,6 @@ legend, after the open work.
 
 - [25. RunPod API v2 migration](#25-runpod-api-v2-migration-built-two-deletions-still-dated) (built; two dated deletions left)
 - [26. The five unreachable SeedVR2 DiT weights](#26-the-five-unreachable-seedvr2-dit-weights-part-a-built-the-vram-constants-next-part-b-gated-on-a-measurement) (Part A built; the model-blind VRAM constants next; Part B needs a measurement)
-- [27. GIF input, static and animated](#27-gif-input-static-and-animated-built-in-063) (built, both phases)
 - [28. Pre-built public RunPod template](#28-pre-built-public-runpod-template-medium-plus-a-cheap-mitigation-worth-doing-first)
 - [21. Denoising before upscaling](#21-denoising-before-upscaling-medium-gated-on-a-measurement-deferred)
 - [12. Local+remote mixed queue](#12-localremote-mixed-queue-medium)
@@ -445,241 +439,6 @@ FIRST: without them the light weights are selectable but cannot reach the cards 
 for, which is also what stops Part B being answerable on those cards. Part B itself is a
 measurement job rather than a coding job, and its cost is GPU hours plus a judgement call on
 real photos.
-
----
-
-## 27. GIF input, static and animated: BUILT in 0.6.3
-
-Researched 2026-08-23, built 2026-08-29 in two phases. **Phase 1 is the static GIF**
-(an image, handled by the Batch Upscaler) and **phase 2 is the animated one** (an
-animation, handled by the Video Upscaler, recorded at the bottom). Phase 2 was
-deliberately unscheduled when phase 1 shipped; it was built when its measurements were
-re-taken against the app's own code, and two of them did not survive that.
-
-**Before this, `.gif` appeared in no extension list at all** - not `IMAGE_EXTS` (all
-three copies), not `VIDEO_EXTS`, not `RAW_EXTS`. The app ignored GIF completely, so this
-was a clean feature and not a latent bug.
-
-### The guard is not a detail of this feature, it IS this feature
-
-Adding `.gif` to `IMAGE_EXTS` **alone reproduces #17's data loss exactly, and the #17
-guard does not fire.** Measured on a 6-frame GIF carrying a transparency index:
-
-```
-VARIANT_CANDIDATE_EXTS: ('.png', '.webp', '.tif', '.tiff', '.bmp')
-image_variant_reason -> None
-```
-
-`.gif` was not a variant candidate, so the check returned None. The engine is RGB
-frame-0 only (`_load_image` does `convert("RGB")`, `_save_image` writes
-`arr[..., :3]` of `tensor[0]`), so the output would be a flattened first frame under a
-mirrored name, and **Conciliation's mirrored-name fallback would then match it with full
-confidence and archive or DELETE the animated original.** That is precisely the
-failure #17 exists to prevent, in a format that was simply never on the list.
-
-**So `.gif` joined `IMAGE_EXTS` and `VARIANT_CANDIDATE_EXTS` in the SAME change, never
-in sequence**, and `test_the_two_lists_moved_together` is what keeps them that way.
-An animated GIF is now reported and skipped ("would lose 5 of 6 frames"), which is
-correct, protective behaviour from day one and needed no decision about animation at
-all. The noun is per format: GIF and animated WebP measure time, a TIFF really does
-have pages.
-
-### As built: the output is `<stem>_gif.png`, and Conciliation inverts it
-
-The one real decision was what a static GIF is written AS. GIF is a 256-colour palette
-with 1-bit transparency, so saving the 4K result back to `.gif` re-quantises and
-re-dithers it, discarding most of what was just computed. It is written as **PNG**.
-
-**The `_gif` marker is #19's RAW+JPEG collision in a second costume.** `logo.gif` and
-`logo.png` in one folder would both want to become `logo.png` in the mirrored output
-tree, and two sources mapping to one output is not a crash: the first processed wins
-and the second is silently counted "already upscaled", with the film strip and the
-lineage row pointing at a file produced from the other source. The suffix is
-**unconditional**, never "only when it would collide", because a name that depends on
-what else is in the folder changes when a sibling is added later, which breaks every
-inverse after the fact.
-
-**Unlike a RAW render, this output IS a replacement for its source**, and that is the
-difference that shaped the rest. A static GIF holds at most 256 colours and 1-bit
-transparency, all of which a PNG carries losslessly, so Conciliation is EXPECTED to
-match it and move it in. `conciliate.resolve_by_name` therefore inverts the naming rule
-explicitly rather than leaving it to the content-hash lineage. Lineage would usually
-match it, and "usually" is not good enough for the one tool that archives or deletes
-originals: a tree upscaled by another install, or one whose `db/cache.db` was deleted,
-has no lineage row at all, and working without one is the entire point of that fallback.
-The tag index is consulted for the GIF name as well as the mirrored one, so an output
-that Tag & Rename has since renamed is still found.
-
-**The conciliated file keeps its marker** (`<stem>_gif.png` lands in the original tree,
-not `<stem>.png`). Stripping it on the way in looks tidier and is not safe: `logo.gif`
-and `logo.png` can both be conciliated into one folder, and `_move_processed_in` moves
-with `shutil.move`, which overwrites without asking. The suffix that stops two sources
-sharing one OUTPUT is the same suffix that stops them sharing one destination.
-
-Three smaller calls, each recorded at its site:
-
-- **Tag & Rename ignores `.gif`**, the same call RAW gets: it writes a description into
-  the file's own metadata and GIF has nowhere to put one. Nothing is lost, because the
-  documented workflow points that tab at the UPSCALED folder, where a GIF is already a
-  PNG.
-- **The upscaled-image browser (#22) pairs it**, unlike a RAW render (which is excluded
-  from pairing outright, because the browser cannot draw a RAW as the "before" half). A
-  GIF is an ordinary Pillow image, so inverting the name is what gives it Compare long
-  after the run ended.
-- **`.gif` is NOT in the browser's own extension list.** The upscaler accepts a GIF but
-  never writes one, so an output tree holds no `.gif`; listing them would only surface
-  files this app did not produce.
-
-Metadata needed nothing: `exif_copy.exif_for_upscaled` returns None for a GIF source and
-`pending_backfill` returns 0, so both #13 halves are already the correct no-op.
-
-### What building it found: BOTH fixtures collapse silently
-
-This is the part worth carrying forward, because it makes a test file look right while
-testing nothing. **Pillow's GIF writer discards the exact properties under test**, in two
-independent ways, measured 2026-08-29:
-
-- `save(transparency=N)` writes **no transparency block** unless index N is actually
-  USED in the pixel data. A uniform fill saved with `transparency=0` reloads with info
-  keys `['background', 'version']` and nothing else. Three separate constructions failed
-  this way before one stuck.
-- `append_images=[im.copy()] * 5` collapses to **`n_frames == 1`**, because identical
-  frames are optimised away. The "animated" fixture is then a 105-byte static GIF.
-
-A naive fixture is therefore quietly the opposite of what it claims. Every builder in
-`tests/test_gif_input.py` asserts its own result before a test relies on it, and one
-test pins both collapse modes so a future Pillow that stops doing this is noticed rather
-than silently making the guard tests vacuous.
-
-The generalisable version: **when a test's subject is a property the WRITER may
-optimise away, the fixture has to be read back and checked, not trusted.** That is the
-same instinct as the "present is not working" trio in `known-defects.md`, applied to
-test data instead of to an installed component.
-
-### Phase 2: animated GIF out to MP4, BUILT in 0.6.3
-
-Built 2026-08-29 on the measurements below, which were taken in 2026-08-23 research and
-then RE-taken against the app's own code. Two of them did not survive contact, and both
-corrections are recorded here rather than quietly fixed.
-
-#### The tool that owns it was not a judgement call
-
-The open question was whether an animated GIF belongs to the Batch Upscaler (it is an
-image file) or the Video Upscaler (it produces a video). It is settled by one fact:
-**`upscale_engine.upscale()` draws a FRESH RANDOM SEED for every image**
-(`self.args.seed = random.randint(...)`, no setting pins it), while the video path fixes
-one stable seed per source (`batch_video_upscale.per_video_seed`). On a photo that is
-invisible. On ten consecutive frames of one scene it is generative FLICKER, and no
-encoder fixes it afterwards. The video path also brings temporal batching, which is what
-makes an animation look coherent in the first place.
-
-So the Video Upscaler owns it, `.gif` is kept OUT of `VIDEO_EXTS` as its own case (the
-same call `raw_decode.RAW_EXTS` gets for the same reason: it is not interchangeable
-anywhere downstream), and **`gif_video.is_animated` is the whole of the static/animated
-split**: static to the Batch Upscaler, animated here. That split is an implementation
-detail a user must never have to hold, which is why the Batch Upscaler's skip line for
-an animated GIF now names the Video Upscaler (`batch_upscale.variant_next_step`).
-
-#### The shape: prep, the existing pipeline unchanged, re-time
-
-`gif_video.prepare()` turns the GIF into an ordinary constant-rate video with exactly one
-frame per source frame, in the work area; everything downstream (plan_split, split, the
-engine, concat, the drift check) treats it as any other short source; then
-`gif_video.retime()` puts the original per-frame timing back, duplicating frames at
-ENCODE time. Structurally it is the same move the CLIP branch already makes, and it sits
-right beside it.
-
-**Correction 1: the inflation is real but the recorded model was wrong.** The entry said
-`plan_split` normalises to `r_fps` = 1/shortest-delay and that "one 10 ms tick among 100
-ms frames costs 9.6x". Measured through this app's own `probe()`, ffmpeg does not report
-r_fps that way: that exact GIF reads `r_fps=59/6` and would cost **0.9x**, not 9.6x. The
-conclusion still holds and the penalty is still worth avoiding, just for a different
-distribution of cases:
-
-| timing | source frames | CFR-normalised |
-|---|---|---|
-| uniform 100 ms | 10 | 10 (1.0x, no penalty) |
-| messy real-world | 10 | 38 (3.8x) |
-
-Every one of those duplicates is a full diffusion pass and nothing in the UI shows the
-waste. The generalisable rule is unchanged and is the reason for the whole shape:
-**duplicate after upscaling, never before.**
-
-**Correction 2: neither concat form is exact, and the entry only caught one half.** It
-recorded that `duration` directives plus the repeated last frame the demuxer needs ran
-+60 ms long. Reproduced exactly. Adding `-t` to trim then **overcorrected to -40 ms**.
-Both leave the trailing frame's length to ffmpeg. `gif_video.plan_timing` removes the
-decision instead: GIF delays are centisecond-quantised, so take the GCD as a tick and
-list each frame `delay/tick` times with no duration directives at all. Total frames
-becomes arithmetic. Measured **zero drift on all four timing shapes**, including the
-pathological one. It is a pure function, so that arithmetic is unit-tested without
-ffmpeg.
-
-#### The matte works, and the first version of it silently did not
-
-Measured: a transparent GIF decodes as `bgra`, a bare conversion composites it to
-**black** (confirming the entry's reasoning for that default), and compositing onto an
-explicit colour source produces black, white, magenta and `#336699` correctly.
-
-The bug worth recording is how the first implementation failed. Compositing in the
-filtergraph needs a second input, a `color` source, and **an overlay takes its output
-RATE from that background input**: `color=c=black` with no rate generated 25 fps, and a
-10-frame GIF came out as **17 PNGs**. Resampling before the model runs is the one thing
-this feature exists to avoid, and it was reintroduced by the matte. It was caught
-immediately, and only because `prepare()` asserts its own frame-exactness and refuses
-rather than continuing. So the work is split deliberately: **ffmpeg explodes the GIF**
-(frame disposal and coalescing are real semantics its decoder implements and a naive
-per-frame read gets wrong) and **Pillow composites the matte** (exact, no rate involved,
-no second input).
-
-The matte setting lives in **Settings -> Video Upscaler**, which is the user's own call
-and the right one: upscaling an animated GIF is a video upscaler's job, and whether a
-thing is "a video or a series of images" is a technical detail nobody should have to hold
-in order to find a setting.
-
-#### Naming, and the third encounter with one collision
-
-Output is **`<base>_gif_<target>.mp4`**. The video upscaler names outputs
-`<base>_<target>.mp4`, so `logo.gif` and `logo.mp4` in one folder would both claim
-`logo_4K.mp4` -- one silently becomes "already upscaled" with its lineage row pointing at
-a file made from the other source. That is #19's RAW+JPEG collision and phase 1's
-GIF+PNG collision for the third time, and the answer is the same each time: an
-UNCONDITIONAL marker. The rule lives in `gif_video.OUTPUT_MARKER` and is applied inside
-`batch_video_upscale._output_path`, which already owns naming for all four of its
-callers; a test pins that the two agree.
-
-#### Conciliation never replaces an animated GIF, three times over
-
-An MP4 is **not a superset** of an animated GIF: looping is gone and transparency has
-been composited onto a matte. Both are accepted losses for a DERIVED file the user asked
-for; neither is acceptable when the original is about to be archived or **deleted**.
-Three independent guards, because the failure is irreversible and quiet:
-
-1. **No lineage row is recorded for a GIF source.** This is #23 item 5's decision applied
-   again, and for exactly its reason: `db.lineage` is not a provenance log, it is what
-   Conciliation MATCHES ON, and video conciliation is lineage-only. No row means the
-   question is never even asked.
-2. **An explicit refusal in `conciliate.build_plan`**, listed and reported separately from
-   RAW (same reason, different files, and a user needs to know which is which).
-3. The #17 variant guard still catches it as a side effect. It is deliberately **not**
-   relied on: its reason ("would lose 5 of 6 frames") describes the Batch Upscaler
-   flattening it, which is no longer what the app does with one, so a future change that
-   taught it about animation would silently remove the protection.
-
-A **static** GIF is unaffected and is still conciliated normally, because there the
-processed PNG genuinely is a superset. The guard is about ANIMATION, not about the
-extension, and a test says so.
-
-#### What is still accepted rather than solved
-
-Looping semantics are lost in a plain video container. The `<base>_gif_` marker survives
-into the output name, which is the honest cost of never letting two sources claim one
-name. And `retime()` explodes the upscaled video to PNG in the work area, so a long GIF
-at 4K needs transient disk proportional to its frame count; GIFs are short, and the work
-area already holds multi-GB video segments, so this was not worth optimising before
-anyone hits it.
-
-See `gif_video.py` and `tests/test_gif_video.py`.
 
 ---
 
@@ -1452,10 +1211,11 @@ kept in two places drifts, and the stale copy is the one that gets read.
   scene is generative flicker. The feature is really the **guard** in both phases: `.gif` in
   `IMAGE_EXTS` without `VARIANT_CANDIDATE_EXTS` reproduces #17's data loss, and Conciliation
   must never replace an animated GIF with a video that has lost its looping and flattened its
-  transparency. The entry stays in the open list above rather than shrinking to this line,
-  because it holds two measurement corrections and the reason a matte cannot be built in an
-  ffmpeg filtergraph. See `CLAUDE.md` (GIF input), `tests/test_gif_input.py` and
-  `tests/test_gif_video.py`.
+  transparency. Phase 2's full record, including two corrections to its own research
+  measurements and the reason a matte cannot be composited in an ffmpeg filtergraph, is
+  `docs/video-upscaler.md` section 20. Phase 1 is `CLAUDE.md` ("Static GIF input") and
+  `tests/test_gif_input.py`, whose docstring holds the fixture finding: Pillow's GIF writer
+  silently discards both properties those tests are about.
 
 <div align="right"><a href="#future-features">↑ Back to top</a></div>
 
