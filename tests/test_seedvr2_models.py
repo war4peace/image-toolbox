@@ -31,7 +31,8 @@ from gui import wizard_recommend as wr
 # source so a widened/narrowed combobox is a deliberate edit here too.
 WIDTH_SETTINGS = 40      # tab_settings._model_cb
 WIDTH_WIZARD = 44        # gui/wizard.py DiT combobox
-WIDTH_VIDEO = 22         # tab_video.method_combo
+WIDTH_VIDEO = 49         # tab_video.method_combo (widened in 0.6.3 to fit the full label)
+WIDTH_QUEUE_COL = 22     # tab_video's "method" queue column, via _short_method
 
 
 def test_every_offered_weight_has_a_download_pin():
@@ -115,14 +116,54 @@ def test_every_recommendation_is_selectable_in_every_list():
 
 @pytest.mark.parametrize("width,attr", [(WIDTH_SETTINGS, "label"),
                                         (WIDTH_WIZARD, "label"),
-                                        (WIDTH_VIDEO, "short")])
-def test_labels_fit_their_combobox(width, attr):
-    """A label wider than its combobox is truncated on screen, which no contents check
-    sees. The Video tab's 22 characters is the tight one."""
+                                        (WIDTH_QUEUE_COL, "short")])
+def test_labels_fit_their_widget(width, attr):
+    """A label wider than the widget showing it is truncated on screen, which no contents
+    check sees. `short` is the QUEUE COLUMN's label now, not a combobox's: the Method
+    picklist shows the full label (below), which is what the other two already showed."""
     for spec in sm.catalog():
         text = getattr(spec, attr)
         assert len(text) <= width, \
-            f"{spec.key}: {attr!r} is {len(text)} chars, combobox is {width}"
+            f"{spec.key}: {attr!r} is {len(text)} chars, the widget takes {width}"
+
+
+def test_the_method_picklist_shows_the_reason_not_just_the_weight():
+    """0.6.3. The Video tab named the weight ("SeedVR2 / 7B Q4") while Settings and the
+    Benchmark window's Models... picker both spelled out the trade for the SAME ten
+    models. A picklist a non-technical user cannot choose from is #26 Part A's problem one
+    layer up, so the combobox was widened rather than the reason dropped."""
+    from gui import tab_video
+    assert tab_video._SEEDVR2_METHOD_LABELS == sm.method_options()
+    assert [lbl for lbl, _f in sm.method_options()] == \
+        [f"{sm.METHOD_PREFIX} / {lbl}" for lbl, _f in sm.options()]
+    for label, _engine, _model in tab_video._method_options(True):
+        assert " / " in label, f"{label!r} does not name its engine"
+        assert "(" in label and label.rstrip().endswith(")"), \
+            f"{label!r} carries no reason to pick it"
+
+
+def test_every_method_option_fits_the_widened_combobox():
+    """Both engines share the one picklist, so a long Real-ESRGAN tier truncates just as
+    a long SeedVR2 label would."""
+    from gui import tab_video
+    for label, _engine, _model in tab_video._method_options(True):
+        assert len(label) <= WIDTH_VIDEO, \
+            f"{label!r} is {len(label)} chars, method_combo is {WIDTH_VIDEO}"
+
+
+def test_the_method_combobox_actually_declares_that_width():
+    """Widening the labels and widening the widget are ONE change; a test that only
+    measured the strings would pass while every option rendered truncated. Read out of the
+    source rather than by building a VideoTab, whose background threads outlive the root
+    window and starve other tests."""
+    import pathlib
+    import re
+    from gui import tab_video
+    src = pathlib.Path(tab_video.__file__).read_text(encoding="utf-8")
+    m = re.search(r"self\.method_combo = ttk\.Combobox\((?:.|\n)*?width=(\d+)", src)
+    assert m, "method_combo's width= is no longer readable from the source"
+    assert int(m.group(1)) == WIDTH_VIDEO, \
+        f"method_combo is width={m.group(1)}, the labels are sized for {WIDTH_VIDEO}"
 
 
 def test_labels_lead_with_the_trade_not_the_filename():

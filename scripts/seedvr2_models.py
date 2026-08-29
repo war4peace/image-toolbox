@@ -67,7 +67,10 @@ class DitSpec:
     `precision` "fp16" | "fp8" | "q8" | "q4"
     `sharp`     the sharp-trained variant (crisper, more stylised)
     `label`     full picklist label, leading with the trade (Settings + wizard)
-    `short`     compact label for the Video tab's narrow Method combobox
+    `short`     compact label for the Video tab's 120 px queue column. NOT the Method
+                picklist, which shows `label` behind the engine name (see method_options):
+                a picklist is where a model is CHOSEN and needs the reason; a queue row
+                only has to say which one was chosen, on one line, in a narrow column.
     """
 
     def __init__(self, key, filename, family, precision, sharp, size_bytes, label, short):
@@ -160,8 +163,28 @@ def options():
 
 
 def short_options():
-    """[(short label, filename)] for the Video tab's narrow Method combobox."""
+    """[(short label, filename)] for the Video tab's QUEUE column, which is 120 px wide
+    and shows one row per queued job (`tab_video._short_method`)."""
     return [(m.short, m.filename) for m in CATALOG]
+
+
+# The engine name the Method picklist prefixes a model with. Real-ESRGAN's rows are
+# built the same way from its own catalog, in `tab_video._method_options`.
+METHOD_PREFIX = "SeedVR2"
+
+
+def method_options():
+    """[(method label, filename)] for the Video tab's Method combobox: the SAME full
+    label the Settings picklist and the Benchmark window's Models... picker show, behind
+    the engine name.
+
+    It used to show `short` instead ("SeedVR2 / 7B Q4"), which names the weight and says
+    nothing about why anyone would pick it -- while the two other places the same ten
+    models are offered both spell out the trade. The combobox was widened to fit rather
+    than the reason being dropped: a model list a user cannot choose from is the same
+    problem #26 Part A set out to fix, one layer up.
+    """
+    return [(f"{METHOD_PREFIX} / {m.label}", m.filename) for m in CATALOG]
 
 
 def total_bytes(names):

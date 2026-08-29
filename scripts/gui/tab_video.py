@@ -72,19 +72,32 @@ def _clip_tc(seconds):
 # seedvr2_models (#26 Part A; this list had drifted from tab_settings' and was missing the
 # 7B FP8-mixed weight the wizard recommends to every 16 GB card), Real-ESRGAN from
 # esrgan_models. Real-ESRGAN runs BOTH locally (#11) and remotely (#18 B: a volume-free
-# esrgan pod), so it is offered in both modes. The catalog's `short` labels are used here
-# because this combobox is only 22 characters wide.
-_SEEDVR2_METHODS = _seedvr2_models.short_options()
+# esrgan pod), so it is offered in both modes.
+#
+# The COMBOBOX shows each model's full label, the same "name (why you would pick it)" the
+# Settings picklist and the Benchmark window's Models... picker show; the combobox was
+# widened to fit it. `short` is kept for the QUEUE COLUMN, which is 120 px and one line per
+# job -- the two are different jobs, and it was the picklist that had the wrong one.
+_SEEDVR2_METHODS = _seedvr2_models.short_options()          # queue column
+_SEEDVR2_METHOD_LABELS = _seedvr2_models.method_options()   # Method combobox
+
+
+def _esrgan_tier_label(spec):
+    """"Compact (fast)" / "Quality (slower)" from the ESRGAN catalog's own label, which is
+    "<tier> (<trade>): <weight filename>". Derived rather than re-typed so the two lists
+    cannot drift; falls back to the bare tier name if that shape ever changes."""
+    head = (spec.label or "").split(":")[0].strip()
+    return head or spec.kind.capitalize()
 
 
 def _method_options(local):
     """The (label, engine, model) rows for the Method combobox. Real-ESRGAN rows are offered
     in BOTH modes now (local #11 and the remote volume-free esrgan pod #18 B). `local` is kept
     for signature stability (callers pass the current mode); it no longer gates the rows."""
-    opts = [(lbl, "seedvr2", fname) for lbl, fname in _SEEDVR2_METHODS]
+    opts = [(lbl, "seedvr2", fname) for lbl, fname in _SEEDVR2_METHOD_LABELS]
     try:
         import esrgan_models as em
-        opts += [(f"Real-ESRGAN / {m.kind.capitalize()}", "fixed_ratio", m.key)
+        opts += [(f"Real-ESRGAN / {_esrgan_tier_label(m)}", "fixed_ratio", m.key)
                  for m in em.catalog()]
     except Exception:                                # noqa: BLE001 (fail-safe: SeedVR2 still works)
         pass
@@ -706,8 +719,11 @@ class VideoTab(MqttTaskState, ttk.Frame):
         method_lbl = ttk.Label(pf, text="Method:")
         method_lbl.grid(row=0, column=2, sticky="e")
         self.method_var = tk.StringVar()
+        # Wide enough for the longest full label ("SeedVR2 / 7B Sharp FP8 mixed (crisper,
+        # less VRAM)", 49 chars); pinned by tests/test_seedvr2_models.py. The whole row
+        # asks 909 px at this width, inside the 1200 px minimum window.
         self.method_combo = ttk.Combobox(pf, textvariable=self.method_var,
-                                         state="readonly", width=22, values=[])
+                                         state="readonly", width=49, values=[])
         self.method_combo.grid(row=0, column=3, padx=(4, 10))
         self.method_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_method_change())
         target_lbl = ttk.Label(pf, text="Target:")
