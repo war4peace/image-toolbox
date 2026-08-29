@@ -21,8 +21,26 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Pillow is NOT a relaxation of the torch-free rule: it is a 3 MB pure app
+      # dependency, and leaving it out was costing real coverage and, since 0.6.3,
+      # stability.
+      #
+      # COVERAGE: without it, `pytest.importorskip("PIL")` silently skipped
+      # test_gif_input + test_gif_video (57 tests, the whole of 0.6.3's headline
+      # feature), test_raw_input, test_exif_copy, test_image_variants, test_lens_view
+      # and six tag/runner modules. The tick was green and the feature untested here.
+      #
+      # STABILITY: a leaked FilmStrip decode thread runs `from PIL import Image` in a
+      # loop. With the module ABSENT that import never caches, so it walks the finders
+      # every time -- and a run of it collided with the main thread's own
+      # importorskip("PIL.Image") inside the import lock, with a GC in the middle, and
+      # killed the process ("Windows fatal exception: code 0x80000003"). Present, the
+      # import is cached and instant.
+      #
+      # torch/CUDA stay out: the suite is torch-free by design (test_import_smoke.py)
+      # and that is what keeps this workflow seconds rather than a ~3 GB download.
       - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+        run: python -m pip install --upgrade pip pytest pillow
 
       - name: Run tests
         run: python -m pytest -ra
